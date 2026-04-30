@@ -33,6 +33,12 @@ These questions arise in many domains. Bundling the answers inside `binary-bpe` 
 
 ### Tokenfs / bbpe direct consumers
 
+Paper labels such as F21/F22/F23b are historical lineage names. Public crate
+APIs should use the product names defined in
+`docs/PAPER_LINEAGE_NAMING.md` (`selector`, `fingerprint`, `sketch`,
+`conditional dispatch`) while docs and calibration benches retain the paper
+labels.
+
 1. **F21 selector** — per-extent entropy fingerprint → predict best representation.
 2. **F22 fingerprint kernel** — per-256-byte-block fingerprint for the predictive selector and skip-compression fast-path.
 3. **F23b ConditionalSimdEncoder** — per-window dispatch in the bbpe SIMD encoder hot loop. Skip the merge trie on high-entropy regions.

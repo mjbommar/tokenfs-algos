@@ -88,6 +88,9 @@ FUSE/kernel integration, and Python bindings.
 
 The paper-linked primitives should move into this crate early, because they
 anchor performance work to empirical claims rather than isolated throughput.
+Per [Paper Lineage Naming](PAPER_LINEAGE_NAMING.md), these labels are retained
+for reproducibility while public APIs use `selector`, `fingerprint`, and
+`sketch`.
 
 | Candidate | Source | Why it matters | Initial status |
 |---|---|---|---|

@@ -6,6 +6,10 @@ This crate should not become detached from the TokenFS paper results. The
 histogram benchmark matrix tells us raw kernel throughput; F21/F22/F23a tell us
 whether the primitives preserve the empirical behavior used in the paper.
 
+Naming follows [Paper Lineage Naming](PAPER_LINEAGE_NAMING.md): `F21`, `F22`,
+and `F23` remain paper/calibration labels, while the crate APIs use product names
+such as `selector`, `fingerprint`, and `sketch`.
+
 ## Current Source
 
 The F22 implementation currently lives at:
