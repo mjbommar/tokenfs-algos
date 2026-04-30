@@ -45,6 +45,29 @@ thread cross-tab charts.
   pass the required `bench-internals` feature. Flamegraph generation still failed
   because perf recording is blocked by `perf_event_paranoid=4`.
 
+## What This Teaches Us
+
+The main lesson is that the problem is not just "write the fastest histogram
+kernel." The real product surface is a planner that selects among several
+hardware-conscious primitives using workload context.
+
+- There is no universal kernel winner. The best primitive changes with byte
+  distribution, size, alignment, access pattern, and thread count.
+- The planner needs first-class context: input length, access pattern, alignment,
+  thread topology, cache/reuse expectations, and real-file/source hints.
+- FUSE-like micro reads and random reads need a no-sampling path. Adaptive
+  analysis can cost more than the actual histogram work for tiny reads.
+- Large sequential file/image work can afford sampling and region planning, and
+  benefits from specialized low-entropy, ASCII/text, and mixed-region paths.
+- Thread count is not "more is better." The planner must choose thread policy by
+  workload and hardware topology, and it needs a cap to avoid oversubscription.
+- Benchmark visualizations are now part of the development loop. Every new
+  primitive should answer: where does it win, where does it lose, and how should
+  the planner learn that boundary?
+- The current benchmark suite is a truth source for synthetic and real-slice
+  throughput, but it is not yet the paper calibration suite until F21/F22 extents
+  are parsed and compared against the oracle.
+
 ## Findings
 
 1. Thread scaling is real but not monotonic. The thread-topology pass had median
