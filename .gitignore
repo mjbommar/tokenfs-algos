@@ -1,0 +1,29 @@
+/target/
+**/target/
+/_references/*
+!/_references/README.md
+/.maturin/
+/.pytest_cache/
+/.ruff_cache/
+/.venv/
+/.coverage
+/htmlcov/
+/dist/
+/build/
+*.egg-info/
+
+# Profiling output.
+/perf.data
+/perf.data.old
+/*.svg
+/*.folded
+/*.profraw
+/*.profdata
+/target/profiles/
+/target/bench-history/
+/target/tokenfs-algos/
+
+# Editor and OS noise.
+.DS_Store
+*.swp
+*~
