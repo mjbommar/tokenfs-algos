@@ -74,10 +74,14 @@ fn bench_byte_histogram(c: &mut Criterion) {
 
 fn bench_kernels() -> Vec<BenchKernel> {
     if env::var_os("TOKENFS_ALGOS_ADAPTIVE_ONLY").is_some() {
-        HistogramKernel::adaptive()
+        let mut kernels = HistogramKernel::adaptive()
             .into_iter()
             .map(BenchKernel::Experimental)
-            .collect()
+            .collect::<Vec<_>>();
+        if env::var_os("TOKENFS_ALGOS_INCLUDE_DIRECT").is_some() {
+            kernels.insert(0, BenchKernel::Experimental(HistogramKernel::DirectU64));
+        }
+        kernels
     } else if env::var_os("TOKENFS_ALGOS_KERNEL_SWEEP").is_some() {
         HistogramKernel::all()
             .into_iter()
@@ -138,19 +142,31 @@ fn bench_workload_matrix(c: &mut Criterion, kernels: &[BenchKernel]) {
 }
 
 fn run_workload(kernel: BenchKernel, workload: &WorkloadInput) -> ByteHistogram {
+    let bytes = workload.bytes();
     match &workload.access {
-        AccessPattern::WholeBlock => kernel.histogram(&workload.bytes),
-        AccessPattern::Sequential { chunk_size } => {
-            histogram_by_chunks(kernel, &workload.bytes, *chunk_size)
-        }
+        AccessPattern::WholeBlock => kernel.histogram(bytes),
+        AccessPattern::Sequential { chunk_size } => histogram_by_chunks(kernel, bytes, *chunk_size),
+        AccessPattern::ReadAhead { chunk_size } => histogram_by_chunks(kernel, bytes, *chunk_size),
         AccessPattern::Random {
             chunk_size,
             offsets,
-        } => histogram_by_offsets(kernel, &workload.bytes, *chunk_size, offsets),
+        }
+        | AccessPattern::ZipfianHotCold {
+            chunk_size,
+            offsets,
+        } => histogram_by_offsets(kernel, bytes, *chunk_size, offsets),
+        AccessPattern::HotRepeat {
+            chunk_size,
+            repeats,
+        } => histogram_repeated_chunks(kernel, bytes, *chunk_size, *repeats),
+        AccessPattern::ColdSweep { chunk_size } => histogram_by_chunks(kernel, bytes, *chunk_size),
+        AccessPattern::SameFileRepeat { repeats } => {
+            histogram_repeated_block(kernel, bytes, *repeats)
+        }
         AccessPattern::ParallelSequential {
             chunk_size,
             threads,
-        } => histogram_parallel(kernel, &workload.bytes, *chunk_size, *threads),
+        } => histogram_parallel(kernel, bytes, *chunk_size, *threads),
     }
 }
 
@@ -172,6 +188,29 @@ fn histogram_by_offsets(
     for &offset in offsets {
         let end = offset + chunk_size;
         kernel.add_block(&bytes[offset..end], &mut histogram);
+    }
+    histogram
+}
+
+fn histogram_repeated_chunks(
+    kernel: BenchKernel,
+    bytes: &[u8],
+    chunk_size: usize,
+    repeats: usize,
+) -> ByteHistogram {
+    let mut histogram = ByteHistogram::new();
+    for _ in 0..repeats {
+        for chunk in bytes.chunks(chunk_size) {
+            kernel.add_block(chunk, &mut histogram);
+        }
+    }
+    histogram
+}
+
+fn histogram_repeated_block(kernel: BenchKernel, bytes: &[u8], repeats: usize) -> ByteHistogram {
+    let mut histogram = ByteHistogram::new();
+    for _ in 0..repeats {
+        kernel.add_block(bytes, &mut histogram);
     }
     histogram
 }

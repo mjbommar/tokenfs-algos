@@ -16,6 +16,7 @@ pub mod fingerprint;
 pub mod histogram;
 pub mod prelude;
 pub mod runlength;
+pub mod sketch;
 pub mod windows;
 
 pub(crate) mod primitives;

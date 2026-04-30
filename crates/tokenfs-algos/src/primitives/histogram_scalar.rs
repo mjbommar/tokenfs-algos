@@ -89,11 +89,126 @@ pub(crate) fn add_block_adaptive_chunked<const CHUNK: usize>(
     }
 }
 
+pub(crate) fn add_block_adaptive_sequential_online<const CHUNK: usize>(
+    block: &[u8],
+    counts: &mut [u64; 256],
+) {
+    debug_assert!(CHUNK > 0);
+
+    let mut previous = AdaptiveChoice::LocalU32;
+    for chunk in block.chunks(CHUNK) {
+        let current = choose_kernel_prefix::<1024>(chunk);
+        let choice = if current == previous {
+            current
+        } else {
+            choose_kernel_spread_4k(chunk)
+        };
+        add_with_choice(chunk, counts, choice);
+        previous = choice;
+    }
+}
+
+pub(crate) fn add_block_adaptive_file_cached<const CHUNK: usize>(
+    block: &[u8],
+    counts: &mut [u64; 256],
+) {
+    debug_assert!(CHUNK > 0);
+
+    let choice = choose_kernel_spread_4k(block);
+    for chunk in block.chunks(CHUNK) {
+        add_with_choice(chunk, counts, choice);
+    }
+}
+
+pub(crate) fn add_block_adaptive_low_entropy_fast(block: &[u8], counts: &mut [u64; 256]) {
+    let sample_len = block.len().min(1024);
+    let metrics = SampleMetrics::from_contiguous(&block[..sample_len]);
+
+    if metrics.len >= 64
+        && (metrics.distinct <= 4
+            || fraction_at_least(metrics.top_count, metrics.len, 3, 4)
+            || usize::try_from(metrics.longest_run).unwrap_or(usize::MAX) >= metrics.len / 4)
+    {
+        add_block_run_length_u64(block, counts);
+    } else {
+        add_block_adaptive_prefix::<1024>(block, counts);
+    }
+}
+
+pub(crate) fn add_block_adaptive_ascii_fast(block: &[u8], counts: &mut [u64; 256]) {
+    let sample_len = block.len().min(1024);
+    let sample = &block[..sample_len];
+    let ascii = sample
+        .iter()
+        .filter(|byte| byte.is_ascii_graphic() || byte.is_ascii_whitespace())
+        .count();
+
+    if sample_len != 0 && ascii * 10 >= sample_len * 9 {
+        add_block_local_u32(block, counts);
+    } else {
+        add_block_adaptive_prefix::<1024>(block, counts);
+    }
+}
+
+pub(crate) fn add_block_adaptive_high_entropy_skip(block: &[u8], counts: &mut [u64; 256]) {
+    let sample_len = block.len().min(4096);
+    let metrics = SampleMetrics::from_contiguous(&block[..sample_len]);
+
+    if metrics.len >= 1024
+        && metrics.distinct >= 192
+        && !fraction_at_least(metrics.top_count, metrics.len, 1, 32)
+        && !fraction_at_least(metrics.adjacent_equal, metrics.len.saturating_sub(1), 1, 64)
+    {
+        add_block_direct_u64(block, counts);
+    } else {
+        add_block_adaptive_prefix::<1024>(block, counts);
+    }
+}
+
+pub(crate) fn add_block_adaptive_meso_detector(block: &[u8], counts: &mut [u64; 256]) {
+    if block.len() < 8192 {
+        add_block_adaptive_prefix::<1024>(block, counts);
+        return;
+    }
+
+    let prefix = SampleMetrics::from_contiguous(&block[..1024.min(block.len())]);
+    let spread = {
+        let mut builder = SampleMetricsBuilder::new();
+        let segment_len = 1024;
+        for start in [
+            0,
+            block.len() / 4,
+            block.len() / 2,
+            block.len().saturating_sub(segment_len),
+        ] {
+            let end = (start + segment_len).min(block.len());
+            builder.add_contiguous(&block[start..end]);
+        }
+        builder.finish()
+    };
+
+    if prefix.distinct.abs_diff(spread.distinct) >= 32
+        || prefix.top_count.abs_diff(spread.top_count) >= 256
+    {
+        add_block_striped_u32::<8>(block, counts);
+    } else {
+        add_with_choice(block, counts, choose_from_metrics(spread));
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AdaptiveChoice {
     LocalU32,
     Stripe8U32,
     RunLengthU64,
+}
+
+fn add_with_choice(block: &[u8], counts: &mut [u64; 256], choice: AdaptiveChoice) {
+    match choice {
+        AdaptiveChoice::LocalU32 => add_block_local_u32(block, counts),
+        AdaptiveChoice::Stripe8U32 => add_block_striped_u32::<8>(block, counts),
+        AdaptiveChoice::RunLengthU64 => add_block_run_length_u64(block, counts),
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

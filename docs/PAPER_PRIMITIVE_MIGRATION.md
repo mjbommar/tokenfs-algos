@@ -26,8 +26,9 @@ Important pieces:
 
 ## Migration Order
 
-1. Move scalar F22 primitives into `tokenfs-algos` behind stable module names.
-2. Add parity tests against copied scalar fixtures and deterministic generated
+1. Done: move scalar F22 primitives into `tokenfs-algos::fingerprint` behind
+   stable module names.
+2. Done: add parity tests against copied scalar fixtures and deterministic generated
    extents.
 3. Add optional F21 sidecar/parquet calibration tests that skip when data is
    unavailable.
@@ -52,6 +53,16 @@ question than the Ubuntu ISO:
 |---|---|
 | Ubuntu ISO slices | How fast are kernels on large binary regions? |
 | F21 parquet extents | Does the planner choose the same kernel/feature path as the paper oracle on real extents? |
+
+The benchmark harness now accepts:
+
+- `TOKENFS_ALGOS_F21_DATA`
+- `TOKENFS_ALGOS_F22_DATA`
+- `TOKENFS_ALGOS_PAPER_ROOT`
+- `cargo xtask bench-real-f21 [path]`
+
+When those files are missing, the suite reports the missing path instead of
+silently fabricating paper calibration data.
 
 ## v0.1 vs v0.2
 

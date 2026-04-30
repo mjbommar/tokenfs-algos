@@ -94,11 +94,15 @@ The first processor-aware slice is implemented:
   kernel for each workload row;
 - `cargo xtask bench-compare <old.jsonl> <new.jsonl>` prints the largest
   matched throughput changes between two history runs;
-- `cargo xtask bench-report [run.jsonl]` emits heatmap HTML, throughput
-  histogram SVG, and timing CSV artifacts under
+- `cargo xtask bench-report [run.jsonl]` emits heatmap HTML, planner-vs-best
+  and winner-count charts, thread-scaling charts, per-dimension cross-tab SVGs,
+  a throughput histogram SVG, and timing CSV artifacts under
   `target/bench-history/reports/`;
 - `cargo xtask bench-calibrate` runs a short adaptive workload matrix with
-  thread rows enabled and logs it to benchmark history;
+  topology thread rows enabled and logs it to benchmark history;
+- named suites now cover smoke, synthetic-full, real ISO, F21/F22 paper data,
+  size sweep, alignment sweep, thread topology, planner parity, cache hot/cold,
+  and profile-oriented runs;
 - `cargo xtask profile` stores `perf stat -d` output under `target/profiles/`
   when Linux `perf` is available;
 - `cargo xtask profile-flamegraph` produces an SVG flamegraph when

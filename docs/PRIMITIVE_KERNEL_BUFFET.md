@@ -14,8 +14,8 @@ on an i9 P-core, an ARM laptop, or a small VM.
 | Byte histogram | 256-bin byte counts for entropy and classification. | direct, local, striped, run-length, adaptive. |
 | Entropy | H1 and windowed entropy over histograms. | scalar H1, chunk/window summaries. |
 | Run-length stats | Repetition and compressibility signals. | longest run, run count, adjacent-equal ratio. |
-| Byte-class stats | ASCII/control/UTF-8-ish/binary byte classes. | scalar classification table, SIMD later. |
-| Fingerprint | File/window fingerprints for TokenFS indexing. | F22 migration, rolling/windowed later. |
+| Byte-class stats | ASCII/control/UTF-8-ish/binary byte classes. | scalar classification table now, SIMD later. |
+| Fingerprint | File/window fingerprints for TokenFS indexing. | F22 scalar block/extent fingerprint now, AVX2 later. |
 | Divergence | Compare byte distributions across windows/files. | histogram distance, KL/JS candidates later. |
 | Windows/chunks | Shared chunking and rolling state. | fixed-size windows, stream state. |
 | Heavy hitters | Approximate frequent-byte or frequent-token summaries. | Misra-Gries top-K from F23a. |
@@ -39,6 +39,12 @@ Current and near-term histogram kernels:
 | `adaptive-prefix-1k` | Sample first 1 KiB. | Best general stateless choice so far. | Prefix may miss later macro changes. |
 | `adaptive-spread-4k` | Four 1 KiB samples. | Meso-structured blocks. | Too expensive for small reads. |
 | `adaptive-chunked-64k` | Per-64 KiB prefix choice. | Macro-mixed files. | Extra per-region overhead. |
+| `adaptive-sequential-online-64k` | Reconsiders choice at chunk boundaries. | Sequential reads with changing regions. | More classifier overhead. |
+| `adaptive-file-cached-64k` | One spread sample reused across chunks. | Stable whole-file content. | Bad if first/global sample misses local shifts. |
+| `adaptive-low-entropy-fast` | Aggressive low-cardinality/run promotion. | Zeros, sparse pages, repeated motifs. | Misclassification can hurt random/text. |
+| `adaptive-ascii-fast` | Text dominance precheck. | Logs, JSON, source, CSV. | Needs SIMD byte-class backend to matter. |
+| `adaptive-high-entropy-skip` | Random-looking sample skips special logic. | Compressed/encrypted/high-entropy blocks. | Sampling can hide later structure. |
+| `adaptive-meso-detector` | Prefix-vs-spread disagreement detector. | Block-palette and mixed-region files. | Needs more calibration before promotion. |
 
 The next production candidate should be a documented, non-`bench-internals`
 variant of the `adaptive-prefix-1k` idea for block/stream chunks, plus a
@@ -85,11 +91,11 @@ anchor performance work to empirical claims rather than isolated throughput.
 
 | Candidate | Source | Why it matters | Initial status |
 |---|---|---|---|
-| F22 block fingerprint | `../tokenfs-paper/tools/rust/entropy_primitives` | 8-byte per-256B block fingerprint used by paper calibration. | Next migration target. |
-| F21 parquet/sidecar extents | TokenFS paper corpus data | Ground truth for planner-oracle comparison over real extents. | Bench fixture support needed. |
-| CRC32C 4-gram hash bins | F22/F23a | Approximate H4/n-gram entropy without large maps. | Candidate primitive. |
-| `c * log2(c)` LUT | F22/F23a | Removes repeated entropy `log2` calls for bounded counts. | Candidate primitive. |
-| Misra-Gries top-K | F23a | Approximate heavy hitters for top-byte/token coverage. | Candidate primitive. |
+| F22 block fingerprint | `../tokenfs-paper/tools/rust/entropy_primitives` | 8-byte per-256B block fingerprint used by paper calibration. | Scalar block/extent API migrated. |
+| F21 parquet/sidecar extents | TokenFS paper corpus data | Ground truth for planner-oracle comparison over real extents. | Bench fixture hooks added; calibration data remains optional. |
+| CRC32C 4-gram hash bins | F22/F23a | Approximate H4/n-gram entropy without large maps. | Scalar primitive added in `sketch`. |
+| `c * log2(c)` LUT | F22/F23a | Removes repeated entropy `log2` calls for bounded counts. | Scalar API added; table specialization remains. |
+| Misra-Gries top-K | F23a | Approximate heavy hitters for top-byte/token coverage. | Fixed-array primitive added in `sketch`. |
 
 If any of these are intentionally left out, the reason should be documented
 here so the crate does not silently drift away from the paper.
@@ -100,7 +106,11 @@ here so the crate does not silently drift away from the paper.
 2. Done: add a simple histogram planner that chooses among named strategies.
 3. Done: log processor profile and planner output with workload benchmarks.
 4. Done: expose histogram kernel catalog metadata for dispatch and reports.
-5. Next: promote the best scalar adaptive strategy behind a public conservative
-   API once the planner interface stabilizes.
-6. Next: add run-length and byte-class primitives so the classifier can use real
+5. Done: migrate scalar F22 block/extent fingerprint surface.
+6. Done: add F23a seed primitives for Misra-Gries, CRC32 hash bins, and
+   entropy-from-counts.
+7. Done: add run-length and byte-class primitives so classifiers can use real
    signals instead of only histogram-sample heuristics.
+8. Next: move F22 AVX2 dispatch after scalar parity and calibration stabilize.
+9. Next: promote the best scalar adaptive strategy behind a public conservative
+   API once the planner interface stabilizes.

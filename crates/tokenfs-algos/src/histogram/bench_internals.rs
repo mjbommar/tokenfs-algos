@@ -32,12 +32,24 @@ pub enum HistogramKernel {
     AdaptiveRunSentinel4K,
     /// Adaptive classifier applied independently to each 64 KiB chunk.
     AdaptiveChunked64K,
+    /// Adaptive sequential planner that updates the choice at 64 KiB chunk boundaries.
+    AdaptiveSequentialOnline64K,
+    /// Adaptive file-level planner that samples once and applies the choice to all chunks.
+    AdaptiveFileCached64K,
+    /// Low-entropy fast path that aggressively promotes obvious runs.
+    AdaptiveLowEntropyFast,
+    /// ASCII/text-biased path that avoids extra sampling once text dominance is clear.
+    AdaptiveAsciiFast,
+    /// High-entropy path that skips specialized logic when the sample looks random.
+    AdaptiveHighEntropySkip,
+    /// Meso-pattern detector tuned for block-palette-like files.
+    AdaptiveMesoDetector,
 }
 
 impl HistogramKernel {
     /// Returns all experimental kernels in a stable order.
     #[must_use]
-    pub const fn all() -> [Self; 10] {
+    pub const fn all() -> [Self; 16] {
         [
             Self::DirectU64,
             Self::LocalU32,
@@ -49,18 +61,30 @@ impl HistogramKernel {
             Self::AdaptiveSpread4K,
             Self::AdaptiveRunSentinel4K,
             Self::AdaptiveChunked64K,
+            Self::AdaptiveSequentialOnline64K,
+            Self::AdaptiveFileCached64K,
+            Self::AdaptiveLowEntropyFast,
+            Self::AdaptiveAsciiFast,
+            Self::AdaptiveHighEntropySkip,
+            Self::AdaptiveMesoDetector,
         ]
     }
 
     /// Returns only the adaptive experimental kernels in a stable order.
     #[must_use]
-    pub const fn adaptive() -> [Self; 5] {
+    pub const fn adaptive() -> [Self; 11] {
         [
             Self::AdaptivePrefix1K,
             Self::AdaptivePrefix4K,
             Self::AdaptiveSpread4K,
             Self::AdaptiveRunSentinel4K,
             Self::AdaptiveChunked64K,
+            Self::AdaptiveSequentialOnline64K,
+            Self::AdaptiveFileCached64K,
+            Self::AdaptiveLowEntropyFast,
+            Self::AdaptiveAsciiFast,
+            Self::AdaptiveHighEntropySkip,
+            Self::AdaptiveMesoDetector,
         ]
     }
 
@@ -78,6 +102,12 @@ impl HistogramKernel {
             Self::AdaptiveSpread4K => "adaptive-spread-4k",
             Self::AdaptiveRunSentinel4K => "adaptive-run-sentinel-4k",
             Self::AdaptiveChunked64K => "adaptive-chunked-64k",
+            Self::AdaptiveSequentialOnline64K => "adaptive-sequential-online-64k",
+            Self::AdaptiveFileCached64K => "adaptive-file-cached-64k",
+            Self::AdaptiveLowEntropyFast => "adaptive-low-entropy-fast",
+            Self::AdaptiveAsciiFast => "adaptive-ascii-fast",
+            Self::AdaptiveHighEntropySkip => "adaptive-high-entropy-skip",
+            Self::AdaptiveMesoDetector => "adaptive-meso-detector",
         }
     }
 }
@@ -120,6 +150,24 @@ pub fn add_block_with_kernel(block: &[u8], histogram: &mut ByteHistogram, kernel
         }
         HistogramKernel::AdaptiveChunked64K => {
             histogram_scalar::add_block_adaptive_chunked::<65_536>(block, counts);
+        }
+        HistogramKernel::AdaptiveSequentialOnline64K => {
+            histogram_scalar::add_block_adaptive_sequential_online::<65_536>(block, counts);
+        }
+        HistogramKernel::AdaptiveFileCached64K => {
+            histogram_scalar::add_block_adaptive_file_cached::<65_536>(block, counts);
+        }
+        HistogramKernel::AdaptiveLowEntropyFast => {
+            histogram_scalar::add_block_adaptive_low_entropy_fast(block, counts);
+        }
+        HistogramKernel::AdaptiveAsciiFast => {
+            histogram_scalar::add_block_adaptive_ascii_fast(block, counts);
+        }
+        HistogramKernel::AdaptiveHighEntropySkip => {
+            histogram_scalar::add_block_adaptive_high_entropy_skip(block, counts);
+        }
+        HistogramKernel::AdaptiveMesoDetector => {
+            histogram_scalar::add_block_adaptive_meso_detector(block, counts);
         }
     }
 

@@ -456,6 +456,8 @@ pub struct HistogramPlan {
     pub chunk_bytes: usize,
     /// Planned sample size in bytes.
     pub sample_bytes: usize,
+    /// Planner confidence on a 0..=255 scale.
+    pub confidence_q8: u8,
     /// Stable human-readable reason.
     pub reason: &'static str,
 }
@@ -470,6 +472,7 @@ pub fn plan_histogram(profile: &ProcessorProfile, workload: &WorkloadShape) -> H
             strategy: HistogramStrategy::DirectU64,
             chunk_bytes: workload.chunk_bytes,
             sample_bytes: 0,
+            confidence_q8: 255,
             reason: "tiny blocks should avoid classifier overhead",
         };
     }
@@ -479,6 +482,7 @@ pub fn plan_histogram(profile: &ProcessorProfile, workload: &WorkloadShape) -> H
             strategy: HistogramStrategy::DirectU64,
             chunk_bytes: workload.chunk_bytes,
             sample_bytes: 0,
+            confidence_q8: 255,
             reason: "tiny random reads are dominated by call overhead; avoid adaptive sampling",
         };
     }
@@ -488,6 +492,7 @@ pub fn plan_histogram(profile: &ProcessorProfile, workload: &WorkloadShape) -> H
             strategy: HistogramStrategy::AdaptiveChunked64K,
             chunk_bytes: 64 * 1024,
             sample_bytes: 1024,
+            confidence_q8: 210,
             reason: "parallel scans should use private chunk histograms before reduction",
         };
     }
@@ -497,6 +502,7 @@ pub fn plan_histogram(profile: &ProcessorProfile, workload: &WorkloadShape) -> H
             strategy: HistogramStrategy::AdaptivePrefix1K,
             chunk_bytes: workload.chunk_bytes,
             sample_bytes: 1024,
+            confidence_q8: 220,
             reason: "small sequential reads need a bounded classifier budget",
         };
     }
@@ -506,6 +512,7 @@ pub fn plan_histogram(profile: &ProcessorProfile, workload: &WorkloadShape) -> H
             strategy: HistogramStrategy::AdaptiveChunked64K,
             chunk_bytes: 64 * 1024,
             sample_bytes: 1024,
+            confidence_q8: 215,
             reason: "macro-scale variation benefits from per-region kernel choice",
         };
     }
@@ -517,6 +524,7 @@ pub fn plan_histogram(profile: &ProcessorProfile, workload: &WorkloadShape) -> H
             strategy: HistogramStrategy::AdaptiveSpread4K,
             chunk_bytes: workload.chunk_bytes,
             sample_bytes: 4 * 1024,
+            confidence_q8: 205,
             reason: "meso-scale structure may be missed by a prefix-only sample",
         };
     }
@@ -526,6 +534,7 @@ pub fn plan_histogram(profile: &ProcessorProfile, workload: &WorkloadShape) -> H
             strategy: HistogramStrategy::AdaptivePrefix1K,
             chunk_bytes: workload.chunk_bytes,
             sample_bytes: 1024,
+            confidence_q8: 190,
             reason: "low-entropy data should first try cheap run/cardinality detection",
         };
     }
@@ -534,6 +543,7 @@ pub fn plan_histogram(profile: &ProcessorProfile, workload: &WorkloadShape) -> H
         strategy: HistogramStrategy::AdaptivePrefix1K,
         chunk_bytes: workload.chunk_bytes,
         sample_bytes: 1024,
+        confidence_q8: 160,
         reason: "general-purpose balanced histogram strategy",
     }
 }

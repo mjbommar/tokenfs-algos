@@ -40,6 +40,12 @@ fn pinned_kernels_match_reference_counts() {
         kernels::adaptive_spread_4k::block(&input),
         kernels::adaptive_run_sentinel_4k::block(&input),
         kernels::adaptive_chunked_64k::block(&input),
+        kernels::adaptive_sequential_online_64k::block(&input),
+        kernels::adaptive_file_cached_64k::block(&input),
+        kernels::adaptive_low_entropy_fast::block(&input),
+        kernels::adaptive_ascii_fast::block(&input),
+        kernels::adaptive_high_entropy_skip::block(&input),
+        kernels::adaptive_meso_detector::block(&input),
     ];
 
     for histogram in histograms {

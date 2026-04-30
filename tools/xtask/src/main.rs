@@ -51,6 +51,16 @@ fn run() -> Result<()> {
         "bench-workloads-adaptive" => bench_workloads_adaptive(&rest),
         "bench-workloads-adaptive-real" => bench_workloads_adaptive_real(&rest),
         "bench-calibrate" => bench_calibrate(&rest),
+        "bench-smoke" => bench_smoke(&rest),
+        "bench-synthetic-full" => bench_synthetic_full(&rest),
+        "bench-real-iso" => bench_real_iso(&rest),
+        "bench-real-f21" => bench_real_f21(&rest),
+        "bench-size-sweep" => bench_size_sweep(&rest),
+        "bench-alignment-sweep" => bench_alignment_sweep(&rest),
+        "bench-thread-topology" => bench_thread_topology(&rest),
+        "bench-planner-parity" => bench_planner_parity(&rest),
+        "bench-cache-hot-cold" => bench_cache_hot_cold(&rest),
+        "bench-profile" => bench_profile_suite(&rest),
         "bench-compare" => bench_compare(&rest),
         "bench-report" => bench_report(&rest),
         "bench-log" => record_bench_history(None),
@@ -207,7 +217,147 @@ fn bench_calibrate(extra: &[OsString]) -> Result<()> {
         &args,
         vec![
             ("TOKENFS_ALGOS_ADAPTIVE_ONLY".into(), "1".into()),
-            ("TOKENFS_ALGOS_THREAD_SWEEP".into(), "1".into()),
+            ("TOKENFS_ALGOS_INCLUDE_DIRECT".into(), "1".into()),
+            ("TOKENFS_ALGOS_THREAD_SWEEP".into(), "full".into()),
+        ],
+    )
+}
+
+fn bench_smoke(extra: &[OsString]) -> Result<()> {
+    let args = default_or_extra(
+        extra,
+        [
+            "--",
+            "--sample-size",
+            "10",
+            "--warm-up-time",
+            "0.01",
+            "--measurement-time",
+            "0.01",
+            "workload_matrix",
+        ],
+    );
+    bench_workloads_with_env(
+        &args,
+        vec![
+            ("TOKENFS_ALGOS_ADAPTIVE_ONLY".into(), "1".into()),
+            ("TOKENFS_ALGOS_INCLUDE_DIRECT".into(), "1".into()),
+        ],
+    )
+}
+
+fn bench_synthetic_full(extra: &[OsString]) -> Result<()> {
+    bench_workloads_with_env(
+        extra,
+        vec![
+            ("TOKENFS_ALGOS_KERNEL_SWEEP".into(), "1".into()),
+            ("TOKENFS_ALGOS_MATRIX_LEVEL".into(), "full".into()),
+            (
+                "TOKENFS_ALGOS_WORKLOAD_SUITE".into(),
+                "synthetic-full".into(),
+            ),
+            ("TOKENFS_ALGOS_THREAD_SWEEP".into(), "full".into()),
+        ],
+    )
+}
+
+fn bench_real_iso(args: &[OsString]) -> Result<()> {
+    let (path, extra) = path_or_default(args, "~/ubuntu-26.04-desktop-amd64.iso")?;
+    bench_workloads_with_env(
+        &extra,
+        vec![
+            ("TOKENFS_ALGOS_REAL_DATA".into(), path.into_os_string()),
+            ("TOKENFS_ALGOS_KERNEL_SWEEP".into(), "1".into()),
+            ("TOKENFS_ALGOS_MATRIX_LEVEL".into(), "full".into()),
+            ("TOKENFS_ALGOS_THREAD_SWEEP".into(), "full".into()),
+        ],
+    )
+}
+
+fn bench_real_f21(args: &[OsString]) -> Result<()> {
+    let (path, extra) = path_or_first_existing(
+        args,
+        &[
+            "/nas4/data/tokenfs-ubuntu/bench/cow/f22-extent-bytes.bin",
+            "../tokenfs-paper/data/tokenizers-corpus-matched/rootfs-65536.json",
+            "../tokenfs-paper/data/tokenizers-corpus-matched/rootfs-4096.json",
+        ],
+    )?;
+    bench_workloads_with_env(
+        &extra,
+        vec![
+            ("TOKENFS_ALGOS_F21_DATA".into(), path.into_os_string()),
+            ("TOKENFS_ALGOS_KERNEL_SWEEP".into(), "1".into()),
+            ("TOKENFS_ALGOS_MATRIX_LEVEL".into(), "full".into()),
+            ("TOKENFS_ALGOS_THREAD_SWEEP".into(), "full".into()),
+        ],
+    )
+}
+
+fn bench_size_sweep(extra: &[OsString]) -> Result<()> {
+    bench_workloads_with_env(
+        extra,
+        vec![
+            ("TOKENFS_ALGOS_KERNEL_SWEEP".into(), "1".into()),
+            ("TOKENFS_ALGOS_SIZE_SWEEP".into(), "1".into()),
+            ("TOKENFS_ALGOS_ACCESS_SWEEP".into(), "1".into()),
+        ],
+    )
+}
+
+fn bench_alignment_sweep(extra: &[OsString]) -> Result<()> {
+    bench_workloads_with_env(
+        extra,
+        vec![
+            ("TOKENFS_ALGOS_KERNEL_SWEEP".into(), "1".into()),
+            ("TOKENFS_ALGOS_ALIGNMENT_SWEEP".into(), "1".into()),
+            ("TOKENFS_ALGOS_ACCESS_SWEEP".into(), "1".into()),
+        ],
+    )
+}
+
+fn bench_thread_topology(extra: &[OsString]) -> Result<()> {
+    bench_workloads_with_env(
+        extra,
+        vec![
+            ("TOKENFS_ALGOS_KERNEL_SWEEP".into(), "1".into()),
+            ("TOKENFS_ALGOS_THREAD_SWEEP".into(), "full".into()),
+        ],
+    )
+}
+
+fn bench_planner_parity(extra: &[OsString]) -> Result<()> {
+    bench_workloads_with_env(
+        extra,
+        vec![
+            ("TOKENFS_ALGOS_KERNEL_SWEEP".into(), "1".into()),
+            ("TOKENFS_ALGOS_THREAD_SWEEP".into(), "full".into()),
+            (
+                "TOKENFS_ALGOS_WORKLOAD_SUITE".into(),
+                "synthetic-full".into(),
+            ),
+        ],
+    )
+}
+
+fn bench_cache_hot_cold(extra: &[OsString]) -> Result<()> {
+    bench_workloads_with_env(
+        extra,
+        vec![
+            ("TOKENFS_ALGOS_KERNEL_SWEEP".into(), "1".into()),
+            ("TOKENFS_ALGOS_CACHE_SWEEP".into(), "1".into()),
+            ("TOKENFS_ALGOS_ACCESS_SWEEP".into(), "1".into()),
+        ],
+    )
+}
+
+fn bench_profile_suite(extra: &[OsString]) -> Result<()> {
+    profile_with_env(
+        extra,
+        vec![
+            ("TOKENFS_ALGOS_KERNEL_SWEEP".into(), "1".into()),
+            ("TOKENFS_ALGOS_WORKLOAD_MATRIX".into(), "1".into()),
+            ("TOKENFS_ALGOS_THREAD_SWEEP".into(), "full".into()),
         ],
     )
 }
@@ -326,9 +476,23 @@ fn bench_report(args: &[OsString]) -> Result<()> {
     let histogram_svg = report_dir.join("throughput-histogram.svg");
     let summary_md = report_dir.join("summary.md");
 
-    write_timing_csv(&timing_csv, &records)?;
-    write_heatmap_html(&heatmap_html, &records, &jsonl_path)?;
     write_throughput_histogram_svg(&histogram_svg, &records)?;
+    let mut visual_artifacts = vec![ReportArtifact {
+        file_name: local_href(&histogram_svg),
+        title: "Throughput Distribution".into(),
+        caption: "Distribution of measured GiB/s values across every row in this report.".into(),
+    }];
+    visual_artifacts.extend(write_dimension_visuals(&report_dir, &records)?);
+    write_timing_csv(&timing_csv, &records)?;
+    write_heatmap_html(
+        &heatmap_html,
+        &records,
+        &jsonl_path,
+        &timing_csv,
+        &histogram_svg,
+        &summary_md,
+        &visual_artifacts,
+    )?;
     write_bench_report_summary(
         &summary_md,
         &records,
@@ -336,6 +500,7 @@ fn bench_report(args: &[OsString]) -> Result<()> {
         &timing_csv,
         &heatmap_html,
         &histogram_svg,
+        &visual_artifacts,
     )?;
 
     eprintln!("xtask: wrote benchmark report `{}`", summary_md.display());
@@ -551,9 +716,17 @@ struct BenchReportRecord {
     threads: String,
     pattern: String,
     planned_kernel: String,
+    planned_confidence_q8: String,
     throughput_bytes: u64,
     mean_ns: f64,
     gib_per_s: f64,
+}
+
+#[derive(Clone)]
+struct ReportArtifact {
+    file_name: String,
+    title: String,
+    caption: String,
 }
 
 fn record_bench_history(group_filter: Option<&str>) -> Result<()> {
@@ -1191,6 +1364,7 @@ fn read_bench_report_records(path: &Path) -> Result<Vec<BenchReportRecord>> {
             threads: bench_field(&value, "threads"),
             pattern: bench_field(&value, "pattern"),
             planned_kernel: bench_field(&value, "planned_kernel"),
+            planned_confidence_q8: bench_field(&value, "planned_confidence_q8"),
             throughput_bytes,
             mean_ns,
             gib_per_s,
@@ -1232,14 +1406,14 @@ fn write_timing_csv(path: &Path, records: &[BenchReportRecord]) -> Result<()> {
         .map_err(|error| format!("failed to create `{}`: {error}", path.display()))?;
     writeln!(
         file,
-        "full_id,group,workload_id,case,source,content,entropy,scale,access,chunk,threads,pattern,kernel,planned_kernel,planner_match,throughput_bytes,mean_ns,gib_per_s"
+        "full_id,group,workload_id,case,source,content,entropy,scale,access,chunk,threads,pattern,kernel,planned_kernel,planned_confidence_q8,planner_match,throughput_bytes,mean_ns,gib_per_s"
     )
     .map_err(write_error(path))?;
 
     for record in records {
         writeln!(
             file,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.6},{:.6}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.6},{:.6}",
             csv_cell(&record.full_id),
             csv_cell(&record.group),
             csv_cell(&record.workload_id),
@@ -1254,6 +1428,7 @@ fn write_timing_csv(path: &Path, records: &[BenchReportRecord]) -> Result<()> {
             csv_cell(&record.pattern),
             csv_cell(&record.kernel),
             csv_cell(&record.planned_kernel),
+            csv_cell(&record.planned_confidence_q8),
             record.planned_kernel == record.kernel,
             record.throughput_bytes,
             record.mean_ns,
@@ -1265,17 +1440,39 @@ fn write_timing_csv(path: &Path, records: &[BenchReportRecord]) -> Result<()> {
     Ok(())
 }
 
-fn write_heatmap_html(path: &Path, records: &[BenchReportRecord], source: &Path) -> Result<()> {
+fn write_heatmap_html(
+    path: &Path,
+    records: &[BenchReportRecord],
+    source: &Path,
+    timing_csv: &Path,
+    histogram_svg: &Path,
+    summary_md: &Path,
+    visual_artifacts: &[ReportArtifact],
+) -> Result<()> {
     let mut kernels = BTreeSet::new();
     let mut workloads: BTreeMap<String, Vec<&BenchReportRecord>> = BTreeMap::new();
+    let mut thread_counts: BTreeMap<String, usize> = BTreeMap::new();
     for record in records {
         kernels.insert(record.kernel.clone());
         workloads
             .entry(workload_label(record))
             .or_default()
             .push(record);
+        *thread_counts
+            .entry(empty_as_unknown(&record.threads).to_owned())
+            .or_default() += 1;
     }
     let kernels = kernels.into_iter().collect::<Vec<_>>();
+    let thread_summary = thread_counts
+        .iter()
+        .map(|(threads, count)| format!("threads={threads}: {count} rows"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let winner_summary = winner_counts(records)
+        .into_iter()
+        .map(|(kernel, count)| format!("{kernel}: {count} wins"))
+        .collect::<Vec<_>>()
+        .join(", ");
 
     let mut file = File::create(path)
         .map_err(|error| format!("failed to create `{}`: {error}", path.display()))?;
@@ -1285,7 +1482,7 @@ fn write_heatmap_html(path: &Path, records: &[BenchReportRecord], source: &Path)
     )
     .map_err(write_error(path))?;
     writeln!(file, "<style>{}</style>", heatmap_css()).map_err(write_error(path))?;
-    writeln!(file, "<h1>Benchmark Heatmap</h1>").map_err(write_error(path))?;
+    writeln!(file, "<h1>Benchmark Report</h1>").map_err(write_error(path))?;
     writeln!(
         file,
         "<p>Source: <code>{}</code>. Cells show GiB/s and are colored relative to the best kernel for that workload row.</p>",
@@ -1294,7 +1491,24 @@ fn write_heatmap_html(path: &Path, records: &[BenchReportRecord], source: &Path)
     .map_err(write_error(path))?;
     writeln!(
         file,
-        "<table><thead><tr><th>Workload</th><th>Planner</th><th>Best</th>"
+        "<nav><a href=\"{}\">summary.md</a><a href=\"{}\">timing.csv</a><a href=\"{}\">throughput-histogram.svg</a></nav>",
+        html_escape(&local_href(summary_md)),
+        html_escape(&local_href(timing_csv)),
+        html_escape(&local_href(histogram_svg)),
+    )
+    .map_err(write_error(path))?;
+    writeln!(
+        file,
+        "<section class=\"guide\"><h2>How to read this</h2><p>Each row is one workload shape: case, access pattern, data pattern, chunk size, and thread count. <b>Planner</b> is the static planner recommendation from the workload manifest. <b>Best measured kernel</b> is the fastest measured kernel in this run. Cells marked <b>winner</b> are row winners. Green cells are closest to the row winner; red cells are furthest from it. The title tooltip on each cell includes mean time and full benchmark id.</p><p><b>Thread rows:</b> {}</p><p><b>Winner counts:</b> {}</p></section>",
+        html_escape(&thread_summary),
+        html_escape(&winner_summary)
+    )
+    .map_err(write_error(path))?;
+    write_visual_gallery(path, &mut file, visual_artifacts)?;
+    writeln!(file, "<h2>Throughput Heatmap</h2>").map_err(write_error(path))?;
+    writeln!(
+        file,
+        "<table><thead><tr><th>Workload</th><th>Planner</th><th>Best measured kernel</th>"
     )
     .map_err(write_error(path))?;
     for kernel in &kernels {
@@ -1336,13 +1550,24 @@ fn write_heatmap_html(path: &Path, records: &[BenchReportRecord], source: &Path)
                 } else {
                     (row.gib_per_s / best).clamp(0.0, 1.0)
                 };
+                let winner = (row.gib_per_s - best).abs() <= f64::EPSILON;
+                let class = if winner { "metric winner" } else { "metric" };
+                let content = if winner {
+                    format!(
+                        "<span class=\"cell-value\">{:.2}</span><span class=\"winner-label\">winner</span>",
+                        row.gib_per_s
+                    )
+                } else {
+                    format!("{:.2}", row.gib_per_s)
+                };
                 writeln!(
                     file,
-                    "<td class=\"metric\" style=\"{}\" title=\"mean {}; full_id {}\">{:.2}</td>",
+                    "<td class=\"{}\" style=\"{}\" title=\"mean {}; full_id {}\">{}</td>",
+                    class,
                     heatmap_cell_style(ratio),
                     html_escape(&format_duration_ns(row.mean_ns)),
                     html_escape(&row.full_id),
-                    row.gib_per_s
+                    content
                 )
                 .map_err(write_error(path))?;
             } else {
@@ -1450,6 +1675,790 @@ fn write_throughput_histogram_svg(path: &Path, records: &[BenchReportRecord]) ->
     Ok(())
 }
 
+fn write_visual_gallery(path: &Path, file: &mut File, artifacts: &[ReportArtifact]) -> Result<()> {
+    writeln!(file, "<h2>Dimension Visuals</h2>").map_err(write_error(path))?;
+    writeln!(file, "<section class=\"gallery\">").map_err(write_error(path))?;
+    for artifact in artifacts {
+        writeln!(
+            file,
+            "<figure><h3>{}</h3><a href=\"{}\"><img src=\"{}\" alt=\"{}\"></a><figcaption>{}</figcaption></figure>",
+            html_escape(&artifact.title),
+            html_escape(&artifact.file_name),
+            html_escape(&artifact.file_name),
+            html_escape(&artifact.title),
+            html_escape(&artifact.caption)
+        )
+        .map_err(write_error(path))?;
+    }
+    writeln!(file, "</section>").map_err(write_error(path))?;
+    Ok(())
+}
+
+struct DimensionSpec {
+    id: &'static str,
+    title: &'static str,
+    value: fn(&BenchReportRecord) -> &str,
+}
+
+fn write_dimension_visuals(
+    report_dir: &Path,
+    records: &[BenchReportRecord],
+) -> Result<Vec<ReportArtifact>> {
+    let mut artifacts = Vec::new();
+    let all_records = records.iter().collect::<Vec<_>>();
+    let parallel_records = records
+        .iter()
+        .filter(|record| {
+            record.access == "parallel-sequential" && parse_usize(&record.threads).is_some()
+        })
+        .collect::<Vec<_>>();
+
+    let path = report_dir.join("planner-vs-best.svg");
+    if write_planner_confusion_svg(&path, records)? {
+        artifacts.push(ReportArtifact {
+            file_name: local_href(&path),
+            title: "Planner vs Best Kernel".into(),
+            caption: "Confusion matrix: static planner recommendation crossed with the measured winner for each workload row.".into(),
+        });
+    }
+
+    let path = report_dir.join("winner-counts.svg");
+    if write_winner_counts_svg(&path, records)? {
+        artifacts.push(ReportArtifact {
+            file_name: local_href(&path),
+            title: "Winner Counts".into(),
+            caption: "How many workload rows each kernel won in this run.".into(),
+        });
+    }
+
+    let path = report_dir.join("thread-scaling-by-kernel.svg");
+    if write_thread_scaling_svg(&path, &parallel_records)? {
+        artifacts.push(ReportArtifact {
+            file_name: local_href(&path),
+            title: "Thread Scaling by Kernel".into(),
+            caption:
+                "Median GiB/s by thread count for parallel-sequential rows, grouped by kernel."
+                    .into(),
+        });
+    }
+
+    for dimension in dimension_specs() {
+        if dimension.id != "kernel" {
+            let path = report_dir.join(format!("dimension-{}-by-kernel.svg", dimension.id));
+            let title = format!("Median GiB/s: {} by Kernel", dimension.title);
+            if write_dimension_heatmap_svg(
+                &path,
+                &title,
+                dimension.title,
+                "Kernel",
+                &all_records,
+                dimension.value,
+                dim_kernel,
+            )? {
+                artifacts.push(ReportArtifact {
+                    file_name: local_href(&path),
+                    title,
+                    caption: format!(
+                        "Median throughput for each {} value crossed with measured kernel.",
+                        dimension.title.to_ascii_lowercase()
+                    ),
+                });
+            }
+        }
+
+        if dimension.id != "threads" {
+            let path = report_dir.join(format!("dimension-{}-by-thread.svg", dimension.id));
+            let title = format!("Median GiB/s: {} by Thread Count", dimension.title);
+            if write_dimension_heatmap_svg(
+                &path,
+                &title,
+                dimension.title,
+                "Threads",
+                &parallel_records,
+                dimension.value,
+                dim_threads,
+            )? {
+                artifacts.push(ReportArtifact {
+                    file_name: local_href(&path),
+                    title,
+                    caption: format!(
+                        "Parallel-sequential median throughput for each {} value as thread count changes.",
+                        dimension.title.to_ascii_lowercase()
+                    ),
+                });
+            }
+        }
+    }
+
+    Ok(artifacts)
+}
+
+fn dimension_specs() -> Vec<DimensionSpec> {
+    vec![
+        DimensionSpec {
+            id: "case",
+            title: "Case",
+            value: dim_case,
+        },
+        DimensionSpec {
+            id: "source",
+            title: "Source",
+            value: dim_source,
+        },
+        DimensionSpec {
+            id: "content",
+            title: "Content",
+            value: dim_content,
+        },
+        DimensionSpec {
+            id: "entropy",
+            title: "Entropy",
+            value: dim_entropy,
+        },
+        DimensionSpec {
+            id: "scale",
+            title: "Scale",
+            value: dim_scale,
+        },
+        DimensionSpec {
+            id: "access",
+            title: "Access",
+            value: dim_access,
+        },
+        DimensionSpec {
+            id: "chunk",
+            title: "Chunk",
+            value: dim_chunk,
+        },
+        DimensionSpec {
+            id: "threads",
+            title: "Threads",
+            value: dim_threads,
+        },
+        DimensionSpec {
+            id: "pattern",
+            title: "Pattern",
+            value: dim_pattern,
+        },
+        DimensionSpec {
+            id: "kernel",
+            title: "Kernel",
+            value: dim_kernel,
+        },
+    ]
+}
+
+fn dim_case(record: &BenchReportRecord) -> &str {
+    &record.case
+}
+
+fn dim_source(record: &BenchReportRecord) -> &str {
+    &record.source
+}
+
+fn dim_content(record: &BenchReportRecord) -> &str {
+    &record.content
+}
+
+fn dim_entropy(record: &BenchReportRecord) -> &str {
+    &record.entropy
+}
+
+fn dim_scale(record: &BenchReportRecord) -> &str {
+    &record.scale
+}
+
+fn dim_access(record: &BenchReportRecord) -> &str {
+    &record.access
+}
+
+fn dim_chunk(record: &BenchReportRecord) -> &str {
+    &record.chunk
+}
+
+fn dim_threads(record: &BenchReportRecord) -> &str {
+    &record.threads
+}
+
+fn dim_pattern(record: &BenchReportRecord) -> &str {
+    &record.pattern
+}
+
+fn dim_kernel(record: &BenchReportRecord) -> &str {
+    &record.kernel
+}
+
+fn write_dimension_heatmap_svg(
+    path: &Path,
+    title: &str,
+    row_axis: &str,
+    col_axis: &str,
+    records: &[&BenchReportRecord],
+    row_value: fn(&BenchReportRecord) -> &str,
+    col_value: fn(&BenchReportRecord) -> &str,
+) -> Result<bool> {
+    let mut cells: BTreeMap<(String, String), Vec<f64>> = BTreeMap::new();
+    let mut rows = BTreeSet::new();
+    let mut cols = BTreeSet::new();
+
+    for record in records {
+        let row = dimension_value(row_value(record));
+        let col = dimension_value(col_value(record));
+        rows.insert(row.clone());
+        cols.insert(col.clone());
+        cells.entry((row, col)).or_default().push(record.gib_per_s);
+    }
+
+    if rows.is_empty() || cols.is_empty() {
+        return Ok(false);
+    }
+
+    let rows = sort_dimension_values(rows.into_iter().collect());
+    let cols = sort_dimension_values(cols.into_iter().collect());
+    let mut medians = BTreeMap::new();
+    let mut max_value = 0.0_f64;
+    for (key, values) in cells {
+        let value = median(values);
+        max_value = max_value.max(value);
+        medians.insert(key, value);
+    }
+
+    let row_label_width = axis_label_width(&rows);
+    let col_width = axis_label_width(&cols).clamp(112.0, 176.0);
+    let row_height = 34.0_f64;
+    let header_height = 82.0_f64;
+    let width = row_label_width + col_width * cols.len() as f64 + 36.0;
+    let height = header_height + row_height * rows.len() as f64 + 50.0;
+    let mut file = File::create(path)
+        .map_err(|error| format!("failed to create `{}`: {error}", path.display()))?;
+
+    writeln!(
+        file,
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width:.0}\" height=\"{height:.0}\" viewBox=\"0 0 {width:.0} {height:.0}\">"
+    )
+    .map_err(write_error(path))?;
+    write_svg_background(&mut file, path)?;
+    writeln!(
+        file,
+        "<text x=\"18\" y=\"28\" font-family=\"sans-serif\" font-size=\"18\" font-weight=\"700\">{}</text>",
+        html_escape(title)
+    )
+    .map_err(write_error(path))?;
+    writeln!(
+        file,
+        "<text x=\"18\" y=\"50\" font-family=\"sans-serif\" font-size=\"12\" fill=\"#57606a\">cell value = median GiB/s; color is relative to this chart's max</text>"
+    )
+    .map_err(write_error(path))?;
+    writeln!(
+        file,
+        "<text x=\"18\" y=\"74\" font-family=\"sans-serif\" font-size=\"12\" font-weight=\"700\">{}</text>",
+        html_escape(row_axis)
+    )
+    .map_err(write_error(path))?;
+    writeln!(
+        file,
+        "<text x=\"{:.1}\" y=\"74\" font-family=\"sans-serif\" font-size=\"12\" font-weight=\"700\">{}</text>",
+        row_label_width,
+        html_escape(col_axis)
+    )
+    .map_err(write_error(path))?;
+
+    for (index, col) in cols.iter().enumerate() {
+        let x = row_label_width + index as f64 * col_width + col_width / 2.0;
+        writeln!(
+            file,
+            "<text x=\"{x:.1}\" y=\"74\" text-anchor=\"middle\" font-family=\"sans-serif\" font-size=\"11\">{}</text>",
+            html_escape(&short_label(col, 22))
+        )
+        .map_err(write_error(path))?;
+    }
+
+    for (row_index, row) in rows.iter().enumerate() {
+        let y = header_height + row_index as f64 * row_height;
+        writeln!(
+            file,
+            "<text x=\"18\" y=\"{:.1}\" font-family=\"sans-serif\" font-size=\"12\">{}</text>",
+            y + 21.0,
+            html_escape(&short_label(row, 30))
+        )
+        .map_err(write_error(path))?;
+        for (col_index, col) in cols.iter().enumerate() {
+            let x = row_label_width + col_index as f64 * col_width;
+            let value = medians.get(&(row.clone(), col.clone())).copied();
+            match value {
+                Some(value) => {
+                    let ratio = if max_value == 0.0 {
+                        0.0
+                    } else {
+                        (value / max_value).clamp(0.0, 1.0)
+                    };
+                    let (fill, text) = heatmap_svg_colors(ratio);
+                    writeln!(
+                        file,
+                        "<rect x=\"{x:.1}\" y=\"{y:.1}\" width=\"{:.1}\" height=\"{:.1}\" fill=\"{}\"><title>{} / {}: {:.3} GiB/s median</title></rect>",
+                        col_width - 3.0,
+                        row_height - 3.0,
+                        fill,
+                        html_escape(row),
+                        html_escape(col),
+                        value
+                    )
+                    .map_err(write_error(path))?;
+                    writeln!(
+                        file,
+                        "<text x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"middle\" font-family=\"sans-serif\" font-size=\"12\" fill=\"{}\">{:.2}</text>",
+                        x + col_width / 2.0,
+                        y + 21.0,
+                        text,
+                        value
+                    )
+                    .map_err(write_error(path))?;
+                }
+                None => {
+                    writeln!(
+                        file,
+                        "<rect x=\"{x:.1}\" y=\"{y:.1}\" width=\"{:.1}\" height=\"{:.1}\" fill=\"#f1f3f4\"/>",
+                        col_width - 3.0,
+                        row_height - 3.0
+                    )
+                    .map_err(write_error(path))?;
+                }
+            }
+        }
+    }
+
+    writeln!(file, "</svg>").map_err(write_error(path))?;
+    Ok(true)
+}
+
+fn write_thread_scaling_svg(path: &Path, records: &[&BenchReportRecord]) -> Result<bool> {
+    let mut by_kernel_thread: BTreeMap<String, BTreeMap<usize, Vec<f64>>> = BTreeMap::new();
+    let mut thread_set = BTreeSet::new();
+    for record in records {
+        let Some(threads) = parse_usize(&record.threads) else {
+            continue;
+        };
+        thread_set.insert(threads);
+        by_kernel_thread
+            .entry(record.kernel.clone())
+            .or_default()
+            .entry(threads)
+            .or_default()
+            .push(record.gib_per_s);
+    }
+
+    if by_kernel_thread.is_empty() || thread_set.len() < 2 {
+        return Ok(false);
+    }
+
+    let threads = thread_set.into_iter().collect::<Vec<_>>();
+    let width = 1120.0_f64;
+    let height = 520.0_f64;
+    let left = 72.0_f64;
+    let right = 220.0_f64;
+    let top = 58.0_f64;
+    let bottom = 70.0_f64;
+    let plot_width = width - left - right;
+    let plot_height = height - top - bottom;
+    let mut series = Vec::new();
+    let mut max_value = 0.0_f64;
+    for (kernel, by_thread) in by_kernel_thread {
+        let mut points = Vec::new();
+        for thread in &threads {
+            if let Some(values) = by_thread.get(thread) {
+                let value = median(values.clone());
+                max_value = max_value.max(value);
+                points.push((*thread, value));
+            }
+        }
+        if points.len() >= 2 {
+            series.push((kernel, points));
+        }
+    }
+
+    if series.is_empty() || max_value == 0.0 {
+        return Ok(false);
+    }
+
+    let mut file = File::create(path)
+        .map_err(|error| format!("failed to create `{}`: {error}", path.display()))?;
+    writeln!(
+        file,
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\" viewBox=\"0 0 {width} {height}\">"
+    )
+    .map_err(write_error(path))?;
+    write_svg_background(&mut file, path)?;
+    writeln!(
+        file,
+        "<text x=\"18\" y=\"28\" font-family=\"sans-serif\" font-size=\"18\" font-weight=\"700\">Thread Scaling by Kernel</text>"
+    )
+    .map_err(write_error(path))?;
+    writeln!(
+        file,
+        "<text x=\"18\" y=\"50\" font-family=\"sans-serif\" font-size=\"12\" fill=\"#57606a\">parallel-sequential rows only; y = median GiB/s across matching workloads</text>"
+    )
+    .map_err(write_error(path))?;
+    let area = ChartArea {
+        left,
+        top,
+        width: plot_width,
+        height: plot_height,
+    };
+    write_chart_axes(&mut file, path, area, "threads", "GiB/s")?;
+
+    for (index, thread) in threads.iter().enumerate() {
+        let x = categorical_x(index, threads.len(), left, plot_width);
+        writeln!(
+            file,
+            "<text x=\"{x:.1}\" y=\"{}\" text-anchor=\"middle\" font-family=\"sans-serif\" font-size=\"12\">{thread}</text>",
+            height - 28.0
+        )
+        .map_err(write_error(path))?;
+    }
+
+    for tick in 0..=4 {
+        let value = max_value * tick as f64 / 4.0;
+        let y = top + plot_height - (value / max_value) * plot_height;
+        writeln!(
+            file,
+            "<text x=\"{}\" y=\"{:.1}\" text-anchor=\"end\" font-family=\"sans-serif\" font-size=\"11\">{value:.1}</text>",
+            left - 8.0,
+            y + 4.0
+        )
+        .map_err(write_error(path))?;
+    }
+
+    for (series_index, (kernel, points)) in series.iter().enumerate() {
+        let color = chart_color(series_index);
+        let mut point_strings = Vec::new();
+        for (thread, value) in points {
+            let thread_index = threads
+                .iter()
+                .position(|candidate| candidate == thread)
+                .unwrap_or(0);
+            let x = categorical_x(thread_index, threads.len(), left, plot_width);
+            let y = top + plot_height - (value / max_value) * plot_height;
+            point_strings.push(format!("{x:.1},{y:.1}"));
+        }
+        writeln!(
+            file,
+            "<polyline fill=\"none\" stroke=\"{}\" stroke-width=\"2.5\" points=\"{}\"/>",
+            color,
+            point_strings.join(" ")
+        )
+        .map_err(write_error(path))?;
+        for (thread, value) in points {
+            let thread_index = threads
+                .iter()
+                .position(|candidate| candidate == thread)
+                .unwrap_or(0);
+            let x = categorical_x(thread_index, threads.len(), left, plot_width);
+            let y = top + plot_height - (value / max_value) * plot_height;
+            writeln!(
+                file,
+                "<circle cx=\"{x:.1}\" cy=\"{y:.1}\" r=\"4\" fill=\"{}\"><title>{}: threads={} median {:.3} GiB/s</title></circle>",
+                color,
+                html_escape(kernel),
+                thread,
+                value
+            )
+            .map_err(write_error(path))?;
+        }
+        if let Some((last_thread, last_value)) = points.last() {
+            let thread_index = threads
+                .iter()
+                .position(|candidate| candidate == last_thread)
+                .unwrap_or(0);
+            let x = categorical_x(thread_index, threads.len(), left, plot_width) + 8.0;
+            let y = top + plot_height - (last_value / max_value) * plot_height + 4.0;
+            writeln!(
+                file,
+                "<text x=\"{x:.1}\" y=\"{y:.1}\" font-family=\"sans-serif\" font-size=\"11\" fill=\"{}\">{}</text>",
+                color,
+                html_escape(&short_label(kernel, 28))
+            )
+            .map_err(write_error(path))?;
+        }
+    }
+
+    writeln!(file, "</svg>").map_err(write_error(path))?;
+    Ok(true)
+}
+
+fn write_winner_counts_svg(path: &Path, records: &[BenchReportRecord]) -> Result<bool> {
+    let counts = winner_counts(records);
+    if counts.is_empty() {
+        return Ok(false);
+    }
+    let bars = counts
+        .into_iter()
+        .map(|(kernel, count)| (kernel, count as f64, format!("{count} wins")))
+        .collect::<Vec<_>>();
+    write_bar_chart_svg(
+        path,
+        "Winner Counts by Kernel",
+        "count of workload rows where kernel had max GiB/s",
+        &bars,
+    )?;
+    Ok(true)
+}
+
+fn write_planner_confusion_svg(path: &Path, records: &[BenchReportRecord]) -> Result<bool> {
+    let mut workloads: BTreeMap<String, Vec<&BenchReportRecord>> = BTreeMap::new();
+    for record in records {
+        workloads
+            .entry(workload_label(record))
+            .or_default()
+            .push(record);
+    }
+
+    let mut cells: BTreeMap<(String, String), f64> = BTreeMap::new();
+    let mut planned_values = BTreeSet::new();
+    let mut best_values = BTreeSet::new();
+    for rows in workloads.values() {
+        let planned = rows
+            .iter()
+            .find(|row| !row.planned_kernel.is_empty())
+            .map_or("no-plan", |row| row.planned_kernel.as_str());
+        let Some(best) = rows.iter().max_by(|left, right| {
+            left.gib_per_s
+                .partial_cmp(&right.gib_per_s)
+                .unwrap_or(Ordering::Equal)
+        }) else {
+            continue;
+        };
+        let planned = dimension_value(planned);
+        let best = dimension_value(&best.kernel);
+        planned_values.insert(planned.clone());
+        best_values.insert(best.clone());
+        *cells.entry((planned, best)).or_default() += 1.0;
+    }
+
+    if planned_values.is_empty() || best_values.is_empty() {
+        return Ok(false);
+    }
+
+    write_count_heatmap_svg(
+        path,
+        "Planner vs Best Kernel",
+        "Planner",
+        "Best measured kernel",
+        planned_values.into_iter().collect(),
+        best_values.into_iter().collect(),
+        cells,
+    )?;
+    Ok(true)
+}
+
+fn write_count_heatmap_svg(
+    path: &Path,
+    title: &str,
+    row_axis: &str,
+    col_axis: &str,
+    rows: Vec<String>,
+    cols: Vec<String>,
+    cells: BTreeMap<(String, String), f64>,
+) -> Result<()> {
+    let rows = sort_dimension_values(rows);
+    let cols = sort_dimension_values(cols);
+    let max_value = cells.values().copied().fold(0.0_f64, f64::max);
+    let row_label_width = axis_label_width(&rows);
+    let col_width = axis_label_width(&cols).clamp(132.0, 190.0);
+    let row_height = 34.0_f64;
+    let header_height = 82.0_f64;
+    let width = row_label_width + col_width * cols.len() as f64 + 36.0;
+    let height = header_height + row_height * rows.len() as f64 + 50.0;
+    let mut file = File::create(path)
+        .map_err(|error| format!("failed to create `{}`: {error}", path.display()))?;
+
+    writeln!(
+        file,
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width:.0}\" height=\"{height:.0}\" viewBox=\"0 0 {width:.0} {height:.0}\">"
+    )
+    .map_err(write_error(path))?;
+    write_svg_background(&mut file, path)?;
+    writeln!(
+        file,
+        "<text x=\"18\" y=\"28\" font-family=\"sans-serif\" font-size=\"18\" font-weight=\"700\">{}</text>",
+        html_escape(title)
+    )
+    .map_err(write_error(path))?;
+    writeln!(
+        file,
+        "<text x=\"18\" y=\"50\" font-family=\"sans-serif\" font-size=\"12\" fill=\"#57606a\">cell value = number of workload rows</text>"
+    )
+    .map_err(write_error(path))?;
+    writeln!(
+        file,
+        "<text x=\"18\" y=\"74\" font-family=\"sans-serif\" font-size=\"12\" font-weight=\"700\">{}</text>",
+        html_escape(row_axis)
+    )
+    .map_err(write_error(path))?;
+    writeln!(
+        file,
+        "<text x=\"{:.1}\" y=\"74\" font-family=\"sans-serif\" font-size=\"12\" font-weight=\"700\">{}</text>",
+        row_label_width,
+        html_escape(col_axis)
+    )
+    .map_err(write_error(path))?;
+
+    for (index, col) in cols.iter().enumerate() {
+        let x = row_label_width + index as f64 * col_width + col_width / 2.0;
+        writeln!(
+            file,
+            "<text x=\"{x:.1}\" y=\"74\" text-anchor=\"middle\" font-family=\"sans-serif\" font-size=\"11\">{}</text>",
+            html_escape(&short_label(col, 22))
+        )
+        .map_err(write_error(path))?;
+    }
+
+    for (row_index, row) in rows.iter().enumerate() {
+        let y = header_height + row_index as f64 * row_height;
+        writeln!(
+            file,
+            "<text x=\"18\" y=\"{:.1}\" font-family=\"sans-serif\" font-size=\"12\">{}</text>",
+            y + 21.0,
+            html_escape(&short_label(row, 30))
+        )
+        .map_err(write_error(path))?;
+        for (col_index, col) in cols.iter().enumerate() {
+            let x = row_label_width + col_index as f64 * col_width;
+            let value = cells
+                .get(&(row.clone(), col.clone()))
+                .copied()
+                .unwrap_or(0.0);
+            let ratio = if max_value == 0.0 {
+                0.0
+            } else {
+                (value / max_value).clamp(0.0, 1.0)
+            };
+            let (fill, text) = heatmap_svg_colors(ratio);
+            writeln!(
+                file,
+                "<rect x=\"{x:.1}\" y=\"{y:.1}\" width=\"{:.1}\" height=\"{:.1}\" fill=\"{}\"><title>{} -> {}: {:.0}</title></rect>",
+                col_width - 3.0,
+                row_height - 3.0,
+                fill,
+                html_escape(row),
+                html_escape(col),
+                value
+            )
+            .map_err(write_error(path))?;
+            writeln!(
+                file,
+                "<text x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"middle\" font-family=\"sans-serif\" font-size=\"12\" fill=\"{}\">{:.0}</text>",
+                x + col_width / 2.0,
+                y + 21.0,
+                text,
+                value
+            )
+            .map_err(write_error(path))?;
+        }
+    }
+
+    writeln!(file, "</svg>").map_err(write_error(path))?;
+    Ok(())
+}
+
+fn write_bar_chart_svg(
+    path: &Path,
+    title: &str,
+    subtitle: &str,
+    bars: &[(String, f64, String)],
+) -> Result<()> {
+    let width = 960.0_f64;
+    let bar_height = 30.0_f64;
+    let top = 62.0_f64;
+    let left = 250.0_f64;
+    let plot_width = 650.0_f64;
+    let height = top + bars.len() as f64 * bar_height + 42.0;
+    let max_value = bars
+        .iter()
+        .fold(0.0_f64, |max, (_, value, _)| max.max(*value));
+    let mut file = File::create(path)
+        .map_err(|error| format!("failed to create `{}`: {error}", path.display()))?;
+
+    writeln!(
+        file,
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height:.0}\" viewBox=\"0 0 {width} {height:.0}\">"
+    )
+    .map_err(write_error(path))?;
+    write_svg_background(&mut file, path)?;
+    writeln!(
+        file,
+        "<text x=\"18\" y=\"28\" font-family=\"sans-serif\" font-size=\"18\" font-weight=\"700\">{}</text>",
+        html_escape(title)
+    )
+    .map_err(write_error(path))?;
+    writeln!(
+        file,
+        "<text x=\"18\" y=\"50\" font-family=\"sans-serif\" font-size=\"12\" fill=\"#57606a\">{}</text>",
+        html_escape(subtitle)
+    )
+    .map_err(write_error(path))?;
+
+    for (index, (label, value, value_label)) in bars.iter().enumerate() {
+        let y = top + index as f64 * bar_height;
+        let ratio = if max_value == 0.0 {
+            0.0
+        } else {
+            value / max_value
+        };
+        let width = plot_width * ratio;
+        writeln!(
+            file,
+            "<text x=\"18\" y=\"{:.1}\" font-family=\"sans-serif\" font-size=\"12\">{}</text>",
+            y + 19.0,
+            html_escape(&short_label(label, 34))
+        )
+        .map_err(write_error(path))?;
+        writeln!(
+            file,
+            "<rect x=\"{left}\" y=\"{:.1}\" width=\"{width:.1}\" height=\"22\" fill=\"#2f7ed8\"><title>{}: {}</title></rect>",
+            y + 4.0,
+            html_escape(label),
+            html_escape(value_label)
+        )
+        .map_err(write_error(path))?;
+        writeln!(
+            file,
+            "<text x=\"{:.1}\" y=\"{:.1}\" font-family=\"sans-serif\" font-size=\"12\">{}</text>",
+            left + width + 8.0,
+            y + 20.0,
+            html_escape(value_label)
+        )
+        .map_err(write_error(path))?;
+    }
+
+    writeln!(file, "</svg>").map_err(write_error(path))?;
+    Ok(())
+}
+
+fn winner_counts(records: &[BenchReportRecord]) -> Vec<(String, usize)> {
+    let mut workloads: BTreeMap<String, Vec<&BenchReportRecord>> = BTreeMap::new();
+    for record in records {
+        workloads
+            .entry(workload_label(record))
+            .or_default()
+            .push(record);
+    }
+
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for rows in workloads.values() {
+        if let Some(best) = rows.iter().max_by(|left, right| {
+            left.gib_per_s
+                .partial_cmp(&right.gib_per_s)
+                .unwrap_or(Ordering::Equal)
+        }) {
+            *counts.entry(best.kernel.clone()).or_default() += 1;
+        }
+    }
+
+    let mut counts = counts.into_iter().collect::<Vec<_>>();
+    counts.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    counts
+}
+
 fn write_bench_report_summary(
     path: &Path,
     records: &[BenchReportRecord],
@@ -1457,6 +2466,7 @@ fn write_bench_report_summary(
     timing_csv: &Path,
     heatmap_html: &Path,
     histogram_svg: &Path,
+    visual_artifacts: &[ReportArtifact],
 ) -> Result<()> {
     let mut file = File::create(path)
         .map_err(|error| format!("failed to create `{}`: {error}", path.display()))?;
@@ -1501,6 +2511,11 @@ fn write_bench_report_summary(
         histogram_svg.display()
     )
     .map_err(write_error(path))?;
+    writeln!(file, "- visual_count: `{}`", visual_artifacts.len()).map_err(write_error(path))?;
+    for artifact in visual_artifacts {
+        writeln!(file, "  - `{}`: {}", artifact.file_name, artifact.title)
+            .map_err(write_error(path))?;
+    }
     writeln!(file).map_err(write_error(path))?;
     writeln!(file, "## Top Throughput").map_err(write_error(path))?;
     writeln!(file).map_err(write_error(path))?;
@@ -1586,17 +2601,186 @@ fn html_escape(value: &str) -> String {
         .replace('"', "&quot;")
 }
 
+fn local_href(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn dimension_value(value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        "?".into()
+    } else {
+        value.into()
+    }
+}
+
+fn parse_usize(value: &str) -> Option<usize> {
+    value.trim().parse::<usize>().ok()
+}
+
+fn sort_dimension_values(mut values: Vec<String>) -> Vec<String> {
+    let numeric = values.iter().all(|value| value.parse::<f64>().is_ok());
+    if numeric {
+        values.sort_by(|left, right| {
+            left.parse::<f64>()
+                .unwrap_or(0.0)
+                .partial_cmp(&right.parse::<f64>().unwrap_or(0.0))
+                .unwrap_or(Ordering::Equal)
+        });
+    } else {
+        values.sort();
+    }
+    values
+}
+
+fn median(mut values: Vec<f64>) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
+    let middle = values.len() / 2;
+    if values.len().is_multiple_of(2) {
+        (values[middle - 1] + values[middle]) / 2.0
+    } else {
+        values[middle]
+    }
+}
+
+fn axis_label_width(values: &[String]) -> f64 {
+    let max_chars = values
+        .iter()
+        .map(|value| value.chars().count())
+        .max()
+        .unwrap_or(8);
+    ((max_chars as f64 * 7.0) + 32.0).clamp(120.0, 300.0)
+}
+
+fn short_label(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_owned();
+    }
+    let mut label = value
+        .chars()
+        .take(max_chars.saturating_sub(3))
+        .collect::<String>();
+    label.push_str("...");
+    label
+}
+
+fn heatmap_svg_colors(ratio: f64) -> (String, &'static str) {
+    let red = (230.0 * (1.0 - ratio) + 38.0 * ratio).round() as u8;
+    let green = (75.0 * (1.0 - ratio) + 166.0 * ratio).round() as u8;
+    let blue = (64.0 * (1.0 - ratio) + 91.0 * ratio).round() as u8;
+    let text = if ratio < 0.45 { "#fff" } else { "#111" };
+    (format!("rgb({red},{green},{blue})"), text)
+}
+
+fn write_svg_background(file: &mut File, path: &Path) -> Result<()> {
+    writeln!(
+        file,
+        "<rect width=\"100%\" height=\"100%\" fill=\"#ffffff\"/>"
+    )
+    .map_err(write_error(path))
+}
+
+#[derive(Clone, Copy)]
+struct ChartArea {
+    left: f64,
+    top: f64,
+    width: f64,
+    height: f64,
+}
+
+fn write_chart_axes(
+    file: &mut File,
+    path: &Path,
+    area: ChartArea,
+    x_label: &str,
+    y_label: &str,
+) -> Result<()> {
+    writeln!(
+        file,
+        "<line x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\" stroke=\"#333\"/>",
+        area.left,
+        area.top + area.height,
+        area.left + area.width,
+        area.top + area.height
+    )
+    .map_err(write_error(path))?;
+    writeln!(
+        file,
+        "<line x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\" stroke=\"#333\"/>",
+        area.left,
+        area.top,
+        area.left,
+        area.top + area.height
+    )
+    .map_err(write_error(path))?;
+    writeln!(
+        file,
+        "<text x=\"{}\" y=\"{}\" text-anchor=\"middle\" font-family=\"sans-serif\" font-size=\"12\">{}</text>",
+        area.left + area.width / 2.0,
+        area.top + area.height + 52.0,
+        html_escape(x_label)
+    )
+    .map_err(write_error(path))?;
+    writeln!(
+        file,
+        "<text x=\"18\" y=\"{}\" font-family=\"sans-serif\" font-size=\"12\" transform=\"rotate(-90 18 {})\">{}</text>",
+        area.top + 56.0,
+        area.top + 56.0,
+        html_escape(y_label)
+    )
+    .map_err(write_error(path))?;
+    Ok(())
+}
+
+fn categorical_x(index: usize, count: usize, left: f64, width: f64) -> f64 {
+    if count <= 1 {
+        left + width / 2.0
+    } else {
+        left + width * index as f64 / (count - 1) as f64
+    }
+}
+
+fn chart_color(index: usize) -> &'static str {
+    const COLORS: [&str; 10] = [
+        "#0969da", "#cf222e", "#1a7f37", "#8250df", "#bf8700", "#0a8080", "#d1248f", "#57606a",
+        "#953800", "#116329",
+    ];
+    COLORS[index % COLORS.len()]
+}
+
 fn md_cell(value: &str) -> String {
     value.replace('|', "\\|")
 }
 
 fn heatmap_css() -> &'static str {
     "body{font-family:system-ui,sans-serif;margin:24px;color:#202124}\
+     nav{display:flex;gap:12px;flex-wrap:wrap;margin:12px 0 18px}\
+     nav a{color:#0969da;text-decoration:none}\
+     nav a:hover{text-decoration:underline}\
+     .guide{max-width:1100px;background:#f6f8fa;border:1px solid #d0d7de;padding:12px 14px;margin:14px 0}\
+     .guide h2{font-size:16px;margin:0 0 8px}\
+     .guide p{margin:6px 0;line-height:1.4}\
+     figure{margin:18px 0 22px;max-width:980px}\
+     figure img{display:block;max-width:100%;border:1px solid #d0d7de}\
+     figure h3{font-size:14px;margin:0 0 8px}\
+     figcaption{font-size:12px;color:#57606a;margin-top:6px}\
+     .gallery{display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:18px;align-items:start}\
+     .gallery figure{margin:0;max-width:none}\
+     h2{font-size:18px;margin-top:22px}\
      table{border-collapse:collapse;font-size:12px}\
      th,td{border:1px solid #d0d7de;padding:4px 6px;white-space:nowrap}\
      thead th{position:sticky;top:0;background:#f6f8fa;z-index:2}\
      tbody th{position:sticky;left:0;background:#f6f8fa;text-align:left;z-index:1}\
      td.metric{text-align:right;font-variant-numeric:tabular-nums}\
+     td.winner{font-weight:700;outline:2px solid #1a7f37;outline-offset:-2px}\
+     .cell-value{display:block}\
+     .winner-label{display:block;text-transform:uppercase;font-size:9px;letter-spacing:.04em}\
      td.missing{background:#f1f3f4}"
 }
 
@@ -1905,6 +3089,74 @@ fn real_data_args(args: &[OsString]) -> Result<(PathBuf, Vec<OsString>)> {
     }
 }
 
+fn default_or_extra<const N: usize>(extra: &[OsString], default_args: [&str; N]) -> Vec<OsString> {
+    if extra.is_empty() {
+        cargo_args(default_args)
+    } else {
+        extra.to_vec()
+    }
+}
+
+fn path_or_default(args: &[OsString], default: &str) -> Result<(PathBuf, Vec<OsString>)> {
+    let (path, extra) = if let Some(first) = args.first() {
+        if !first.to_string_lossy().starts_with('-') {
+            (PathBuf::from(first), args[1..].to_vec())
+        } else {
+            (expand_tilde(default), args.to_vec())
+        }
+    } else {
+        (expand_tilde(default), Vec::new())
+    };
+
+    if path.exists() {
+        Ok((path, extra))
+    } else {
+        Err(format!(
+            "benchmark data `{}` does not exist",
+            path.display()
+        ))
+    }
+}
+
+fn path_or_first_existing(
+    args: &[OsString],
+    defaults: &[&str],
+) -> Result<(PathBuf, Vec<OsString>)> {
+    if let Some(first) = args.first()
+        && !first.to_string_lossy().starts_with('-')
+    {
+        let path = PathBuf::from(first);
+        if path.exists() {
+            return Ok((path, args[1..].to_vec()));
+        }
+        return Err(format!(
+            "benchmark data `{}` does not exist",
+            path.display()
+        ));
+    }
+
+    for default in defaults {
+        let path = expand_tilde(default);
+        if path.exists() {
+            return Ok((path, args.to_vec()));
+        }
+    }
+
+    Err(format!(
+        "none of the default benchmark data paths exist: {}",
+        defaults.join(", ")
+    ))
+}
+
+fn expand_tilde(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(rest);
+    }
+    PathBuf::from(path)
+}
+
 fn default_real_data_path() -> Result<PathBuf> {
     if let Some(path) = env::var_os("TOKENFS_ALGOS_REAL_DATA") {
         return Ok(PathBuf::from(path));
@@ -1977,6 +3229,26 @@ fn help() {
                     compare adaptive kernels over synthetic + real workloads\n\
            bench-calibrate\n\
                     run a short adaptive calibration matrix and log results\n\
+           bench-smoke\n\
+                    fast workload-matrix sanity suite\n\
+           bench-synthetic-full\n\
+                    full synthetic matrix with all kernels and topology threads\n\
+           bench-real-iso [path]\n\
+                    Ubuntu ISO matrix with all kernels and topology threads\n\
+           bench-real-f21 [path]\n\
+                    F21/F22/rootfs paper-data calibration matrix\n\
+           bench-size-sweep\n\
+                    powers-of-two payload-size sweep\n\
+           bench-alignment-sweep\n\
+                    pointer-alignment sweep at +0/+1/+3/+7/+31 offsets\n\
+           bench-thread-topology\n\
+                    2/4/physical/logical/saturated thread sweep\n\
+           bench-planner-parity\n\
+                    planner-vs-all-kernels matrix with no hidden direct kernels\n\
+           bench-cache-hot-cold\n\
+                    hot-repeat, cold-sweep, and same-file-repeat access patterns\n\
+           bench-profile\n\
+                    perf profile over workload matrix when available\n\
            bench-compare <old.jsonl> <new.jsonl>\n\
                     compare two benchmark history JSONL runs\n\
            bench-report [run.jsonl]\n\
