@@ -52,9 +52,10 @@ pub fn explain_block(bytes: &[u8], profile: &ProcessorProfile) -> PlannedByteHis
 #[must_use]
 pub fn plan_block(bytes: &[u8], profile: &ProcessorProfile) -> HistogramPlan {
     let mut workload = WorkloadShape::new(ApiContext::Block, bytes.len());
-    workload.content = ContentKind::Unknown;
-    workload.entropy = EntropyClass::Unknown;
-    workload.scale = EntropyScale::Unknown;
+    let (content, entropy, scale) = classify_block_sample(bytes);
+    workload.content = content;
+    workload.entropy = entropy;
+    workload.scale = scale;
     plan_histogram(profile, &workload)
 }
 
@@ -71,8 +72,77 @@ pub fn block_with_plan(bytes: &[u8], plan: &HistogramPlan) -> ByteHistogram {
         HistogramStrategy::AdaptivePrefix4K => kernels::adaptive_prefix_4k::block(bytes),
         HistogramStrategy::AdaptiveSpread4K => kernels::adaptive_spread_4k::block(bytes),
         HistogramStrategy::AdaptiveRunSentinel4K => kernels::adaptive_run_sentinel_4k::block(bytes),
-        HistogramStrategy::AdaptiveChunked64K | HistogramStrategy::StatefulSequential => {
-            kernels::adaptive_chunked_64k::block(bytes)
+        HistogramStrategy::AdaptiveLowEntropyFast => {
+            kernels::adaptive_low_entropy_fast::block(bytes)
         }
+        HistogramStrategy::AdaptiveAsciiFast => kernels::adaptive_ascii_fast::block(bytes),
+        HistogramStrategy::AdaptiveHighEntropySkip => {
+            kernels::adaptive_high_entropy_skip::block(bytes)
+        }
+        HistogramStrategy::AdaptiveMesoDetector => kernels::adaptive_meso_detector::block(bytes),
+        HistogramStrategy::AdaptiveChunked64K => kernels::adaptive_chunked_64k::block(bytes),
+        HistogramStrategy::AdaptiveSequentialOnline64K | HistogramStrategy::StatefulSequential => {
+            kernels::adaptive_sequential_online_64k::block(bytes)
+        }
+        HistogramStrategy::AdaptiveFileCached64K => kernels::adaptive_file_cached_64k::block(bytes),
     }
+}
+
+fn classify_block_sample(bytes: &[u8]) -> (ContentKind, EntropyClass, EntropyScale) {
+    let sample_len = bytes.len().min(4 * 1024);
+    if sample_len == 0 {
+        return (
+            ContentKind::Unknown,
+            EntropyClass::Unknown,
+            EntropyScale::Unknown,
+        );
+    }
+
+    let sample = &bytes[..sample_len];
+    let mut counts = [0_usize; 256];
+    let mut ascii_text = 0_usize;
+    let mut longest_run = 0_usize;
+    let mut current_run = 0_usize;
+    let mut previous = None;
+
+    for &byte in sample {
+        counts[byte as usize] += 1;
+        if byte.is_ascii_graphic() || matches!(byte, b' ' | b'\n' | b'\r' | b'\t') {
+            ascii_text += 1;
+        }
+
+        if Some(byte) == previous {
+            current_run += 1;
+        } else {
+            current_run = 1;
+            previous = Some(byte);
+        }
+        longest_run = longest_run.max(current_run);
+    }
+
+    let unique = counts.iter().filter(|&&count| count > 0).count();
+    let max_count = counts.iter().copied().max().unwrap_or(0);
+
+    let content = if ascii_text * 100 >= sample_len * 90 {
+        ContentKind::Text
+    } else {
+        ContentKind::Binary
+    };
+
+    let entropy =
+        if unique <= 4 || max_count * 100 >= sample_len * 80 || longest_run >= sample_len / 2 {
+            EntropyClass::Low
+        } else if unique >= 192 && max_count * 100 < sample_len * 4 {
+            EntropyClass::High
+        } else {
+            EntropyClass::Medium
+        };
+
+    let scale = if bytes.len() >= 64 * 1024 {
+        EntropyScale::Flat
+    } else {
+        EntropyScale::Unknown
+    };
+
+    (content, entropy, scale)
 }

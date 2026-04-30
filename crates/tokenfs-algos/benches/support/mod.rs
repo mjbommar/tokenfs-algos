@@ -11,8 +11,8 @@ use std::{
 };
 
 use tokenfs_algos::dispatch::{
-    ApiContext, ContentKind, EntropyClass, EntropyScale, ProcessorProfile, WorkloadShape,
-    plan_histogram,
+    ApiContext, CacheState, ContentKind, EntropyClass, EntropyScale, ProcessorProfile,
+    ReadPattern as PlannerReadPattern, SourceHint, WorkloadShape, plan_histogram,
 };
 
 pub(crate) struct BenchInput {
@@ -1532,6 +1532,20 @@ fn workload_shape(
             }
             AccessPattern::ParallelSequential { .. } => ApiContext::Parallel,
         },
+        read_pattern: match access {
+            AccessPattern::WholeBlock => PlannerReadPattern::WholeBlock,
+            AccessPattern::Sequential { .. } => PlannerReadPattern::Sequential,
+            AccessPattern::ReadAhead { .. } => PlannerReadPattern::Readahead,
+            AccessPattern::Random { chunk_size, .. } if *chunk_size <= 1 => {
+                PlannerReadPattern::RandomTiny
+            }
+            AccessPattern::Random { .. } => PlannerReadPattern::Random,
+            AccessPattern::ZipfianHotCold { .. } => PlannerReadPattern::ZipfianHotCold,
+            AccessPattern::HotRepeat { .. } => PlannerReadPattern::HotRepeat,
+            AccessPattern::ColdSweep { .. } => PlannerReadPattern::ColdSweep,
+            AccessPattern::SameFileRepeat { .. } => PlannerReadPattern::SameFileRepeat,
+            AccessPattern::ParallelSequential { .. } => PlannerReadPattern::ParallelSequential,
+        },
         content: match payload.content {
             "text" => ContentKind::Text,
             "binary" => ContentKind::Binary,
@@ -1555,6 +1569,19 @@ fn workload_shape(
         total_bytes: processed_bytes,
         chunk_bytes: access.chunk_size(),
         threads: access.threads(),
+        alignment_offset: payload.byte_offset,
+        cache_state: match access {
+            AccessPattern::HotRepeat { .. } => CacheState::Hot,
+            AccessPattern::ColdSweep { .. } => CacheState::Cold,
+            AccessPattern::SameFileRepeat { .. } => CacheState::Reused,
+            _ => CacheState::Unknown,
+        },
+        source_hint: match payload.source {
+            "synthetic" => SourceHint::Synthetic,
+            "real" => SourceHint::RealFile,
+            "paper" | "f21" | "f22" => SourceHint::PaperExtent,
+            _ => SourceHint::Unknown,
+        },
     }
 }
 

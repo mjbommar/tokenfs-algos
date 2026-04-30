@@ -1,8 +1,8 @@
 //! Print detected processor facts and histogram planner examples.
 
 use tokenfs_algos::dispatch::{
-    ApiContext, ContentKind, EntropyClass, EntropyScale, WorkloadShape, detected_processor_profile,
-    histogram_kernel_catalog, plan_histogram,
+    ApiContext, CacheState, ContentKind, EntropyClass, EntropyScale, ReadPattern, SourceHint,
+    WorkloadShape, detected_processor_profile, histogram_kernel_catalog, plan_histogram,
 };
 
 fn main() {
@@ -114,12 +114,16 @@ fn shape(
 ) -> WorkloadShape {
     WorkloadShape {
         context,
+        read_pattern: ReadPattern::from_context(context),
         content,
         entropy,
         scale,
         total_bytes,
         chunk_bytes,
         threads,
+        alignment_offset: 0,
+        cache_state: CacheState::Unknown,
+        source_hint: SourceHint::Unknown,
     }
 }
 

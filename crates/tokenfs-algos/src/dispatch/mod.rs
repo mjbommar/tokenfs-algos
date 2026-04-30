@@ -173,6 +173,44 @@ pub enum ApiContext {
     Parallel,
 }
 
+/// More specific read/access pattern supplied to the planner.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ReadPattern {
+    /// One whole in-memory block.
+    WholeBlock,
+    /// Sequential reads without explicit readahead.
+    Sequential,
+    /// Sequential reads with caller/file-system readahead.
+    Readahead,
+    /// Random reads with non-trivial chunks.
+    Random,
+    /// Random single-byte or tiny reads.
+    RandomTiny,
+    /// Hot/cold random reads with a skewed access distribution.
+    ZipfianHotCold,
+    /// Repeated reads from hot cache.
+    HotRepeat,
+    /// Large scans intended to defeat cache reuse.
+    ColdSweep,
+    /// Same file or region repeatedly planned across calls.
+    SameFileRepeat,
+    /// Sequential chunks processed by multiple workers.
+    ParallelSequential,
+}
+
+impl ReadPattern {
+    /// Returns the default read pattern implied by a high-level API context.
+    #[must_use]
+    pub const fn from_context(context: ApiContext) -> Self {
+        match context {
+            ApiContext::Block => Self::WholeBlock,
+            ApiContext::File | ApiContext::Sequential => Self::Sequential,
+            ApiContext::Random => Self::Random,
+            ApiContext::Parallel => Self::ParallelSequential,
+        }
+    }
+}
+
 /// Coarse content family used by dispatch planning.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum ContentKind {
@@ -216,11 +254,42 @@ pub enum EntropyScale {
     Macro,
 }
 
-/// Workload shape supplied to a primitive planner.
+/// Expected cache state for this call or stream.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct WorkloadShape {
+pub enum CacheState {
+    /// Cache behavior is not known.
+    Unknown,
+    /// Caller expects a hot-cache repeat.
+    Hot,
+    /// Caller expects cold-ish scan behavior.
+    Cold,
+    /// Caller expects repeated calls over the same file or region.
+    Reused,
+}
+
+/// Source/data hint supplied to the planner.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum SourceHint {
+    /// Source is not known.
+    Unknown,
+    /// Synthetic/generated benchmark data.
+    Synthetic,
+    /// Real file or file slice.
+    RealFile,
+    /// Parsed paper/corpus extent.
+    PaperExtent,
+}
+
+/// Full context supplied to a primitive planner.
+///
+/// This is the first-class public planner surface. `WorkloadShape` remains as a
+/// compatibility alias.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct PlanContext {
     /// API context.
     pub context: ApiContext,
+    /// Specific read/access pattern.
+    pub read_pattern: ReadPattern,
     /// Content family.
     pub content: ContentKind,
     /// Entropy class.
@@ -233,20 +302,33 @@ pub struct WorkloadShape {
     pub chunk_bytes: usize,
     /// Thread count requested by the caller. One means single-threaded.
     pub threads: usize,
+    /// Byte alignment offset from the preferred/cache-line boundary.
+    pub alignment_offset: usize,
+    /// Expected cache state.
+    pub cache_state: CacheState,
+    /// Source/data hint.
+    pub source_hint: SourceHint,
 }
 
-impl WorkloadShape {
-    /// Builds a workload shape with unknown content and entropy.
+/// Backward-compatible name for planner context.
+pub type WorkloadShape = PlanContext;
+
+impl PlanContext {
+    /// Builds a planner context with unknown content and entropy.
     #[must_use]
     pub const fn new(context: ApiContext, total_bytes: usize) -> Self {
         Self {
             context,
+            read_pattern: ReadPattern::from_context(context),
             content: ContentKind::Unknown,
             entropy: EntropyClass::Unknown,
             scale: EntropyScale::Unknown,
             total_bytes,
             chunk_bytes: 0,
             threads: 1,
+            alignment_offset: 0,
+            cache_state: CacheState::Unknown,
+            source_hint: SourceHint::Unknown,
         }
     }
 }
@@ -274,6 +356,18 @@ pub enum HistogramStrategy {
     AdaptiveRunSentinel4K,
     /// Per-64 KiB chunk adaptation.
     AdaptiveChunked64K,
+    /// Adaptive sequential planner updated at 64 KiB boundaries.
+    AdaptiveSequentialOnline64K,
+    /// File-level planner that samples once and reuses that choice.
+    AdaptiveFileCached64K,
+    /// Low-entropy fast path.
+    AdaptiveLowEntropyFast,
+    /// ASCII/text-biased fast path.
+    AdaptiveAsciiFast,
+    /// High-entropy path that skips specialized logic.
+    AdaptiveHighEntropySkip,
+    /// Meso-pattern detector for block-palette-like data.
+    AdaptiveMesoDetector,
     /// Stateful sequential planner that reuses decisions across reads.
     StatefulSequential,
 }
@@ -293,6 +387,12 @@ impl HistogramStrategy {
             Self::AdaptiveSpread4K => "adaptive-spread-4k",
             Self::AdaptiveRunSentinel4K => "adaptive-run-sentinel-4k",
             Self::AdaptiveChunked64K => "adaptive-chunked-64k",
+            Self::AdaptiveSequentialOnline64K => "adaptive-sequential-online-64k",
+            Self::AdaptiveFileCached64K => "adaptive-file-cached-64k",
+            Self::AdaptiveLowEntropyFast => "adaptive-low-entropy-fast",
+            Self::AdaptiveAsciiFast => "adaptive-ascii-fast",
+            Self::AdaptiveHighEntropySkip => "adaptive-high-entropy-skip",
+            Self::AdaptiveMesoDetector => "adaptive-meso-detector",
             Self::StatefulSequential => "stateful-sequential",
         }
     }
@@ -312,7 +412,7 @@ pub const fn histogram_kernel_catalog() -> &'static [HistogramKernelInfo] {
     &HISTOGRAM_KERNEL_CATALOG
 }
 
-const HISTOGRAM_KERNEL_CATALOG: [HistogramKernelInfo; 11] = [
+const HISTOGRAM_KERNEL_CATALOG: [HistogramKernelInfo; 17] = [
     HistogramKernelInfo {
         family: PrimitiveFamily::ByteHistogram,
         strategy: HistogramStrategy::DirectU64,
@@ -435,6 +535,78 @@ const HISTOGRAM_KERNEL_CATALOG: [HistogramKernelInfo; 11] = [
     },
     HistogramKernelInfo {
         family: PrimitiveFamily::ByteHistogram,
+        strategy: HistogramStrategy::AdaptiveSequentialOnline64K,
+        isa: KernelIsa::PortableScalar,
+        working_set: WorkingSetClass::Streaming,
+        statefulness: KernelStatefulness::Stateful,
+        min_bytes: 64 * 1024,
+        preferred_chunk_bytes: 64 * 1024,
+        sample_bytes: 1024,
+        private_table_bytes: 8 * 256 * 4,
+        description: "online sequential planner that can change choices at chunk boundaries",
+    },
+    HistogramKernelInfo {
+        family: PrimitiveFamily::ByteHistogram,
+        strategy: HistogramStrategy::AdaptiveFileCached64K,
+        isa: KernelIsa::PortableScalar,
+        working_set: WorkingSetClass::Streaming,
+        statefulness: KernelStatefulness::Stateful,
+        min_bytes: 64 * 1024,
+        preferred_chunk_bytes: 64 * 1024,
+        sample_bytes: 4096,
+        private_table_bytes: 8 * 256 * 4,
+        description: "file-level planner that samples once and reuses the choice",
+    },
+    HistogramKernelInfo {
+        family: PrimitiveFamily::ByteHistogram,
+        strategy: HistogramStrategy::AdaptiveLowEntropyFast,
+        isa: KernelIsa::PortableScalar,
+        working_set: WorkingSetClass::Streaming,
+        statefulness: KernelStatefulness::Stateless,
+        min_bytes: 4 * 1024,
+        preferred_chunk_bytes: 0,
+        sample_bytes: 4096,
+        private_table_bytes: 0,
+        description: "low-entropy detector that promotes obvious long-run inputs",
+    },
+    HistogramKernelInfo {
+        family: PrimitiveFamily::ByteHistogram,
+        strategy: HistogramStrategy::AdaptiveAsciiFast,
+        isa: KernelIsa::PortableScalar,
+        working_set: WorkingSetClass::Streaming,
+        statefulness: KernelStatefulness::Stateless,
+        min_bytes: 4 * 1024,
+        preferred_chunk_bytes: 0,
+        sample_bytes: 4096,
+        private_table_bytes: 8 * 256 * 4,
+        description: "ASCII/text-biased path that avoids extra sampling when text dominates",
+    },
+    HistogramKernelInfo {
+        family: PrimitiveFamily::ByteHistogram,
+        strategy: HistogramStrategy::AdaptiveHighEntropySkip,
+        isa: KernelIsa::PortableScalar,
+        working_set: WorkingSetClass::Streaming,
+        statefulness: KernelStatefulness::Stateless,
+        min_bytes: 64 * 1024,
+        preferred_chunk_bytes: 0,
+        sample_bytes: 4096,
+        private_table_bytes: 256 * 4,
+        description: "high-entropy path that avoids run/text-specific probes",
+    },
+    HistogramKernelInfo {
+        family: PrimitiveFamily::ByteHistogram,
+        strategy: HistogramStrategy::AdaptiveMesoDetector,
+        isa: KernelIsa::PortableScalar,
+        working_set: WorkingSetClass::L2,
+        statefulness: KernelStatefulness::Stateless,
+        min_bytes: 64 * 1024,
+        preferred_chunk_bytes: 0,
+        sample_bytes: 4096,
+        private_table_bytes: 8 * 256 * 4,
+        description: "meso-pattern detector for block-palette-like data",
+    },
+    HistogramKernelInfo {
+        family: PrimitiveFamily::ByteHistogram,
         strategy: HistogramStrategy::StatefulSequential,
         isa: KernelIsa::PortableScalar,
         working_set: WorkingSetClass::Streaming,
@@ -466,85 +638,237 @@ pub struct HistogramPlan {
 #[must_use]
 pub fn plan_histogram(profile: &ProcessorProfile, workload: &WorkloadShape) -> HistogramPlan {
     let _backend = profile.backend;
+    let total_bytes = workload.total_bytes;
+    let call_bytes = if workload.chunk_bytes == 0 {
+        total_bytes
+    } else {
+        workload.chunk_bytes.min(total_bytes.max(1))
+    };
+    let threads = workload.threads.max(1);
+    let oversubscribed = profile
+        .logical_cpus
+        .is_some_and(|logical| threads > logical.max(1));
 
-    if workload.total_bytes <= 256 && workload.threads <= 1 {
-        return HistogramPlan {
-            strategy: HistogramStrategy::DirectU64,
-            chunk_bytes: workload.chunk_bytes,
-            sample_bytes: 0,
-            confidence_q8: 255,
-            reason: "tiny blocks should avoid classifier overhead",
-        };
+    if threads <= 1 && call_bytes <= 4 * 1024 {
+        return plan(
+            HistogramStrategy::DirectU64,
+            workload.chunk_bytes,
+            0,
+            255,
+            "micro reads should avoid classifier overhead",
+        );
     }
 
-    if workload.context == ApiContext::Random && workload.chunk_bytes <= 1 {
-        return HistogramPlan {
-            strategy: HistogramStrategy::DirectU64,
-            chunk_bytes: workload.chunk_bytes,
-            sample_bytes: 0,
-            confidence_q8: 255,
-            reason: "tiny random reads are dominated by call overhead; avoid adaptive sampling",
-        };
+    if matches!(
+        workload.read_pattern,
+        ReadPattern::RandomTiny | ReadPattern::Random | ReadPattern::ZipfianHotCold
+    ) && call_bytes <= 4 * 1024
+    {
+        return plan(
+            HistogramStrategy::DirectU64,
+            workload.chunk_bytes,
+            0,
+            255,
+            "tiny random reads are dominated by call overhead; avoid adaptive sampling",
+        );
     }
 
-    if workload.threads > 1 || workload.context == ApiContext::Parallel {
-        return HistogramPlan {
-            strategy: HistogramStrategy::AdaptiveChunked64K,
-            chunk_bytes: 64 * 1024,
-            sample_bytes: 1024,
-            confidence_q8: 210,
-            reason: "parallel scans should use private chunk histograms before reduction",
-        };
+    if workload.entropy == EntropyClass::Low && total_bytes >= 64 * 1024 {
+        return plan(
+            HistogramStrategy::AdaptiveLowEntropyFast,
+            workload.chunk_bytes,
+            4 * 1024,
+            235,
+            "large low-entropy inputs need the dedicated low-entropy fast path",
+        );
     }
 
-    if workload.context == ApiContext::Sequential && workload.chunk_bytes <= 4 * 1024 {
-        return HistogramPlan {
-            strategy: HistogramStrategy::AdaptivePrefix1K,
-            chunk_bytes: workload.chunk_bytes,
-            sample_bytes: 1024,
-            confidence_q8: 220,
-            reason: "small sequential reads need a bounded classifier budget",
-        };
+    if workload.cache_state == CacheState::Reused && total_bytes >= 64 * 1024 {
+        return plan(
+            HistogramStrategy::AdaptiveFileCached64K,
+            64 * 1024,
+            4 * 1024,
+            215,
+            "repeated file access can amortize one file-level decision",
+        );
     }
 
-    if workload.scale == EntropyScale::Macro && workload.total_bytes >= 256 * 1024 {
-        return HistogramPlan {
-            strategy: HistogramStrategy::AdaptiveChunked64K,
-            chunk_bytes: 64 * 1024,
-            sample_bytes: 1024,
-            confidence_q8: 215,
-            reason: "macro-scale variation benefits from per-region kernel choice",
-        };
+    if threads > 1 || workload.context == ApiContext::Parallel {
+        if workload.content == ContentKind::Text {
+            return plan(
+                HistogramStrategy::LocalU32,
+                64 * 1024,
+                0,
+                if oversubscribed { 150 } else { 205 },
+                "parallel text scans favored simple private tables over chunked adaptation",
+            );
+        }
+
+        if workload.entropy == EntropyClass::High && workload.scale == EntropyScale::Flat {
+            return plan(
+                HistogramStrategy::DirectU64,
+                64 * 1024,
+                0,
+                if oversubscribed { 145 } else { 210 },
+                "parallel high-entropy scans should avoid adaptive chunk over-selection",
+            );
+        }
+
+        return plan(
+            HistogramStrategy::AdaptiveRunSentinel4K,
+            64 * 1024,
+            4 * 1024,
+            if oversubscribed { 145 } else { 185 },
+            "parallel mixed scans use a cheap run sentinel instead of default chunked planning",
+        );
+    }
+
+    if workload.alignment_offset >= 16
+        && workload.entropy == EntropyClass::High
+        && total_bytes >= 64 * 1024
+    {
+        return plan(
+            HistogramStrategy::LocalU32,
+            workload.chunk_bytes,
+            0,
+            185,
+            "large unaligned high-entropy inputs avoid the direct u64 path",
+        );
+    }
+
+    if workload.scale == EntropyScale::Macro && total_bytes >= 256 * 1024 {
+        if workload.source_hint == SourceHint::RealFile
+            && workload.entropy == EntropyClass::High
+            && workload.content == ContentKind::Binary
+        {
+            return plan(
+                HistogramStrategy::DirectU64,
+                workload.chunk_bytes,
+                0,
+                175,
+                "real high-entropy file slices favored direct/simple kernels in calibration",
+            );
+        }
+
+        return plan(
+            HistogramStrategy::AdaptiveChunked64K,
+            64 * 1024,
+            1024,
+            205,
+            "macro-scale variation benefits from per-region kernel choice",
+        );
     }
 
     if workload.scale == EntropyScale::Meso
         && (workload.context == ApiContext::Block || workload.chunk_bytes >= 64 * 1024)
     {
-        return HistogramPlan {
-            strategy: HistogramStrategy::AdaptiveSpread4K,
-            chunk_bytes: workload.chunk_bytes,
-            sample_bytes: 4 * 1024,
-            confidence_q8: 205,
-            reason: "meso-scale structure may be missed by a prefix-only sample",
-        };
+        return plan(
+            HistogramStrategy::AdaptiveMesoDetector,
+            workload.chunk_bytes,
+            4 * 1024,
+            205,
+            "meso-scale structure needs a block-pattern detector",
+        );
     }
 
-    if workload.entropy == EntropyClass::Low && workload.total_bytes >= 64 * 1024 {
-        return HistogramPlan {
-            strategy: HistogramStrategy::AdaptivePrefix1K,
-            chunk_bytes: workload.chunk_bytes,
-            sample_bytes: 1024,
-            confidence_q8: 190,
-            reason: "low-entropy data should first try cheap run/cardinality detection",
-        };
+    if workload.content == ContentKind::Text {
+        if total_bytes >= 64 * 1024 * 1024 || workload.context == ApiContext::File {
+            return plan(
+                HistogramStrategy::AdaptiveFileCached64K,
+                64 * 1024,
+                4 * 1024,
+                205,
+                "large text/file inputs can amortize file-level text detection",
+            );
+        }
+
+        if total_bytes >= 16 * 1024 * 1024 {
+            return plan(
+                HistogramStrategy::AdaptiveAsciiFast,
+                workload.chunk_bytes,
+                4 * 1024,
+                210,
+                "large text inputs benefit from the ASCII-biased fast path",
+            );
+        }
+
+        if total_bytes >= 8 * 1024 {
+            return plan(
+                HistogramStrategy::LocalU32,
+                workload.chunk_bytes,
+                0,
+                200,
+                "medium text inputs favored local private tables in size sweeps",
+            );
+        }
     }
 
+    if workload.entropy == EntropyClass::High {
+        if total_bytes <= 16 * 1024 {
+            return plan(
+                HistogramStrategy::DirectU64,
+                workload.chunk_bytes,
+                0,
+                220,
+                "small high-entropy inputs favored the direct path",
+            );
+        }
+
+        if total_bytes <= 1024 * 1024 {
+            return plan(
+                HistogramStrategy::LocalU32,
+                workload.chunk_bytes,
+                0,
+                190,
+                "mid-sized high-entropy inputs favored local private tables",
+            );
+        }
+
+        return plan(
+            HistogramStrategy::AdaptiveHighEntropySkip,
+            workload.chunk_bytes,
+            4 * 1024,
+            175,
+            "large high-entropy inputs should skip low-entropy/text probes",
+        );
+    }
+
+    if matches!(
+        workload.read_pattern,
+        ReadPattern::Sequential | ReadPattern::Readahead
+    ) && total_bytes >= 64 * 1024
+    {
+        return plan(
+            HistogramStrategy::AdaptiveSequentialOnline64K,
+            64 * 1024,
+            1024,
+            170,
+            "sequential reads can update choices at region boundaries",
+        );
+    }
+
+    plan(
+        HistogramStrategy::AdaptivePrefix1K,
+        workload.chunk_bytes,
+        1024,
+        150,
+        "general-purpose fallback with a bounded prefix classifier",
+    )
+}
+
+fn plan(
+    strategy: HistogramStrategy,
+    chunk_bytes: usize,
+    sample_bytes: usize,
+    confidence_q8: u8,
+    reason: &'static str,
+) -> HistogramPlan {
     HistogramPlan {
-        strategy: HistogramStrategy::AdaptivePrefix1K,
-        chunk_bytes: workload.chunk_bytes,
-        sample_bytes: 1024,
-        confidence_q8: 160,
-        reason: "general-purpose balanced histogram strategy",
+        strategy,
+        chunk_bytes,
+        sample_bytes,
+        confidence_q8,
+        reason,
     }
 }
 
@@ -772,8 +1096,9 @@ fn detect_aarch64_backend() -> Backend {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApiContext, ContentKind, EntropyClass, EntropyScale, HistogramStrategy, ProcessorProfile,
-        WorkloadShape, histogram_kernel_catalog, plan_histogram,
+        ApiContext, CacheState, ContentKind, EntropyClass, EntropyScale, HistogramStrategy,
+        ProcessorProfile, ReadPattern, SourceHint, WorkloadShape, histogram_kernel_catalog,
+        plan_histogram,
     };
 
     #[test]
@@ -814,15 +1139,103 @@ mod tests {
     }
 
     #[test]
-    fn planner_uses_bounded_prefix_for_small_sequential_reads() {
+    fn planner_avoids_sampling_for_small_sequential_reads() {
         let profile = ProcessorProfile::portable();
         let mut workload = WorkloadShape::new(ApiContext::Sequential, 1024 * 1024);
         workload.chunk_bytes = 4 * 1024;
 
         let plan = plan_histogram(&profile, &workload);
 
-        assert_eq!(plan.strategy, HistogramStrategy::AdaptivePrefix1K);
-        assert_eq!(plan.sample_bytes, 1024);
+        assert_eq!(plan.strategy, HistogramStrategy::DirectU64);
+        assert_eq!(plan.sample_bytes, 0);
+    }
+
+    #[test]
+    fn planner_uses_low_entropy_fast_path_for_large_low_entropy_inputs() {
+        let profile = ProcessorProfile::portable();
+        let mut workload = WorkloadShape::new(ApiContext::Block, 256 * 1024 * 1024);
+        workload.entropy = EntropyClass::Low;
+        workload.scale = EntropyScale::Flat;
+
+        let plan = plan_histogram(&profile, &workload);
+
+        assert_eq!(plan.strategy, HistogramStrategy::AdaptiveLowEntropyFast);
+        assert_ne!(plan.strategy, HistogramStrategy::DirectU64);
+    }
+
+    #[test]
+    fn planner_does_not_blindly_chunk_parallel_high_entropy_scans() {
+        let profile = ProcessorProfile {
+            logical_cpus: Some(24),
+            ..ProcessorProfile::portable()
+        };
+        let mut workload = WorkloadShape::new(ApiContext::Parallel, 64 * 1024 * 1024);
+        workload.read_pattern = ReadPattern::ParallelSequential;
+        workload.content = ContentKind::Binary;
+        workload.entropy = EntropyClass::High;
+        workload.scale = EntropyScale::Flat;
+        workload.chunk_bytes = 64 * 1024;
+        workload.threads = 4;
+
+        let plan = plan_histogram(&profile, &workload);
+
+        assert_eq!(plan.strategy, HistogramStrategy::DirectU64);
+    }
+
+    #[test]
+    fn planner_uses_local_table_for_medium_text() {
+        let profile = ProcessorProfile::portable();
+        let mut workload = WorkloadShape::new(ApiContext::Block, 64 * 1024);
+        workload.content = ContentKind::Text;
+        workload.entropy = EntropyClass::Medium;
+        workload.scale = EntropyScale::Micro;
+
+        let plan = plan_histogram(&profile, &workload);
+
+        assert_eq!(plan.strategy, HistogramStrategy::LocalU32);
+        assert_eq!(plan.sample_bytes, 0);
+    }
+
+    #[test]
+    fn planner_uses_cached_file_strategy_for_repeated_large_regions() {
+        let profile = ProcessorProfile::portable();
+        let mut workload = WorkloadShape::new(ApiContext::File, 256 * 1024 * 1024);
+        workload.read_pattern = ReadPattern::SameFileRepeat;
+        workload.content = ContentKind::Text;
+        workload.entropy = EntropyClass::Medium;
+        workload.cache_state = CacheState::Reused;
+
+        let plan = plan_histogram(&profile, &workload);
+
+        assert_eq!(plan.strategy, HistogramStrategy::AdaptiveFileCached64K);
+    }
+
+    #[test]
+    fn planner_uses_alignment_context_for_large_unaligned_high_entropy_inputs() {
+        let profile = ProcessorProfile::portable();
+        let mut workload = WorkloadShape::new(ApiContext::Block, 1024 * 1024);
+        workload.content = ContentKind::Binary;
+        workload.entropy = EntropyClass::High;
+        workload.scale = EntropyScale::Flat;
+        workload.alignment_offset = 31;
+
+        let plan = plan_histogram(&profile, &workload);
+
+        assert_eq!(plan.strategy, HistogramStrategy::LocalU32);
+    }
+
+    #[test]
+    fn planner_avoids_chunked_for_real_high_entropy_file_slices() {
+        let profile = ProcessorProfile::portable();
+        let mut workload = WorkloadShape::new(ApiContext::File, 4 * 1024 * 1024);
+        workload.content = ContentKind::Binary;
+        workload.entropy = EntropyClass::High;
+        workload.scale = EntropyScale::Macro;
+        workload.source_hint = SourceHint::RealFile;
+
+        let plan = plan_histogram(&profile, &workload);
+
+        assert_eq!(plan.strategy, HistogramStrategy::DirectU64);
     }
 
     #[test]

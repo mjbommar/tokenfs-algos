@@ -20,7 +20,10 @@ fn explain_block_returns_the_plan_used() {
     let profile = ProcessorProfile::portable();
     let explained = histogram::explain_block(&bytes, &profile);
 
-    assert_eq!(explained.plan.strategy, HistogramStrategy::AdaptivePrefix1K);
+    assert_eq!(
+        explained.plan.strategy,
+        HistogramStrategy::AdaptiveLowEntropyFast
+    );
     assert_eq!(explained.histogram.counts(), &reference_counts(&bytes));
 }
 

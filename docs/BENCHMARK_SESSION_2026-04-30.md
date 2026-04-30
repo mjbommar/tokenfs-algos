@@ -140,3 +140,30 @@ hardware-conscious primitives using workload context.
 - Run flamegraphs after enabling perf access on the host.
 - Keep the full 256 MiB planner parity pass as an overnight/regression suite;
   use smaller filters for routine development.
+
+## Planner V1 Follow-Up
+
+After the session, planner v1 added first-class `PlanContext` fields for read
+pattern, cache state, source hint, and alignment offset. It also made the
+previously benchmark-only adaptive variants selectable through the public
+`HistogramStrategy` enum.
+
+Focused smoke rerun:
+
+- Run ID: `1777591759-8dc2a97a3d43-dirty`
+- Report: `target/bench-history/reports/1777591759-8dc2a97a3d43-dirty/`
+- Scope: 720 records, 60 workloads, 12 smoke kernels
+- Old smoke planner hit rate: 19/60 = 31.7%
+- New smoke planner hit rate: 37/60 = 61.7%
+
+The important improvement is not that the planner is done. It is that adding
+context and allowing more public strategies immediately doubled smoke parity.
+The remaining misses show the next planner work:
+
+- `adaptive-prefix-4k` and `adaptive-ascii-fast` still win several cases where
+  v1 chooses `direct-u64`, `local-u32`, or a broader adaptive path.
+- Some medium mixed/binary motifs are still poorly modeled by simple
+  entropy/content labels.
+- Smoke parity improved, but the full planner-parity, thread-topology, real ISO,
+  and true F21/F22 calibration suites still need reruns before treating v1 as a
+  stable default policy.

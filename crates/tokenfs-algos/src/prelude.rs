@@ -1,11 +1,11 @@
 //! Convenient imports for common `tokenfs-algos` APIs.
 
 pub use crate::dispatch::{
-    ApiContext, Backend, CacheProfile, ContentKind, EntropyClass, EntropyScale,
+    ApiContext, Backend, CacheProfile, CacheState, ContentKind, EntropyClass, EntropyScale,
     HistogramKernelInfo, HistogramPlan, HistogramStrategy, KernelIsa, KernelStatefulness,
-    PrimitiveFamily, ProcessorProfile, WorkingSetClass, WorkloadShape, clear_forced_backend,
-    detected_backend, detected_cache_profile, detected_processor_profile, force_backend,
-    histogram_kernel_catalog, plan_histogram,
+    PlanContext, PrimitiveFamily, ProcessorProfile, ReadPattern, SourceHint, WorkingSetClass,
+    WorkloadShape, clear_forced_backend, detected_backend, detected_cache_profile,
+    detected_processor_profile, force_backend, histogram_kernel_catalog, plan_histogram,
 };
 pub use crate::entropy;
 pub use crate::histogram::{
