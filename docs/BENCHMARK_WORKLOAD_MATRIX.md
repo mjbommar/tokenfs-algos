@@ -108,6 +108,21 @@ cargo xtask bench-compare \
   target/bench-history/runs/<new>.jsonl
 ```
 
+Generate visual and tabular artifacts for a run:
+
+```bash
+cargo xtask bench-report target/bench-history/runs/<run>.jsonl
+```
+
+With no argument, `bench-report` uses the newest JSONL run. It writes:
+
+- `summary.md`: report overview and top-throughput rows;
+- `heatmap.html`: workload-by-kernel throughput heatmap, colored relative to
+  the best kernel per workload;
+- `throughput-histogram.svg`: distribution of observed GiB/s values;
+- `timing.csv`: row-level timing table for scripts, spreadsheets, and paper
+  plots.
+
 ## Logged Outputs
 
 Every `bench-workloads*` command writes a history entry under:
@@ -122,6 +137,8 @@ The important files are:
 - `target/bench-history/index.tsv`: append-only run index.
 - `target/bench-history/runs/<timestamp>-<commit>.jsonl`: machine-readable rows.
 - `target/bench-history/runs/<timestamp>-<commit>.md`: per-run Markdown summary.
+- `target/bench-history/reports/<run>/`: generated report artifacts from
+  `bench-report`.
 - `target/tokenfs-algos/workload-manifest.jsonl`: latest workload manifest.
 
 The JSONL rows include timestamp, git commit, dirty flag, rustc version, CPU

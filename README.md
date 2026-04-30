@@ -21,7 +21,9 @@ cargo xtask bench-workloads
 cargo xtask bench-workloads-adaptive
 cargo xtask bench-calibrate
 cargo xtask bench-compare target/bench-history/runs/<old>.jsonl target/bench-history/runs/<new>.jsonl
+cargo xtask bench-report
 cargo xtask profile
+cargo xtask profile-flamegraph -- --profile-time 10 workload_matrix/adaptive-prefix-1k
 cargo run -p tokenfs-algos --example dispatch_explain
 ```
 

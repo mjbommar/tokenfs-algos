@@ -2,7 +2,7 @@
 
 use std::{
     cmp::Ordering,
-    collections::HashMap,
+    collections::{BTreeMap, BTreeSet, HashMap},
     env,
     ffi::OsString,
     fs::{self, File, OpenOptions},
@@ -52,9 +52,12 @@ fn run() -> Result<()> {
         "bench-workloads-adaptive-real" => bench_workloads_adaptive_real(&rest),
         "bench-calibrate" => bench_calibrate(&rest),
         "bench-compare" => bench_compare(&rest),
+        "bench-report" => bench_report(&rest),
         "bench-log" => record_bench_history(None),
         "profile" => profile(&rest),
         "profile-real" => profile_real(&rest),
+        "profile-flamegraph" => profile_flamegraph(&rest),
+        "profile-flamegraph-real" => profile_flamegraph_real(&rest),
         "ci" => ci(),
         "help" | "-h" | "--help" => {
             help();
@@ -282,6 +285,70 @@ fn bench_compare(args: &[OsString]) -> Result<()> {
     Ok(())
 }
 
+fn bench_report(args: &[OsString]) -> Result<()> {
+    if args.len() > 1 {
+        return Err("usage: cargo xtask bench-report [run.jsonl]".into());
+    }
+
+    let jsonl_path = if let Some(path) = args.first() {
+        PathBuf::from(path)
+    } else {
+        latest_bench_jsonl()?
+    };
+    let mut records = read_bench_report_records(&jsonl_path)?;
+    if records
+        .iter()
+        .any(|record| record.group == "workload_matrix")
+    {
+        records.retain(|record| record.group == "workload_matrix");
+    }
+    if records.is_empty() {
+        return Err(format!(
+            "benchmark run `{}` has no rows",
+            jsonl_path.display()
+        ));
+    }
+
+    let report_id = jsonl_path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("bench-report");
+    let report_dir = bench_history_dir().join("reports").join(report_id);
+    fs::create_dir_all(&report_dir).map_err(|error| {
+        format!(
+            "failed to create benchmark report directory `{}`: {error}",
+            report_dir.display()
+        )
+    })?;
+
+    let timing_csv = report_dir.join("timing.csv");
+    let heatmap_html = report_dir.join("heatmap.html");
+    let histogram_svg = report_dir.join("throughput-histogram.svg");
+    let summary_md = report_dir.join("summary.md");
+
+    write_timing_csv(&timing_csv, &records)?;
+    write_heatmap_html(&heatmap_html, &records, &jsonl_path)?;
+    write_throughput_histogram_svg(&histogram_svg, &records)?;
+    write_bench_report_summary(
+        &summary_md,
+        &records,
+        &jsonl_path,
+        &timing_csv,
+        &heatmap_html,
+        &histogram_svg,
+    )?;
+
+    eprintln!("xtask: wrote benchmark report `{}`", summary_md.display());
+    eprintln!("xtask: wrote timing table `{}`", timing_csv.display());
+    eprintln!("xtask: wrote heatmap `{}`", heatmap_html.display());
+    eprintln!(
+        "xtask: wrote throughput histogram `{}`",
+        histogram_svg.display()
+    );
+
+    Ok(())
+}
+
 fn bench_workloads_with_env(
     extra: &[OsString],
     mut env_vars: Vec<(OsString, OsString)>,
@@ -327,6 +394,18 @@ fn profile_real(args: &[OsString]) -> Result<()> {
     )
 }
 
+fn profile_flamegraph(extra: &[OsString]) -> Result<()> {
+    profile_flamegraph_with_env(extra, Vec::new())
+}
+
+fn profile_flamegraph_real(args: &[OsString]) -> Result<()> {
+    let (path, extra) = real_data_args(args)?;
+    profile_flamegraph_with_env(
+        &extra,
+        vec![("TOKENFS_ALGOS_REAL_DATA".into(), path.into_os_string())],
+    )
+}
+
 fn profile_with_env(extra: &[OsString], env_vars: Vec<(OsString, OsString)>) -> Result<()> {
     ensure_profile_dir()?;
     cargo([
@@ -340,9 +419,12 @@ fn profile_with_env(extra: &[OsString], env_vars: Vec<(OsString, OsString)>) -> 
     ])?;
 
     if command_exists("perf") {
+        let perf_path = profile_output_path("perf-stat", "txt");
         let mut args = vec![
             OsString::from("stat"),
             OsString::from("-d"),
+            OsString::from("-o"),
+            perf_path.clone().into_os_string(),
             OsString::from("cargo"),
             OsString::from("bench"),
             OsString::from("-p"),
@@ -352,7 +434,14 @@ fn profile_with_env(extra: &[OsString], env_vars: Vec<(OsString, OsString)>) -> 
             OsString::from("--all-features"),
         ];
         args.extend(extra.iter().cloned());
-        run_command_with_env("perf", args, env_vars)?;
+        match run_command_with_env("perf", args, env_vars.clone()) {
+            Ok(()) => eprintln!("xtask: wrote perf stat output `{}`", perf_path.display()),
+            Err(error) => {
+                eprintln!("xtask: perf stat failed: {error}");
+                eprintln!("xtask: running Criterion benchmark without perf counters");
+                bench_with_env(extra, env_vars.clone())?;
+            }
+        }
     } else {
         eprintln!("xtask: `perf` not found; running Criterion benchmark only");
         bench_with_env(extra, env_vars)?;
@@ -360,10 +449,39 @@ fn profile_with_env(extra: &[OsString], env_vars: Vec<(OsString, OsString)>) -> 
 
     if command_exists("cargo-flamegraph") {
         eprintln!(
-            "xtask: cargo-flamegraph is installed; run targeted flamegraphs manually when needed"
+            "xtask: cargo-flamegraph is installed; run `cargo xtask profile-flamegraph` for SVG output"
         );
     }
 
+    Ok(())
+}
+
+fn profile_flamegraph_with_env(
+    extra: &[OsString],
+    env_vars: Vec<(OsString, OsString)>,
+) -> Result<()> {
+    if !command_exists("cargo-flamegraph") {
+        return Err(
+            "`cargo-flamegraph` not found; install it with `cargo install flamegraph`".into(),
+        );
+    }
+
+    ensure_profile_dir()?;
+    let output = profile_output_path("flamegraph", "svg");
+    let mut args = vec![
+        OsString::from("flamegraph"),
+        OsString::from("-o"),
+        output.clone().into_os_string(),
+        OsString::from("-p"),
+        OsString::from("tokenfs-algos"),
+        OsString::from("--bench"),
+        OsString::from("histogram"),
+        OsString::from("--"),
+    ];
+    args.extend(criterion_args(extra));
+
+    run_command_with_env("cargo", args, env_vars)?;
+    eprintln!("xtask: wrote flamegraph `{}`", output.display());
     Ok(())
 }
 
@@ -416,6 +534,26 @@ struct BenchDelta {
     old_mean_ns: f64,
     new_mean_ns: f64,
     change_pct: f64,
+}
+
+struct BenchReportRecord {
+    full_id: String,
+    group: String,
+    kernel: String,
+    workload_id: String,
+    case: String,
+    source: String,
+    content: String,
+    entropy: String,
+    scale: String,
+    access: String,
+    chunk: String,
+    threads: String,
+    pattern: String,
+    planned_kernel: String,
+    throughput_bytes: u64,
+    mean_ns: f64,
+    gib_per_s: f64,
 }
 
 fn record_bench_history(group_filter: Option<&str>) -> Result<()> {
@@ -984,6 +1122,492 @@ fn read_bench_log_records(path: &Path) -> Result<HashMap<String, BenchLogRecord>
     Ok(records)
 }
 
+fn read_bench_report_records(path: &Path) -> Result<Vec<BenchReportRecord>> {
+    let file = File::open(path)
+        .map_err(|error| format!("failed to open `{}`: {error}", path.display()))?;
+    let mut records = Vec::new();
+
+    for (index, line) in BufReader::new(file).lines().enumerate() {
+        let line_number = index + 1;
+        let line = line.map_err(|error| {
+            format!(
+                "failed to read line {line_number} from `{}`: {error}",
+                path.display()
+            )
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let value = serde_json::from_str::<Value>(&line).map_err(|error| {
+            format!(
+                "failed to parse line {line_number} from `{}`: {error}",
+                path.display()
+            )
+        })?;
+        let full_id = json_string(&value, "full_id").ok_or_else(|| {
+            format!(
+                "missing `full_id` on line {line_number} from `{}`",
+                path.display()
+            )
+        })?;
+        let kernel = json_string(&value, "kernel").unwrap_or_default();
+        let workload_id = json_string(&value, "workload_id").unwrap_or_else(|| full_id.clone());
+        let throughput_bytes = value
+            .get("throughput_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let mean_ns = value
+            .get("mean_ns")
+            .and_then(Value::as_f64)
+            .ok_or_else(|| {
+                format!(
+                    "missing `mean_ns` on line {line_number} from `{}`",
+                    path.display()
+                )
+            })?;
+        let gib_per_s = value
+            .get("gib_per_s")
+            .and_then(Value::as_f64)
+            .ok_or_else(|| {
+                format!(
+                    "missing `gib_per_s` on line {line_number} from `{}`",
+                    path.display()
+                )
+            })?;
+
+        records.push(BenchReportRecord {
+            full_id,
+            group: json_string(&value, "group").unwrap_or_default(),
+            kernel,
+            workload_id,
+            case: bench_field(&value, "case"),
+            source: bench_field(&value, "source"),
+            content: bench_field(&value, "content"),
+            entropy: bench_field_any(&value, &["entropy_class", "entropy"]),
+            scale: bench_field_any(&value, &["entropy_scale", "scale"]),
+            access: bench_field(&value, "access"),
+            chunk: bench_field_any(&value, &["chunk", "chunk_size"]),
+            threads: bench_field(&value, "threads"),
+            pattern: bench_field(&value, "pattern"),
+            planned_kernel: bench_field(&value, "planned_kernel"),
+            throughput_bytes,
+            mean_ns,
+            gib_per_s,
+        });
+    }
+
+    records.sort_by(|left, right| {
+        workload_label(left)
+            .cmp(&workload_label(right))
+            .then_with(|| left.kernel.cmp(&right.kernel))
+    });
+    Ok(records)
+}
+
+fn latest_bench_jsonl() -> Result<PathBuf> {
+    let runs_dir = bench_history_dir().join("runs");
+    let entries = fs::read_dir(&runs_dir)
+        .map_err(|error| format!("failed to read `{}`: {error}", runs_dir.display()))?;
+    let mut paths = Vec::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|error| format!("failed to read `{}` entry: {error}", runs_dir.display()))?
+            .path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    paths.pop().ok_or_else(|| {
+        format!(
+            "no benchmark JSONL runs found under `{}`",
+            runs_dir.display()
+        )
+    })
+}
+
+fn write_timing_csv(path: &Path, records: &[BenchReportRecord]) -> Result<()> {
+    let mut file = File::create(path)
+        .map_err(|error| format!("failed to create `{}`: {error}", path.display()))?;
+    writeln!(
+        file,
+        "full_id,group,workload_id,case,source,content,entropy,scale,access,chunk,threads,pattern,kernel,planned_kernel,planner_match,throughput_bytes,mean_ns,gib_per_s"
+    )
+    .map_err(write_error(path))?;
+
+    for record in records {
+        writeln!(
+            file,
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.6},{:.6}",
+            csv_cell(&record.full_id),
+            csv_cell(&record.group),
+            csv_cell(&record.workload_id),
+            csv_cell(&record.case),
+            csv_cell(&record.source),
+            csv_cell(&record.content),
+            csv_cell(&record.entropy),
+            csv_cell(&record.scale),
+            csv_cell(&record.access),
+            csv_cell(&record.chunk),
+            csv_cell(&record.threads),
+            csv_cell(&record.pattern),
+            csv_cell(&record.kernel),
+            csv_cell(&record.planned_kernel),
+            record.planned_kernel == record.kernel,
+            record.throughput_bytes,
+            record.mean_ns,
+            record.gib_per_s,
+        )
+        .map_err(write_error(path))?;
+    }
+
+    Ok(())
+}
+
+fn write_heatmap_html(path: &Path, records: &[BenchReportRecord], source: &Path) -> Result<()> {
+    let mut kernels = BTreeSet::new();
+    let mut workloads: BTreeMap<String, Vec<&BenchReportRecord>> = BTreeMap::new();
+    for record in records {
+        kernels.insert(record.kernel.clone());
+        workloads
+            .entry(workload_label(record))
+            .or_default()
+            .push(record);
+    }
+    let kernels = kernels.into_iter().collect::<Vec<_>>();
+
+    let mut file = File::create(path)
+        .map_err(|error| format!("failed to create `{}`: {error}", path.display()))?;
+    writeln!(
+        file,
+        "<!doctype html><meta charset=\"utf-8\"><title>tokenfs-algos benchmark heatmap</title>"
+    )
+    .map_err(write_error(path))?;
+    writeln!(file, "<style>{}</style>", heatmap_css()).map_err(write_error(path))?;
+    writeln!(file, "<h1>Benchmark Heatmap</h1>").map_err(write_error(path))?;
+    writeln!(
+        file,
+        "<p>Source: <code>{}</code>. Cells show GiB/s and are colored relative to the best kernel for that workload row.</p>",
+        html_escape(&source.display().to_string())
+    )
+    .map_err(write_error(path))?;
+    writeln!(
+        file,
+        "<table><thead><tr><th>Workload</th><th>Planner</th><th>Best</th>"
+    )
+    .map_err(write_error(path))?;
+    for kernel in &kernels {
+        writeln!(file, "<th>{}</th>", html_escape(kernel)).map_err(write_error(path))?;
+    }
+    writeln!(file, "</tr></thead><tbody>").map_err(write_error(path))?;
+
+    for (workload, rows) in workloads {
+        let best = rows
+            .iter()
+            .fold(0.0_f64, |best, row| best.max(row.gib_per_s));
+        let best_kernel = rows
+            .iter()
+            .max_by(|left, right| {
+                left.gib_per_s
+                    .partial_cmp(&right.gib_per_s)
+                    .unwrap_or(Ordering::Equal)
+            })
+            .map_or("", |row| row.kernel.as_str());
+        let planned_kernel = rows
+            .iter()
+            .find(|row| !row.planned_kernel.is_empty())
+            .map_or("", |row| row.planned_kernel.as_str());
+
+        writeln!(
+            file,
+            "<tr><th>{}</th><td>{}</td><td>{}</td>",
+            html_escape(&workload),
+            html_escape(planned_kernel),
+            html_escape(best_kernel)
+        )
+        .map_err(write_error(path))?;
+
+        for kernel in &kernels {
+            let row = rows.iter().find(|row| &row.kernel == kernel);
+            if let Some(row) = row {
+                let ratio = if best == 0.0 {
+                    0.0
+                } else {
+                    (row.gib_per_s / best).clamp(0.0, 1.0)
+                };
+                writeln!(
+                    file,
+                    "<td class=\"metric\" style=\"{}\" title=\"mean {}; full_id {}\">{:.2}</td>",
+                    heatmap_cell_style(ratio),
+                    html_escape(&format_duration_ns(row.mean_ns)),
+                    html_escape(&row.full_id),
+                    row.gib_per_s
+                )
+                .map_err(write_error(path))?;
+            } else {
+                writeln!(file, "<td class=\"missing\"></td>").map_err(write_error(path))?;
+            }
+        }
+        writeln!(file, "</tr>").map_err(write_error(path))?;
+    }
+
+    writeln!(file, "</tbody></table>").map_err(write_error(path))?;
+    Ok(())
+}
+
+fn write_throughput_histogram_svg(path: &Path, records: &[BenchReportRecord]) -> Result<()> {
+    let max = records
+        .iter()
+        .fold(0.0_f64, |max, record| max.max(record.gib_per_s));
+    let bucket_count = 24_usize;
+    let mut buckets = vec![0_usize; bucket_count];
+    if max > 0.0 {
+        for record in records {
+            let mut index = ((record.gib_per_s / max) * bucket_count as f64) as usize;
+            if index >= bucket_count {
+                index = bucket_count - 1;
+            }
+            buckets[index] += 1;
+        }
+    }
+
+    let width = 960.0_f64;
+    let height = 420.0_f64;
+    let margin_left = 56.0_f64;
+    let margin_bottom = 52.0_f64;
+    let plot_width = width - margin_left - 24.0;
+    let plot_height = height - 42.0 - margin_bottom;
+    let max_count = buckets.iter().copied().max().unwrap_or(1).max(1) as f64;
+    let bar_gap = 4.0_f64;
+    let bar_width = (plot_width / bucket_count as f64) - bar_gap;
+
+    let mut file = File::create(path)
+        .map_err(|error| format!("failed to create `{}`: {error}", path.display()))?;
+    writeln!(
+        file,
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\" viewBox=\"0 0 {width} {height}\">"
+    )
+    .map_err(write_error(path))?;
+    writeln!(
+        file,
+        "<rect width=\"100%\" height=\"100%\" fill=\"#ffffff\"/>"
+    )
+    .map_err(write_error(path))?;
+    writeln!(
+        file,
+        "<text x=\"{margin_left}\" y=\"26\" font-family=\"sans-serif\" font-size=\"18\">Throughput Distribution</text>"
+    )
+    .map_err(write_error(path))?;
+    writeln!(
+        file,
+        "<line x1=\"{margin_left}\" y1=\"{}\" x2=\"{}\" y2=\"{}\" stroke=\"#333\"/>",
+        height - margin_bottom,
+        width - 24.0,
+        height - margin_bottom
+    )
+    .map_err(write_error(path))?;
+    writeln!(
+        file,
+        "<line x1=\"{margin_left}\" y1=\"42\" x2=\"{margin_left}\" y2=\"{}\" stroke=\"#333\"/>",
+        height - margin_bottom
+    )
+    .map_err(write_error(path))?;
+
+    for (index, count) in buckets.iter().enumerate() {
+        let x = margin_left + index as f64 * (bar_width + bar_gap);
+        let bar_height = (*count as f64 / max_count) * plot_height;
+        let y = height - margin_bottom - bar_height;
+        let bucket_start = max * index as f64 / bucket_count as f64;
+        let bucket_end = max * (index + 1) as f64 / bucket_count as f64;
+        writeln!(
+            file,
+            "<rect x=\"{x:.1}\" y=\"{y:.1}\" width=\"{bar_width:.1}\" height=\"{bar_height:.1}\" fill=\"#2f7ed8\"><title>{bucket_start:.2}-{bucket_end:.2} GiB/s: {count}</title></rect>"
+        )
+        .map_err(write_error(path))?;
+    }
+
+    writeln!(
+        file,
+        "<text x=\"{}\" y=\"{}\" font-family=\"sans-serif\" font-size=\"12\">0 GiB/s</text>",
+        margin_left,
+        height - 18.0
+    )
+    .map_err(write_error(path))?;
+    writeln!(
+        file,
+        "<text x=\"{}\" y=\"{}\" text-anchor=\"end\" font-family=\"sans-serif\" font-size=\"12\">{max:.2} GiB/s</text>",
+        width - 24.0,
+        height - 18.0
+    )
+    .map_err(write_error(path))?;
+    writeln!(
+        file,
+        "<text x=\"18\" y=\"52\" font-family=\"sans-serif\" font-size=\"12\" transform=\"rotate(-90 18 52)\">count</text>"
+    )
+    .map_err(write_error(path))?;
+    writeln!(file, "</svg>").map_err(write_error(path))?;
+    Ok(())
+}
+
+fn write_bench_report_summary(
+    path: &Path,
+    records: &[BenchReportRecord],
+    source: &Path,
+    timing_csv: &Path,
+    heatmap_html: &Path,
+    histogram_svg: &Path,
+) -> Result<()> {
+    let mut file = File::create(path)
+        .map_err(|error| format!("failed to create `{}`: {error}", path.display()))?;
+    let workload_count = records
+        .iter()
+        .map(workload_label)
+        .collect::<BTreeSet<_>>()
+        .len();
+    let kernel_count = records
+        .iter()
+        .map(|record| record.kernel.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
+    let fastest = records.iter().max_by(|left, right| {
+        left.gib_per_s
+            .partial_cmp(&right.gib_per_s)
+            .unwrap_or(Ordering::Equal)
+    });
+
+    writeln!(file, "# Benchmark Report").map_err(write_error(path))?;
+    writeln!(file).map_err(write_error(path))?;
+    writeln!(file, "- source: `{}`", source.display()).map_err(write_error(path))?;
+    writeln!(file, "- records: `{}`", records.len()).map_err(write_error(path))?;
+    writeln!(file, "- workloads: `{workload_count}`").map_err(write_error(path))?;
+    writeln!(file, "- kernels: `{kernel_count}`").map_err(write_error(path))?;
+    if let Some(fastest) = fastest {
+        writeln!(
+            file,
+            "- fastest: `{}` at `{:.2} GiB/s`",
+            fastest.full_id, fastest.gib_per_s
+        )
+        .map_err(write_error(path))?;
+    }
+    writeln!(file).map_err(write_error(path))?;
+    writeln!(file, "## Artifacts").map_err(write_error(path))?;
+    writeln!(file).map_err(write_error(path))?;
+    writeln!(file, "- timing_csv: `{}`", timing_csv.display()).map_err(write_error(path))?;
+    writeln!(file, "- heatmap_html: `{}`", heatmap_html.display()).map_err(write_error(path))?;
+    writeln!(
+        file,
+        "- throughput_histogram_svg: `{}`",
+        histogram_svg.display()
+    )
+    .map_err(write_error(path))?;
+    writeln!(file).map_err(write_error(path))?;
+    writeln!(file, "## Top Throughput").map_err(write_error(path))?;
+    writeln!(file).map_err(write_error(path))?;
+    writeln!(file, "| Kernel | Workload | GiB/s | Mean |").map_err(write_error(path))?;
+    writeln!(file, "|---|---|---:|---:|").map_err(write_error(path))?;
+
+    let mut rows = records.iter().collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .gib_per_s
+            .partial_cmp(&left.gib_per_s)
+            .unwrap_or(Ordering::Equal)
+    });
+    for record in rows.iter().take(20) {
+        writeln!(
+            file,
+            "| {} | {} | {:.2} | {} |",
+            md_cell(&record.kernel),
+            md_cell(&workload_label(record)),
+            record.gib_per_s,
+            format_duration_ns(record.mean_ns)
+        )
+        .map_err(write_error(path))?;
+    }
+
+    Ok(())
+}
+
+fn bench_field(value: &Value, key: &str) -> String {
+    json_nested_string(value, "metadata", key)
+        .or_else(|| json_nested_string(value, "manifest", key))
+        .unwrap_or_default()
+}
+
+fn bench_field_any(value: &Value, keys: &[&str]) -> String {
+    keys.iter()
+        .find_map(|key| {
+            json_nested_string(value, "metadata", key)
+                .or_else(|| json_nested_string(value, "manifest", key))
+        })
+        .unwrap_or_default()
+}
+
+fn json_string(value: &Value, key: &str) -> Option<String> {
+    value.get(key).map(value_to_summary_string)
+}
+
+fn json_nested_string(value: &Value, object: &str, key: &str) -> Option<String> {
+    value
+        .get(object)
+        .and_then(|nested| nested.get(key))
+        .map(value_to_summary_string)
+}
+
+fn workload_label(record: &BenchReportRecord) -> String {
+    format!(
+        "{} | {} | {} | chunk={} | threads={}",
+        empty_as_unknown(&record.case),
+        empty_as_unknown(&record.access),
+        empty_as_unknown(&record.pattern),
+        empty_as_unknown(&record.chunk),
+        empty_as_unknown(&record.threads)
+    )
+}
+
+fn empty_as_unknown(value: &str) -> &str {
+    if value.is_empty() { "?" } else { value }
+}
+
+fn csv_cell(value: &str) -> String {
+    if value.contains([',', '"', '\n']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
+    }
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn md_cell(value: &str) -> String {
+    value.replace('|', "\\|")
+}
+
+fn heatmap_css() -> &'static str {
+    "body{font-family:system-ui,sans-serif;margin:24px;color:#202124}\
+     table{border-collapse:collapse;font-size:12px}\
+     th,td{border:1px solid #d0d7de;padding:4px 6px;white-space:nowrap}\
+     thead th{position:sticky;top:0;background:#f6f8fa;z-index:2}\
+     tbody th{position:sticky;left:0;background:#f6f8fa;text-align:left;z-index:1}\
+     td.metric{text-align:right;font-variant-numeric:tabular-nums}\
+     td.missing{background:#f1f3f4}"
+}
+
+fn heatmap_cell_style(ratio: f64) -> String {
+    let red = (230.0 * (1.0 - ratio) + 38.0 * ratio).round() as u8;
+    let green = (75.0 * (1.0 - ratio) + 166.0 * ratio).round() as u8;
+    let blue = (64.0 * (1.0 - ratio) + 91.0 * ratio).round() as u8;
+    let color = if ratio < 0.45 { "#fff" } else { "#111" };
+    format!("background-color:rgb({red},{green},{blue});color:{color}")
+}
+
 fn bench_history_dir() -> PathBuf {
     env::var_os("TOKENFS_ALGOS_BENCH_HISTORY")
         .map(PathBuf::from)
@@ -1312,6 +1936,18 @@ fn ensure_profile_dir() -> Result<()> {
         .map_err(|error| format!("failed to create `{}`: {error}", path.display()))
 }
 
+fn profile_output_path(kind: &str, extension: &str) -> PathBuf {
+    Path::new("target/profiles").join(format!("{}-{kind}.{extension}", unix_timestamp()))
+}
+
+fn criterion_args(args: &[OsString]) -> Vec<OsString> {
+    if args.first().is_some_and(|arg| arg == "--") {
+        args[1..].to_vec()
+    } else {
+        args.to_vec()
+    }
+}
+
 fn help() {
     eprintln!(
         "usage: cargo xtask <task>\n\n\
@@ -1343,11 +1979,17 @@ fn help() {
                     run a short adaptive calibration matrix and log results\n\
            bench-compare <old.jsonl> <new.jsonl>\n\
                     compare two benchmark history JSONL runs\n\
+           bench-report [run.jsonl]\n\
+                    generate heatmap, histogram, and timing-table artifacts\n\
            bench-log\n\
                     log the current target/criterion results to benchmark history\n\
            profile  benchmark under perf when available\n\
            profile-real [path]\n\
                     real-data benchmark under perf when available\n\
+           profile-flamegraph\n\
+                    generate a flamegraph SVG with cargo-flamegraph\n\
+           profile-flamegraph-real [path]\n\
+                    real-data flamegraph SVG with cargo-flamegraph\n\
            ci       local CI gate"
     );
 }
