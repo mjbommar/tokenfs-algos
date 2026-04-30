@@ -639,6 +639,8 @@ fn profile_flamegraph_with_env(
         output.clone().into_os_string(),
         OsString::from("-p"),
         OsString::from("tokenfs-algos"),
+        OsString::from("--features"),
+        OsString::from("bench-internals"),
         OsString::from("--bench"),
         OsString::from("histogram"),
         OsString::from("--"),
