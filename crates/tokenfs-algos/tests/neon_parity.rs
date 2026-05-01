@@ -11,6 +11,7 @@
 //! exercises the NEON kernel against the pinned scalar reference.
 
 #![allow(missing_docs)]
+#![allow(clippy::unwrap_used)] // Test code — panic on None/Err is the desired failure mode.
 #![cfg(all(feature = "neon", target_arch = "aarch64"))]
 
 use proptest::prelude::*;

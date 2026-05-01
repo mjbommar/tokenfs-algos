@@ -25,6 +25,9 @@ struct PrimitiveInput {
     bytes: Vec<u8>,
 }
 
+// Several variants are constructed only on x86/x86_64; on aarch64 they
+// remain in the enum to keep `id()`/`group()` exhaustive across targets.
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 enum PrimitiveKernel {
     HistogramDefault,
@@ -495,6 +498,10 @@ fn run_kernel(kernel: PrimitiveKernel, bytes: &[u8]) -> u64 {
                 .fold(0_u64, |acc, count| acc + u64::from(*count))
         }
         PrimitiveKernel::SketchCrc32Hash4Sse42 => {
+            // `bins` is only mutated under x86/x86_64; aarch64 leaves it
+            // at zero. Allow unused-mut so the same source compiles
+            // cleanly on every target.
+            #[allow(unused_mut)]
             let mut bins = [0_u32; 4096];
             #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
             {

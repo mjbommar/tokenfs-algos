@@ -246,10 +246,11 @@ unsafe fn check_special_cases(input: uint8x16_t, prev1: uint8x16_t) -> uint8x16_
     }
 }
 
-/// "Must-be-continuation" check: bytes >= 0xE0 require a 3rd cont; bytes
-/// >= 0xF0 require a 4th. XOR with `special_cases` so non-continuations
-/// show up as errors. Mirrors `must_be_2_3_continuation` +
-/// `check_multibyte_lengths` from upstream `algorithm.rs`.
+/// "Must-be-continuation" check: bytes 0xE0-0xEF require a 3rd
+/// continuation, bytes 0xF0-0xF7 require a 4th. XOR with `special_cases`
+/// so non-continuations show up as errors. Mirrors
+/// `must_be_2_3_continuation` + `check_multibyte_lengths` from upstream
+/// `algorithm.rs`.
 ///
 /// SAFETY: precondition — NEON is available.
 #[target_feature(enable = "neon")]
