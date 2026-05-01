@@ -1,6 +1,6 @@
 //! Rule registry for byte-histogram planning.
 //!
-//! Every rule is a `pub(crate) const Rule` item. The [`RULES`] slice
+//! Every rule is a `pub(crate) const Rule` item. The `RULES` slice
 //! lists them in priority order — first match wins. To add a rule:
 //!
 //! 1. Pick a kebab-case `name`. It will appear in trace output and bench
@@ -17,11 +17,12 @@
 //!    Avoid raw integer literals in the builder; if you need a new
 //!    threshold, add it to [`super::tunes::Tunes`] (and its
 //!    [`super::consts`] default) so it stays override-able.
-//! 5. Append `RULE_FOO` to [`RULES`] at the right precedence position.
+//! 5. Append `RULE_FOO` to the `RULES` registry at the right precedence
+//!    position.
 //! 6. If the rule names a calibration class, add a corresponding regression
 //!    test in `crate::dispatch::tests` that pins its expected output.
 //!
-//! Rule order in this file matches rule order in [`RULES`] which matches
+//! Rule order in this file matches rule order in `RULES` which matches
 //! the priority order of the legacy `plan_histogram` chain. This is
 //! deliberate — the redesign is a no-op against the existing 24 planner
 //! regression tests; behaviour preservation is asserted by those tests.

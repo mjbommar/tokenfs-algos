@@ -3,8 +3,9 @@
 //! `Tunes` is a value type holding every numeric value the planner reads:
 //! byte thresholds, sample sizes, confidence quanta. It defaults to the
 //! compile-time constants in [`super::consts`]; callers can override
-//! individual fields per-host via [`Tunes::with`] or load a JSON override
-//! file via [`Tunes::from_json`] (when the `tunes-json` feature is on).
+//! individual fields per-host via the `Tunes::with_*` builder methods or
+//! load a JSON override file via [`Tunes::from_json`] (when the
+//! `tunes-json` feature is on).
 //!
 //! ## Why a struct, not just constants
 //!
@@ -21,8 +22,8 @@
 //! - [`Tunes::DEFAULT`] is the compile-time default; identical to the
 //!   constants in [`super::consts`]. Equality with the const-based
 //!   defaults is asserted by `tunes_default_equals_consts` in tests.
-//! - [`Tunes::with`] returns a new `Tunes` with one field replaced.
-//!   Chainable builder.
+//! - The `Tunes::with_*` builder methods (one per field) return a new
+//!   `Tunes` with that field replaced. Chainable.
 //! - [`Tunes::from_json`] (feature `tunes-json`) parses a flat JSON object
 //!   on top of `DEFAULT`; missing keys keep their default value, unknown
 //!   keys are an error.
@@ -35,8 +36,8 @@ use super::consts;
 /// Override table for planner-tunable values.
 ///
 /// Construct via [`Tunes::DEFAULT`] for the compile-time defaults, then
-/// override individual fields with [`Tunes::with`]. JSON loading via
-/// [`Tunes::from_json`] requires the `tunes-json` feature.
+/// override individual fields with the `Tunes::with_*` builder methods.
+/// JSON loading via [`Tunes::from_json`] requires the `tunes-json` feature.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct Tunes {
     // ---- byte thresholds ----

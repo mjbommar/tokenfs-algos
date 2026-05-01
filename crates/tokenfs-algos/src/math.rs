@@ -59,3 +59,27 @@ pub(crate) fn round_f32(value: f32) -> f32 {
         libm::roundf(value)
     }
 }
+
+#[inline]
+pub(crate) fn sqrt_f32(value: f32) -> f32 {
+    #[cfg(feature = "std")]
+    {
+        value.sqrt()
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        libm::sqrtf(value)
+    }
+}
+
+#[inline]
+pub(crate) fn cos_f64(value: f64) -> f64 {
+    #[cfg(feature = "std")]
+    {
+        value.cos()
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        libm::cos(value)
+    }
+}

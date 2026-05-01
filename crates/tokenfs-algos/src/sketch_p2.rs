@@ -99,8 +99,9 @@ impl Estimator {
             self.q[(self.count - 1) as usize] = value;
             if self.count == 5 {
                 // Sort the initial 5 markers ascending and seed n / np.
-                self.q
-                    .sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
+                // Manual insertion sort keeps this no_std-clean (slice
+                // sort_by is alloc/std-only).
+                insertion_sort_5(&mut self.q);
                 for (i, ni) in self.n.iter_mut().enumerate() {
                     *ni = (i as i64) + 1;
                 }
@@ -196,7 +197,9 @@ impl Estimator {
             let n = self.count as usize;
             let mut buf = [0.0_f64; 5];
             buf[..n].copy_from_slice(&self.q[..n]);
-            buf[..n].sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
+            // Manual insertion sort over at most 5 entries: avoids the
+            // alloc/std-only slice `sort_by`.
+            insertion_sort_partial(&mut buf, n);
             // Linear interpolation at the target quantile within the
             // sample's empirical CDF: position = p * (n - 1).
             let pos = self.p * ((n - 1) as f64);
@@ -216,6 +219,34 @@ impl Estimator {
         self.q = [0.0; 5];
         self.n = [0; 5];
         self.np = [0.0; 5];
+    }
+}
+
+/// Ascending insertion sort over a 5-element `f64` array. NaN-safe via
+/// `partial_cmp` fallback to `Equal`.
+#[inline]
+fn insertion_sort_5(a: &mut [f64; 5]) {
+    insertion_sort_partial(a.as_mut_slice(), 5);
+}
+
+/// Ascending insertion sort over the first `n` entries of `a`.
+#[inline]
+fn insertion_sort_partial(a: &mut [f64], n: usize) {
+    let mut i = 1;
+    while i < n {
+        let key = a[i];
+        let mut j = i;
+        while j > 0
+            && a[j - 1]
+                .partial_cmp(&key)
+                .unwrap_or(core::cmp::Ordering::Equal)
+                == core::cmp::Ordering::Greater
+        {
+            a[j] = a[j - 1];
+            j -= 1;
+        }
+        a[j] = key;
+        i += 1;
     }
 }
 

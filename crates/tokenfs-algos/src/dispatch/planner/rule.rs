@@ -13,8 +13,8 @@
 //!
 //! Rules live in [`super::rules`] as `pub(crate) const` items in source
 //! order. Adding a rule is: append a `pub(crate) const RULE_FOO: Rule`
-//! item with the right predicate, then add it to [`super::rules::RULES`]
-//! at the appropriate precedence position.
+//! item with the right predicate, then add it to the `RULES` registry in
+//! [`super::rules`] at the appropriate precedence position.
 
 use crate::dispatch::{HistogramPlan, PlannerConfidenceSource, ProcessorProfile, WorkloadShape};
 

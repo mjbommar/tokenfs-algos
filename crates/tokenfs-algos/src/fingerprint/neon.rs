@@ -237,7 +237,10 @@ unsafe fn merge_4_stripes_u32_neon<const N: usize>(
     c: &[u32; N],
     d: &[u32; N],
 ) -> [u32; N] {
-    debug_assert!(N.is_multiple_of(8), "N must be a multiple of 8 for the NEON merge");
+    debug_assert!(
+        N.is_multiple_of(8),
+        "N must be a multiple of 8 for the NEON merge"
+    );
 
     let mut out = [0_u32; N];
     let mut i = 0;

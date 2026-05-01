@@ -50,7 +50,7 @@ impl Signature64 {
     pub fn estimated_cosine(self, other: Self) -> f64 {
         let d = self.hamming_distance(other);
         let theta = core::f64::consts::PI * (d as f64) / 64.0;
-        theta.cos()
+        crate::math::cos_f64(theta)
     }
 }
 

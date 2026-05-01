@@ -101,7 +101,7 @@ pub mod distance {
     /// Euclidean / L2 distance of two `f32` vectors.
     #[must_use]
     pub fn l2_f32(a: &[f32], b: &[f32]) -> Option<f32> {
-        kernels::auto::l2_squared_f32(a, b).map(|s| s.sqrt())
+        kernels::auto::l2_squared_f32(a, b).map(crate::math::sqrt_f32)
     }
 
     /// Cosine similarity of two `f32` vectors in `[-1, 1]`.

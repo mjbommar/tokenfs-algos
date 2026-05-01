@@ -2,7 +2,7 @@
 //!
 //! Quality-faithful reimplementation of the algorithm described in
 //! Oliver, Cheng, Chen, "TLSH — A Locality Sensitive Hash" (CTC 2013) and
-//! the Apache-2.0 reference at https://github.com/trendmicro/tlsh.
+//! the Apache-2.0 reference at <https://github.com/trendmicro/tlsh>.
 //!
 //! # Algorithm
 //!
@@ -268,8 +268,13 @@ fn l_capturing(n: u64) -> u8 {
     }
     // log_1.5(N) = ln(N) / ln(1.5)
     let ln_15 = 0.405_465_108_108_164_4_f64; // ln(1.5)
-    let v = (n as f64).ln() / ln_15;
-    if v >= 255.0 { 255 } else { v.floor() as u8 }
+    let v = crate::math::ln_f64(n as f64) / ln_15;
+    if v >= 255.0 {
+        255
+    } else {
+        // floor() is std-only on f64 in core; cast-to-i64 floor for non-neg.
+        v as i64 as u8
+    }
 }
 
 /// Hamming-on-dibits distance between two body bytes: sum over each of the

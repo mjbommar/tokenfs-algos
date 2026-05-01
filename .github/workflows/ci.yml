@@ -109,8 +109,11 @@ jobs:
       - name: Test (default features)
         run: cargo test -p tokenfs-algos --all-targets
 
-      - name: Test (no default features)
-        run: cargo test -p tokenfs-algos --no-default-features
+      # Compile-only validation that the library builds with no_std and no
+      # SIMD features. Tests are not run here: most require `alloc` (Vec /
+      # vec!) which is not enabled in this configuration.
+      - name: Check (no default features)
+        run: cargo check -p tokenfs-algos --no-default-features --lib
 
       - name: Test (with std + tunes-json)
         run: cargo test -p tokenfs-algos --features tunes-json

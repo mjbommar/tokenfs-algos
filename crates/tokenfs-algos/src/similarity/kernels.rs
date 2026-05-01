@@ -98,7 +98,7 @@ pub mod auto {
     /// L2 distance of two `u32` vectors as `f64`.
     #[must_use]
     pub fn l2_u32(a: &[u32], b: &[u32]) -> Option<f64> {
-        l2_squared_u32(a, b).map(|s| (s as f64).sqrt())
+        l2_squared_u32(a, b).map(|s| crate::math::sqrt_f64(s as f64))
     }
 
     /// Cosine similarity of two `u32` vectors as `f64`.
@@ -279,7 +279,7 @@ pub mod scalar {
         if norm_a == 0 || norm_b == 0 {
             return Some(0.0);
         }
-        let denom = ((norm_a as f64) * (norm_b as f64)).sqrt();
+        let denom = crate::math::sqrt_f64((norm_a as f64) * (norm_b as f64));
         Some((dot as f64) / denom)
     }
 
@@ -330,7 +330,7 @@ pub mod scalar {
         if norm_a == 0.0 || norm_b == 0.0 {
             return Some(0.0);
         }
-        Some(dot / (norm_a * norm_b).sqrt())
+        Some(dot / crate::math::sqrt_f32(norm_a * norm_b))
     }
 }
 
