@@ -8,9 +8,10 @@ planner.
 
 ## Run
 
-- run_id: `1777595055-d1ed85d12b10-dirty`
-- JSONL: `target/bench-history/runs/1777595055-d1ed85d12b10-dirty.jsonl`
-- report: `target/bench-history/reports/1777595055-d1ed85d12b10-dirty/`
+- run_id: `1777595436-05ecc61a82d4`
+- commit: `05ecc61`
+- JSONL: `target/bench-history/runs/1777595436-05ecc61a82d4.jsonl`
+- report: `target/bench-history/reports/1777595436-05ecc61a82d4/`
 - records: `300`
 - primitive kernels: `15`
 - synthetic cases: zeros, PRNG, ASCII text, long runs, repeated 64-byte motif
@@ -49,31 +50,32 @@ Median throughput by primitive kernel:
 
 | Kernel | Median GiB/s | Max GiB/s |
 |---|---:|---:|
-| `runlength-summarize` | 2.075 | 3.739 |
-| `sketch-entropy-lut` | 1.138 | 4.584 |
-| `sketch-crc32-hash4-auto` | 1.094 | 3.274 |
-| `sketch-crc32-hash4-sse42` | 1.091 | 3.377 |
-| `byteclass-classify` | 1.042 | 1.662 |
-| `entropy-h1-from-histogram` | 0.965 | 4.221 |
-| `structure-summarize` | 0.368 | 0.656 |
-| `fingerprint-extent-auto` | 0.285 | 0.782 |
-| `sketch-misra-gries-k16` | 0.244 | 2.253 |
-| `sketch-count-min-4x1024` | 0.208 | 0.224 |
-| `fingerprint-block-auto` | 0.173 | 0.212 |
-| `selector-signals` | 0.133 | 0.347 |
-| `sketch-crc32-hash4-scalar` | 0.087 | 0.092 |
-| `fingerprint-extent-scalar` | 0.067 | 0.086 |
-| `fingerprint-block-scalar` | 0.061 | 0.066 |
+| `runlength-summarize` | 2.094 | 3.814 |
+| `sketch-entropy-lut` | 1.126 | 4.541 |
+| `sketch-crc32-hash4-auto` | 1.087 | 3.022 |
+| `byteclass-classify` | 1.070 | 1.951 |
+| `sketch-crc32-hash4-sse42` | 1.045 | 3.267 |
+| `entropy-h1-from-histogram` | 0.969 | 4.112 |
+| `structure-summarize` | 0.356 | 0.659 |
+| `fingerprint-extent-auto` | 0.259 | 0.789 |
+| `sketch-misra-gries-k16` | 0.230 | 2.240 |
+| `sketch-count-min-4x1024` | 0.208 | 0.220 |
+| `fingerprint-block-auto` | 0.168 | 0.208 |
+| `selector-signals` | 0.133 | 0.344 |
+| `sketch-crc32-hash4-scalar` | 0.086 | 0.092 |
+| `fingerprint-extent-scalar` | 0.066 | 0.087 |
+| `fingerprint-block-scalar` | 0.061 | 0.065 |
 
 Key observations:
 
 1. The SSE4.2 CRC32C path is load-bearing. At 1 MiB, `sketch-crc32-hash4-auto`
-   was 7.9x to 36.7x faster than the scalar CRC32C path depending on content.
-   The explicit pinned `sketch-crc32-hash4-sse42` rows track `auto` closely,
-   confirming that runtime dispatch is choosing the expected backend on this
-   CPU.
+   was 7.7x to 33.6x faster than the scalar CRC32C path depending on content.
+   The median explicit pinned `sketch-crc32-hash4-sse42` rows track `auto`
+   closely, confirming that runtime dispatch is choosing the expected backend
+   on this CPU. One clean-run 1 MiB text row for pinned SSE4.2 was noisy; use
+   median and repeated runs for backend comparisons.
 2. The fingerprint extent path inherits that win. At 1 MiB,
-   `fingerprint-extent-auto` was 6.1x to 9.3x faster than pinned scalar.
+   `fingerprint-extent-auto` was 6.1x to 10.2x faster than pinned scalar.
 3. Block fingerprints are intentionally expensive per byte because every 256 B
    block pays fixed histogram, RLE, top-K, byte-class, and hash-bin setup costs.
    Extent fingerprints amortize those costs and are the better default for
@@ -94,16 +96,16 @@ Selected 1 MiB speedups:
 
 | Pair | Case | Auto GiB/s | SSE4.2 GiB/s | Scalar GiB/s | Speedup |
 |---|---|---:|---:|---:|---:|
-| CRC32 hash bins | zeros | 0.699 | 0.683 | 0.089 | 7.9x |
-| CRC32 hash bins | PRNG | 2.757 | 3.377 | 0.092 | 29.9x |
-| CRC32 hash bins | text | 3.274 | 3.041 | 0.089 | 36.7x |
-| CRC32 hash bins | runs | 1.122 | 1.094 | 0.091 | 12.3x |
-| CRC32 hash bins | motif-64 | 3.264 | 2.703 | 0.090 | 36.3x |
-| fingerprint extent | zeros | 0.526 | n/a | 0.086 | 6.1x |
-| fingerprint extent | PRNG | 0.777 | n/a | 0.082 | 9.5x |
-| fingerprint extent | text | 0.782 | n/a | 0.084 | 9.3x |
-| fingerprint extent | runs | 0.690 | n/a | 0.086 | 8.0x |
-| fingerprint extent | motif-64 | 0.764 | n/a | 0.082 | 9.3x |
+| CRC32 hash bins | zeros | 0.701 | 0.690 | 0.091 | 7.7x |
+| CRC32 hash bins | PRNG | 2.781 | 3.267 | 0.092 | 30.1x |
+| CRC32 hash bins | text | 2.950 | 0.261 | 0.092 | 32.1x |
+| CRC32 hash bins | runs | 1.098 | 1.126 | 0.091 | 12.1x |
+| CRC32 hash bins | motif-64 | 3.022 | 2.617 | 0.090 | 33.6x |
+| fingerprint extent | zeros | 0.528 | n/a | 0.087 | 6.1x |
+| fingerprint extent | PRNG | 0.785 | n/a | 0.082 | 9.6x |
+| fingerprint extent | text | 0.766 | n/a | 0.081 | 9.5x |
+| fingerprint extent | runs | 0.691 | n/a | 0.086 | 8.0x |
+| fingerprint extent | motif-64 | 0.789 | n/a | 0.077 | 10.2x |
 
 ## Implications
 
