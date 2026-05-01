@@ -136,6 +136,78 @@ jobs:
       - name: Run dispatch_explain (logs the runner's planner choices)
         run: cargo run -p tokenfs-algos --example dispatch_explain --release
 
+      # --- per-runner micro-benchmarks (scalar vs SIMD) ---
+      # Output is a TSV: one row per (primitive, backend, payload_bytes).
+      # The aggregator job downloads every runner's TSV and joins them
+      # into a single markdown report on the workflow summary.
+      - name: Run bench_compare (TSV per architecture)
+        env:
+          RUNNER_LABEL: ${{ matrix.label }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Sanitize the matrix label into a filename-safe slug.
+          slug=$(printf '%s' "${{ matrix.label }}" | tr ' /()' '-' | tr -s '-')
+          out="perf-${slug}.tsv"
+          cargo run -p tokenfs-algos --example bench_compare --release > "$out"
+          echo "=== $out ==="
+          cat "$out"
+
+      - name: Upload perf TSV artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-${{ matrix.label }}
+          path: perf-*.tsv
+          if-no-files-found: error
+          retention-days: 30
+
+  # ============================================================================
+  # Aggregator: download every native runner's perf TSV and join them into
+  # a single markdown report on the workflow summary. Lets you eyeball
+  # "how does AVX2 stack up against Apple-Silicon NEON on this commit"
+  # without leaving the GitHub Actions UI. Artifacts also stay available
+  # for 30 days for downstream trending.
+  # ============================================================================
+  perf-report:
+    name: perf cross-arch report
+    needs: native
+    runs-on: ubuntu-latest
+    if: always() && needs.native.result != 'cancelled'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all perf artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: perf-*
+          merge-multiple: true
+          path: perf-data
+
+      - name: List downloaded files
+        run: ls -la perf-data || true
+
+      - name: Aggregate into markdown summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -d perf-data ] || [ -z "$(ls perf-data/perf-*.tsv 2>/dev/null)" ]; then
+            echo "no perf TSVs found — skipping aggregation" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python3 tools/perf/aggregate_perf.py perf-data/perf-*.tsv > perf-summary.md
+          cat perf-summary.md >> "$GITHUB_STEP_SUMMARY"
+          echo "--- joined report ---"
+          cat perf-summary.md
+
+      - name: Upload joined perf report
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-summary
+          path: perf-summary.md
+          if-no-files-found: warn
+          retention-days: 90
+
   # ============================================================================
   # Cross-compile / QEMU emulation. Builds aarch64 binaries on x86 then runs
   # them under QEMU-user — cheap correctness gate that complements the native
