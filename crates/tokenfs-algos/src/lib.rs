@@ -9,6 +9,7 @@
 #[cfg(all(feature = "alloc", not(feature = "std")))]
 extern crate alloc;
 
+pub mod approx;
 pub mod byteclass;
 pub mod chunk;
 pub mod dispatch;
@@ -23,7 +24,9 @@ pub mod paper;
 pub mod prelude;
 pub mod runlength;
 pub mod selector;
+pub mod similarity;
 pub mod sketch;
+pub mod sketch_p2;
 pub mod structure;
 pub mod windows;
 

@@ -36,7 +36,8 @@ fn main() {
 
     println!("planner examples");
     for workload in example_workloads() {
-        let plan = plan_histogram(&profile, &workload);
+        let (plan, trace) =
+            tokenfs_algos::dispatch::planner::plan_histogram_traced(&profile, &workload);
         println!(
             "  {:?} total={} chunk={} threads={} scale={:?} entropy={:?} => {} chunk={} sample={}",
             workload.context,
@@ -49,8 +50,30 @@ fn main() {
             format_bytes(nonzero(plan.chunk_bytes)),
             format_bytes(nonzero(plan.sample_bytes)),
         );
-        println!("    {}", plan.reason);
+        println!(
+            "    rule={} confidence={}/255 source={} reason={}",
+            trace.last().map(|d| d.name).unwrap_or("?"),
+            plan.confidence_q8,
+            plan.confidence_source.as_str(),
+            plan.reason,
+        );
+        if trace.len() > 1 {
+            println!(
+                "    walked {} rules; misses: {}",
+                trace.len(),
+                trace[..trace.len() - 1]
+                    .iter()
+                    .map(|d| d.name)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+        }
     }
+
+    // Silence the unused-import warning on `plan_histogram` — we use the
+    // traced variant in this example, but leave the simple import in
+    // place because it's the public surface most users will touch.
+    let _ = plan_histogram;
 }
 
 fn example_workloads() -> [WorkloadShape; 5] {

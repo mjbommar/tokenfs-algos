@@ -63,6 +63,17 @@ Keep raw SIMD and target-feature-specific functions in `primitives` and
 `pub(crate)` by default. Public APIs should be safe, documented, and hard to
 misuse.
 
+The histogram planner lives in `dispatch::planner` as a rule-table architecture:
+named thresholds and confidence bands in `planner::consts`, derived workload
+predicates in `planner::signals::Signals`, the `Rule` data type in
+`planner::rule`, and the priority-ordered `RULES` slice in `planner::rules`.
+Adding a new rule or tuning constant is a structured operation — see
+`docs/PLANNER_DESIGN.md` for the recipe and the architectural rationale.
+Magic numbers in rule bodies, substring-matched confidence sources, and
+implicit precedence by source-line order are all design regressions; CI
+catches the first two via `planner_fallback_source_implies_low_confidence`
+and the architecture tests in `dispatch::tests`.
+
 ## Core API Rules
 
 - Operate on `&[u8]`, slices, iterators, and small value types.

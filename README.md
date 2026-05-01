@@ -53,6 +53,40 @@ Paper-data calibration is a hard gate when the `calibration` feature is enabled:
 cargo test -p tokenfs-algos --features calibration --test fingerprint_f22 -- --nocapture
 ```
 
+## Cross-arch testing (AArch64 / NEON)
+
+NEON byte-class, run-length, and UTF-8 kernels live behind
+`cfg(target_arch = "aarch64")` and are exercised by `tests/neon_parity.rs`. To
+run them on an x86 dev host:
+
+```bash
+sudo apt install gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user
+rustup target add aarch64-unknown-linux-gnu
+cargo test -p tokenfs-algos --target aarch64-unknown-linux-gnu --test neon_parity
+```
+
+`.cargo/config.toml` wires `tools/cross-runner/qemu-aarch64.sh` as the test
+runner so QEMU user-mode emulates the binaries transparently. See
+`docs/PROFILING.md` for cache/perf/thread caveats.
+
+## Fuzzing
+
+Hot parser/windowing/dispatcher paths have cargo-fuzz harnesses in `fuzz/`:
+
+```bash
+cargo install cargo-fuzz   # one-time
+cargo +nightly fuzz run chunk_gear_no_panic                    -- -max_total_time=60
+cargo +nightly fuzz run chunk_fastcdc_no_panic                 -- -max_total_time=60
+cargo +nightly fuzz run ngram_windows_no_panic                 -- -max_total_time=60
+cargo +nightly fuzz run byteclass_utf8_dispatch_parity         -- -max_total_time=60
+cargo +nightly fuzz run runlength_transitions_dispatch_parity  -- -max_total_time=60
+```
+
+The two `*_dispatch_parity` targets verify the runtime-dispatched SIMD path
+matches the scalar reference byte-for-byte; the three `*_no_panic` targets
+verify chunking and n-gram windowing tolerate arbitrary inputs without panic
+or invariant violation.
+
 The calibration feature requires the F21/F22 artifacts to exist locally or be
 provided through `TOKENFS_ALGOS_F22_DATA` and `TOKENFS_ALGOS_F21_ANALYSIS`.
 
@@ -72,7 +106,10 @@ The workload benchmark matrix and logged result format are documented in
 `docs/BENCHMARK_WORKLOAD_MATRIX.md`. Processor-aware dispatch and kernel
 promotion strategy are documented in `docs/PROCESSOR_AWARE_DISPATCH.md`,
 `docs/PRIMITIVE_KERNEL_BUFFET.md`, and
-`docs/AUTOTUNING_AND_BENCH_HISTORY.md`. Paper-linked primitive migration and
-consumer latency budgets are tracked in `docs/PAPER_PRIMITIVE_MIGRATION.md` and
-`docs/CONSUMER_LATENCY_BUDGETS.md`. Current calibration gates are summarized in
+`docs/AUTOTUNING_AND_BENCH_HISTORY.md`. The histogram planner architecture
+(rule table, named constants with bench provenance, trace mode, and the
+recipe for adding a rule or threshold) lives in `docs/PLANNER_DESIGN.md`.
+Paper-linked primitive migration and consumer latency budgets are tracked
+in `docs/PAPER_PRIMITIVE_MIGRATION.md` and `docs/CONSUMER_LATENCY_BUDGETS.md`.
+Current calibration gates are summarized in
 `docs/CALIBRATION_GATES_2026-05-01.md`.

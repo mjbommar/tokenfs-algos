@@ -86,6 +86,13 @@ kernel_module!(
 );
 
 /// AVX2-dispatched general four-stripe counter with scalar fallback.
+///
+/// **Status:** the body is currently scalar four-stripe counting under an
+/// `#[target_feature(enable = "avx2")]` gate. It exists so the planner has a
+/// pinned, feature-dispatched general-cardinality slot distinct from the
+/// palette specialization (`avx2_palette_u32`). A real AVX2 byte-histogram
+/// implementation is tracked separately; until it lands, this module's output
+/// is bit-exact with [`stripe4_u32`] and `tests/avx2_parity.rs` enforces that.
 #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
 pub mod avx2_stripe4_u32 {
     use super::{ByteHistogram, histogram_scalar};

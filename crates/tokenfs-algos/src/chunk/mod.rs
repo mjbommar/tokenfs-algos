@@ -3,6 +3,8 @@
 //! This module provides allocation-free Gear/FastCDC-style boundary detection.
 //! It does not perform file I/O and does not own chunk payloads.
 
+pub mod recursive;
+
 use crate::windows::{GearHash64, gear_update};
 
 /// One chunk boundary over an input byte slice.

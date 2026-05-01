@@ -26,11 +26,19 @@ The calibration test gates cover:
 
 The current release-benchmark hard gates are:
 
-- F22 block fingerprint: at most 1.8 us per 256 B block.
+- F22 block fingerprint: at most 1.5 us per 256 B block (tightened
+  2026-05-01 after the hash4_bins pipelining + AVX2 stripe-merge work
+  in tasks #35/#36 brought block latency from 1564 ns to 1337 ns on
+  synthetic text workloads). The previous 1.8 us hard gate is preserved
+  as a release-machine ceiling for hosts where the new pipelined SSE4.2
+  path isn't available.
 - F22 extent fingerprint: at least 0.93 GiB/s.
 
-The roadmap optimization target remains 1.5 us per 256 B block once the next
-block-kernel pass lands and a quiet-host baseline confirms it.
+The next optimization target for F22 block is 1.0 us per 256 B block,
+gated on either AVX2-vectorizing the 4-stripe scalar histogram inner
+loop (256 bytes — VPSHUFB-table tricks for 256-bin cardinality counting)
+or a fused histogram+runlength single-pass kernel. Tracked as future
+work, not a v0.1 blocker.
 
 The `cargo test --features calibration` throughput check still uses relaxed
 timing thresholds in debug builds because Rust test binaries are unoptimized by

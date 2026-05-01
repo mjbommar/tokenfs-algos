@@ -19,15 +19,20 @@ const SAMPLE_BYTES: usize = 4096;
 
 /// Counts bytes with four private `u32` tables under an AVX2-dispatched entry.
 ///
-/// This is the general exact AVX2 histogram candidate. x86 does not have a
-/// native byte histogram instruction, so this kernel still performs scalar
-/// table increments; the value is that it gives the planner a pinned,
-/// feature-dispatched general path distinct from the low-cardinality palette
-/// specialization.
+/// **Planner placeholder, not a real AVX2 kernel.** x86 has no native byte
+/// histogram instruction; this body performs the same scalar four-stripe
+/// counting as [`crate::primitives::histogram_scalar::add_block_striped_u32`]
+/// with `LANES = 4` but is reachable from the planner via an AVX2-gated
+/// dispatch slot so a future genuine AVX2 implementation (gather-free /
+/// pshufb 16-bin pass / radix) can replace it without re-plumbing the
+/// dispatch tables. Bit-exact parity with the scalar reference is enforced
+/// by `tests/avx2_parity.rs`.
 ///
 /// # Safety
 ///
-/// The caller must ensure the current CPU supports AVX2.
+/// The caller must ensure the current CPU supports AVX2. (The body is
+/// currently scalar, but the `target_feature` attribute requires the contract
+/// regardless and a future vectorized body will rely on it.)
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 pub(crate) unsafe fn add_block_stripe4_u32(bytes: &[u8], counts: &mut [u64; 256]) {

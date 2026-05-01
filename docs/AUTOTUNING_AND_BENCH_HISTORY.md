@@ -116,6 +116,15 @@ build one. For v0.1, the planner should remain static, transparent, and
 feature-dispatch driven. A persistent calibration cache and generated dispatch
 tables belong in v0.2, after the kernel set stabilizes.
 
+The planner itself is now a rule table: every threshold and confidence quantum
+is a named constant in `dispatch::planner::consts` with an inline `SOURCE:`
+comment naming the bench-history artifact that justifies its value. When a
+calibration sweep invalidates a constant, the workflow is to update it in
+`consts.rs` and bump the source line, *not* to edit a magic number inside a
+rule body. See `docs/PLANNER_DESIGN.md` for the full architecture, the
+"adding a constant" recipe, and the recipe for feeding calibration results
+back into the planner that item (3) under "Near-Term Tooling" describes.
+
 ## Near-Term Tooling
 
 The next useful tooling increments are:
@@ -125,7 +134,9 @@ The next useful tooling increments are:
 2. Teach `bench-compare` to group deltas by case/access/kernel and flag planner
    mismatches explicitly.
 3. Feed calibration results back into the planner before falling through to
-   static heuristics.
+   static heuristics. The planner's rule table (`dispatch::planner::rules`)
+   plus named-constant cache (`dispatch::planner::consts`) give this a clean
+   landing surface — task #27 in the SIMD/algorithm roadmap.
 4. Add stable named Criterion baselines once scalar adaptive promotion starts.
 
 ## Perf Permission Note

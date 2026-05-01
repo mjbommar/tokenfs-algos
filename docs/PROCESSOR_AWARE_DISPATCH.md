@@ -69,6 +69,14 @@ block fingerprint path. AVX-512/NEON/SVE/SVE2 are feature-shaped targets, but
 `backend_kernel_support()` reports them as scalar fallback until real kernels
 exist and pass backend parity tests.
 
+The histogram planner that consumes this catalog is implemented as a rule
+table in `dispatch::planner`. Architecture, named-constant convention,
+trace-mode usage, and the recipe for adding a rule or threshold are
+documented in `docs/PLANNER_DESIGN.md`. Read that before editing planner
+rules — the audit-flagged brittlenesses (magic numbers, substring-matched
+confidence sources, implicit precedence by source-line order) are
+explicitly disallowed by the new design.
+
 ## Compile-Time Families
 
 We should support multiple build families:

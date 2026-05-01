@@ -58,7 +58,12 @@ enum PrimitiveKernel {
     ByteClassClassifyAvx2,
     ByteClassUtf8FullScan,
     ByteClassUtf8RejectLatency,
+    ByteClassUtf8FullScanScalar,
+    ByteClassUtf8FullScanAvx2,
     RunLengthSummarize,
+    RunLengthTransitionsAuto,
+    RunLengthTransitionsScalar,
+    RunLengthTransitionsAvx2,
     StructureSummarize,
     EntropyH1FromHistogram,
     EntropyMinH1,
@@ -112,7 +117,12 @@ impl PrimitiveKernel {
             Self::ByteClassClassifyScalar,
             Self::ByteClassUtf8FullScan,
             Self::ByteClassUtf8RejectLatency,
+            Self::ByteClassUtf8FullScanScalar,
+            Self::ByteClassUtf8FullScanAvx2,
             Self::RunLengthSummarize,
+            Self::RunLengthTransitionsAuto,
+            Self::RunLengthTransitionsScalar,
+            Self::RunLengthTransitionsAvx2,
             Self::StructureSummarize,
             Self::EntropyH1FromHistogram,
             Self::EntropyMinH1,
@@ -188,7 +198,12 @@ impl PrimitiveKernel {
             Self::ByteClassClassifyAvx2 => "byteclass-classify-avx2",
             Self::ByteClassUtf8FullScan => "byteclass-utf8-fullscan",
             Self::ByteClassUtf8RejectLatency => "byteclass-utf8-reject-latency",
+            Self::ByteClassUtf8FullScanScalar => "byteclass-utf8-fullscan-scalar",
+            Self::ByteClassUtf8FullScanAvx2 => "byteclass-utf8-fullscan-avx2",
             Self::RunLengthSummarize => "runlength-summarize",
+            Self::RunLengthTransitionsAuto => "runlength-transitions-auto",
+            Self::RunLengthTransitionsScalar => "runlength-transitions-scalar",
+            Self::RunLengthTransitionsAvx2 => "runlength-transitions-avx2",
             Self::StructureSummarize => "structure-summarize",
             Self::EntropyH1FromHistogram => "entropy-h1-from-histogram",
             Self::EntropyMinH1 => "entropy-min-h1",
@@ -244,8 +259,13 @@ impl PrimitiveKernel {
             | Self::ByteClassClassifyScalar
             | Self::ByteClassClassifyAvx2
             | Self::ByteClassUtf8FullScan
-            | Self::ByteClassUtf8RejectLatency => "byteclass",
-            Self::RunLengthSummarize => "runlength",
+            | Self::ByteClassUtf8RejectLatency
+            | Self::ByteClassUtf8FullScanScalar
+            | Self::ByteClassUtf8FullScanAvx2 => "byteclass",
+            Self::RunLengthSummarize
+            | Self::RunLengthTransitionsAuto
+            | Self::RunLengthTransitionsScalar
+            | Self::RunLengthTransitionsAvx2 => "runlength",
             Self::StructureSummarize => "structure",
             Self::EntropyH1FromHistogram
             | Self::EntropyMinH1
@@ -565,9 +585,40 @@ fn run_kernel(kernel: PrimitiveKernel, bytes: &[u8]) -> u64 {
         PrimitiveKernel::ByteClassUtf8FullScan | PrimitiveKernel::ByteClassUtf8RejectLatency => {
             fold_utf8(byteclass::validate_utf8(bytes))
         }
+        PrimitiveKernel::ByteClassUtf8FullScanScalar => {
+            fold_utf8(byteclass::kernels::scalar::validate_utf8(bytes))
+        }
+        PrimitiveKernel::ByteClassUtf8FullScanAvx2 => {
+            #[cfg(all(
+                feature = "std",
+                feature = "avx2",
+                any(target_arch = "x86", target_arch = "x86_64")
+            ))]
+            {
+                if byteclass::kernels::avx2::is_available() {
+                    // SAFETY: availability was checked immediately above.
+                    return fold_utf8(unsafe { byteclass::kernels::avx2::validate_utf8(bytes) });
+                }
+            }
+            fold_utf8(byteclass::kernels::scalar::validate_utf8(bytes))
+        }
         PrimitiveKernel::RunLengthSummarize => {
             let summary = runlength::summarize(bytes);
             summary.transitions ^ summary.bytes_in_runs_ge4 ^ summary.runs_ge4
+        }
+        PrimitiveKernel::RunLengthTransitionsAuto => runlength::transitions(bytes),
+        PrimitiveKernel::RunLengthTransitionsScalar => {
+            runlength::kernels::scalar::transitions(bytes)
+        }
+        PrimitiveKernel::RunLengthTransitionsAvx2 => {
+            #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+            {
+                if runlength::kernels::avx2::is_available() {
+                    // SAFETY: availability was checked immediately above.
+                    return unsafe { runlength::kernels::avx2::transitions(bytes) };
+                }
+            }
+            runlength::kernels::scalar::transitions(bytes)
         }
         PrimitiveKernel::StructureSummarize => {
             let summary = structure::summarize(bytes);

@@ -1,5 +1,7 @@
 //! Runtime backend detection, kernel catalogs, and planner support.
 
+pub mod planner;
+
 use core::sync::atomic::{AtomicU8, Ordering};
 
 const AUTO_BACKEND: u8 = u8::MAX;
@@ -196,7 +198,16 @@ pub const fn backend_kernel_support(backend: Backend) -> BackendKernelSupport {
             byte_class: KernelAvailability::Native,
             sketch: KernelAvailability::Native,
         },
-        Backend::Avx512 | Backend::Neon | Backend::Sve | Backend::Sve2 => BackendKernelSupport {
+        Backend::Neon => BackendKernelSupport {
+            backend,
+            // Histogram, fingerprint, sketch don't have NEON kernels yet —
+            // see byteclass::kernels::neon for the first NEON path.
+            byte_histogram: KernelAvailability::ScalarFallback,
+            fingerprint: KernelAvailability::ScalarFallback,
+            byte_class: KernelAvailability::Native,
+            sketch: KernelAvailability::ScalarFallback,
+        },
+        Backend::Avx512 | Backend::Sve | Backend::Sve2 => BackendKernelSupport {
             backend,
             byte_histogram: KernelAvailability::ScalarFallback,
             fingerprint: KernelAvailability::ScalarFallback,
@@ -569,7 +580,13 @@ const HISTOGRAM_KERNEL_CATALOG: [HistogramKernelInfo; 19] = [
         preferred_chunk_bytes: 0,
         sample_bytes: 0,
         private_table_bytes: 4 * 256 * 4,
-        description: "AVX2-dispatched general four-stripe counter with exact scalar fallback",
+        // Planner placeholder: the body of this kernel is currently scalar
+        // four-stripe counting under an AVX2 target_feature gate. It exists
+        // so the planner has a feature-dispatched general-cardinality slot
+        // distinct from the palette specialization. A real AVX2 byte
+        // histogram (gather-free / pshufb-table / radix) will replace it
+        // and exact parity is enforced by tests/avx2_parity.rs today.
+        description: "AVX2-dispatched general four-stripe counter (currently scalar body, real AVX2 pending)",
     },
     HistogramKernelInfo {
         family: PrimitiveFamily::ByteHistogram,
@@ -770,449 +787,13 @@ impl PlannerConfidenceSource {
 }
 
 /// Plans a histogram strategy from processor and workload metadata.
+///
+/// The planner is implemented as a rule table — see [`planner`] for the
+/// architecture. Adding a rule, threshold, or confidence band goes through
+/// the planner submodule, not this function.
 #[must_use]
 pub fn plan_histogram(profile: &ProcessorProfile, workload: &WorkloadShape) -> HistogramPlan {
-    let backend = profile.backend;
-    let total_bytes = workload.total_bytes;
-    let call_bytes = if workload.chunk_bytes == 0 {
-        total_bytes
-    } else {
-        workload.chunk_bytes.min(total_bytes.max(1))
-    };
-    let threads = workload.threads.max(1);
-    let oversubscribed = profile
-        .logical_cpus
-        .is_some_and(|logical| threads > logical.max(1));
-    let random_like = matches!(
-        workload.read_pattern,
-        ReadPattern::RandomTiny | ReadPattern::Random | ReadPattern::ZipfianHotCold
-    );
-    let sequential_like = matches!(
-        workload.read_pattern,
-        ReadPattern::Sequential | ReadPattern::Readahead
-    );
-    let mixedish_entropy = matches!(workload.entropy, EntropyClass::Mixed | EntropyClass::Medium);
-    let structured_scale = matches!(workload.scale, EntropyScale::Meso | EntropyScale::Macro);
-
-    if workload.source_hint == SourceHint::PaperExtent
-        && random_like
-        && call_bytes <= 4 * 1024
-        && total_bytes >= 64 * 1024
-        && mixedish_entropy
-    {
-        return plan(
-            HistogramStrategy::DirectU64,
-            workload.chunk_bytes,
-            0,
-            205,
-            "F22/rootfs random 4K calibration favored direct counting over stripe8",
-        );
-    }
-
-    if threads <= 1 && call_bytes <= 4 * 1024 {
-        if workload.entropy == EntropyClass::Low && call_bytes > 1 {
-            return plan(
-                HistogramStrategy::RunLengthU64,
-                workload.chunk_bytes,
-                0,
-                235,
-                "small low-entropy reads favored the dedicated run-length kernel",
-            );
-        }
-
-        if call_bytes >= 4 * 1024 && mixedish_entropy && structured_scale {
-            let strategy = if backend == Backend::Avx2 && workload.scale == EntropyScale::Meso {
-                HistogramStrategy::Avx2PaletteU32
-            } else if workload.scale == EntropyScale::Macro {
-                HistogramStrategy::Stripe8U32
-            } else {
-                HistogramStrategy::Stripe4U32
-            };
-            return plan(
-                strategy,
-                workload.chunk_bytes,
-                0,
-                210,
-                "small structured 4K reads favored pinned structured-data kernels",
-            );
-        }
-
-        if random_like
-            && call_bytes >= 4 * 1024
-            && workload.entropy == EntropyClass::High
-            && workload.scale == EntropyScale::Meso
-        {
-            return plan(
-                HistogramStrategy::Stripe4U32,
-                workload.chunk_bytes,
-                0,
-                195,
-                "small high-entropy meso random reads favored striped private buckets",
-            );
-        }
-
-        return plan(
-            HistogramStrategy::DirectU64,
-            workload.chunk_bytes,
-            0,
-            255,
-            "micro reads should avoid classifier overhead",
-        );
-    }
-
-    if random_like && call_bytes <= 4 * 1024 {
-        return plan(
-            HistogramStrategy::DirectU64,
-            workload.chunk_bytes,
-            0,
-            255,
-            "tiny random reads are dominated by call overhead; avoid adaptive sampling",
-        );
-    }
-
-    if workload.entropy == EntropyClass::Low && backend == Backend::Avx2 && total_bytes >= 64 * 1024
-    {
-        return plan(
-            HistogramStrategy::Avx2PaletteU32,
-            workload.chunk_bytes,
-            4 * 1024,
-            240,
-            "AVX2 palette counting dominated large low-entropy calibration slices",
-        );
-    }
-
-    if workload.entropy == EntropyClass::Low && total_bytes >= 64 * 1024 {
-        return plan(
-            HistogramStrategy::AdaptiveLowEntropyFast,
-            workload.chunk_bytes,
-            4 * 1024,
-            235,
-            "large low-entropy inputs need the dedicated low-entropy fast path",
-        );
-    }
-
-    if workload.source_hint == SourceHint::PaperExtent
-        && total_bytes >= 64 * 1024
-        && matches!(workload.entropy, EntropyClass::Mixed | EntropyClass::Medium)
-    {
-        return plan(
-            HistogramStrategy::Stripe8U32,
-            workload.chunk_bytes,
-            0,
-            210,
-            "F22/rootfs sidecar calibration favored stripe8 on large mixed extents",
-        );
-    }
-
-    if backend == Backend::Avx2
-        && workload.content == ContentKind::Binary
-        && workload.entropy == EntropyClass::Medium
-        && workload.scale == EntropyScale::Micro
-        && total_bytes >= 8 * 1024
-    {
-        return plan(
-            HistogramStrategy::Avx2PaletteU32,
-            workload.chunk_bytes,
-            4 * 1024,
-            175,
-            "AVX2 palette counting is worth trying on medium-entropy micro-pattern binary inputs",
-        );
-    }
-
-    if workload.cache_state == CacheState::Reused && total_bytes >= 64 * 1024 {
-        return plan(
-            HistogramStrategy::AdaptiveFileCached64K,
-            64 * 1024,
-            4 * 1024,
-            215,
-            "repeated file access can amortize one file-level decision",
-        );
-    }
-
-    if threads > 1 || workload.context == ApiContext::Parallel {
-        if mixedish_entropy && workload.content != ContentKind::Text {
-            if workload.scale == EntropyScale::Macro && backend == Backend::Avx2 {
-                return plan(
-                    HistogramStrategy::Avx2PaletteU32,
-                    64 * 1024,
-                    4 * 1024,
-                    if oversubscribed { 150 } else { 205 },
-                    "parallel macro-mixed calibration favored AVX2 palette counting",
-                );
-            }
-
-            if workload.scale == EntropyScale::Meso {
-                return plan(
-                    if threads >= 4 {
-                        HistogramStrategy::Stripe4U32
-                    } else {
-                        HistogramStrategy::Stripe8U32
-                    },
-                    64 * 1024,
-                    0,
-                    if oversubscribed { 150 } else { 205 },
-                    "parallel meso-structured calibration favored striped private buckets",
-                );
-            }
-        }
-
-        if workload.content == ContentKind::Text {
-            if total_bytes <= 4 * 1024 {
-                return plan(
-                    HistogramStrategy::DirectU64,
-                    64 * 1024,
-                    0,
-                    if oversubscribed { 150 } else { 205 },
-                    "tiny parallel text scans favored direct counting",
-                );
-            }
-
-            return plan(
-                HistogramStrategy::LocalU32,
-                64 * 1024,
-                0,
-                if oversubscribed { 150 } else { 205 },
-                "parallel text scans favored simple private tables over chunked adaptation",
-            );
-        }
-
-        if workload.entropy == EntropyClass::High {
-            let strategy = if workload.scale == EntropyScale::Meso && threads >= 4 {
-                HistogramStrategy::LocalU32
-            } else {
-                HistogramStrategy::DirectU64
-            };
-            return plan(
-                strategy,
-                64 * 1024,
-                0,
-                if oversubscribed { 145 } else { 210 },
-                "parallel high-entropy scans should avoid adaptive chunk over-selection",
-            );
-        }
-
-        return plan(
-            HistogramStrategy::AdaptiveRunSentinel4K,
-            64 * 1024,
-            4 * 1024,
-            if oversubscribed { 145 } else { 185 },
-            "parallel mixed scans use a cheap run sentinel instead of default chunked planning",
-        );
-    }
-
-    if workload.source_hint == SourceHint::RealFile
-        && workload.content == ContentKind::Binary
-        && workload.entropy == EntropyClass::High
-        && workload.scale == EntropyScale::Flat
-        && total_bytes >= 64 * 1024
-        && !random_like
-    {
-        return plan(
-            HistogramStrategy::DirectU64,
-            workload.chunk_bytes,
-            0,
-            185,
-            "real high-entropy flat files favored direct counting in calibration",
-        );
-    }
-
-    if workload.alignment_offset >= 16
-        && workload.entropy == EntropyClass::High
-        && total_bytes >= 64 * 1024
-    {
-        return plan(
-            HistogramStrategy::LocalU32,
-            workload.chunk_bytes,
-            0,
-            185,
-            "large unaligned high-entropy inputs avoid the direct u64 path",
-        );
-    }
-
-    if backend == Backend::Avx2
-        && workload.scale == EntropyScale::Macro
-        && workload.entropy == EntropyClass::Mixed
-        && sequential_like
-        && total_bytes >= 64 * 1024
-    {
-        return plan(
-            HistogramStrategy::Avx2PaletteU32,
-            workload.chunk_bytes,
-            4 * 1024,
-            205,
-            "sequential macro-mixed calibration favored AVX2 palette counting",
-        );
-    }
-
-    if workload.scale == EntropyScale::Macro && total_bytes >= 256 * 1024 {
-        if workload.source_hint == SourceHint::RealFile
-            && workload.entropy == EntropyClass::High
-            && workload.content == ContentKind::Binary
-        {
-            return plan(
-                HistogramStrategy::DirectU64,
-                workload.chunk_bytes,
-                0,
-                175,
-                "real high-entropy file slices favored direct/simple kernels in calibration",
-            );
-        }
-
-        return plan(
-            HistogramStrategy::AdaptiveChunked64K,
-            64 * 1024,
-            1024,
-            205,
-            "macro-scale variation benefits from per-region kernel choice",
-        );
-    }
-
-    if workload.entropy == EntropyClass::High
-        && workload.scale == EntropyScale::Meso
-        && total_bytes >= 64 * 1024
-        && workload.context == ApiContext::Block
-    {
-        return plan(
-            HistogramStrategy::Stripe8U32,
-            workload.chunk_bytes,
-            0,
-            205,
-            "high-entropy meso real blocks favored stripe8 over adaptive probes",
-        );
-    }
-
-    if workload.scale == EntropyScale::Meso && sequential_like && call_bytes >= 64 * 1024 {
-        return plan(
-            HistogramStrategy::Stripe8U32,
-            workload.chunk_bytes,
-            0,
-            210,
-            "sequential meso-structured calibration favored stripe8 private buckets",
-        );
-    }
-
-    if workload.scale == EntropyScale::Meso
-        && (workload.context == ApiContext::Block || workload.chunk_bytes >= 64 * 1024)
-    {
-        return plan(
-            HistogramStrategy::AdaptiveMesoDetector,
-            workload.chunk_bytes,
-            4 * 1024,
-            205,
-            "meso-scale structure needs a block-pattern detector",
-        );
-    }
-
-    if workload.content == ContentKind::Text {
-        if total_bytes >= 64 * 1024 * 1024 || workload.context == ApiContext::File {
-            return plan(
-                HistogramStrategy::AdaptiveFileCached64K,
-                64 * 1024,
-                4 * 1024,
-                205,
-                "large text/file inputs can amortize file-level text detection",
-            );
-        }
-
-        if total_bytes >= 16 * 1024 * 1024 {
-            return plan(
-                HistogramStrategy::AdaptiveAsciiFast,
-                workload.chunk_bytes,
-                4 * 1024,
-                210,
-                "large text inputs benefit from the ASCII-biased fast path",
-            );
-        }
-
-        if total_bytes >= 8 * 1024 {
-            return plan(
-                HistogramStrategy::LocalU32,
-                workload.chunk_bytes,
-                0,
-                200,
-                "medium text inputs favored local private tables in size sweeps",
-            );
-        }
-    }
-
-    if workload.entropy == EntropyClass::High {
-        if total_bytes <= 16 * 1024 {
-            return plan(
-                HistogramStrategy::DirectU64,
-                workload.chunk_bytes,
-                0,
-                220,
-                "small high-entropy inputs favored the direct path",
-            );
-        }
-
-        if total_bytes <= 1024 * 1024 {
-            return plan(
-                HistogramStrategy::LocalU32,
-                workload.chunk_bytes,
-                0,
-                190,
-                "mid-sized high-entropy inputs favored local private tables",
-            );
-        }
-
-        return plan(
-            HistogramStrategy::AdaptiveHighEntropySkip,
-            workload.chunk_bytes,
-            4 * 1024,
-            175,
-            "large high-entropy inputs should skip low-entropy/text probes",
-        );
-    }
-
-    if matches!(
-        workload.read_pattern,
-        ReadPattern::Sequential | ReadPattern::Readahead
-    ) && total_bytes >= 64 * 1024
-    {
-        return plan(
-            HistogramStrategy::AdaptiveSequentialOnline64K,
-            64 * 1024,
-            1024,
-            170,
-            "sequential reads can update choices at region boundaries",
-        );
-    }
-
-    plan(
-        HistogramStrategy::AdaptivePrefix1K,
-        workload.chunk_bytes,
-        1024,
-        150,
-        "general-purpose fallback with a bounded prefix classifier",
-    )
-}
-
-fn plan(
-    strategy: HistogramStrategy,
-    chunk_bytes: usize,
-    sample_bytes: usize,
-    confidence_q8: u8,
-    reason: &'static str,
-) -> HistogramPlan {
-    HistogramPlan {
-        strategy,
-        chunk_bytes,
-        sample_bytes,
-        confidence_q8,
-        confidence_source: confidence_source_for(reason, confidence_q8),
-        reason,
-    }
-}
-
-fn confidence_source_for(reason: &str, confidence_q8: u8) -> PlannerConfidenceSource {
-    if reason.contains("calibration") || reason.contains("F22") || reason.contains("rootfs") {
-        PlannerConfidenceSource::CalibrationRule
-    } else if confidence_q8 <= 150 || reason.contains("fallback") {
-        PlannerConfidenceSource::Fallback
-    } else {
-        PlannerConfidenceSource::StaticRule
-    }
+    planner::rules::plan_histogram(profile, workload)
 }
 
 /// Returns the backend that public kernels should use on this process.
@@ -1825,12 +1406,84 @@ mod tests {
     }
 
     #[test]
+    fn planner_does_not_select_the_avx2_stripe4_placeholder() {
+        // Per docs/PRIMITIVE_KERNEL_BUFFET.md: the Avx2Stripe4U32 strategy
+        // is a planner placeholder whose body is currently scalar (no real
+        // x86 byte-histogram win exists per published literature — see
+        // Powturbo TurboHist, Yann Collet, Lemire). It survives only as a
+        // benchmark history label so a future genuine AVX2 implementation
+        // can replace it without re-plumbing the bench schema. No active
+        // planner rule should emit it.
+        //
+        // This sweep exercises a representative cross-product of profiles
+        // and workloads. If a future planner rule starts selecting the
+        // placeholder, this test will flag it.
+        let profiles = [
+            ProcessorProfile::portable(),
+            {
+                let mut p = ProcessorProfile::portable();
+                p.backend = Backend::Avx2;
+                p
+            },
+            {
+                let mut p = ProcessorProfile::portable();
+                p.backend = Backend::Neon;
+                p
+            },
+        ];
+        let api_contexts = [
+            ApiContext::Block,
+            ApiContext::Sequential,
+            ApiContext::Random,
+            ApiContext::File,
+            ApiContext::Parallel,
+        ];
+        let entropies = [EntropyClass::Low, EntropyClass::Mixed, EntropyClass::High];
+        let scales = [EntropyScale::Micro, EntropyScale::Meso, EntropyScale::Macro];
+        let totals = [256_u64, 4 * 1024, 64 * 1024, 1024 * 1024, 64 * 1024 * 1024];
+
+        for profile in profiles {
+            for api in api_contexts {
+                for entropy in entropies {
+                    for scale in scales {
+                        for total in totals {
+                            let mut workload = WorkloadShape::new(api, total as usize);
+                            workload.entropy = entropy;
+                            workload.scale = scale;
+                            let plan = plan_histogram(&profile, &workload);
+                            assert_ne!(
+                                plan.strategy,
+                                HistogramStrategy::Avx2Stripe4U32,
+                                "Avx2Stripe4U32 selected by planner: backend={:?}, api={:?}, \
+                                 entropy={:?}, scale={:?}, total={total}",
+                                profile.backend,
+                                api,
+                                entropy,
+                                scale,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn backend_support_is_honest_about_future_backends() {
         let avx2 = backend_kernel_support(Backend::Avx2);
         assert_eq!(avx2.byte_histogram, KernelAvailability::Native);
         assert_eq!(avx2.fingerprint, KernelAvailability::Native);
 
-        for backend in [Backend::Avx512, Backend::Neon, Backend::Sve, Backend::Sve2] {
+        // NEON has a real byte-class kernel (see byteclass::kernels::neon).
+        // Other primitive families on NEON remain scalar fallback until
+        // parity-tested kernels exist.
+        let neon = backend_kernel_support(Backend::Neon);
+        assert_eq!(neon.byte_class, KernelAvailability::Native);
+        assert_eq!(neon.byte_histogram, KernelAvailability::ScalarFallback);
+        assert_eq!(neon.fingerprint, KernelAvailability::ScalarFallback);
+        assert_eq!(neon.sketch, KernelAvailability::ScalarFallback);
+
+        for backend in [Backend::Avx512, Backend::Sve, Backend::Sve2] {
             let support = backend_kernel_support(backend);
             assert_eq!(support.byte_histogram, KernelAvailability::ScalarFallback);
             assert_eq!(support.fingerprint, KernelAvailability::ScalarFallback);
@@ -1844,5 +1497,297 @@ mod tests {
         assert_eq!(super::parse_size_bytes("1280K"), Some(1280 * 1024));
         assert_eq!(super::parse_size_bytes("30M"), Some(30 * 1024 * 1024));
         assert_eq!(super::parse_size_bytes("n/a"), None);
+    }
+
+    // ============================================================================
+    // Rule-table architecture tests (added by the #28 redesign).
+    // ============================================================================
+
+    #[test]
+    fn planner_rule_names_are_unique() {
+        use crate::dispatch::planner::rules::RULES;
+        let mut names: Vec<&'static str> = RULES.iter().map(|r| r.name).collect();
+        names.sort_unstable();
+        let total = names.len();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            total,
+            "duplicate rule names in RULES — names must be unique for telemetry to work"
+        );
+    }
+
+    #[test]
+    fn planner_rule_table_has_a_terminal_match() {
+        // The last rule in RULES must be the general fallback; otherwise
+        // some workload could fall off the end and trigger the unreachable
+        // path in plan_histogram.
+        use crate::dispatch::planner::rules::{RULE_GENERAL_FALLBACK, RULES};
+        let last = RULES.last().expect("RULES is empty");
+        assert_eq!(
+            last.name, RULE_GENERAL_FALLBACK.name,
+            "last rule must be the general fallback"
+        );
+    }
+
+    #[test]
+    fn planner_general_fallback_predicate_always_matches() {
+        use crate::dispatch::planner::rules::RULE_GENERAL_FALLBACK;
+        use crate::dispatch::planner::signals::Signals;
+        let profile = ProcessorProfile::portable();
+        let workload = WorkloadShape::new(ApiContext::Block, 0);
+        let signals = Signals::derive(&profile, &workload);
+        assert!((RULE_GENERAL_FALLBACK.predicate)(
+            &profile, &workload, &signals
+        ));
+    }
+
+    #[test]
+    fn planner_fallback_source_implies_low_confidence() {
+        // Rules tagged Fallback should emit a confidence at or below the
+        // documented fallback floor; rules above the floor should never
+        // be tagged Fallback. This keeps the bench-history confidence
+        // distribution coherent with the source classification.
+        use crate::dispatch::planner::consts::CONFIDENCE_FALLBACK_FLOOR;
+        use crate::dispatch::planner::rules::RULES;
+        use crate::dispatch::planner::signals::Signals;
+
+        let profile = ProcessorProfile::portable();
+        let workload = WorkloadShape::new(ApiContext::Block, 0);
+        let signals = Signals::derive(&profile, &workload);
+        for rule in RULES {
+            if rule.source == PlannerConfidenceSource::Fallback {
+                let plan = (rule.builder)(&profile, &workload, &signals);
+                assert!(
+                    plan.confidence_q8 <= CONFIDENCE_FALLBACK_FLOOR,
+                    "rule {} is tagged Fallback but emits confidence {} > floor {}",
+                    rule.name,
+                    plan.confidence_q8,
+                    CONFIDENCE_FALLBACK_FLOOR,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn planner_traced_returns_winner_in_trace() {
+        use crate::dispatch::planner::plan_histogram_traced;
+        let profile = ProcessorProfile::portable();
+        let workload = WorkloadShape::new(ApiContext::Block, 0);
+        let (plan, trace) = plan_histogram_traced(&profile, &workload);
+        let winner = trace.last().expect("trace must be non-empty");
+        assert!(winner.matched, "trace's last entry must be the winner");
+        // The winning plan's reason must equal the winning rule's reason.
+        // Look up the winning rule by name.
+        use crate::dispatch::planner::rules::RULES;
+        let winning_rule = RULES
+            .iter()
+            .find(|r| r.name == winner.name)
+            .expect("winner not in RULES");
+        assert_eq!(plan.reason, winning_rule.reason);
+    }
+
+    #[test]
+    fn planner_traced_records_misses_before_winner() {
+        // For a workload that should reach a late rule, the trace should
+        // contain at least one false entry before the winning true.
+        use crate::dispatch::planner::plan_histogram_traced;
+        let profile = ProcessorProfile::portable();
+        let workload = WorkloadShape::new(ApiContext::Block, 32 * 1024);
+        // 32 KiB block is below the LARGE threshold, so it falls through
+        // most rules and lands in the general fallback.
+        let (_plan, trace) = plan_histogram_traced(&profile, &workload);
+        assert!(trace.len() > 1, "trace must show fall-through misses");
+        let winner_pos = trace
+            .iter()
+            .position(|d| d.matched)
+            .expect("winner present");
+        // All entries before the winner must be misses.
+        for entry in &trace[..winner_pos] {
+            assert!(
+                !entry.matched,
+                "rule {} matched before the winner",
+                entry.name
+            );
+        }
+    }
+
+    // ============================================================================
+    // Tunes (#27) — persisted planner overrides
+    // ============================================================================
+
+    #[test]
+    fn tunes_default_equals_consts() {
+        // Tunes::DEFAULT is built from the const values; this test catches
+        // accidental drift if a const is updated without updating the
+        // corresponding Tunes::DEFAULT field (or vice versa).
+        use crate::dispatch::planner::consts;
+        use crate::dispatch::planner::tunes::Tunes;
+        let t = Tunes::DEFAULT;
+        assert_eq!(
+            t.block_threshold_micro_bytes,
+            consts::BLOCK_THRESHOLD_MICRO_BYTES
+        );
+        assert_eq!(
+            t.block_threshold_large_bytes,
+            consts::BLOCK_THRESHOLD_LARGE_BYTES
+        );
+        assert_eq!(
+            t.total_threshold_macro_bytes,
+            consts::TOTAL_THRESHOLD_MACRO_BYTES
+        );
+        assert_eq!(t.confidence_deterministic, consts::CONFIDENCE_DETERMINISTIC);
+        assert_eq!(
+            t.confidence_fallback_floor,
+            consts::CONFIDENCE_FALLBACK_FLOOR
+        );
+        assert_eq!(
+            t.confidence_general_fallback,
+            consts::CONFIDENCE_GENERAL_FALLBACK
+        );
+    }
+
+    #[test]
+    fn tuned_planner_default_matches_untuned() {
+        // plan_histogram(profile, workload) and plan_histogram_tuned(profile,
+        // workload, &Tunes::DEFAULT) must be bit-identical.
+        use crate::dispatch::planner::plan_histogram_tuned;
+        use crate::dispatch::planner::tunes::Tunes;
+        let profile = ProcessorProfile::portable();
+        let workloads = [
+            WorkloadShape::new(ApiContext::Block, 32 * 1024),
+            WorkloadShape::new(ApiContext::Random, 1024 * 1024),
+            WorkloadShape::new(ApiContext::Sequential, 256 * 1024 * 1024),
+        ];
+        for w in workloads {
+            let untuned = plan_histogram(&profile, &w);
+            let tuned = plan_histogram_tuned(&profile, &w, &Tunes::DEFAULT);
+            assert_eq!(untuned, tuned, "default tunes must match untuned path");
+        }
+    }
+
+    #[test]
+    fn tunes_override_can_flip_micro_threshold_to_change_strategy() {
+        // A 6 KiB block on a single thread normally falls past the micro
+        // ladder (call_bytes > 4 KiB) and lands further down the table.
+        // Overriding block_threshold_micro_bytes to 8 KiB pulls it into the
+        // micro-default branch (DirectU64).
+        use crate::dispatch::planner::plan_histogram_tuned;
+        use crate::dispatch::planner::tunes::Tunes;
+        let profile = ProcessorProfile::portable();
+        let mut workload = WorkloadShape::new(ApiContext::Block, 6 * 1024);
+        workload.entropy = EntropyClass::High;
+        workload.scale = EntropyScale::Flat;
+
+        let baseline = plan_histogram(&profile, &workload);
+        let overridden = plan_histogram_tuned(
+            &profile,
+            &workload,
+            &Tunes::DEFAULT.with_block_threshold_micro_bytes(8 * 1024),
+        );
+
+        // The override widens the micro band; the workload now lands on
+        // DirectU64 with deterministic confidence.
+        assert_eq!(overridden.strategy, HistogramStrategy::DirectU64);
+        assert_eq!(overridden.confidence_q8, 255);
+
+        // Baseline (default 4 KiB micro threshold) routes a 6 KiB
+        // high-entropy block through the high-entropy ladder (small high
+        // entropy -> DirectU64 with confidence_calibrated_boundary=220).
+        // The strategies happen to agree here, but the confidences differ
+        // because the override hit the deterministic micro rule, not the
+        // calibrated-boundary rule.
+        assert_ne!(baseline.confidence_q8, overridden.confidence_q8);
+        assert_ne!(baseline.reason, overridden.reason);
+    }
+
+    #[test]
+    fn tunes_override_can_promote_a_workload_into_repeated_regions() {
+        // A 64 KiB total at the LARGE threshold normally fires the
+        // repeated-regions rule on cache=Reused. Cutting the threshold
+        // to 32 KiB pulls a 48 KiB workload into the same rule.
+        use crate::dispatch::planner::plan_histogram_tuned;
+        use crate::dispatch::planner::tunes::Tunes;
+        let profile = ProcessorProfile::portable();
+        let mut workload = WorkloadShape::new(ApiContext::Block, 48 * 1024);
+        workload.cache_state = CacheState::Reused;
+        workload.entropy = EntropyClass::Mixed;
+
+        let baseline = plan_histogram(&profile, &workload);
+        let overridden = plan_histogram_tuned(
+            &profile,
+            &workload,
+            &Tunes::DEFAULT.with_block_threshold_large_bytes(32 * 1024),
+        );
+
+        // Default LARGE = 64 KiB → 48 KiB total doesn't hit
+        // repeated-regions; falls to the general fallback.
+        assert_ne!(baseline.strategy, HistogramStrategy::AdaptiveFileCached64K);
+        // Overridden LARGE = 32 KiB → 48 KiB ≥ 32 KiB → repeated-regions fires.
+        assert_eq!(
+            overridden.strategy,
+            HistogramStrategy::AdaptiveFileCached64K
+        );
+    }
+
+    #[cfg(feature = "tunes-json")]
+    #[test]
+    fn tunes_from_json_overrides_named_fields() {
+        use crate::dispatch::planner::tunes::Tunes;
+        let json = r#"{
+            "block_threshold_large_bytes": 32768,
+            "confidence_general_fallback": 100
+        }"#;
+        let tunes = Tunes::from_json(json).expect("valid JSON");
+        assert_eq!(tunes.block_threshold_large_bytes, 32 * 1024);
+        assert_eq!(tunes.confidence_general_fallback, 100);
+        // Untouched fields keep their default value.
+        assert_eq!(
+            tunes.confidence_deterministic,
+            Tunes::DEFAULT.confidence_deterministic
+        );
+    }
+
+    #[cfg(feature = "tunes-json")]
+    #[test]
+    fn tunes_from_json_rejects_unknown_fields() {
+        use crate::dispatch::planner::tunes::{TuneLoadError, Tunes};
+        let json = r#"{ "not_a_real_field": 42 }"#;
+        let err = Tunes::from_json(json).expect_err("must reject unknown field");
+        assert!(matches!(err, TuneLoadError::UnknownField(name) if name == "not_a_real_field"));
+    }
+
+    #[cfg(feature = "tunes-json")]
+    #[test]
+    fn tunes_from_json_rejects_out_of_range_u8() {
+        use crate::dispatch::planner::tunes::{TuneLoadError, Tunes};
+        let json = r#"{ "confidence_general_fallback": 9999 }"#;
+        let err = Tunes::from_json(json).expect_err("must reject out-of-range u8");
+        assert!(matches!(err, TuneLoadError::OutOfRange { .. }));
+    }
+
+    #[cfg(feature = "tunes-json")]
+    #[test]
+    fn tunes_from_json_empty_object_yields_default() {
+        use crate::dispatch::planner::tunes::Tunes;
+        let tunes = Tunes::from_json("{}").expect("empty object is valid");
+        assert_eq!(tunes, Tunes::DEFAULT);
+    }
+
+    #[cfg(feature = "tunes-json")]
+    #[test]
+    fn tunes_example_json_in_docs_parses_and_matches_default() {
+        // The example file at docs/examples/planner-tunes.json is the
+        // canonical reference for callers building bench-calibrate output.
+        // Keep it loadable and aligned with the current Tunes schema by
+        // testing it on every change.
+        use crate::dispatch::planner::tunes::Tunes;
+        // Path is relative to the crate root (the test runner's CWD).
+        let json = std::fs::read_to_string("../../docs/examples/planner-tunes.json")
+            .expect("docs/examples/planner-tunes.json must exist");
+        let tunes = Tunes::from_json(&json).expect("example tunes file must parse cleanly");
+        // The example file lists every field at its compile-time default;
+        // loading it should be byte-identical to Tunes::DEFAULT.
+        assert_eq!(tunes, Tunes::DEFAULT);
     }
 }

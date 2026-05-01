@@ -219,6 +219,14 @@ fn calibration_selector_analysis_gate_when_available() {
 
 #[test]
 fn f22_fingerprint_throughput_gate_when_available() {
+    if env::var_os("TOKENFS_ALGOS_SKIP_THROUGHPUT_GATE").is_some() {
+        eprintln!(
+            "TOKENFS_ALGOS_SKIP_THROUGHPUT_GATE set; skipping (intended for \
+             QEMU/emulated cross-test runs where wall-clock timings are not \
+             representative of native execution)"
+        );
+        return;
+    }
     let Some(path) = calibration_path_or_skip("F22 sidecar", f22_sidecar_path()) else {
         return;
     };

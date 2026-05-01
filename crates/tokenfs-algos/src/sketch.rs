@@ -32,7 +32,21 @@ pub mod kernels {
         }
     }
 
-    /// x86 SSE4.2 CRC32C sketch kernels.
+    /// x86 SSE4.2 CRC32C sketch kernels with pipelined hash4-bins
+    /// implementations.
+    ///
+    /// `crc32_hash4_bins_pipelined` is the productized fast path for the
+    /// F22 fingerprint extent's hash4 stage. Per the audit (docs/PRIMITIVE
+    /// _KERNEL_BUFFET.md and the #35 sub-agent survey of CRC32C
+    /// implementations), the F22 hash4_bins bottleneck is NOT the CRC
+    /// dependency chain (each window hashes from `seed=0` so successive
+    /// CRCs are independent) — it's the *single-stream* loop shape:
+    /// `_mm_crc32_u32` has 3-cycle latency and 1-cycle throughput on
+    /// Skylake-class hardware, and the loop body waits for the hash
+    /// before scattering to one shared `bins` array. Two fixes here:
+    /// (1) issue 4 independent CRCs per iteration so the port stays
+    /// saturated, and (2) keep 4 separate per-stream bin tables to
+    /// eliminate the scatter aliasing — merge them at the end.
     #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
     pub mod sse42 {
         /// Returns true when the current CPU supports SSE4.2 CRC32C.
@@ -100,6 +114,108 @@ pub mod kernels {
                 // SAFETY: this function's target_feature contract guarantees SSE4.2.
                 unsafe { crc32c_u32(seed, value) }
             });
+        }
+
+        /// Pipelined hash4-bins: 4 windows in flight per iteration, 4
+        /// per-stream bin tables merged at the end.
+        ///
+        /// Output is bit-exact with [`crc32_hash4_bins`] for any
+        /// `(bytes, bins)` pair.
+        ///
+        /// # Safety
+        ///
+        /// The caller must ensure that SSE4.2 is available on the current
+        /// CPU. `BINS` must be a power of two — non-power-of-two `BINS`
+        /// values would force a `% BINS` division per window, which the
+        /// scheduler can't pipeline. The function falls back to the
+        /// single-stream path for that case.
+        #[target_feature(enable = "sse4.2")]
+        pub unsafe fn crc32_hash4_bins_pipelined<const BINS: usize>(
+            bytes: &[u8],
+            bins: &mut [u32; BINS],
+        ) {
+            // SAFETY: caller guarantees SSE4.2; we hold a mutable bins.
+            unsafe { hash4_bins_pipelined_impl::<BINS>(bytes, bins) }
+        }
+
+        #[target_feature(enable = "sse4.2")]
+        unsafe fn hash4_bins_pipelined_impl<const BINS: usize>(
+            bytes: &[u8],
+            bins: &mut [u32; BINS],
+        ) {
+            if BINS == 0 || bytes.len() < 4 {
+                return;
+            }
+            // Non-power-of-two BINS would force `% BINS` per window; the
+            // scheduler can't pipeline a div, so fall back to the
+            // single-stream path which uses the same modulo expression.
+            if !BINS.is_power_of_two() {
+                // SAFETY: caller guarantees SSE4.2.
+                unsafe { crc32_hash4_bins::<BINS>(bytes, bins) };
+                return;
+            }
+            let mask = BINS - 1;
+
+            // Four per-stream bin tables avoid the scatter aliasing
+            // through one shared `bins` array. Merged at the end.
+            //
+            // Note: this is on the stack — at BINS=4096 (the F22 hash4
+            // size) that's 4*4096*4 = 64 KiB of stack. F22 callers run
+            // off a normal user stack so this is fine; if you ever wire
+            // this from a kernel-adjacent caller with a tiny stack,
+            // consider heap-allocating once and reusing.
+            let mut bin0 = [0_u32; BINS];
+            let mut bin1 = [0_u32; BINS];
+            let mut bin2 = [0_u32; BINS];
+            let mut bin3 = [0_u32; BINS];
+
+            // Total number of 4-byte sliding windows.
+            let n_windows = bytes.len() - 3;
+            let mut i = 0;
+
+            // Inner loop: 4 independent CRCs in flight, 4 independent bin
+            // increments. Each `crc32_u32(0, word)` has 3-cycle latency on
+            // Skylake but 1-cycle throughput; with 4 in flight the port
+            // stays saturated.
+            while i + 4 <= n_windows {
+                // Pack 4 windows. We deliberately use unaligned u32 reads
+                // because the windows overlap (stride 1).
+                let w0 = u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+                let w1 =
+                    u32::from_le_bytes([bytes[i + 1], bytes[i + 2], bytes[i + 3], bytes[i + 4]]);
+                let w2 =
+                    u32::from_le_bytes([bytes[i + 2], bytes[i + 3], bytes[i + 4], bytes[i + 5]]);
+                let w3 =
+                    u32::from_le_bytes([bytes[i + 3], bytes[i + 4], bytes[i + 5], bytes[i + 6]]);
+                // SAFETY: SSE4.2 enabled by the surrounding target_feature.
+                let h0 = unsafe { crc32c_u32(0, w0) } as usize;
+                let h1 = unsafe { crc32c_u32(0, w1) } as usize;
+                let h2 = unsafe { crc32c_u32(0, w2) } as usize;
+                let h3 = unsafe { crc32c_u32(0, w3) } as usize;
+                bin0[h0 & mask] += 1;
+                bin1[h1 & mask] += 1;
+                bin2[h2 & mask] += 1;
+                bin3[h3 & mask] += 1;
+                i += 4;
+            }
+
+            // Tail: remaining windows go into bin0 (already in flight).
+            while i < n_windows {
+                let word = u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+                // SAFETY: SSE4.2 enabled.
+                let h = unsafe { crc32c_u32(0, word) } as usize;
+                bin0[h & mask] += 1;
+                i += 1;
+            }
+
+            // Merge the 4 per-stream tables into the caller's bins.
+            for k in 0..BINS {
+                bins[k] = bins[k]
+                    .wrapping_add(bin0[k])
+                    .wrapping_add(bin1[k])
+                    .wrapping_add(bin2[k])
+                    .wrapping_add(bin3[k]);
+            }
         }
     }
 }
@@ -401,12 +517,17 @@ fn crc32c_byte(seed: u32, byte: u8) -> u32 {
 }
 
 /// Counts 4-grams into a CRC32C-hashed fixed bin array.
+///
+/// On SSE4.2 hosts, dispatches to the pipelined kernel that issues 4
+/// independent CRCs per iteration into 4 per-stream bin tables —
+/// substantially faster than the single-stream loop on the F22 fingerprint
+/// extent's hash4 stage.
 pub fn crc32_hash4_bins<const BINS: usize>(bytes: &[u8], bins: &mut [u32; BINS]) {
     #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
     {
         if kernels::sse42::is_available() {
             // SAFETY: availability was checked immediately above.
-            unsafe { kernels::sse42::crc32_hash4_bins(bytes, bins) };
+            unsafe { kernels::sse42::crc32_hash4_bins_pipelined(bytes, bins) };
             return;
         }
     }

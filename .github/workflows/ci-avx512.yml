@@ -1,0 +1,97 @@
+name: CI (AVX-512 self-hosted)
+
+# This workflow runs on self-hosted runners labeled `avx512`. Per
+# docs/AVX512_HARDWARE.md, the local fleet has 4 AVX-512-capable hosts
+# (Skylake-X s3 and Zen-4 s5/s6/s7); GitHub-hosted public runners do not
+# expose AVX-512. Register a runner via:
+#
+#   gh api -X POST -H "Accept: application/vnd.github+json" \
+#     /repos/mjbommar/tokenfs-algos/actions/runners/registration-token
+#
+# then on each AVX-512-capable host:
+#
+#   ./config.sh --url https://github.com/mjbommar/tokenfs-algos \
+#               --token <registration-token> \
+#               --labels avx512,linux,$(uname -m)
+#
+# The job below picks any runner labeled `avx512`. Distinguish microarch
+# (Skylake-X vs. Zen 4) via additional labels if you want microarch-
+# specific sweeps.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  avx512:
+    name: AVX-512 (${{ matrix.label }})
+    # Skip silently when no self-hosted runner with the label is online.
+    runs-on: [self-hosted, avx512]
+    strategy:
+      fail-fast: false
+      matrix:
+        # Single matrix entry today — extend with `microarch: [zen4, skylakex]`
+        # if the local fleet later wants per-microarch jobs.
+        include:
+          - label: avx512-host
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log AVX-512 features
+        run: |
+          echo "===== /proc/cpuinfo (model + flags) ====="
+          grep -E '^(model name|flags)' /proc/cpuinfo | head -2
+          echo
+          echo "===== AVX-512 feature subset ====="
+          grep '^flags' /proc/cpuinfo | head -1 | tr ' ' '\n' | grep -E '^avx512' | sort
+          echo
+          echo "===== uname / kernel ====="
+          uname -a
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy, rust-src, llvm-tools-preview
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: avx512-${{ runner.name }}
+
+      - name: Check (default + avx512 feature when present)
+        run: cargo check -p tokenfs-algos --all-targets --features tunes-json
+
+      - name: Test (default features — sanity gate)
+        run: cargo test -p tokenfs-algos
+
+      - name: Test (with bench-internals feature)
+        run: cargo test -p tokenfs-algos --features bench-internals
+
+      - name: Test (with tunes-json feature)
+        run: cargo test -p tokenfs-algos --features tunes-json
+
+      # Once #38 lands the AVX-512 kernels behind feature="avx512", these
+      # next two steps will exercise the new SIMD paths against scalar
+      # parity. Until then they're no-ops on the avx512 feature flag.
+      - name: Test (with avx512 feature, when available)
+        continue-on-error: true
+        run: cargo test -p tokenfs-algos --features avx512
+
+      - name: Bench AVX-512 paths (build-only smoke check)
+        continue-on-error: true
+        run: cargo bench -p tokenfs-algos --features bench-internals,avx512 --no-run
+
+      - name: Run dispatch_explain on this runner (logs detected backend)
+        run: cargo run -p tokenfs-algos --example dispatch_explain --release

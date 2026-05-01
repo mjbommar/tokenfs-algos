@@ -1,0 +1,56 @@
+# Empty [workspace] table keeps `fuzz` out of the parent workspace so
+# cargo-fuzz's RUSTFLAGS-heavy build doesn't bleed into the main library.
+[workspace]
+
+[package]
+name = "tokenfs-algos-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.tokenfs-algos]
+path = "../crates/tokenfs-algos"
+
+# Each fuzz target is its own binary so cargo-fuzz can drive them
+# independently. Run with: cargo +nightly fuzz run <target_name>
+
+[[bin]]
+name = "chunk_gear_no_panic"
+path = "fuzz_targets/chunk_gear_no_panic.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chunk_fastcdc_no_panic"
+path = "fuzz_targets/chunk_fastcdc_no_panic.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ngram_windows_no_panic"
+path = "fuzz_targets/ngram_windows_no_panic.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "byteclass_utf8_dispatch_parity"
+path = "fuzz_targets/byteclass_utf8_dispatch_parity.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "runlength_transitions_dispatch_parity"
+path = "fuzz_targets/runlength_transitions_dispatch_parity.rs"
+test = false
+doc = false
+bench = false

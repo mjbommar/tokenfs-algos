@@ -11,11 +11,47 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
 
 jobs:
-  rust:
-    name: Rust
-    runs-on: ubuntu-latest
+  # ============================================================================
+  # Native test matrix — every architecture / OS combination GitHub Actions
+  # offers (excluding deprecated Intel macOS). Each job logs CPU facts so the
+  # runner-side hardware-acceleration coverage is visible in test output.
+  # ============================================================================
+  native:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64 (AVX2)
+            runner: ubuntu-latest
+            arch: x86_64
+            os: linux
+            simd_features: ""
+          - label: linux-aarch64 (NEON)
+            runner: ubuntu-24.04-arm
+            arch: aarch64
+            os: linux
+            simd_features: ""
+          - label: windows-x86_64
+            runner: windows-latest
+            arch: x86_64
+            os: windows
+            simd_features: ""
+          - label: windows-aarch64
+            runner: windows-11-arm
+            arch: aarch64
+            os: windows
+            simd_features: ""
+          - label: macos-aarch64 (Apple Silicon NEON)
+            runner: macos-latest
+            arch: aarch64
+            os: macos
+            simd_features: ""
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,12 +63,184 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          # Distinguish caches per (runner, arch, os) so cross-arch traffic
+          # doesn't poison each other.
+          shared-key: ${{ matrix.runner }}-${{ matrix.arch }}
 
-      - name: Check
-        run: cargo xtask check
+      # --- log hardware facts so the CI history shows what each job ran on ---
+      - name: Log CPU info (Linux)
+        if: matrix.os == 'linux'
+        run: |
+          echo "===== /proc/cpuinfo (model + flags) ====="
+          grep -E '^(model name|flags|Features|CPU implementer|CPU part)' /proc/cpuinfo | sort -u | head -40
+          echo
+          echo "===== lscpu ====="
+          lscpu || true
+          echo
+          echo "===== nproc / kernel ====="
+          nproc; uname -a
 
-      - name: Test
-        run: cargo xtask test
+      - name: Log CPU info (macOS)
+        if: matrix.os == 'macos'
+        run: |
+          echo "===== sysctl machdep.cpu ====="
+          sysctl machdep.cpu | head -40
+          echo
+          echo "===== sysctl hw ====="
+          sysctl hw | head -30
+          echo
+          echo "===== uname ====="
+          uname -a
 
-      - name: Build benchmarks
-        run: cargo bench -p tokenfs-algos --all-features --bench histogram --no-run
+      - name: Log CPU info (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          Write-Host "===== Get-CimInstance Win32_Processor ====="
+          Get-CimInstance Win32_Processor | Format-List Manufacturer,Name,Architecture,NumberOfCores,NumberOfLogicalProcessors,L2CacheSize,L3CacheSize
+          Write-Host "===== systeminfo ====="
+          systeminfo | Select-String -Pattern "OS|System Type|Processor"
+
+      # --- core build + test ---
+      - name: Check (default features)
+        run: cargo check -p tokenfs-algos --all-targets
+
+      - name: Test (default features)
+        run: cargo test -p tokenfs-algos --all-targets
+
+      - name: Test (no default features)
+        run: cargo test -p tokenfs-algos --no-default-features
+
+      - name: Test (with std + tunes-json)
+        run: cargo test -p tokenfs-algos --features tunes-json
+
+      - name: Test (parallel feature)
+        run: cargo test -p tokenfs-algos --features parallel
+
+      - name: Test (bench-internals feature)
+        run: cargo test -p tokenfs-algos --features bench-internals
+
+      - name: Build benchmarks (no-run, smoke-check)
+        run: |
+          cargo bench -p tokenfs-algos --features bench-internals --bench primitives --no-run
+          cargo bench -p tokenfs-algos --bench similarity --no-run
+          cargo bench -p tokenfs-algos --bench planner --no-run
+
+      - name: Clippy (default features)
+        run: cargo clippy -p tokenfs-algos --tests --benches --features bench-internals,tunes-json -- -D warnings
+
+      - name: Run dispatch_explain (logs the runner's planner choices)
+        run: cargo run -p tokenfs-algos --example dispatch_explain --release
+
+  # ============================================================================
+  # Cross-compile / QEMU emulation. Builds aarch64 binaries on x86 then runs
+  # them under QEMU-user — cheap correctness gate that complements the native
+  # aarch64 jobs. Catches regressions between full GitHub-hosted aarch64 runs.
+  # ============================================================================
+  cross-aarch64-qemu:
+    name: cross-aarch64-qemu (correctness gate)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: aarch64-unknown-linux-gnu
+          components: rustfmt, clippy, rust-src
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: cross-aarch64
+
+      - name: Install cross-toolchain + qemu-user
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user
+
+      - name: Check (default features)
+        run: cargo check -p tokenfs-algos --target aarch64-unknown-linux-gnu --all-targets
+
+      - name: Test under QEMU (default features)
+        run: cargo test -p tokenfs-algos --target aarch64-unknown-linux-gnu
+
+      - name: Test under QEMU (NEON parity)
+        run: cargo test -p tokenfs-algos --target aarch64-unknown-linux-gnu --test neon_parity
+
+      - name: Test under QEMU (with calibration disabled — gates skip)
+        run: cargo test -p tokenfs-algos --target aarch64-unknown-linux-gnu --features tunes-json,parallel
+
+  # ============================================================================
+  # Fuzz target build smoke test — ensures the cargo-fuzz harnesses keep
+  # compiling. Doesn't run extended fuzz cycles on every push.
+  # ============================================================================
+  fuzz-build:
+    name: fuzz-build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src, llvm-tools-preview
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: fuzz
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+
+      - name: Build all fuzz targets
+        run: |
+          cd fuzz
+          cargo +nightly fuzz build chunk_gear_no_panic
+          cargo +nightly fuzz build chunk_fastcdc_no_panic
+          cargo +nightly fuzz build ngram_windows_no_panic
+          cargo +nightly fuzz build byteclass_utf8_dispatch_parity
+          cargo +nightly fuzz build runlength_transitions_dispatch_parity
+
+      - name: Smoke-fuzz each target (15s)
+        run: |
+          cd fuzz
+          for target in chunk_gear_no_panic chunk_fastcdc_no_panic ngram_windows_no_panic byteclass_utf8_dispatch_parity runlength_transitions_dispatch_parity; do
+            echo "=== smoking $target for 15s ==="
+            timeout 25 cargo +nightly fuzz run "$target" -- -max_total_time=15 || true
+          done
+
+  # ============================================================================
+  # Format + lint check (architecture-independent, fast).
+  # ============================================================================
+  format:
+    name: format + lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: format
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy (all features, deny warnings)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Doc check
+        run: cargo doc --workspace --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: "-D warnings"

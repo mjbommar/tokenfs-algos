@@ -18,6 +18,9 @@ use crate::{
     math, sketch,
 };
 
+#[cfg(all(feature = "neon", target_arch = "aarch64"))]
+mod neon;
+
 /// F22 block size. A 64 KiB extent contains 256 such blocks.
 pub const BLOCK_SIZE: usize = 256;
 
@@ -158,6 +161,10 @@ pub mod kernels {
         extent_scalar,
     };
 
+    /// AArch64 NEON fused F22 block fingerprint kernel.
+    #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+    pub use super::neon::public as neon;
+
     /// Runtime-dispatched/default fingerprint kernel.
     pub mod auto {
         use super::{BLOCK_SIZE, BlockFingerprint, ExtentFingerprint, block_auto, extent_auto};
@@ -270,6 +277,15 @@ fn block_auto(bytes: &[u8; BLOCK_SIZE]) -> BlockFingerprint {
         }
     }
 
+    #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+    {
+        if kernels::neon::is_available() {
+            // SAFETY: NEON is mandatory on AArch64; CRC extension checked
+            // by `kernels::neon::is_available()`.
+            return unsafe { neon::block_neon_unchecked(bytes) };
+        }
+    }
+
     block_with_hash4(bytes, sketch::crc32_hash4_bins)
 }
 
@@ -286,7 +302,10 @@ use core::arch::x86_64::_mm_crc32_u32 as crc32_u32_intrinsic;
 #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
 #[target_feature(enable = "avx2,sse4.2")]
 unsafe fn block_avx2_unchecked(bytes: &[u8; BLOCK_SIZE]) -> BlockFingerprint {
-    let histogram = histogram_byte_block_avx2(bytes);
+    // SAFETY: target_feature(enable = "avx2,sse4.2") on this fn satisfies the
+    // requirements of histogram_byte_block_avx2 (avx2) and
+    // histogram_hash4_block_avx2 (avx2,sse4.2).
+    let histogram = unsafe { histogram_byte_block_avx2(bytes) };
     let h1 = sketch::entropy_from_counts_u32(&histogram, BLOCK_SIZE as u64);
     let h1_q4 = quantize_q4(h1);
     let (rl_runs_ge4, _) = runlength(bytes);
@@ -310,7 +329,8 @@ unsafe fn block_avx2_unchecked(bytes: &[u8; BLOCK_SIZE]) -> BlockFingerprint {
 }
 
 #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
-fn histogram_byte_block_avx2(bytes: &[u8; BLOCK_SIZE]) -> [u32; 256] {
+#[target_feature(enable = "avx2")]
+unsafe fn histogram_byte_block_avx2(bytes: &[u8; BLOCK_SIZE]) -> [u32; 256] {
     let mut h0 = [0_u32; 256];
     let mut h1 = [0_u32; 256];
     let mut h2 = [0_u32; 256];
@@ -323,15 +343,57 @@ fn histogram_byte_block_avx2(bytes: &[u8; BLOCK_SIZE]) -> [u32; 256] {
         h3[bytes[192 + index] as usize] += 1;
     }
 
-    let mut out = [0_u32; 256];
-    for index in 0..256 {
-        out[index] = h0[index] + h1[index] + h2[index] + h3[index];
+    // SAFETY: AVX2 enabled by target_feature; 4 stripes are 4 KiB each.
+    unsafe { merge_4_stripes_u32_avx2::<256>(&h0, &h1, &h2, &h3) }
+}
+
+/// AVX2 sum-reduce four `[u32; N]` stripes into one. Replaces the prior
+/// scalar `for i in 0..N { out[i] = a[i] + b[i] + c[i] + d[i]; }` loop —
+/// 8 lanes per `_mm256_add_epi32`, so 32 iterations per 256-element merge
+/// instead of 256.
+///
+/// # Safety
+///
+/// Caller must ensure AVX2 is available and `N` is a multiple of 8.
+#[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+#[target_feature(enable = "avx2")]
+unsafe fn merge_4_stripes_u32_avx2<const N: usize>(
+    a: &[u32; N],
+    b: &[u32; N],
+    c: &[u32; N],
+    d: &[u32; N],
+) -> [u32; N] {
+    debug_assert!(
+        N.is_multiple_of(8),
+        "N must be a multiple of 8 for the AVX2 merge"
+    );
+
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::{__m256i, _mm256_add_epi32, _mm256_loadu_si256, _mm256_storeu_si256};
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::{__m256i, _mm256_add_epi32, _mm256_loadu_si256, _mm256_storeu_si256};
+
+    let mut out = [0_u32; N];
+    let mut i = 0;
+    while i < N {
+        // SAFETY: i + 8 <= N is guaranteed by the loop condition + N % 8
+        // assertion; arrays a/b/c/d/out all have length N.
+        let va = unsafe { _mm256_loadu_si256(a.as_ptr().add(i).cast::<__m256i>()) };
+        let vb = unsafe { _mm256_loadu_si256(b.as_ptr().add(i).cast::<__m256i>()) };
+        let vc = unsafe { _mm256_loadu_si256(c.as_ptr().add(i).cast::<__m256i>()) };
+        let vd = unsafe { _mm256_loadu_si256(d.as_ptr().add(i).cast::<__m256i>()) };
+        let sum = _mm256_add_epi32(_mm256_add_epi32(va, vb), _mm256_add_epi32(vc, vd));
+        // SAFETY: same.
+        unsafe {
+            _mm256_storeu_si256(out.as_mut_ptr().add(i).cast::<__m256i>(), sum);
+        }
+        i += 8;
     }
     out
 }
 
 #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
-#[target_feature(enable = "sse4.2")]
+#[target_feature(enable = "avx2,sse4.2")]
 unsafe fn histogram_hash4_block_avx2(bytes: &[u8; BLOCK_SIZE]) -> [u32; QUAD_HASH_BLOCK_BINS] {
     let mut c0 = [0_u32; QUAD_HASH_BLOCK_BINS];
     let mut c1 = [0_u32; QUAD_HASH_BLOCK_BINS];
@@ -385,11 +447,9 @@ unsafe fn histogram_hash4_block_avx2(bytes: &[u8; BLOCK_SIZE]) -> [u32; QUAD_HAS
         c0[(crc32_u32_intrinsic(0, q) & mask) as usize] += 1;
     }
 
-    let mut out = [0_u32; QUAD_HASH_BLOCK_BINS];
-    for index in 0..QUAD_HASH_BLOCK_BINS {
-        out[index] = c0[index] + c1[index] + c2[index] + c3[index];
-    }
-    out
+    // SAFETY: avx2 + sse4.2 enabled by target_feature; QUAD_HASH_BLOCK_BINS=256
+    // is a multiple of 8.
+    unsafe { merge_4_stripes_u32_avx2::<QUAD_HASH_BLOCK_BINS>(&c0, &c1, &c2, &c3) }
 }
 
 fn block_with_hash4(

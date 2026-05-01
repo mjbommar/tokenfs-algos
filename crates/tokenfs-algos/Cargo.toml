@@ -22,12 +22,15 @@ avx512 = ["nightly"]
 neon = []
 sve = ["nightly"]
 sve2 = ["nightly"]
+# JSON loading for planner Tunes (see dispatch::planner::tunes::Tunes::from_json).
+tunes-json = ["std", "dep:serde_json"]
 
 [dependencies]
 cfg-if.workspace = true
 bytemuck = { version = "1", optional = true }
 libm = "0.2"
 rayon = { version = "1", optional = true }
+serde_json = { version = "1", optional = true }
 
 [dev-dependencies]
 criterion = "0.5"
@@ -44,6 +47,14 @@ required-features = ["bench-internals"]
 name = "primitives"
 harness = false
 required-features = ["bench-internals"]
+
+[[bench]]
+name = "similarity"
+harness = false
+
+[[bench]]
+name = "planner"
+harness = false
 
 [lints]
 workspace = true

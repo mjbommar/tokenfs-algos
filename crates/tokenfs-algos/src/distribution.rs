@@ -104,6 +104,18 @@ pub enum ByteDistributionMetric {
     TotalVariation,
     /// Kolmogorov-Smirnov cumulative-distribution statistic.
     KolmogorovSmirnov,
+    /// L2 (Euclidean) distance over u32-cast byte counts.
+    ///
+    /// Routes through [`crate::similarity::distance::l2_u32`], which uses
+    /// the runtime-dispatched AVX2/NEON dense kernels. Bit-exact with the
+    /// scalar reference for inputs whose per-bin counts fit in `u32`
+    /// (up to ~4 GiB total bytes).
+    L2,
+    /// Cosine distance (`1 - cosine_similarity`) over u32-cast byte counts.
+    ///
+    /// Routes through [`crate::similarity::distance::cosine_distance_u32`].
+    /// See [`Self::L2`] for the u32 fit caveat.
+    Cosine,
 }
 
 impl ByteDistributionMetric {
@@ -115,6 +127,8 @@ impl ByteDistributionMetric {
             Self::Hellinger => "hellinger",
             Self::TotalVariation => "total-variation",
             Self::KolmogorovSmirnov => "kolmogorov-smirnov",
+            Self::L2 => "l2",
+            Self::Cosine => "cosine",
         }
     }
 
@@ -134,9 +148,35 @@ impl ByteDistributionMetric {
             Self::KolmogorovSmirnov => {
                 divergence::ks_statistic_counts(left.counts(), right.counts())
             }
+            Self::L2 => {
+                let a = cast_counts_to_u32(left.counts());
+                let b = cast_counts_to_u32(right.counts());
+                crate::similarity::distance::l2_u32(&a, &b)
+            }
+            Self::Cosine => {
+                let a = cast_counts_to_u32(left.counts());
+                let b = cast_counts_to_u32(right.counts());
+                crate::similarity::distance::cosine_distance_u32(&a, &b)
+            }
         }
         .unwrap_or(f64::INFINITY)
     }
+}
+
+/// Saturating `u64 → u32` cast of per-bin byte counts. Counts above
+/// `u32::MAX` saturate; with 256 bins this clips at ~1 TiB total per bin,
+/// which exceeds any realistic in-memory byte distribution.
+#[inline]
+fn cast_counts_to_u32(counts: &[u64; 256]) -> [u32; 256] {
+    let mut out = [0_u32; 256];
+    for (dst, &src) in out.iter_mut().zip(counts.iter()) {
+        *dst = if src > u64::from(u32::MAX) {
+            u32::MAX
+        } else {
+            src as u32
+        };
+    }
+    out
 }
 
 /// Common byte-distribution distances.
@@ -286,5 +326,30 @@ mod tests {
             ByteDistributionMetric::KolmogorovSmirnov.as_str(),
             "kolmogorov-smirnov"
         );
+        assert_eq!(ByteDistributionMetric::L2.as_str(), "l2");
+        assert_eq!(ByteDistributionMetric::Cosine.as_str(), "cosine");
+    }
+
+    #[test]
+    fn l2_and_cosine_metrics_route_through_simd_dense_distance() {
+        let zeros = ByteDistribution::from_bytes(&[0_u8; 4096]);
+        let text = ByteDistribution::from_bytes(b"fn main() { println!(\"hello\"); }\n");
+
+        // Identical → L2 distance = 0, Cosine distance = 0.
+        let zero_self_l2 = ByteDistributionMetric::L2.distance(&zeros, &zeros);
+        let zero_self_cos = ByteDistributionMetric::Cosine.distance(&zeros, &zeros);
+        assert!(zero_self_l2 < 1e-9, "L2 self={zero_self_l2}");
+        // Cosine of all-zero vector is 0/0 → convention is similarity=0,
+        // so distance = 1.
+        assert!(
+            !(1e-9..=0.99).contains(&zero_self_cos),
+            "cos self={zero_self_cos}"
+        );
+
+        // Different distributions → both metrics are positive.
+        let l2 = ByteDistributionMetric::L2.distance(&zeros, &text);
+        let cos = ByteDistributionMetric::Cosine.distance(&zeros, &text);
+        assert!(l2 > 0.0, "L2 zeros vs text={l2}");
+        assert!(cos > 0.0, "cos zeros vs text={cos}");
     }
 }

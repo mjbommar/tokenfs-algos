@@ -36,7 +36,7 @@ Current and near-term histogram kernels:
 | `stripe4-u32` | Four local tables. | Low-cardinality data. | Larger working set. |
 | `stripe8-u32` | Eight local tables. | Low-cardinality and repeated data. | Larger L1 pressure. |
 | `run-length-u64` | Count runs. | Huge runs/zero tails. | Poor high-entropy branch behavior. |
-| `avx2-stripe4-u32` | Four private stripes behind x86 AVX2 dispatch. | Reproducible AVX2 candidate for benchmarking. | Not a general winner yet; x86 lacks byte-histogram gather/scatter magic. |
+| `avx2-stripe4-u32` | **Planner placeholder, body is currently scalar four-stripe under an AVX2 target_feature gate.** | Bench-history continuity slot — preserved so a future genuine AVX2 implementation can replace it without reshaping the bench schema or planner enum. | **No active planner rule selects this** (see `planner_does_not_select_the_avx2_stripe4_placeholder` in `dispatch::tests`). Per published literature (Powturbo TurboHist shootout, Yann Collet FSE notes, Lemire's group), no AVX2 byte-histogram beats well-tuned scalar 4-/8-stripe on general inputs — VPGATHERDD, pshufb-16-bin nibble lookup, sort-then-RLE, and AVX-512 VPCONFLICTD all fall behind. Don't redirect planner rules into this kernel without bench evidence of a workload class where it dominates. |
 | `adaptive-prefix-1k` | Sample first 1 KiB. | Best general stateless choice so far. | Prefix may miss later macro changes. |
 | `adaptive-spread-4k` | Four 1 KiB samples. | Meso-structured blocks. | Too expensive for small reads. |
 | `adaptive-chunked-64k` | Per-64 KiB prefix choice. | Macro-mixed files. | Extra per-region overhead. |
@@ -106,6 +106,31 @@ before it graduates from experiment to public primitive.
 
 If any of these are intentionally left out, the reason should be documented
 here so the crate does not silently drift away from the paper.
+
+### Fingerprint extent bottleneck (2026-05-01)
+
+Bench evidence (`primitive_matrix/fingerprint-extent-{auto,scalar}` on synthetic
+1 MiB inputs):
+
+| Path                | zeros | prng  | text  | runs  |
+| ------------------- | ----- | ----- | ----- | ----- |
+| `extent-auto` (SSE4.2 CRC32C) | 33.0 MiB/s | 32.4 MiB/s | 32.8 MiB/s | (similar) |
+| `extent-scalar`     | 24.6 MiB/s | 24.2 MiB/s | 24.4 MiB/s | (similar) |
+
+The auto path is already 33% faster than scalar from `_mm_crc32_u32` alone.
+**The bottleneck is the CRC32C hash4 dependency chain**, not the histogram or
+run-length passes — `_mm_crc32_u32` has 3-cycle latency and the existing code
+feeds four stripes (c0/c1/c2/c3) sequentially per loop iteration.
+
+Vectorizing histogram or transition counting in the extent body (the audit's
+original intuition) would shift the bottleneck onto CRC32C anyway and add ~3×
+cache traffic. The right next move is **PCLMULQDQ-parallel CRC32C** — Intel
+whitepaper "Fast CRC Computation for iSCSI Polynomial Using CRC32 Instruction",
+implemented in `intel-isa-l` and `folly`. Expected win: >1 GiB/s extent
+throughput, which closes the F22 block-latency gap to the documented
+`docs/CONSUMER_LATENCY_BUDGETS.md` 1 µs target.
+
+Tracked separately as task #33 in the SIMD roadmap.
 
 ## Immediate Implementation Queue
 

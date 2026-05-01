@@ -49,6 +49,7 @@ fn run() -> Result<()> {
         "bench-workloads" => bench_workloads(&rest),
         "bench-workloads-real" => bench_workloads_real(&rest),
         "bench-workloads-adaptive" => bench_workloads_adaptive(&rest),
+        "bench-similarity-distance" => bench_similarity_distance(&rest),
         "bench-workloads-adaptive-real" => bench_workloads_adaptive_real(&rest),
         "bench-calibrate" => bench_calibrate(&rest),
         "bench-smoke" => bench_smoke(&rest),
@@ -882,6 +883,16 @@ fn bench_primitives_with_env_no_log(
     ]);
     args.extend(extra.iter().cloned());
     run_command_with_env("cargo", args, env_vars)
+}
+
+fn bench_similarity_distance(extra: &[OsString]) -> Result<()> {
+    let started = SystemTime::now()
+        .checked_sub(Duration::from_secs(2))
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let mut args = cargo_args(["bench", "-p", "tokenfs-algos", "--bench", "similarity"]);
+    args.extend(extra.iter().cloned());
+    run_command_with_env("cargo", args, Vec::new())?;
+    record_bench_history_since(Some("similarity_distance"), Some(started))
 }
 
 fn profile(extra: &[OsString]) -> Result<()> {

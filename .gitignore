@@ -1,5 +1,8 @@
 /target/
 **/target/
+
+# Claude Code session state (local only).
+/.claude/
 /_references/*
 !/_references/README.md
 /.maturin/
@@ -22,6 +25,12 @@
 /target/profiles/
 /target/bench-history/
 /target/tokenfs-algos/
+
+# cargo-fuzz outputs (corpora and crash artifacts are local-only).
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/coverage/
+/fuzz/target/
 
 # Editor and OS noise.
 .DS_Store
