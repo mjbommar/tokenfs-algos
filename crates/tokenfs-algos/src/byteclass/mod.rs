@@ -19,6 +19,25 @@ pub struct ByteClassCounts {
     pub other: u64,
 }
 
+/// UTF-8 validation summary.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Utf8Validation {
+    /// True when the entire byte slice is valid UTF-8.
+    pub valid: bool,
+    /// Number of valid bytes before the first error.
+    pub valid_up_to: usize,
+    /// Error length in bytes. Zero means valid or incomplete trailing sequence.
+    pub error_len: u8,
+}
+
+impl Utf8Validation {
+    /// Returns true when validation ended at an incomplete trailing sequence.
+    #[must_use]
+    pub const fn is_incomplete(self) -> bool {
+        !self.valid && self.error_len == 0
+    }
+}
+
 impl ByteClassCounts {
     /// Counts all bytes in the class summary.
     #[must_use]
@@ -29,11 +48,9 @@ impl ByteClassCounts {
 
 /// Byte-class kernels.
 pub mod kernels {
-    use super::ByteClassCounts;
-
     /// Runtime-dispatched byte-class classifier.
     pub mod auto {
-        use super::ByteClassCounts;
+        use crate::byteclass::{ByteClassCounts, Utf8Validation};
 
         /// Counts coarse byte classes using the best available kernel.
         #[must_use]
@@ -52,11 +69,17 @@ pub mod kernels {
 
             super::scalar::classify(bytes)
         }
+
+        /// Validates UTF-8 using the best available kernel.
+        #[must_use]
+        pub fn validate_utf8(bytes: &[u8]) -> Utf8Validation {
+            super::scalar::validate_utf8(bytes)
+        }
     }
 
     /// Portable scalar byte-class classifier.
     pub mod scalar {
-        use super::ByteClassCounts;
+        use crate::byteclass::{ByteClassCounts, Utf8Validation};
 
         /// Counts coarse byte classes in one scalar pass.
         #[must_use]
@@ -76,12 +99,30 @@ pub mod kernels {
                 }
             }
         }
+
+        /// Validates UTF-8 with the scalar reference path.
+        #[must_use]
+        pub fn validate_utf8(bytes: &[u8]) -> Utf8Validation {
+            match core::str::from_utf8(bytes) {
+                Ok(_) => Utf8Validation {
+                    valid: true,
+                    valid_up_to: bytes.len(),
+                    error_len: 0,
+                },
+                Err(error) => Utf8Validation {
+                    valid: false,
+                    valid_up_to: error.valid_up_to(),
+                    error_len: error.error_len().unwrap_or(0) as u8,
+                },
+            }
+        }
     }
 
     /// AVX2 byte-class classifier.
     #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
     pub mod avx2 {
-        use super::{ByteClassCounts, scalar};
+        use super::scalar;
+        use crate::byteclass::ByteClassCounts;
 
         #[cfg(target_arch = "x86")]
         use core::arch::x86::{
@@ -163,6 +204,12 @@ pub fn classify(bytes: &[u8]) -> ByteClassCounts {
     kernels::auto::classify(bytes)
 }
 
+/// Validates UTF-8 using the public runtime-dispatched path.
+#[must_use]
+pub fn validate_utf8(bytes: &[u8]) -> Utf8Validation {
+    kernels::auto::validate_utf8(bytes)
+}
+
 /// Returns true when the slice is strongly ASCII/text dominated.
 #[must_use]
 pub fn is_ascii_dominant(bytes: &[u8]) -> bool {
@@ -175,7 +222,7 @@ pub fn is_ascii_dominant(bytes: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify, is_ascii_dominant, kernels};
+    use super::{classify, is_ascii_dominant, kernels, validate_utf8};
 
     #[test]
     fn classifies_ascii_text() {
@@ -189,7 +236,27 @@ mod tests {
     fn public_default_matches_scalar_on_edge_cases() {
         for bytes in byteclass_cases() {
             assert_eq!(classify(&bytes), kernels::scalar::classify(&bytes));
+            assert_eq!(
+                validate_utf8(&bytes),
+                kernels::scalar::validate_utf8(&bytes)
+            );
         }
+    }
+
+    #[test]
+    fn validates_utf8_with_error_offsets() {
+        let valid = validate_utf8("hello \u{2603}".as_bytes());
+        assert!(valid.valid);
+        assert_eq!(valid.valid_up_to, "hello \u{2603}".len());
+
+        let invalid = validate_utf8(b"abc\xffdef");
+        assert!(!invalid.valid);
+        assert_eq!(invalid.valid_up_to, 3);
+        assert_eq!(invalid.error_len, 1);
+
+        let incomplete = validate_utf8(b"abc\xe2\x98");
+        assert!(incomplete.is_incomplete());
+        assert_eq!(incomplete.valid_up_to, 3);
     }
 
     #[cfg(all(

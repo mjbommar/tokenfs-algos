@@ -12,14 +12,14 @@ on an i9 P-core, an ARM laptop, or a small VM.
 | Family | Purpose | First kernels |
 |---|---|---|
 | Byte histogram | 256-bin byte counts for entropy and classification. | direct, local, striped, run-length, adaptive. |
-| Entropy | H1 and windowed entropy over histograms. | scalar H1, exact H2..H8, hashed sketches for hot paths. |
+| Entropy | H1 and windowed entropy over histograms. | scalar H1, min/collision/Renyi, dense exact H2, exact sparse H2..H8, hashed sketches for hot paths. |
 | Run-length stats | Repetition and compressibility signals. | longest run, run count, adjacent-equal ratio. |
-| Byte-class stats | ASCII/control/UTF-8-ish/binary byte classes. | scalar classification table now, SIMD later. |
+| Byte-class stats | ASCII/control/UTF-8/binary byte classes. | scalar classification and UTF-8 validation now, SIMD later. |
 | Fingerprint | File/window fingerprints for TokenFS indexing. | F22 scalar block/extent and AVX2/SSE4.2 fused block fingerprint. |
 | Divergence | Compare byte distributions across windows/files. | histogram distance, KL/JS candidates later. |
-| Windows/chunks | Shared chunking and rolling state. | fixed-size windows, strided windows, Gear/FastCDC-style chunking. |
+| Windows/chunks | Shared chunking and rolling state. | fixed-size windows, strided windows, Gear chunking, normalized FastCDC-style chunking. |
 | Heavy hitters | Approximate frequent-byte or frequent-token summaries. | Misra-Gries top-K from F23a. |
-| Hash-bin counters | Approximate n-gram distributions without full maps. | CRC32C 4-gram bins from F22/F23a. |
+| Hash-bin counters | Approximate n-gram distributions without full maps. | CRC32C 4-gram bins from F22/F23a; FNV-1a/mix64 scalar hashes for additional families. |
 | Entropy reductions | Fast entropy from bounded integer counts. | `c * log2(c)` lookup table from F23a. |
 
 The first production goal is still a trustworthy histogram and entropy base.

@@ -1,5 +1,7 @@
 //! Small fixed-memory sketches used by fingerprint and calibration kernels.
 
+use crate::math;
+
 /// Pinned sketch kernels.
 pub mod kernels {
     /// Portable scalar sketch kernels.
@@ -490,7 +492,7 @@ pub fn c_log2_c(count: u32) -> f64 {
         0.0
     } else {
         let count = f64::from(count);
-        count * count.log2()
+        count * math::log2_f64(count)
     }
 }
 
@@ -514,7 +516,7 @@ impl<const N: usize> CLog2Lut<N> {
         let mut count = 1_usize;
         while count < N {
             let value = count as f64;
-            values[count] = value * value.log2();
+            values[count] = value * math::log2_f64(value);
             count += 1;
         }
         Self { values }
@@ -539,7 +541,7 @@ pub fn entropy_from_counts_u32(counts: &[u32], total: u64) -> f32 {
 
     let sum = counts.iter().copied().map(c_log2_c).sum::<f64>();
     let total = total as f64;
-    let entropy = total.log2() - sum / total;
+    let entropy = math::log2_f64(total) - sum / total;
     entropy.max(0.0) as f32
 }
 
@@ -560,7 +562,7 @@ pub fn entropy_from_counts_u32_lut<const N: usize>(
         .map(|count| lut.get(count))
         .sum::<f64>();
     let total = total as f64;
-    let entropy = total.log2() - sum / total;
+    let entropy = math::log2_f64(total) - sum / total;
     entropy.max(0.0) as f32
 }
 

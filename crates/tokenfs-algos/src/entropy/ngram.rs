@@ -5,7 +5,7 @@
 //! [`crate::sketch::HashBinSketch`] and the sketch entropy helpers.
 
 #[cfg(any(feature = "std", feature = "alloc"))]
-use crate::histogram::ngram::NGramHistogram;
+use crate::{histogram::ngram::NGramHistogram, math};
 
 /// Computes exact Shannon entropy in bits per observed n-gram.
 #[cfg(any(feature = "std", feature = "alloc"))]
@@ -28,7 +28,7 @@ pub fn h_from_histogram<const N: usize>(histogram: &NGramHistogram<N>) -> f32 {
     let mut entropy = 0.0_f64;
     for (_, count) in histogram.iter() {
         let p = count as f64 / total_f;
-        entropy -= p * p.log2();
+        entropy -= p * math::log2_f64(p);
     }
     entropy as f32
 }

@@ -14,6 +14,10 @@ AVX2 histogram coverage, future-backend honesty, and profiling.
 | Chunking | Implemented allocation-free Gear/FastCDC-style boundary detection with min/avg/max sizes. | `chunk::chunks`, `chunk::find_boundary`, `chunk::ChunkConfig`. |
 | Exact n-gram histograms | Implemented exact sparse histograms for `1 <= N <= 8` behind `std` or `alloc`. | `histogram::ngram::NGramHistogram<N>`. |
 | Exact H2..H8 | Implemented exact Shannon entropy over n-grams. | `entropy::ngram::{h2,h3,h4,h5,h6,h7,h8}`. |
+| Dense H2 and conditional entropy | Implemented no-heap dense byte-pair histogram, joint H2, and conditional next-byte entropy. | `histogram::BytePairHistogram`, `entropy::joint::h2_pairs`, `entropy::conditional::h_next_given_prev`. |
+| Min/Renyi entropy | Implemented min-entropy and collision/Renyi entropy reference paths. | `entropy::min`, `entropy::renyi`. |
+| UTF-8 validation | Implemented scalar pinned UTF-8 validation with error offsets. | `byteclass::validate_utf8`, `byteclass::kernels::scalar::validate_utf8`. |
+| Hash families | Added stable scalar FNV-1a and mix64 hash primitives. | `hash::fnv1a64`, `hash::mix64`. |
 | F22 AVX2 block | Migrated a fused x86 AVX2/SSE4.2 block path and added scalar parity tests. | `fingerprint::kernels::avx2::block`. |
 | AVX2 histogram candidate | Added a pinned AVX2 four-stripe histogram candidate and primitive benchmark rows. | `histogram::kernels::avx2_stripe4_u32::block`. |
 | Backend honesty | Added support reporting so NEON/AVX-512/SVE/SVE2 are scalar fallback until real kernels exist. | `dispatch::backend_kernel_support`. |
@@ -120,7 +124,8 @@ Short-run findings:
 
 ## Remaining Gaps
 
-- A normalized FastCDC variant with multiple masks and distribution tests.
+- Larger normalized FastCDC distribution tests over real files and entropy
+  classes.
 - Fully fused F22 extent AVX2 path.
 - Public planner policy that can use the AVX2 histogram candidate only where it
   wins durably.

@@ -18,6 +18,7 @@ pub use crate::fingerprint::{
     FingerprintKernelInfo, block as fingerprint_block, extent as fingerprint_extent,
     kernel_catalog as fingerprint_kernel_catalog,
 };
+pub use crate::hash::{fnv1a64, mix64};
 pub use crate::histogram::{
     ByteHistogram, HistogramBlockSignals, PlannedByteHistogram, block as histogram_block,
     block_with_profile as histogram_block_with_profile, explain_block as explain_histogram_block,

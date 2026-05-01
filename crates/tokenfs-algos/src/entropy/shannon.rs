@@ -1,6 +1,6 @@
 //! Shannon entropy estimators.
 
-use crate::histogram::ByteHistogram;
+use crate::{histogram::ByteHistogram, math};
 
 /// Computes first-order Shannon entropy in bits per byte.
 ///
@@ -20,7 +20,7 @@ pub fn h1(histogram: &ByteHistogram) -> f32 {
         .filter(|count| *count != 0)
         .map(|count| {
             let p = count as f64 / total;
-            -p * p.log2()
+            -p * math::log2_f64(p)
         })
         .sum::<f64>();
 

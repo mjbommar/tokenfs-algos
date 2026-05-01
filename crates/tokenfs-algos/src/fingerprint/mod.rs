@@ -8,7 +8,7 @@
 use crate::{
     dispatch::{KernelIsa, KernelStatefulness, PrimitiveFamily, WorkingSetClass},
     histogram::ByteHistogram,
-    sketch,
+    math, sketch,
 };
 
 /// F22 block size. A 64 KiB extent contains 256 such blocks.
@@ -452,7 +452,7 @@ fn quantize_q4(bits_per_byte: f32) -> u8 {
     } else if value >= 255.0 {
         255
     } else {
-        value.round() as u8
+        math::round_f32(value) as u8
     }
 }
 
@@ -498,7 +498,7 @@ fn top_k_coverage_q8(histogram: &[u32; 256], k: usize, total: u32) -> u8 {
         top += count;
         counts[index] = 0;
     }
-    let value = ((top as f32 / total as f32) * 256.0).round();
+    let value = math::round_f32((top as f32 / total as f32) * 256.0);
     if value >= 255.0 {
         255
     } else if value <= 0.0 {

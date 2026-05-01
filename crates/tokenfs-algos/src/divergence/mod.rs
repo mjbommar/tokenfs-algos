@@ -4,6 +4,8 @@
 //! for calibration experiments such as "does this random disk block look closer
 //! to known gzip, source-code, font, or database byte distributions?"
 
+use crate::math;
+
 /// Computes total-variation distance between two count vectors.
 ///
 /// Returns `None` when lengths differ. Empty distributions compare as zero.
@@ -79,7 +81,7 @@ pub fn kl_divergence_counts(a: &[u64], b: &[u64], smoothing: f64) -> Option<f64>
         if q == 0.0 {
             return Some(f64::INFINITY);
         }
-        divergence += p * (p / q).ln();
+        divergence += p * math::ln_f64(p / q);
     }
 
     Some(divergence.max(0.0))
@@ -114,14 +116,14 @@ pub fn jensen_shannon_distance_counts(a: &[u64], b: &[u64], smoothing: f64) -> O
         let q = (right as f64 + smoothing) / right_total;
         let m = 0.5 * (p + q);
         if p != 0.0 {
-            left_kl += p * (p / m).ln();
+            left_kl += p * math::ln_f64(p / m);
         }
         if q != 0.0 {
-            right_kl += q * (q / m).ln();
+            right_kl += q * math::ln_f64(q / m);
         }
     }
 
-    Some((0.5 * (left_kl + right_kl)).max(0.0).sqrt())
+    Some(math::sqrt_f64((0.5 * (left_kl + right_kl)).max(0.0)))
 }
 
 /// Computes Hellinger distance between two count vectors.
@@ -134,11 +136,12 @@ pub fn hellinger_distance_counts(a: &[u64], b: &[u64]) -> Option<f64> {
 
     let mut sum = 0.0;
     for (&left, &right) in a.iter().zip(b) {
-        let delta = probability(left, totals.left).sqrt() - probability(right, totals.right).sqrt();
+        let delta = math::sqrt_f64(probability(left, totals.left))
+            - math::sqrt_f64(probability(right, totals.right));
         sum += delta * delta;
     }
 
-    Some((0.5 * sum).sqrt())
+    Some(math::sqrt_f64(0.5 * sum))
 }
 
 /// Computes triangular discrimination between two count vectors.
@@ -179,7 +182,7 @@ pub fn l2_distance_counts_u32(a: &[u32], b: &[u32]) -> Option<f64> {
         sum += delta * delta;
     }
 
-    Some(sum.sqrt())
+    Some(math::sqrt_f64(sum))
 }
 
 /// Computes L2 distance between normalized `u32` count distributions.
@@ -196,7 +199,7 @@ pub fn normalized_l2_distance_counts_u32(a: &[u32], b: &[u32]) -> Option<f64> {
         sum += delta * delta;
     }
 
-    Some(sum.sqrt())
+    Some(math::sqrt_f64(sum))
 }
 
 /// Computes cosine distance `1 - cosine_similarity` for dense `u32` counts.
@@ -224,7 +227,7 @@ pub fn cosine_distance_counts_u32(a: &[u32], b: &[u32]) -> Option<f64> {
         return Some(1.0);
     }
 
-    let similarity = dot / (left_norm.sqrt() * right_norm.sqrt());
+    let similarity = dot / (math::sqrt_f64(left_norm) * math::sqrt_f64(right_norm));
     Some((1.0 - similarity).clamp(0.0, 2.0))
 }
 
@@ -253,14 +256,14 @@ pub fn jensen_shannon_distance_counts_u32(a: &[u32], b: &[u32], smoothing: f64) 
         let q = (f64::from(right) + smoothing) / right_total;
         let m = 0.5 * (p + q);
         if p != 0.0 {
-            left_kl += p * (p / m).ln();
+            left_kl += p * math::ln_f64(p / m);
         }
         if q != 0.0 {
-            right_kl += q * (q / m).ln();
+            right_kl += q * math::ln_f64(q / m);
         }
     }
 
-    Some((0.5 * (left_kl + right_kl)).max(0.0).sqrt())
+    Some(math::sqrt_f64((0.5 * (left_kl + right_kl)).max(0.0)))
 }
 
 #[derive(Clone, Copy)]

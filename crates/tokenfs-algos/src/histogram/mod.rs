@@ -3,6 +3,7 @@
 pub mod byte;
 pub mod kernels;
 pub mod ngram;
+pub mod pair;
 
 #[cfg(feature = "bench-internals")]
 pub mod bench_internals;
@@ -13,6 +14,7 @@ use crate::dispatch::{
 };
 
 pub use byte::ByteHistogram;
+pub use pair::BytePairHistogram;
 
 /// Result of a planned histogram call with the selected plan attached.
 #[derive(Clone, Debug, Eq, PartialEq)]

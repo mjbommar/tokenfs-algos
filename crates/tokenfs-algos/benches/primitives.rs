@@ -10,7 +10,7 @@ use std::{
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use tokenfs_algos::{
-    byteclass, distribution, divergence, entropy, fingerprint,
+    byteclass, chunk, distribution, divergence, entropy, fingerprint, hash,
     histogram::{self, ByteHistogram},
     runlength, selector, sketch, structure,
 };
@@ -56,12 +56,21 @@ enum PrimitiveKernel {
     ByteClassClassify,
     ByteClassClassifyScalar,
     ByteClassClassifyAvx2,
+    ByteClassUtf8Validate,
     RunLengthSummarize,
     StructureSummarize,
     EntropyH1FromHistogram,
+    EntropyMinH1,
+    EntropyCollisionH1,
     EntropyH2Exact,
     EntropyH4Exact,
     EntropyH8Exact,
+    EntropyJointH2Dense,
+    EntropyConditionalNextPrev,
+    HashFnv1a64,
+    HashMix64,
+    ChunkGear,
+    ChunkFastCdc,
     DivergenceByteJs,
     DivergenceByteKs,
     DistributionNearestByteJs,
@@ -98,12 +107,21 @@ impl PrimitiveKernel {
             Self::SketchEntropyLut,
             Self::ByteClassClassify,
             Self::ByteClassClassifyScalar,
+            Self::ByteClassUtf8Validate,
             Self::RunLengthSummarize,
             Self::StructureSummarize,
             Self::EntropyH1FromHistogram,
+            Self::EntropyMinH1,
+            Self::EntropyCollisionH1,
             Self::EntropyH2Exact,
             Self::EntropyH4Exact,
             Self::EntropyH8Exact,
+            Self::EntropyJointH2Dense,
+            Self::EntropyConditionalNextPrev,
+            Self::HashFnv1a64,
+            Self::HashMix64,
+            Self::ChunkGear,
+            Self::ChunkFastCdc,
             Self::DivergenceByteJs,
             Self::DivergenceByteKs,
             Self::DistributionNearestByteJs,
@@ -162,12 +180,21 @@ impl PrimitiveKernel {
             Self::ByteClassClassify => "byteclass-classify",
             Self::ByteClassClassifyScalar => "byteclass-classify-scalar",
             Self::ByteClassClassifyAvx2 => "byteclass-classify-avx2",
+            Self::ByteClassUtf8Validate => "byteclass-utf8-validate",
             Self::RunLengthSummarize => "runlength-summarize",
             Self::StructureSummarize => "structure-summarize",
             Self::EntropyH1FromHistogram => "entropy-h1-from-histogram",
+            Self::EntropyMinH1 => "entropy-min-h1",
+            Self::EntropyCollisionH1 => "entropy-collision-h1",
             Self::EntropyH2Exact => "entropy-h2-exact",
             Self::EntropyH4Exact => "entropy-h4-exact",
             Self::EntropyH8Exact => "entropy-h8-exact",
+            Self::EntropyJointH2Dense => "entropy-joint-h2-dense",
+            Self::EntropyConditionalNextPrev => "entropy-conditional-next-prev",
+            Self::HashFnv1a64 => "hash-fnv1a64",
+            Self::HashMix64 => "hash-mix64",
+            Self::ChunkGear => "chunk-gear",
+            Self::ChunkFastCdc => "chunk-fastcdc",
             Self::DivergenceByteJs => "divergence-byte-js",
             Self::DivergenceByteKs => "divergence-byte-ks",
             Self::DistributionNearestByteJs => "distribution-nearest-byte-js",
@@ -206,13 +233,20 @@ impl PrimitiveKernel {
             }
             Self::ByteClassClassify
             | Self::ByteClassClassifyScalar
-            | Self::ByteClassClassifyAvx2 => "byteclass",
+            | Self::ByteClassClassifyAvx2
+            | Self::ByteClassUtf8Validate => "byteclass",
             Self::RunLengthSummarize => "runlength",
             Self::StructureSummarize => "structure",
             Self::EntropyH1FromHistogram
+            | Self::EntropyMinH1
+            | Self::EntropyCollisionH1
             | Self::EntropyH2Exact
             | Self::EntropyH4Exact
-            | Self::EntropyH8Exact => "entropy",
+            | Self::EntropyH8Exact
+            | Self::EntropyJointH2Dense
+            | Self::EntropyConditionalNextPrev => "entropy",
+            Self::HashFnv1a64 | Self::HashMix64 => "hash",
+            Self::ChunkGear | Self::ChunkFastCdc => "chunk",
             Self::DivergenceByteJs | Self::DivergenceByteKs => "divergence",
             Self::DistributionNearestByteJs
             | Self::DistributionNearestByteHellinger
@@ -488,6 +522,7 @@ fn run_kernel(kernel: PrimitiveKernel, bytes: &[u8]) -> u64 {
             }
             fold_byteclass(byteclass::kernels::scalar::classify(bytes))
         }
+        PrimitiveKernel::ByteClassUtf8Validate => fold_utf8(byteclass::validate_utf8(bytes)),
         PrimitiveKernel::RunLengthSummarize => {
             let summary = runlength::summarize(bytes);
             summary.transitions ^ summary.bytes_in_runs_ge4 ^ summary.runs_ge4
@@ -503,9 +538,27 @@ fn run_kernel(kernel: PrimitiveKernel, bytes: &[u8]) -> u64 {
             let histogram = ByteHistogram::from_block(bytes);
             entropy::shannon::h1(&histogram).to_bits() as u64
         }
+        PrimitiveKernel::EntropyMinH1 => {
+            let histogram = ByteHistogram::from_block(bytes);
+            entropy::min::h1(&histogram).to_bits() as u64
+        }
+        PrimitiveKernel::EntropyCollisionH1 => {
+            let histogram = ByteHistogram::from_block(bytes);
+            entropy::renyi::collision_h1(&histogram).to_bits() as u64
+        }
         PrimitiveKernel::EntropyH2Exact => entropy::ngram::h2(bytes).to_bits() as u64,
         PrimitiveKernel::EntropyH4Exact => entropy::ngram::h4(bytes).to_bits() as u64,
         PrimitiveKernel::EntropyH8Exact => entropy::ngram::h8(bytes).to_bits() as u64,
+        PrimitiveKernel::EntropyJointH2Dense => entropy::joint::h2_pairs(bytes).to_bits() as u64,
+        PrimitiveKernel::EntropyConditionalNextPrev => {
+            entropy::conditional::h_next_given_prev(bytes).to_bits() as u64
+        }
+        PrimitiveKernel::HashFnv1a64 => hash::fnv1a64(bytes),
+        PrimitiveKernel::HashMix64 => hash::mix64(bytes, 0x1234_5678_9abc_def0),
+        PrimitiveKernel::ChunkGear => fold_chunks(chunk::chunks(bytes, chunk_config())),
+        PrimitiveKernel::ChunkFastCdc => {
+            fold_chunks(chunk::fastcdc_chunks(bytes, fastcdc_config()))
+        }
         PrimitiveKernel::DivergenceByteJs => {
             let (left, right) = split_halves(bytes);
             let left = histogram::kernels::direct_u64::block(left);
@@ -582,6 +635,32 @@ fn fold_byteclass(counts: byteclass::ByteClassCounts) -> u64 {
         ^ counts.control.rotate_left(13)
         ^ counts.high_bit.rotate_left(19)
         ^ counts.other.rotate_left(29)
+}
+
+fn fold_utf8(validation: byteclass::Utf8Validation) -> u64 {
+    validation.valid as u64
+        ^ (validation.valid_up_to as u64).rotate_left(11)
+        ^ u64::from(validation.error_len).rotate_left(23)
+}
+
+fn chunk_config() -> chunk::ChunkConfig {
+    chunk::ChunkConfig::with_sizes(1024, 4096, 16 * 1024)
+}
+
+fn fastcdc_config() -> chunk::FastCdcConfig {
+    chunk::FastCdcConfig::with_sizes(1024, 4096, 16 * 1024)
+}
+
+fn fold_chunks<I>(chunks: I) -> u64
+where
+    I: IntoIterator<Item = chunk::Chunk>,
+{
+    chunks.into_iter().fold(0_u64, |acc, chunk| {
+        acc.wrapping_add(chunk.len() as u64)
+            ^ (chunk.start as u64).rotate_left(7)
+            ^ (chunk.end as u64).rotate_left(13)
+            ^ chunk.boundary_hash.rotate_left(23)
+    })
 }
 
 fn fold_u32_bins(bins: &[u32]) -> u64 {
