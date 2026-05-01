@@ -802,9 +802,9 @@ fn byte_class_bitmap(histogram: &[u32; 256]) -> u8 {
     let total = histogram.iter().sum::<u32>().max(1);
     let half = total / 2;
     let printable = (0x21..=0x7e).map(|byte| histogram[byte]).sum::<u32>();
-    let whitespace = [b' ', b'\n', b'\r', b'\t']
-        .into_iter()
-        .map(|byte| histogram[byte as usize])
+    let whitespace = b" \n\r\t"
+        .iter()
+        .map(|&byte| histogram[byte as usize])
         .sum::<u32>();
     let control = (0x00..0x20).map(|byte| histogram[byte]).sum::<u32>();
     let high = (0x80..=0xff).map(|byte| histogram[byte]).sum::<u32>();
