@@ -59,7 +59,9 @@ fn run() -> Result<()> {
         "bench-alignment-sweep" => bench_alignment_sweep(&rest),
         "bench-thread-topology" => bench_thread_topology(&rest),
         "bench-planner-parity" => bench_planner_parity(&rest),
+        "bench-planner-parity-real" => bench_planner_parity_real(&rest),
         "bench-cache-hot-cold" => bench_cache_hot_cold(&rest),
+        "bench-real-magic-bpe" => bench_real_magic_bpe(&rest),
         "bench-profile" => bench_profile_suite(&rest),
         "bench-primitives" => bench_primitives(&rest),
         "bench-primitives-real" => bench_primitives_real(&rest),
@@ -71,10 +73,12 @@ fn run() -> Result<()> {
         "bench-byteclass-real" => bench_primitive_filter_real(&rest, "byteclass"),
         "bench-runlength" => bench_primitive_filter(&rest, "runlength"),
         "bench-entropy" => bench_primitive_filter(&rest, "entropy"),
+        "bench-divergence" => bench_primitive_filter(&rest, "divergence"),
         "bench-selector" => bench_primitive_filter(&rest, "selector"),
         "bench-compare" => bench_compare(&rest),
         "bench-report" => bench_report(&rest),
         "bench-log" => record_bench_history(None),
+        "calibrate-magic-bpe" => calibrate_magic_bpe(&rest),
         "profile" => profile(&rest),
         "profile-real" => profile_real(&rest),
         "profile-flamegraph" => profile_flamegraph(&rest),
@@ -355,6 +359,118 @@ fn bench_planner_parity(extra: &[OsString]) -> Result<()> {
     )
 }
 
+fn bench_planner_parity_real(args: &[OsString]) -> Result<()> {
+    let (path, extra) = path_or_first_existing(
+        args,
+        &[
+            "/nas4/data/tokenfs-ubuntu/bench/cow/f22-extent-bytes.bin",
+            "../tokenfs-paper/data/tokenizers-corpus-matched/rootfs-65536.json",
+            "../tokenfs-paper/data/tokenizers-corpus-matched/rootfs-4096.json",
+        ],
+    )?;
+    bench_workloads_with_env(
+        &extra,
+        vec![
+            ("TOKENFS_ALGOS_F21_DATA".into(), path.into_os_string()),
+            ("TOKENFS_ALGOS_KERNEL_SWEEP".into(), "1".into()),
+            (
+                "TOKENFS_ALGOS_WORKLOAD_SUITE".into(),
+                "synthetic-full,paper".into(),
+            ),
+            ("TOKENFS_ALGOS_THREAD_SWEEP".into(), "full".into()),
+        ],
+    )
+}
+
+fn bench_real_magic_bpe(args: &[OsString]) -> Result<()> {
+    let (path, extra) = path_or_default(args, "/nas4/data/training/magic-bpe/project/data")?;
+    bench_workloads_with_env(
+        &extra,
+        vec![
+            ("TOKENFS_ALGOS_MAGIC_BPE_DATA".into(), path.into_os_string()),
+            ("TOKENFS_ALGOS_ONLY_MAGIC_BPE".into(), "1".into()),
+            ("TOKENFS_ALGOS_KERNEL_SWEEP".into(), "1".into()),
+            ("TOKENFS_ALGOS_THREAD_SWEEP".into(), "quick".into()),
+            ("TOKENFS_ALGOS_MATRIX_LEVEL".into(), "quick".into()),
+        ],
+    )
+}
+
+fn calibrate_magic_bpe(args: &[OsString]) -> Result<()> {
+    let (root, _extra) = path_or_default(args, "/nas4/data/training/magic-bpe/project/data")?;
+    let index = root.join("processed-index.jsonl");
+    let processed = root.join("processed");
+    let limit = env_usize("TOKENFS_ALGOS_MAGIC_BPE_LIMIT").unwrap_or(4096);
+    let per_mime_limit = env_usize("TOKENFS_ALGOS_MAGIC_BPE_PER_MIME_LIMIT").unwrap_or(128);
+    let seed = env_usize("TOKENFS_ALGOS_MAGIC_BPE_SEED").unwrap_or(0x51f1_5eed) as u64;
+    let shuffle = env_bool("TOKENFS_ALGOS_MAGIC_BPE_SHUFFLE").unwrap_or(true);
+    let output = env::var_os("TOKENFS_ALGOS_MAGIC_BPE_CALIBRATION")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("target/calibration/magic-bpe-byte-histograms.jsonl"));
+
+    let mut candidates = magic_bpe_candidates(&index, seed, shuffle)?;
+    candidates.sort_by_key(|candidate| candidate.key);
+
+    let mut aggregates = BTreeMap::<String, MagicBpeAggregate>::new();
+    let mut per_mime = BTreeMap::<String, usize>::new();
+    let mut selected = 0_usize;
+    for candidate in candidates {
+        if limit != 0 && selected >= limit {
+            break;
+        }
+        let count = per_mime.entry(candidate.mime.clone()).or_default();
+        if per_mime_limit != 0 && *count >= per_mime_limit {
+            continue;
+        }
+        let path = processed.join(&candidate.sample_relpath);
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        if bytes.is_empty() {
+            continue;
+        }
+
+        let aggregate = aggregates
+            .entry(candidate.mime.clone())
+            .or_insert_with(|| MagicBpeAggregate::new(candidate.mime.clone()));
+        aggregate.samples += 1;
+        aggregate.bytes += bytes.len() as u64;
+        for &byte in &bytes {
+            aggregate.counts[byte as usize] += 1;
+        }
+
+        *count += 1;
+        selected += 1;
+    }
+
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("failed to create `{}`: {error}", parent.display()))?;
+    }
+    let mut file = File::create(&output)
+        .map_err(|error| format!("failed to create `{}`: {error}", output.display()))?;
+    for aggregate in aggregates.values() {
+        let line = json!({
+            "mime_type": aggregate.mime,
+            "samples": aggregate.samples,
+            "bytes": aggregate.bytes,
+            "h1_bits_per_byte": entropy_from_counts(&aggregate.counts),
+            "counts": aggregate.counts.to_vec(),
+        });
+        serde_json::to_writer(&mut file, &line)
+            .map_err(|error| format!("failed to write calibration JSON: {error}"))?;
+        file.write_all(b"\n").map_err(write_error(&output))?;
+    }
+
+    eprintln!(
+        "xtask: wrote {} MIME byte-histogram calibrations from {} samples to `{}`",
+        aggregates.len(),
+        selected,
+        output.display()
+    );
+    Ok(())
+}
+
 fn bench_cache_hot_cold(extra: &[OsString]) -> Result<()> {
     bench_workloads_with_env(
         extra,
@@ -573,6 +689,7 @@ fn bench_report(args: &[OsString]) -> Result<()> {
     })?;
 
     let timing_csv = report_dir.join("timing.csv");
+    let planner_parity_csv = report_dir.join("planner-parity.csv");
     let heatmap_html = report_dir.join("heatmap.html");
     let histogram_svg = report_dir.join("throughput-histogram.svg");
     let summary_md = report_dir.join("summary.md");
@@ -585,11 +702,13 @@ fn bench_report(args: &[OsString]) -> Result<()> {
     }];
     visual_artifacts.extend(write_dimension_visuals(&report_dir, &records)?);
     write_timing_csv(&timing_csv, &records)?;
+    let planner_parity_written = write_planner_parity_csv(&planner_parity_csv, &records)?;
     write_heatmap_html(
         &heatmap_html,
         &records,
         &jsonl_path,
         &timing_csv,
+        planner_parity_written.then_some(planner_parity_csv.as_path()),
         &histogram_svg,
         &summary_md,
         &visual_artifacts,
@@ -599,6 +718,7 @@ fn bench_report(args: &[OsString]) -> Result<()> {
         &records,
         &jsonl_path,
         &timing_csv,
+        planner_parity_written.then_some(planner_parity_csv.as_path()),
         &heatmap_html,
         &histogram_svg,
         &visual_artifacts,
@@ -606,6 +726,12 @@ fn bench_report(args: &[OsString]) -> Result<()> {
 
     eprintln!("xtask: wrote benchmark report `{}`", summary_md.display());
     eprintln!("xtask: wrote timing table `{}`", timing_csv.display());
+    if planner_parity_written {
+        eprintln!(
+            "xtask: wrote planner parity `{}`",
+            planner_parity_csv.display()
+        );
+    }
     eprintln!("xtask: wrote heatmap `{}`", heatmap_html.display());
     eprintln!(
         "xtask: wrote throughput histogram `{}`",
@@ -1682,11 +1808,94 @@ fn write_timing_csv(path: &Path, records: &[BenchReportRecord]) -> Result<()> {
     Ok(())
 }
 
+fn write_planner_parity_csv(path: &Path, records: &[BenchReportRecord]) -> Result<bool> {
+    if !records
+        .iter()
+        .any(|record| !record.planned_kernel.trim().is_empty())
+    {
+        return Ok(false);
+    }
+
+    let mut workloads: BTreeMap<String, Vec<&BenchReportRecord>> = BTreeMap::new();
+    for record in records {
+        workloads
+            .entry(workload_label(record))
+            .or_default()
+            .push(record);
+    }
+
+    let mut file = File::create(path)
+        .map_err(|error| format!("failed to create `{}`: {error}", path.display()))?;
+    writeln!(
+        file,
+        "workload,case,source,content,entropy,scale,access,chunk,threads,pattern,planned_kernel,planned_confidence_q8,winner_kernel,winner_gib_per_s,planned_gib_per_s,gap_gib_per_s,gap_pct,kernel_results"
+    )
+    .map_err(write_error(path))?;
+
+    for (workload, mut rows) in workloads {
+        rows.sort_by(|left, right| {
+            right
+                .gib_per_s
+                .partial_cmp(&left.gib_per_s)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| left.kernel.cmp(&right.kernel))
+        });
+        let Some(best) = rows.first().copied() else {
+            continue;
+        };
+        let planned_kernel = rows
+            .iter()
+            .find(|row| !row.planned_kernel.is_empty())
+            .map_or("", |row| row.planned_kernel.as_str());
+        let planned = rows.iter().find(|row| row.kernel == planned_kernel);
+        let planned_gib = planned.map_or(0.0, |row| row.gib_per_s);
+        let gap = best.gib_per_s - planned_gib;
+        let gap_pct = if planned_gib > 0.0 {
+            gap / planned_gib * 100.0
+        } else {
+            0.0
+        };
+        let kernel_results = rows
+            .iter()
+            .map(|row| format!("{}:{:.6}", row.kernel, row.gib_per_s))
+            .collect::<Vec<_>>()
+            .join(";");
+
+        writeln!(
+            file,
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{:.6},{:.6},{:.6},{:.3},{}",
+            csv_cell(&workload),
+            csv_cell(&best.case),
+            csv_cell(&best.source),
+            csv_cell(&best.content),
+            csv_cell(&best.entropy),
+            csv_cell(&best.scale),
+            csv_cell(&best.access),
+            csv_cell(&best.chunk),
+            csv_cell(&best.threads),
+            csv_cell(&best.pattern),
+            csv_cell(planned_kernel),
+            csv_cell(&best.planned_confidence_q8),
+            csv_cell(&best.kernel),
+            best.gib_per_s,
+            planned_gib,
+            gap,
+            gap_pct,
+            csv_cell(&kernel_results),
+        )
+        .map_err(write_error(path))?;
+    }
+
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn write_heatmap_html(
     path: &Path,
     records: &[BenchReportRecord],
     source: &Path,
     timing_csv: &Path,
+    planner_parity_csv: Option<&Path>,
     histogram_svg: &Path,
     summary_md: &Path,
     visual_artifacts: &[ReportArtifact],
@@ -1731,11 +1940,24 @@ fn write_heatmap_html(
         html_escape(&source.display().to_string())
     )
     .map_err(write_error(path))?;
-    writeln!(
+    write!(
         file,
-        "<nav><a href=\"{}\">summary.md</a><a href=\"{}\">timing.csv</a><a href=\"{}\">throughput-histogram.svg</a></nav>",
+        "<nav><a href=\"{}\">summary.md</a><a href=\"{}\">timing.csv</a>",
         html_escape(&local_href(summary_md)),
         html_escape(&local_href(timing_csv)),
+    )
+    .map_err(write_error(path))?;
+    if let Some(planner_parity_csv) = planner_parity_csv {
+        write!(
+            file,
+            "<a href=\"{}\">planner-parity.csv</a>",
+            html_escape(&local_href(planner_parity_csv)),
+        )
+        .map_err(write_error(path))?;
+    }
+    writeln!(
+        file,
+        "<a href=\"{}\">throughput-histogram.svg</a></nav>",
         html_escape(&local_href(histogram_svg)),
     )
     .map_err(write_error(path))?;
@@ -1965,6 +2187,17 @@ fn write_dimension_visuals(
             file_name: local_href(&path),
             title: "Planner vs Best Kernel".into(),
             caption: "Confusion matrix: static planner recommendation crossed with the measured winner for each workload row.".into(),
+        });
+    }
+
+    let path = report_dir.join("planner-gap-top.svg");
+    if write_planner_gap_svg(&path, records)? {
+        artifacts.push(ReportArtifact {
+            file_name: local_href(&path),
+            title: "Largest Planner Gaps".into(),
+            caption:
+                "Worst measured throughput gaps between the planner-selected kernel and the row winner."
+                    .into(),
         });
     }
 
@@ -2523,6 +2756,78 @@ fn write_planner_confusion_svg(path: &Path, records: &[BenchReportRecord]) -> Re
     Ok(true)
 }
 
+fn write_planner_gap_svg(path: &Path, records: &[BenchReportRecord]) -> Result<bool> {
+    let mut workloads: BTreeMap<String, Vec<&BenchReportRecord>> = BTreeMap::new();
+    for record in records {
+        workloads
+            .entry(workload_label(record))
+            .or_default()
+            .push(record);
+    }
+
+    let mut bars = Vec::new();
+    for (workload, rows) in workloads {
+        let planned = rows
+            .iter()
+            .find(|row| !row.planned_kernel.is_empty())
+            .map_or("", |row| row.planned_kernel.as_str());
+        if planned.is_empty() {
+            continue;
+        }
+        let Some(best) = rows.iter().max_by(|left, right| {
+            left.gib_per_s
+                .partial_cmp(&right.gib_per_s)
+                .unwrap_or(Ordering::Equal)
+        }) else {
+            continue;
+        };
+        let Some(planned_row) = rows.iter().find(|row| row.kernel == planned) else {
+            bars.push((
+                format!(
+                    "{workload} | planned {planned} missing, winner {}",
+                    best.kernel
+                ),
+                best.gib_per_s,
+                "planned kernel was not measured".to_owned(),
+            ));
+            continue;
+        };
+        if best.kernel == planned_row.kernel {
+            continue;
+        }
+        let gap_pct = if planned_row.gib_per_s > 0.0 {
+            (best.gib_per_s - planned_row.gib_per_s) / planned_row.gib_per_s * 100.0
+        } else {
+            0.0
+        };
+        bars.push((
+            format!(
+                "{workload} | planner {} -> winner {}",
+                planned_row.kernel, best.kernel
+            ),
+            gap_pct.max(0.0),
+            format!(
+                "{gap_pct:.1}% gap; planned {:.2} GiB/s, winner {:.2} GiB/s",
+                planned_row.gib_per_s, best.gib_per_s
+            ),
+        ));
+    }
+
+    if bars.is_empty() {
+        return Ok(false);
+    }
+
+    bars.sort_by(|left, right| right.1.partial_cmp(&left.1).unwrap_or(Ordering::Equal));
+    bars.truncate(30);
+    write_bar_chart_svg(
+        path,
+        "Largest Planner Throughput Gaps",
+        "top planner misses by percent gap versus measured winner",
+        &bars,
+    )?;
+    Ok(true)
+}
+
 fn write_count_heatmap_svg(
     path: &Path,
     title: &str,
@@ -2732,11 +3037,13 @@ fn winner_counts(records: &[BenchReportRecord]) -> Vec<(String, usize)> {
     counts
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_bench_report_summary(
     path: &Path,
     records: &[BenchReportRecord],
     source: &Path,
     timing_csv: &Path,
+    planner_parity_csv: Option<&Path>,
     heatmap_html: &Path,
     histogram_svg: &Path,
     visual_artifacts: &[ReportArtifact],
@@ -2777,6 +3084,14 @@ fn write_bench_report_summary(
     writeln!(file, "## Artifacts").map_err(write_error(path))?;
     writeln!(file).map_err(write_error(path))?;
     writeln!(file, "- timing_csv: `{}`", timing_csv.display()).map_err(write_error(path))?;
+    if let Some(planner_parity_csv) = planner_parity_csv {
+        writeln!(
+            file,
+            "- planner_parity_csv: `{}`",
+            planner_parity_csv.display()
+        )
+        .map_err(write_error(path))?;
+    }
     writeln!(file, "- heatmap_html: `{}`", heatmap_html.display()).map_err(write_error(path))?;
     writeln!(
         file,
@@ -3454,6 +3769,134 @@ fn default_real_data_path() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join("ubuntu-26.04-desktop-amd64.iso"))
 }
 
+struct MagicBpeCalibrationCandidate {
+    key: u64,
+    sample_relpath: String,
+    mime: String,
+}
+
+struct MagicBpeAggregate {
+    mime: String,
+    samples: u64,
+    bytes: u64,
+    counts: [u64; 256],
+}
+
+impl MagicBpeAggregate {
+    fn new(mime: String) -> Self {
+        Self {
+            mime,
+            samples: 0,
+            bytes: 0,
+            counts: [0; 256],
+        }
+    }
+}
+
+fn magic_bpe_candidates(
+    index: &Path,
+    seed: u64,
+    shuffle: bool,
+) -> Result<Vec<MagicBpeCalibrationCandidate>> {
+    let file = File::open(index)
+        .map_err(|error| format!("failed to open `{}`: {error}", index.display()))?;
+    let mut candidates = Vec::new();
+
+    for (line_index, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.map_err(|error| {
+            format!(
+                "failed to read line {} from `{}`: {error}",
+                line_index + 1,
+                index.display()
+            )
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let sample_bytes = value
+            .get("sample_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if sample_bytes == 0 {
+            continue;
+        }
+        let Some(sample_relpath) = value.get("sample_relpath").and_then(Value::as_str) else {
+            continue;
+        };
+        let mime = value
+            .get("mime_type")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let original_path = value.get("path").and_then(Value::as_str).unwrap_or("");
+        let key = if shuffle {
+            mix_u64(
+                seed ^ line_index as u64 ^ stable_str_hash(mime) ^ stable_str_hash(original_path),
+            )
+        } else {
+            line_index as u64
+        };
+
+        candidates.push(MagicBpeCalibrationCandidate {
+            key,
+            sample_relpath: sample_relpath.to_owned(),
+            mime: mime.to_owned(),
+        });
+    }
+
+    Ok(candidates)
+}
+
+fn entropy_from_counts(counts: &[u64; 256]) -> f64 {
+    let total = counts.iter().copied().sum::<u64>();
+    if total == 0 {
+        return 0.0;
+    }
+
+    let total_f = total as f64;
+    counts
+        .iter()
+        .copied()
+        .filter(|count| *count != 0)
+        .map(|count| {
+            let p = count as f64 / total_f;
+            -p * p.log2()
+        })
+        .sum()
+}
+
+fn env_usize(name: &str) -> Option<usize> {
+    env::var(name).ok().and_then(|value| value.parse().ok())
+}
+
+fn env_bool(name: &str) -> Option<bool> {
+    env::var(name).ok().map(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on" | "shuffle"
+        )
+    })
+}
+
+fn stable_str_hash(value: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in value.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    hash
+}
+
+fn mix_u64(mut value: u64) -> u64 {
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
 fn command_exists(program: &str) -> bool {
     let Some(path) = env::var_os("PATH") else {
         return false;
@@ -3528,6 +3971,10 @@ fn help() {
                     2/4/physical/logical/saturated thread sweep\n\
            bench-planner-parity\n\
                     planner-vs-all-kernels matrix with no hidden direct kernels\n\
+           bench-planner-parity-real [path]\n\
+                    planner-vs-all-kernels matrix including F21/F22/rootfs data\n\
+           bench-real-magic-bpe [path]\n\
+                    optional Magic-BPE processed-index matrix; limit/shuffle via TOKENFS_ALGOS_MAGIC_BPE_*\n\
            bench-cache-hot-cold\n\
                     hot-repeat, cold-sweep, and same-file-repeat access patterns\n\
            bench-profile\n\
@@ -3552,6 +3999,8 @@ fn help() {
                     isolated run-length primitive benchmarks\n\
            bench-entropy\n\
                     isolated entropy primitive benchmarks\n\
+           bench-divergence\n\
+                    isolated byte-distribution divergence benchmarks\n\
            bench-selector\n\
                     isolated selector-signal benchmarks\n\
            bench-compare <old.jsonl> <new.jsonl>\n\
@@ -3560,6 +4009,8 @@ fn help() {
                     generate heatmap, histogram, and timing-table artifacts\n\
            bench-log\n\
                     log the current target/criterion results to benchmark history\n\
+           calibrate-magic-bpe [path]\n\
+                    write MIME-grouped byte-histogram calibration JSONL from Magic-BPE samples\n\
            profile  benchmark under perf when available\n\
            profile-real [path]\n\
                     real-data benchmark under perf when available\n\

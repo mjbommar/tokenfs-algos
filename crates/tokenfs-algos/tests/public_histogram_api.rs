@@ -24,6 +24,11 @@ fn explain_block_returns_the_plan_used() {
         explained.plan.strategy,
         HistogramStrategy::AdaptiveLowEntropyFast
     );
+    assert_eq!(
+        explained.signals.entropy,
+        tokenfs_algos::dispatch::EntropyClass::Low
+    );
+    assert_eq!(explained.signals.top_ratio_q8(), 255);
     assert_eq!(explained.histogram.counts(), &reference_counts(&bytes));
 }
 
@@ -38,6 +43,8 @@ fn pinned_kernels_match_reference_counts() {
         kernels::stripe4_u32::block(&input),
         kernels::stripe8_u32::block(&input),
         kernels::run_length_u64::block(&input),
+        #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+        kernels::avx2_palette_u32::block(&input),
         kernels::adaptive_prefix_1k::block(&input),
         kernels::adaptive_prefix_4k::block(&input),
         kernels::adaptive_spread_4k::block(&input),

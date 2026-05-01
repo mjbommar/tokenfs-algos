@@ -773,6 +773,7 @@ dependencies = [
  "hex-literal",
  "proptest",
  "rayon",
+ "serde_json",
 ]
 
 [[package]]

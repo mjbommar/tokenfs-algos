@@ -14,7 +14,7 @@ pub use crate::fingerprint::{
     kernel_catalog as fingerprint_kernel_catalog,
 };
 pub use crate::histogram::{
-    ByteHistogram, PlannedByteHistogram, block as histogram_block,
+    ByteHistogram, HistogramBlockSignals, PlannedByteHistogram, block as histogram_block,
     block_with_profile as histogram_block_with_profile, explain_block as explain_histogram_block,
     plan_block as plan_histogram_block,
 };

@@ -5,11 +5,12 @@ use std::{
     env,
     fmt::Write as _,
     fs::{self, File},
-    io::{Read, Seek, SeekFrom, Write as _},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write as _},
     path::{Path, PathBuf},
     sync::Arc,
 };
 
+use serde_json::Value;
 use tokenfs_algos::dispatch::{
     ApiContext, CacheState, ContentKind, EntropyClass, EntropyScale, ProcessorProfile,
     ReadPattern as PlannerReadPattern, SourceHint, WorkloadShape, plan_histogram,
@@ -284,7 +285,12 @@ pub(crate) fn workload_matrix_inputs_from_env() -> Vec<WorkloadInput> {
     let threaded = full || env::var_os("TOKENFS_ALGOS_THREAD_SWEEP").is_some();
     let base_size = if full { 4 * 1024 * 1024 } else { 1024 * 1024 };
     let suite = WorkloadSuite::from_env(full);
-    let mut payloads = synthetic_workload_payloads(base_size);
+    let only_magic_bpe = env::var_os("TOKENFS_ALGOS_ONLY_MAGIC_BPE").is_some();
+    let mut payloads = if only_magic_bpe {
+        Vec::new()
+    } else {
+        synthetic_workload_payloads(base_size)
+    };
     let profile = ProcessorProfile::detect();
 
     if suite.mixed_regions {
@@ -323,7 +329,7 @@ pub(crate) fn workload_matrix_inputs_from_env() -> Vec<WorkloadInput> {
         }
     }
     for path in paper_paths_from_env(suite.paper) {
-        match real_workload_payloads_from_path(&path, base_size.min(1024 * 1024)) {
+        match paper_workload_payloads_from_path(&path, base_size.min(1024 * 1024)) {
             Ok(real_payloads) => payloads.extend(real_payloads),
             Err(error) => {
                 eprintln!(
@@ -333,15 +339,56 @@ pub(crate) fn workload_matrix_inputs_from_env() -> Vec<WorkloadInput> {
             }
         }
     }
+    if let Some(path) = env::var_os("TOKENFS_ALGOS_MAGIC_BPE_DATA") {
+        match magic_bpe_payloads_from_root(Path::new(&path)) {
+            Ok(real_payloads) => payloads.extend(real_payloads),
+            Err(error) => {
+                eprintln!(
+                    "skipping Magic-BPE workload matrix payloads for `{}`: {error}",
+                    PathBuf::from(path).display()
+                );
+            }
+        }
+    }
+
+    filter_payloads_from_env(&mut payloads);
+    let access_filter = env_tokens("TOKENFS_ALGOS_WORKLOAD_ACCESS");
 
     let mut inputs = Vec::new();
     for payload in &payloads {
         for access in workload_access_patterns(payload.len(), full, threaded, &suite) {
+            if !access_matches_filter(&access, access_filter.as_deref()) {
+                continue;
+            }
+            if access.processed_bytes(payload.len()) == 0 {
+                continue;
+            }
             inputs.push(WorkloadInput::new(payload, access, &profile));
         }
     }
 
+    if let Some(max_inputs) = env_usize("TOKENFS_ALGOS_WORKLOAD_MAX_INPUTS") {
+        inputs.truncate(max_inputs);
+    }
+
     inputs
+}
+
+fn filter_payloads_from_env(payloads: &mut Vec<Payload>) {
+    if let Some(tokens) = env_tokens("TOKENFS_ALGOS_WORKLOAD_CASES") {
+        payloads.retain(|payload| {
+            matches_any_token(&payload.label, &tokens)
+                || matches_any_token(payload.source, &tokens)
+                || matches_any_token(payload.content, &tokens)
+                || matches_any_token(payload.entropy, &tokens)
+                || matches_any_token(payload.scale, &tokens)
+                || matches_any_token(payload.pattern, &tokens)
+        });
+    }
+
+    if let Some(max_payloads) = env_usize("TOKENFS_ALGOS_WORKLOAD_MAX_PAYLOADS") {
+        payloads.truncate(max_payloads);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -763,6 +810,115 @@ fn real_workload_payloads_from_path(path: &Path, size: usize) -> std::io::Result
     Ok(payloads)
 }
 
+fn paper_workload_payloads_from_path(path: &Path, size: usize) -> std::io::Result<Vec<Payload>> {
+    let mut payloads = real_workload_payloads_from_path(path, size)?;
+    for payload in &mut payloads {
+        payload.source = "paper";
+        payload.content = "binary";
+        payload.entropy = "mixed";
+        payload.scale = "macro";
+        payload.pattern = "paper-extents";
+    }
+    Ok(payloads)
+}
+
+fn magic_bpe_payloads_from_root(root: &Path) -> std::io::Result<Vec<Payload>> {
+    let index = root.join("processed-index.jsonl");
+    let processed = root.join("processed");
+    let file = File::open(&index)?;
+    let limit = env_usize("TOKENFS_ALGOS_MAGIC_BPE_LIMIT").unwrap_or(64);
+    let per_mime_limit = env_usize("TOKENFS_ALGOS_MAGIC_BPE_PER_MIME_LIMIT").unwrap_or(4);
+    let seed = env_usize("TOKENFS_ALGOS_MAGIC_BPE_SEED").unwrap_or(0x51f1_5eed) as u64;
+    let shuffle = env_bool("TOKENFS_ALGOS_MAGIC_BPE_SHUFFLE").unwrap_or(true);
+    let mut candidates = Vec::new();
+
+    for (index, line) in BufReader::new(file).lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let sample_bytes = value
+            .get("sample_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if sample_bytes == 0 {
+            continue;
+        }
+        let Some(sample_relpath) = value.get("sample_relpath").and_then(Value::as_str) else {
+            continue;
+        };
+        let mime = value
+            .get("mime_type")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let extension = value.get("extension").and_then(Value::as_str);
+        let original_path = value.get("path").and_then(Value::as_str).unwrap_or("");
+        let key = if shuffle {
+            mix_u64(seed ^ index as u64 ^ stable_str_hash(mime) ^ stable_str_hash(original_path))
+        } else {
+            index as u64
+        };
+        candidates.push(MagicBpeCandidate {
+            key,
+            sample_relpath: sample_relpath.to_owned(),
+            mime: mime.to_owned(),
+            extension: extension.map(ToOwned::to_owned),
+            original_path: original_path.to_owned(),
+        });
+    }
+
+    candidates.sort_by_key(|candidate| candidate.key);
+
+    let mut payloads = Vec::new();
+    let mut per_mime = std::collections::BTreeMap::<String, usize>::new();
+    for candidate in candidates {
+        if limit != 0 && payloads.len() >= limit {
+            break;
+        }
+        let count = per_mime.entry(candidate.mime.clone()).or_default();
+        if per_mime_limit != 0 && *count >= per_mime_limit {
+            continue;
+        }
+
+        let path = processed.join(&candidate.sample_relpath);
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        if bytes.is_empty() {
+            continue;
+        }
+
+        let pattern = magic_bpe_pattern(&candidate.mime, candidate.extension.as_deref());
+        let content = magic_bpe_content(&candidate.mime, candidate.extension.as_deref());
+        let entropy = entropy_label(shannon_entropy(&bytes));
+        let scale = scale_label(&bytes);
+        let label = format!(
+            "magic-{}-{}-{}",
+            pattern,
+            sanitize_id_fragment(&candidate.mime),
+            payloads.len()
+        );
+        let mut payload = Payload::new(label, "magic-bpe", content, entropy, scale, pattern, bytes);
+        payload.byte_len = payload.byte_len.min(64 * 1024);
+        let _ = &candidate.original_path;
+        payloads.push(payload);
+        *count += 1;
+    }
+
+    Ok(payloads)
+}
+
+struct MagicBpeCandidate {
+    key: u64,
+    sample_relpath: String,
+    mime: String,
+    extension: Option<String>,
+    original_path: String,
+}
+
 fn real_workload_payloads_from_dir(path: &Path, size: usize) -> std::io::Result<Vec<Payload>> {
     let mut payloads = Vec::new();
     let mut files = Vec::new();
@@ -1008,6 +1164,32 @@ fn thread_sweep_counts(full: bool) -> Vec<usize> {
     }
 
     counts.into_iter().filter(|threads| *threads > 1).collect()
+}
+
+fn access_matches_filter(access: &AccessPattern, tokens: Option<&[String]>) -> bool {
+    let Some(tokens) = tokens else {
+        return true;
+    };
+    if tokens.is_empty() {
+        return true;
+    }
+
+    let access_name = access.name();
+    if matches_any_token(access_name, tokens) {
+        return true;
+    }
+
+    let chunk_key = format!("{access_name}-{}", access.chunk_size());
+    if matches_any_token(&chunk_key, tokens) {
+        return true;
+    }
+
+    let threads = access.threads();
+    threads > 1
+        && (matches_any_token("parallel", tokens)
+            || matches_any_token("threaded", tokens)
+            || matches_any_token(&format!("{access_name}-{threads}"), tokens)
+            || matches_any_token(&format!("threads-{threads}"), tokens))
 }
 
 fn insert_quick_thread_sweep(counts: &mut BTreeSet<usize>) {
@@ -1578,7 +1760,7 @@ fn workload_shape(
         },
         source_hint: match payload.source {
             "synthetic" => SourceHint::Synthetic,
-            "real" => SourceHint::RealFile,
+            "real" | "magic-bpe" => SourceHint::RealFile,
             "paper" | "f21" | "f22" => SourceHint::PaperExtent,
             _ => SourceHint::Unknown,
         },
@@ -1635,4 +1817,165 @@ fn sanitize_id_fragment(value: &str) -> String {
             }
         })
         .collect()
+}
+
+fn env_usize(name: &str) -> Option<usize> {
+    env::var(name).ok().and_then(|value| value.parse().ok())
+}
+
+fn env_tokens(name: &str) -> Option<Vec<String>> {
+    env::var(name).ok().map(|value| {
+        value
+            .split([',', ';', ':', ' '])
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .map(|token| token.to_ascii_lowercase())
+            .collect()
+    })
+}
+
+fn matches_any_token(value: &str, tokens: &[String]) -> bool {
+    let value = value.to_ascii_lowercase();
+    tokens
+        .iter()
+        .any(|token| token == "*" || value == *token || value.contains(token))
+}
+
+fn env_bool(name: &str) -> Option<bool> {
+    env::var(name).ok().map(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on" | "shuffle"
+        )
+    })
+}
+
+fn magic_bpe_content(mime: &str, extension: Option<&str>) -> &'static str {
+    let mime = mime.to_ascii_lowercase();
+    let extension = extension.unwrap_or("").to_ascii_lowercase();
+    if mime.starts_with("text/")
+        || mime.contains("json")
+        || mime.contains("xml")
+        || mime.contains("javascript")
+        || matches!(
+            extension.as_str(),
+            "rs" | "c"
+                | "h"
+                | "cpp"
+                | "hpp"
+                | "py"
+                | "js"
+                | "ts"
+                | "json"
+                | "csv"
+                | "html"
+                | "svg"
+                | "md"
+                | "toml"
+        )
+    {
+        "text"
+    } else {
+        "binary"
+    }
+}
+
+fn magic_bpe_pattern(mime: &str, extension: Option<&str>) -> &'static str {
+    let mime = mime.to_ascii_lowercase();
+    let extension = extension.unwrap_or("").to_ascii_lowercase();
+
+    if mime.contains("gzip")
+        || mime.contains("zstd")
+        || mime.contains("zlib")
+        || mime.contains("zip")
+        || mime.contains("7z")
+        || matches!(
+            extension.as_str(),
+            "gz" | "zst" | "zip" | "7z" | "xz" | "bz2"
+        )
+    {
+        "archive-compressed"
+    } else if mime.starts_with("image/") {
+        "image"
+    } else if mime.starts_with("audio/") {
+        "audio"
+    } else if mime.contains("font")
+        || matches!(extension.as_str(), "ttf" | "otf" | "woff" | "woff2" | "tfm")
+    {
+        "font"
+    } else if mime.contains("sqlite") || matches!(extension.as_str(), "sqlite" | "db") {
+        "database"
+    } else if mime.contains("executable")
+        || mime.contains("sharedlib")
+        || matches!(extension.as_str(), "exe" | "so" | "a" | "o")
+    {
+        "executable-library"
+    } else if mime.starts_with("text/")
+        || mime.contains("json")
+        || mime.contains("javascript")
+        || matches!(
+            extension.as_str(),
+            "rs" | "c"
+                | "h"
+                | "cpp"
+                | "hpp"
+                | "py"
+                | "js"
+                | "ts"
+                | "json"
+                | "csv"
+                | "html"
+                | "svg"
+                | "md"
+                | "toml"
+        )
+    {
+        "text-source"
+    } else if mime.contains("powerpoint")
+        || mime.contains("excel")
+        || mime.contains("ole")
+        || matches!(
+            extension.as_str(),
+            "ppt" | "pptx" | "xls" | "xlsx" | "doc" | "docx"
+        )
+    {
+        "document"
+    } else {
+        "binary-other"
+    }
+}
+
+fn entropy_label(h1: f64) -> &'static str {
+    if h1 < 2.5 {
+        "low"
+    } else if h1 >= 7.25 {
+        "high"
+    } else {
+        "medium"
+    }
+}
+
+fn scale_label(bytes: &[u8]) -> &'static str {
+    if bytes.len() < 8 * 1024 {
+        return "micro";
+    }
+    let (_, min, max) = chunk_entropy_stats(bytes, 4 * 1024);
+    if max - min >= 3.0 { "meso" } else { "flat" }
+}
+
+fn stable_str_hash(value: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in value.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    hash
+}
+
+fn mix_u64(mut value: u64) -> u64 {
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
 }

@@ -368,6 +368,8 @@ pub enum HistogramStrategy {
     Stripe8U32,
     /// Run-length count.
     RunLengthU64,
+    /// AVX2 palette counter with exact scalar fallback.
+    Avx2PaletteU32,
     /// Cheap adaptive classifier using a 1 KiB prefix.
     AdaptivePrefix1K,
     /// Adaptive classifier using a 4 KiB prefix.
@@ -404,6 +406,7 @@ impl HistogramStrategy {
             Self::Stripe4U32 => "stripe4-u32",
             Self::Stripe8U32 => "stripe8-u32",
             Self::RunLengthU64 => "run-length-u64",
+            Self::Avx2PaletteU32 => "avx2-palette-u32",
             Self::AdaptivePrefix1K => "adaptive-prefix-1k",
             Self::AdaptivePrefix4K => "adaptive-prefix-4k",
             Self::AdaptiveSpread4K => "adaptive-spread-4k",
@@ -434,7 +437,7 @@ pub const fn histogram_kernel_catalog() -> &'static [HistogramKernelInfo] {
     &HISTOGRAM_KERNEL_CATALOG
 }
 
-const HISTOGRAM_KERNEL_CATALOG: [HistogramKernelInfo; 17] = [
+const HISTOGRAM_KERNEL_CATALOG: [HistogramKernelInfo; 18] = [
     HistogramKernelInfo {
         family: PrimitiveFamily::ByteHistogram,
         strategy: HistogramStrategy::DirectU64,
@@ -494,6 +497,18 @@ const HISTOGRAM_KERNEL_CATALOG: [HistogramKernelInfo; 17] = [
         sample_bytes: 0,
         private_table_bytes: 0,
         description: "run scanner that increments one counter per equal-byte run",
+    },
+    HistogramKernelInfo {
+        family: PrimitiveFamily::ByteHistogram,
+        strategy: HistogramStrategy::Avx2PaletteU32,
+        isa: KernelIsa::X86Avx2,
+        working_set: WorkingSetClass::L1,
+        statefulness: KernelStatefulness::Stateless,
+        min_bytes: 1024,
+        preferred_chunk_bytes: 0,
+        sample_bytes: 4096,
+        private_table_bytes: 16 * 8,
+        description: "AVX2 movemask/popcnt palette counter with exact scalar fallback",
     },
     HistogramKernelInfo {
         family: PrimitiveFamily::ByteHistogram,
@@ -659,7 +674,7 @@ pub struct HistogramPlan {
 /// Plans a histogram strategy from processor and workload metadata.
 #[must_use]
 pub fn plan_histogram(profile: &ProcessorProfile, workload: &WorkloadShape) -> HistogramPlan {
-    let _backend = profile.backend;
+    let backend = profile.backend;
     let total_bytes = workload.total_bytes;
     let call_bytes = if workload.chunk_bytes == 0 {
         total_bytes
@@ -670,8 +685,59 @@ pub fn plan_histogram(profile: &ProcessorProfile, workload: &WorkloadShape) -> H
     let oversubscribed = profile
         .logical_cpus
         .is_some_and(|logical| threads > logical.max(1));
+    let random_like = matches!(
+        workload.read_pattern,
+        ReadPattern::RandomTiny | ReadPattern::Random | ReadPattern::ZipfianHotCold
+    );
+    let sequential_like = matches!(
+        workload.read_pattern,
+        ReadPattern::Sequential | ReadPattern::Readahead
+    );
+    let mixedish_entropy = matches!(workload.entropy, EntropyClass::Mixed | EntropyClass::Medium);
+    let structured_scale = matches!(workload.scale, EntropyScale::Meso | EntropyScale::Macro);
 
     if threads <= 1 && call_bytes <= 4 * 1024 {
+        if workload.entropy == EntropyClass::Low && call_bytes > 1 {
+            return plan(
+                HistogramStrategy::RunLengthU64,
+                workload.chunk_bytes,
+                0,
+                235,
+                "small low-entropy reads favored the dedicated run-length kernel",
+            );
+        }
+
+        if call_bytes >= 4 * 1024 && mixedish_entropy && structured_scale {
+            let strategy = if backend == Backend::Avx2 && workload.scale == EntropyScale::Meso {
+                HistogramStrategy::Avx2PaletteU32
+            } else if workload.scale == EntropyScale::Macro {
+                HistogramStrategy::Stripe8U32
+            } else {
+                HistogramStrategy::Stripe4U32
+            };
+            return plan(
+                strategy,
+                workload.chunk_bytes,
+                0,
+                210,
+                "small structured 4K reads favored pinned structured-data kernels",
+            );
+        }
+
+        if random_like
+            && call_bytes >= 4 * 1024
+            && workload.entropy == EntropyClass::High
+            && workload.scale == EntropyScale::Meso
+        {
+            return plan(
+                HistogramStrategy::Stripe4U32,
+                workload.chunk_bytes,
+                0,
+                195,
+                "small high-entropy meso random reads favored striped private buckets",
+            );
+        }
+
         return plan(
             HistogramStrategy::DirectU64,
             workload.chunk_bytes,
@@ -681,17 +747,24 @@ pub fn plan_histogram(profile: &ProcessorProfile, workload: &WorkloadShape) -> H
         );
     }
 
-    if matches!(
-        workload.read_pattern,
-        ReadPattern::RandomTiny | ReadPattern::Random | ReadPattern::ZipfianHotCold
-    ) && call_bytes <= 4 * 1024
-    {
+    if random_like && call_bytes <= 4 * 1024 {
         return plan(
             HistogramStrategy::DirectU64,
             workload.chunk_bytes,
             0,
             255,
             "tiny random reads are dominated by call overhead; avoid adaptive sampling",
+        );
+    }
+
+    if workload.entropy == EntropyClass::Low && backend == Backend::Avx2 && total_bytes >= 64 * 1024
+    {
+        return plan(
+            HistogramStrategy::Avx2PaletteU32,
+            workload.chunk_bytes,
+            4 * 1024,
+            240,
+            "AVX2 palette counting dominated large low-entropy calibration slices",
         );
     }
 
@@ -702,6 +775,34 @@ pub fn plan_histogram(profile: &ProcessorProfile, workload: &WorkloadShape) -> H
             4 * 1024,
             235,
             "large low-entropy inputs need the dedicated low-entropy fast path",
+        );
+    }
+
+    if workload.source_hint == SourceHint::PaperExtent
+        && total_bytes >= 64 * 1024
+        && matches!(workload.entropy, EntropyClass::Mixed | EntropyClass::Medium)
+    {
+        return plan(
+            HistogramStrategy::Stripe8U32,
+            workload.chunk_bytes,
+            0,
+            210,
+            "F22/rootfs sidecar calibration favored stripe8 on large mixed extents",
+        );
+    }
+
+    if backend == Backend::Avx2
+        && workload.content == ContentKind::Binary
+        && workload.entropy == EntropyClass::Medium
+        && workload.scale == EntropyScale::Micro
+        && total_bytes >= 8 * 1024
+    {
+        return plan(
+            HistogramStrategy::Avx2PaletteU32,
+            workload.chunk_bytes,
+            4 * 1024,
+            175,
+            "AVX2 palette counting is worth trying on medium-entropy micro-pattern binary inputs",
         );
     }
 
@@ -716,7 +817,43 @@ pub fn plan_histogram(profile: &ProcessorProfile, workload: &WorkloadShape) -> H
     }
 
     if threads > 1 || workload.context == ApiContext::Parallel {
+        if mixedish_entropy && workload.content != ContentKind::Text {
+            if workload.scale == EntropyScale::Macro && backend == Backend::Avx2 {
+                return plan(
+                    HistogramStrategy::Avx2PaletteU32,
+                    64 * 1024,
+                    4 * 1024,
+                    if oversubscribed { 150 } else { 205 },
+                    "parallel macro-mixed calibration favored AVX2 palette counting",
+                );
+            }
+
+            if workload.scale == EntropyScale::Meso {
+                return plan(
+                    if threads >= 4 {
+                        HistogramStrategy::Stripe4U32
+                    } else {
+                        HistogramStrategy::Stripe8U32
+                    },
+                    64 * 1024,
+                    0,
+                    if oversubscribed { 150 } else { 205 },
+                    "parallel meso-structured calibration favored striped private buckets",
+                );
+            }
+        }
+
         if workload.content == ContentKind::Text {
+            if total_bytes <= 4 * 1024 {
+                return plan(
+                    HistogramStrategy::DirectU64,
+                    64 * 1024,
+                    0,
+                    if oversubscribed { 150 } else { 205 },
+                    "tiny parallel text scans favored direct counting",
+                );
+            }
+
             return plan(
                 HistogramStrategy::LocalU32,
                 64 * 1024,
@@ -726,9 +863,14 @@ pub fn plan_histogram(profile: &ProcessorProfile, workload: &WorkloadShape) -> H
             );
         }
 
-        if workload.entropy == EntropyClass::High && workload.scale == EntropyScale::Flat {
+        if workload.entropy == EntropyClass::High {
+            let strategy = if workload.scale == EntropyScale::Meso && threads >= 4 {
+                HistogramStrategy::LocalU32
+            } else {
+                HistogramStrategy::DirectU64
+            };
             return plan(
-                HistogramStrategy::DirectU64,
+                strategy,
                 64 * 1024,
                 0,
                 if oversubscribed { 145 } else { 210 },
@@ -745,6 +887,22 @@ pub fn plan_histogram(profile: &ProcessorProfile, workload: &WorkloadShape) -> H
         );
     }
 
+    if workload.source_hint == SourceHint::RealFile
+        && workload.content == ContentKind::Binary
+        && workload.entropy == EntropyClass::High
+        && workload.scale == EntropyScale::Flat
+        && total_bytes >= 64 * 1024
+        && !random_like
+    {
+        return plan(
+            HistogramStrategy::DirectU64,
+            workload.chunk_bytes,
+            0,
+            185,
+            "real high-entropy flat files favored direct counting in calibration",
+        );
+    }
+
     if workload.alignment_offset >= 16
         && workload.entropy == EntropyClass::High
         && total_bytes >= 64 * 1024
@@ -755,6 +913,21 @@ pub fn plan_histogram(profile: &ProcessorProfile, workload: &WorkloadShape) -> H
             0,
             185,
             "large unaligned high-entropy inputs avoid the direct u64 path",
+        );
+    }
+
+    if backend == Backend::Avx2
+        && workload.scale == EntropyScale::Macro
+        && workload.entropy == EntropyClass::Mixed
+        && sequential_like
+        && total_bytes >= 64 * 1024
+    {
+        return plan(
+            HistogramStrategy::Avx2PaletteU32,
+            workload.chunk_bytes,
+            4 * 1024,
+            205,
+            "sequential macro-mixed calibration favored AVX2 palette counting",
         );
     }
 
@@ -778,6 +951,30 @@ pub fn plan_histogram(profile: &ProcessorProfile, workload: &WorkloadShape) -> H
             1024,
             205,
             "macro-scale variation benefits from per-region kernel choice",
+        );
+    }
+
+    if workload.entropy == EntropyClass::High
+        && workload.scale == EntropyScale::Meso
+        && total_bytes >= 64 * 1024
+        && workload.context == ApiContext::Block
+    {
+        return plan(
+            HistogramStrategy::Stripe8U32,
+            workload.chunk_bytes,
+            0,
+            205,
+            "high-entropy meso real blocks favored stripe8 over adaptive probes",
+        );
+    }
+
+    if workload.scale == EntropyScale::Meso && sequential_like && call_bytes >= 64 * 1024 {
+        return plan(
+            HistogramStrategy::Stripe8U32,
+            workload.chunk_bytes,
+            0,
+            210,
+            "sequential meso-structured calibration favored stripe8 private buckets",
         );
     }
 
@@ -1118,9 +1315,9 @@ fn detect_aarch64_backend() -> Backend {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApiContext, CacheState, ContentKind, EntropyClass, EntropyScale, HistogramStrategy,
-        ProcessorProfile, ReadPattern, SourceHint, WorkloadShape, histogram_kernel_catalog,
-        plan_histogram,
+        ApiContext, Backend, CacheState, ContentKind, EntropyClass, EntropyScale,
+        HistogramStrategy, ProcessorProfile, ReadPattern, SourceHint, WorkloadShape,
+        histogram_kernel_catalog, plan_histogram,
     };
 
     #[test]
@@ -1144,6 +1341,35 @@ mod tests {
 
         assert_eq!(plan.strategy, HistogramStrategy::DirectU64);
         assert_eq!(plan.sample_bytes, 0);
+    }
+
+    #[test]
+    fn planner_uses_run_length_for_small_low_entropy_reads() {
+        let profile = ProcessorProfile::portable();
+        let mut workload = WorkloadShape::new(ApiContext::Sequential, 1024 * 1024);
+        workload.chunk_bytes = 4 * 1024;
+        workload.entropy = EntropyClass::Low;
+        workload.scale = EntropyScale::Flat;
+
+        let plan = plan_histogram(&profile, &workload);
+
+        assert_eq!(plan.strategy, HistogramStrategy::RunLengthU64);
+        assert_eq!(plan.sample_bytes, 0);
+    }
+
+    #[test]
+    fn planner_uses_avx2_palette_for_large_low_entropy_inputs() {
+        let profile = ProcessorProfile {
+            backend: Backend::Avx2,
+            ..ProcessorProfile::portable()
+        };
+        let mut workload = WorkloadShape::new(ApiContext::Block, 1024 * 1024);
+        workload.entropy = EntropyClass::Low;
+        workload.scale = EntropyScale::Flat;
+
+        let plan = plan_histogram(&profile, &workload);
+
+        assert_eq!(plan.strategy, HistogramStrategy::Avx2PaletteU32);
     }
 
     #[test]
@@ -1205,6 +1431,74 @@ mod tests {
     }
 
     #[test]
+    fn planner_avoids_adaptive_wrappers_for_parallel_high_entropy_meso_scans() {
+        let profile = ProcessorProfile {
+            logical_cpus: Some(24),
+            ..ProcessorProfile::portable()
+        };
+        let mut workload = WorkloadShape::new(ApiContext::Parallel, 64 * 1024);
+        workload.read_pattern = ReadPattern::ParallelSequential;
+        workload.content = ContentKind::Binary;
+        workload.entropy = EntropyClass::High;
+        workload.scale = EntropyScale::Meso;
+        workload.chunk_bytes = 64 * 1024;
+        workload.threads = 2;
+
+        let plan = plan_histogram(&profile, &workload);
+
+        assert_eq!(plan.strategy, HistogramStrategy::DirectU64);
+
+        workload.threads = 4;
+        let plan = plan_histogram(&profile, &workload);
+
+        assert_eq!(plan.strategy, HistogramStrategy::LocalU32);
+    }
+
+    #[test]
+    fn planner_uses_stripe8_for_high_entropy_meso_blocks() {
+        let profile = ProcessorProfile::portable();
+        let mut workload = WorkloadShape::new(ApiContext::Block, 64 * 1024);
+        workload.content = ContentKind::Binary;
+        workload.entropy = EntropyClass::High;
+        workload.scale = EntropyScale::Meso;
+        workload.source_hint = SourceHint::RealFile;
+
+        let plan = plan_histogram(&profile, &workload);
+
+        assert_eq!(plan.strategy, HistogramStrategy::Stripe8U32);
+    }
+
+    #[test]
+    fn planner_uses_stripe4_for_high_entropy_meso_random_4k_reads() {
+        let profile = ProcessorProfile::portable();
+        let mut workload = WorkloadShape::new(ApiContext::Random, 64 * 1024);
+        workload.read_pattern = ReadPattern::Random;
+        workload.content = ContentKind::Binary;
+        workload.entropy = EntropyClass::High;
+        workload.scale = EntropyScale::Meso;
+        workload.chunk_bytes = 4 * 1024;
+        workload.source_hint = SourceHint::RealFile;
+
+        let plan = plan_histogram(&profile, &workload);
+
+        assert_eq!(plan.strategy, HistogramStrategy::Stripe4U32);
+    }
+
+    #[test]
+    fn planner_uses_direct_for_real_high_entropy_flat_files() {
+        let profile = ProcessorProfile::portable();
+        let mut workload = WorkloadShape::new(ApiContext::Block, 64 * 1024);
+        workload.content = ContentKind::Binary;
+        workload.entropy = EntropyClass::High;
+        workload.scale = EntropyScale::Flat;
+        workload.source_hint = SourceHint::RealFile;
+
+        let plan = plan_histogram(&profile, &workload);
+
+        assert_eq!(plan.strategy, HistogramStrategy::DirectU64);
+    }
+
+    #[test]
     fn planner_uses_local_table_for_medium_text() {
         let profile = ProcessorProfile::portable();
         let mut workload = WorkloadShape::new(ApiContext::Block, 64 * 1024);
@@ -1258,6 +1552,83 @@ mod tests {
         let plan = plan_histogram(&profile, &workload);
 
         assert_eq!(plan.strategy, HistogramStrategy::DirectU64);
+    }
+
+    #[test]
+    fn planner_uses_stripe8_for_large_paper_mixed_extents() {
+        let profile = ProcessorProfile::portable();
+        let mut workload = WorkloadShape::new(ApiContext::Block, 1024 * 1024);
+        workload.content = ContentKind::Binary;
+        workload.entropy = EntropyClass::Mixed;
+        workload.scale = EntropyScale::Macro;
+        workload.source_hint = SourceHint::PaperExtent;
+
+        let plan = plan_histogram(&profile, &workload);
+
+        assert_eq!(plan.strategy, HistogramStrategy::Stripe8U32);
+    }
+
+    #[test]
+    fn planner_can_select_avx2_palette_for_medium_micro_binary_inputs() {
+        let profile = ProcessorProfile {
+            backend: Backend::Avx2,
+            ..ProcessorProfile::portable()
+        };
+        let mut workload = WorkloadShape::new(ApiContext::Block, 64 * 1024);
+        workload.content = ContentKind::Binary;
+        workload.entropy = EntropyClass::Medium;
+        workload.scale = EntropyScale::Micro;
+
+        let plan = plan_histogram(&profile, &workload);
+
+        assert_eq!(plan.strategy, HistogramStrategy::Avx2PaletteU32);
+    }
+
+    #[test]
+    fn planner_uses_stripe8_for_sequential_meso_structured_inputs() {
+        let profile = ProcessorProfile::portable();
+        let mut workload = WorkloadShape::new(ApiContext::Sequential, 1024 * 1024);
+        workload.content = ContentKind::Binary;
+        workload.entropy = EntropyClass::Mixed;
+        workload.scale = EntropyScale::Meso;
+        workload.chunk_bytes = 64 * 1024;
+
+        let plan = plan_histogram(&profile, &workload);
+
+        assert_eq!(plan.strategy, HistogramStrategy::Stripe8U32);
+    }
+
+    #[test]
+    fn planner_uses_striped_buckets_for_parallel_meso_structured_inputs() {
+        let profile = ProcessorProfile::portable();
+        let mut workload = WorkloadShape::new(ApiContext::Parallel, 1024 * 1024);
+        workload.content = ContentKind::Binary;
+        workload.entropy = EntropyClass::Mixed;
+        workload.scale = EntropyScale::Meso;
+        workload.chunk_bytes = 64 * 1024;
+        workload.threads = 4;
+
+        let plan = plan_histogram(&profile, &workload);
+
+        assert_eq!(plan.strategy, HistogramStrategy::Stripe4U32);
+    }
+
+    #[test]
+    fn planner_uses_avx2_palette_for_parallel_macro_mixed_inputs() {
+        let profile = ProcessorProfile {
+            backend: Backend::Avx2,
+            ..ProcessorProfile::portable()
+        };
+        let mut workload = WorkloadShape::new(ApiContext::Parallel, 1024 * 1024);
+        workload.content = ContentKind::Mixed;
+        workload.entropy = EntropyClass::Mixed;
+        workload.scale = EntropyScale::Macro;
+        workload.chunk_bytes = 64 * 1024;
+        workload.threads = 4;
+
+        let plan = plan_histogram(&profile, &workload);
+
+        assert_eq!(plan.strategy, HistogramStrategy::Avx2PaletteU32);
     }
 
     #[test]
