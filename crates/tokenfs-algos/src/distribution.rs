@@ -214,11 +214,24 @@ pub fn nearest_byte_distribution<'a>(
         })
 }
 
+/// Finds the nearest calibrated byte-distribution reference.
+///
+/// This is the short public-contract alias for callers that are already inside
+/// the `distribution` module namespace.
+#[must_use]
+pub fn nearest_reference<'a>(
+    query: &ByteDistribution,
+    references: &'a [ByteDistributionReference<'a>],
+    metric: ByteDistributionMetric,
+) -> Option<NearestByteDistribution<'a>> {
+    nearest_byte_distribution(query, references, metric)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ByteDistribution, ByteDistributionMetric, ByteDistributionReference,
-        nearest_byte_distribution,
+        nearest_byte_distribution, nearest_reference,
     };
 
     #[test]
@@ -260,6 +273,11 @@ mod tests {
         assert_eq!(nearest.index, 0);
         assert_eq!(nearest.mime_type, "application/x-zero");
         assert_eq!(nearest.distance, 0.0);
+
+        let nearest_alias =
+            nearest_reference(&zeros, &references, ByteDistributionMetric::JensenShannon)
+                .expect("non-empty references");
+        assert_eq!(nearest_alias.index, nearest.index);
     }
 
     #[test]

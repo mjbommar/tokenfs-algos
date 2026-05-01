@@ -55,6 +55,7 @@ fn run() -> Result<()> {
         "bench-synthetic-full" => bench_synthetic_full(&rest),
         "bench-real-iso" => bench_real_iso(&rest),
         "bench-real-f21" => bench_real_f21(&rest),
+        "bench-real-f22" => bench_real_f22(&rest),
         "bench-size-sweep" => bench_size_sweep(&rest),
         "bench-alignment-sweep" => bench_alignment_sweep(&rest),
         "bench-thread-topology" => bench_thread_topology(&rest),
@@ -306,6 +307,18 @@ fn bench_real_f21(args: &[OsString]) -> Result<()> {
             "../tokenfs-paper/data/tokenizers-corpus-matched/rootfs-4096.json",
         ],
     )?;
+    cargo([
+        "test",
+        "-p",
+        "tokenfs-algos",
+        "--features",
+        "calibration",
+        "--test",
+        "fingerprint_f22",
+        "--",
+        "--nocapture",
+        "calibration",
+    ])?;
     bench_workloads_with_env(
         &extra,
         vec![
@@ -314,7 +327,60 @@ fn bench_real_f21(args: &[OsString]) -> Result<()> {
             ("TOKENFS_ALGOS_MATRIX_LEVEL".into(), "full".into()),
             ("TOKENFS_ALGOS_THREAD_SWEEP".into(), "full".into()),
         ],
-    )
+    )?;
+    let latest = latest_bench_jsonl()?;
+    bench_report(&[latest.clone().into_os_string()])?;
+    verify_f21_workload_bench(&latest)
+}
+
+fn bench_real_f22(args: &[OsString]) -> Result<()> {
+    let (path, extra) = path_or_first_existing(
+        args,
+        &["/nas4/data/tokenfs-ubuntu/bench/cow/f22-extent-bytes.bin"],
+    )?;
+
+    cargo([
+        "test",
+        "-p",
+        "tokenfs-algos",
+        "--features",
+        "calibration",
+        "--test",
+        "fingerprint_f22",
+        "--",
+        "--nocapture",
+        "f22_",
+    ])?;
+
+    let bench_args = default_or_extra(
+        &extra,
+        [
+            "--",
+            "--sample-size",
+            "10",
+            "--warm-up-time",
+            "0.02",
+            "--measurement-time",
+            "0.05",
+            "primitive_matrix/fingerprint",
+        ],
+    );
+    bench_primitives_with_env(
+        &bench_args,
+        vec![
+            (
+                "TOKENFS_ALGOS_PRIMITIVE_FILTER".into(),
+                "fingerprint".into(),
+            ),
+            (
+                "TOKENFS_ALGOS_PRIMITIVE_REAL_FILES".into(),
+                path.into_os_string(),
+            ),
+        ],
+    )?;
+    let latest = latest_bench_jsonl()?;
+    bench_report(&[latest.clone().into_os_string()])?;
+    verify_f22_primitive_bench(&latest)
 }
 
 fn bench_size_sweep(extra: &[OsString]) -> Result<()> {
@@ -2390,6 +2456,103 @@ fn planner_compare_summary(records: &[BenchReportRecord]) -> PlannerCompareSumma
         mean_gap_pct_of_best: mean(&gaps),
         top_misses,
     }
+}
+
+fn verify_f21_workload_bench(path: &Path) -> Result<()> {
+    let records = read_bench_report_records(path)?;
+    let paper_records = records
+        .iter()
+        .filter(|record| record.source == "paper")
+        .count();
+    if paper_records == 0 {
+        return Err(format!(
+            "F21 calibration bench `{}` produced no `source=paper` rows",
+            path.display()
+        ));
+    }
+
+    let planner_summary = planner_compare_summary(&records);
+    if planner_summary.workloads == 0 {
+        return Err(format!(
+            "F21 calibration bench `{}` produced no planner-comparable workloads",
+            path.display()
+        ));
+    }
+    if planner_summary.missing_planned_kernel != 0 {
+        return Err(format!(
+            "F21 calibration bench has {} workloads whose planned kernel was not measured",
+            planner_summary.missing_planned_kernel
+        ));
+    }
+
+    let max_median_gap = env_f64("TOKENFS_ALGOS_F21_PLANNER_MAX_MEDIAN_GAP_PCT").unwrap_or(50.0);
+    if planner_summary.median_gap_pct_of_best > max_median_gap {
+        return Err(format!(
+            "F21 calibration planner median gap {:.2}% exceeds gate {:.2}%",
+            planner_summary.median_gap_pct_of_best, max_median_gap
+        ));
+    }
+
+    eprintln!(
+        "xtask: F21 calibration bench gate passed: paper_rows={}, workloads={}, wins={}, misses={}, median_gap={:.2}%",
+        paper_records,
+        planner_summary.workloads,
+        planner_summary.wins,
+        planner_summary.misses,
+        planner_summary.median_gap_pct_of_best
+    );
+    Ok(())
+}
+
+fn verify_f22_primitive_bench(path: &Path) -> Result<()> {
+    let records = read_bench_report_records(path)?;
+    let real_rows = records
+        .iter()
+        .filter(|record| record.source == "real-custom" || record.source == "real-f22")
+        .collect::<Vec<_>>();
+    if real_rows.is_empty() {
+        return Err(format!(
+            "F22 primitive bench `{}` produced no real F22 rows",
+            path.display()
+        ));
+    }
+
+    let block_max_ns = env_f64("TOKENFS_ALGOS_F22_BLOCK_MAX_NS").unwrap_or(1_800.0);
+    let extent_min_gib_s = env_f64("TOKENFS_ALGOS_F22_EXTENT_MIN_GIB_S").unwrap_or(0.93);
+
+    let best_block_ns = real_rows
+        .iter()
+        .filter(|record| record.kernel == "fingerprint-block-auto")
+        .filter_map(|record| {
+            let bytes = record.bytes.parse::<usize>().ok()?;
+            let blocks = bytes / 256;
+            (blocks > 0).then_some(record.mean_ns / blocks as f64)
+        })
+        .min_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal))
+        .ok_or_else(|| "F22 primitive bench produced no fingerprint-block-auto rows".to_owned())?;
+
+    let best_extent_gib_s = real_rows
+        .iter()
+        .filter(|record| record.kernel == "fingerprint-extent-auto")
+        .map(|record| record.gib_per_s)
+        .max_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal))
+        .ok_or_else(|| "F22 primitive bench produced no fingerprint-extent-auto rows".to_owned())?;
+
+    if best_block_ns > block_max_ns {
+        return Err(format!(
+            "F22 block benchmark gate failed: best_ns_per_block={best_block_ns:.1}, threshold={block_max_ns:.1}"
+        ));
+    }
+    if best_extent_gib_s < extent_min_gib_s {
+        return Err(format!(
+            "F22 extent benchmark gate failed: best_gib_s={best_extent_gib_s:.3}, threshold={extent_min_gib_s:.3}"
+        ));
+    }
+
+    eprintln!(
+        "xtask: F22 primitive bench gate passed: best_ns_per_block={best_block_ns:.1}, best_extent_gib_s={best_extent_gib_s:.3}"
+    );
+    Ok(())
 }
 
 fn write_group_delta_svg(
@@ -4610,6 +4773,10 @@ fn env_usize(name: &str) -> Option<usize> {
     env::var(name).ok().and_then(|value| value.parse().ok())
 }
 
+fn env_f64(name: &str) -> Option<f64> {
+    env::var(name).ok().and_then(|value| value.parse().ok())
+}
+
 fn env_bool(name: &str) -> Option<bool> {
     env::var(name).ok().map(|value| {
         matches!(
@@ -4702,6 +4869,8 @@ fn help() {
                     Ubuntu ISO matrix with all kernels and topology threads\n\
            bench-real-f21 [path]\n\
                     F21/F22/rootfs paper-data calibration matrix\n\
+           bench-real-f22 [path]\n\
+                    F22 fingerprint primitive calibration with throughput gates\n\
            bench-size-sweep\n\
                     powers-of-two payload-size sweep\n\
            bench-alignment-sweep\n\

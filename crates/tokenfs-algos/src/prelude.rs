@@ -10,7 +10,7 @@ pub use crate::dispatch::{
 };
 pub use crate::distribution::{
     ByteDistribution, ByteDistributionDistances, ByteDistributionMetric, ByteDistributionReference,
-    NearestByteDistribution, nearest_byte_distribution,
+    NearestByteDistribution, nearest_byte_distribution, nearest_reference,
 };
 pub use crate::entropy;
 pub use crate::fingerprint::{
@@ -20,9 +20,9 @@ pub use crate::fingerprint::{
 };
 pub use crate::hash::{fnv1a64, mix64};
 pub use crate::histogram::{
-    ByteHistogram, HistogramBlockSignals, PlannedByteHistogram, block as histogram_block,
-    block_with_profile as histogram_block_with_profile, explain_block as explain_histogram_block,
-    plan_block as plan_histogram_block,
+    ByteHistogram, BytePairHistogram, BytePairScratch, HistogramBlockSignals, PlannedByteHistogram,
+    block as histogram_block, block_with_profile as histogram_block_with_profile,
+    explain_block as explain_histogram_block, plan_block as plan_histogram_block,
 };
 pub use crate::selector::{RepresentationHint, SelectorSignals};
 pub use crate::sketch::{CLog2Lut, CountMinSketch, HashBinSketch, MisraGries};

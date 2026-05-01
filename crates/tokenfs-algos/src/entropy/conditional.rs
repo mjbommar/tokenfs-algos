@@ -1,6 +1,9 @@
 //! Conditional entropy estimators over adjacent byte pairs.
 
-use crate::{entropy::joint, histogram::BytePairHistogram};
+use crate::{
+    entropy::joint,
+    histogram::{BytePairHistogram, BytePairScratch},
+};
 
 /// Computes exact conditional entropy `H(X_{i+1} | X_i)`.
 ///
@@ -22,6 +25,13 @@ pub fn h_next_given_prev(bytes: &[u8]) -> f32 {
     h_next_given_prev_from_counts(&pairs, &predecessors)
 }
 
+/// Computes exact conditional entropy using reusable pair scratch state.
+#[must_use]
+pub fn h_next_given_prev_with_scratch(bytes: &[u8], scratch: &mut BytePairScratch) -> f32 {
+    scratch.reset_and_add_bytes(bytes);
+    h_next_given_prev_from_scratch(scratch)
+}
+
 /// Computes `H(X_{i+1} | X_i)` from pair and predecessor counts.
 #[must_use]
 pub fn h_next_given_prev_from_counts(
@@ -37,9 +47,25 @@ pub fn h_next_given_prev_from_counts(
     (joint - predecessor).max(0.0)
 }
 
+/// Computes `H(X_{i+1} | X_i)` from reusable pair scratch state.
+#[must_use]
+pub fn h_next_given_prev_from_scratch(scratch: &BytePairScratch) -> f32 {
+    if scratch.observations() == 0 {
+        return 0.0;
+    }
+
+    let joint = joint::h2_from_pair_scratch(scratch);
+    let predecessor = joint::entropy_nonzero_counts(
+        scratch.iter_predecessors().map(|(_, count)| count),
+        scratch.observations(),
+    );
+    (joint - predecessor).max(0.0)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::h_next_given_prev;
+    use super::{h_next_given_prev, h_next_given_prev_with_scratch};
+    use crate::histogram::BytePairScratch;
 
     #[test]
     fn deterministic_next_byte_has_zero_conditional_entropy() {
@@ -49,5 +75,15 @@ mod tests {
     #[test]
     fn mixed_next_byte_has_positive_conditional_entropy() {
         assert!(h_next_given_prev(b"abacabad") > 0.0);
+    }
+
+    #[test]
+    fn scratch_conditional_entropy_matches_dense_path() {
+        let bytes = b"abacabadabacaba";
+        let mut scratch = Box::new(BytePairScratch::new());
+        assert_eq!(
+            h_next_given_prev(bytes),
+            h_next_given_prev_with_scratch(bytes, &mut scratch)
+        );
     }
 }

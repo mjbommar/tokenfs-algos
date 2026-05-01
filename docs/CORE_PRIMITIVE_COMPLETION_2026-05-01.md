@@ -14,11 +14,12 @@ AVX2 histogram coverage, future-backend honesty, and profiling.
 | Chunking | Implemented allocation-free Gear/FastCDC-style boundary detection with min/avg/max sizes. | `chunk::chunks`, `chunk::find_boundary`, `chunk::ChunkConfig`. |
 | Exact n-gram histograms | Implemented exact sparse histograms for `1 <= N <= 8` behind `std` or `alloc`. | `histogram::ngram::NGramHistogram<N>`. |
 | Exact H2..H8 | Implemented exact Shannon entropy over n-grams. | `entropy::ngram::{h2,h3,h4,h5,h6,h7,h8}`. |
-| Dense H2 and conditional entropy | Implemented no-heap dense byte-pair histogram, joint H2, and conditional next-byte entropy. | `histogram::BytePairHistogram`, `entropy::joint::h2_pairs`, `entropy::conditional::h_next_given_prev`. |
+| Dense H2 and conditional entropy | Implemented no-heap dense byte-pair histogram, reusable lazy-reset scratch, joint H2, and conditional next-byte entropy. | `histogram::{BytePairHistogram, BytePairScratch}`, `entropy::joint::{h2_pairs,h2_pairs_with_scratch}`, `entropy::conditional::{h_next_given_prev,h_next_given_prev_with_scratch}`. |
 | Min/Renyi entropy | Implemented min-entropy and collision/Renyi entropy reference paths. | `entropy::min`, `entropy::renyi`. |
 | UTF-8 validation | Implemented scalar pinned UTF-8 validation with error offsets. | `byteclass::validate_utf8`, `byteclass::kernels::scalar::validate_utf8`. |
 | Hash families | Added stable scalar FNV-1a and mix64 hash primitives. | `hash::fnv1a64`, `hash::mix64`. |
 | F22 AVX2 block | Migrated a fused x86 AVX2/SSE4.2 block path and added scalar parity tests. | `fingerprint::kernels::avx2::block`. |
+| F22 fused extent | Replaced the extent path with a fused accumulator for histogram, run-length, top coverage, and hash-bin H4. The pinned scalar path is exact; the public/default path samples H4 for large extents. | `fingerprint::extent`, `fingerprint::kernels::{auto,scalar,avx2}::extent`. |
 | AVX2 histogram candidate | Added a pinned AVX2 four-stripe histogram candidate and primitive benchmark rows. | `histogram::kernels::avx2_stripe4_u32::block`. |
 | Backend honesty | Added support reporting so NEON/AVX-512/SVE/SVE2 are scalar fallback until real kernels exist. | `dispatch::backend_kernel_support`. |
 | Primitive profiling | Added a direct profiling driver to reduce Criterion flamegraph noise. | `cargo run -p tokenfs-algos --example profile_primitives -- all`. |
@@ -33,9 +34,13 @@ in calibration, tests, and offline analysis; hash-bin sketches remain the
 allocation-free hot path for random disk blocks and streaming readers.
 
 The F22 AVX2 block path is now a real fused path. It improves substantially over
-scalar on 256-byte blocks and large synthetic slices, but the extent API still
-uses default sub-primitives. A fully fused extent kernel is a separate piece of
-work because it has different state, reduction, and chunking behavior.
+scalar on 256-byte blocks and large synthetic slices. The extent API now also
+uses a fused accumulator. `fingerprint::kernels::scalar::extent` is the exact
+reference path. `fingerprint::extent` keeps exact H1, run-length, top coverage,
+and skew, but samples H4 every fourth hash window above 64 KiB so large
+sequential reads do not pay the full exact hash-bin cost. The current sampled-H4
+regression bound is 2.5 bits on a periodic-text fixture, so calibration and
+forensic runs should pin the scalar extent path when exact H4 matters.
 
 The new AVX2 histogram path is deliberately exposed as a pinned kernel, not a
 planner default. It is exact and reproducible, but benchmark snippets show that
@@ -122,11 +127,26 @@ Short-run findings:
   This supports keeping the new stripe4 AVX2 path pinned and benchmarked rather
   than making it the planner default.
 
+## Calibration Gate Artifacts
+
+The calibration hard-gate pass produced these short-run reports:
+
+```text
+target/bench-history/reports/1777645452-7b1846e04fb2-dirty/summary.md
+target/bench-history/reports/1777645708-7b1846e04fb2-dirty/summary.md
+```
+
+The F21 gate was green with `median_gap=12.60%`. The F22 hard gate was green at
+`1563.7 ns/block` and `1.195 GiB/s` extent throughput. The block result is still
+above the 1.5 us optimization target, so the next kernel pass should focus there
+before tightening the hard gate.
+
 ## Remaining Gaps
 
 - Larger normalized FastCDC distribution tests over real files and entropy
   classes.
-- Fully fused F22 extent AVX2 path.
+- Native fully vectorized F22 extent AVX2 path beyond the fused
+  scalar/runtime-dispatched accumulator.
 - Public planner policy that can use the AVX2 histogram candidate only where it
   wins durably.
 - AVX-512/NEON/SVE/SVE2 implementations on real hardware or CI runners.

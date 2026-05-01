@@ -1,8 +1,60 @@
 # tokenfs-algos — Plan
 
-**Status:** founding plan document. 2026-04-30. The crate does not yet exist; this document describes what it will be, scoped against the use cases that motivated it.
+**Status:** living roadmap. Created 2026-04-30, updated 2026-05-01. The workspace and core crate now exist; this document records both the founding intent and the gates that must stay true as implementation continues.
 
-**Audience:** future readers (you, me, contributors) who want to understand why this crate exists separately from `binary-bpe`, `tokenfs_writer`, and `tokenfs_reader`, what it does, and how the API and modules fit together before any code is written.
+**Audience:** future readers (you, me, contributors) who want to understand why this crate exists separately from `binary-bpe`, `tokenfs_writer`, and `tokenfs_reader`, what it does, and how the API and modules fit together.
+
+---
+
+## 0. Living Roadmap
+
+### Completed Foundations
+
+- Workspace scaffold, crate module tree, `xtask`, benchmark history, SVG/HTML reports, and GitHub-ready metadata exist.
+- Public primitive contracts are documented in `docs/PRIMITIVE_CONTRACTS.md`: pure `&[u8]`, scalar baseline, pinned kernels, planner/default path, stable benchmark labels, and no hot-path allocation unless documented.
+- Byte histograms, exact n-gram histograms, dense byte-pair histograms, Misra-Gries, Count-Min Sketch, CRC32C hash bins, FNV-1a/mix64 hash families, byte-class counts, UTF-8 validation, run-length/structure summaries, Gear chunking, normalized FastCDC chunking, distribution distances, calibrated byte-distribution lookup, selector signals, and F22/content fingerprints exist at scalar/reference level.
+- Runtime processor detection, histogram planner explanations, pinned histogram kernels, benchmark comparison, planner parity reports, thread/topology workload dimensions, and benchmark artifact logging exist.
+- F22 block fingerprint has scalar and x86 AVX2/SSE4.2 pinned paths. F22 extent fingerprint has a fused scalar/runtime-dispatched accumulator path; pinned scalar is exact, while the public default samples large-extent H4 by design.
+- `no_std`/`alloc` checks are intentionally supported for the core crate where feasible; math goes through the crate-local `math` wrapper and `libm` outside `std`.
+
+### Current Blockers
+
+- F21/F22 calibration is now a hard gate when `--features calibration` is used. The next blocker is keeping those gates green on clean commits and quiet-host benchmark reruns.
+- Exact H2/H3/H4/H8 APIs are correct research/calibration surfaces, but high-order exact entropy is not a universal hot path. Dense H2/conditional entropy now has caller-owned scratch; planner policy still needs longer-run evidence before routing hot paths to exact high-order entropy.
+- Benchmark semantics now distinguish throughput from early-exit latency for UTF-8 and expose chunk-quality labels. Planner win/miss/gap needs continued calibration reporting as real workloads expand.
+- SIMD coverage is honest but incomplete: NEON, AVX-512, SVE, and SVE2 are feature-shaped scalar fallbacks until real parity-tested kernels land.
+- README/examples now cover the core public path; docs.rs-level examples and
+  downstream integration guides still need to catch up.
+
+### Next Acceptance Gates
+
+- `cargo test -p tokenfs-algos --features calibration` must give clear pass/fail output for:
+  - F21 feature drift against the paper sidecar.
+  - F21 selector analysis thresholds from the paper analysis artifact.
+  - F22 H1/fingerprint drift.
+  - F22 block and extent throughput sanity.
+- `cargo xtask bench-real-f21` must run the paper/rootfs workload matrix, emit report artifacts, and fail when planner-calibration rows are missing or the median planner gap exceeds the configured threshold.
+- `cargo xtask bench-real-f22` must run F22 fingerprint primitive benches, emit report artifacts, and fail when block/extent throughput targets are missed.
+- Public examples should cover the common contract:
+  - `histogram::block(bytes)`
+  - `fingerprint::block(bytes)`
+  - `fingerprint::extent(bytes)`
+  - `chunk::fastcdc_chunks(bytes, config)`
+  - `distribution::nearest_reference(...)`
+  - pinned `kernels::*` paths.
+
+### Deferred Hardware Backends
+
+- AVX2 remains the primary optimized x86 target.
+- AVX-512, NEON, SVE, and SVE2 stay visible in dispatch/backend reporting but must remain marked scalar fallback until native kernels have scalar parity tests and benchmark labels.
+- Hardware work should follow profiling evidence: histogram, F22 extent, dense sketch distance, UTF-8 validation, and CRC/hash-bin sketching are the current candidates.
+
+### Consumer-Facing Milestones
+
+- FUSE/read-path users need bounded-latency 4 KiB and 64 KiB paths, cached file/region plans, and no surprise allocation.
+- Kernel-adjacent consumers need fixed-size structs, no hidden heap allocation, scalar fallback, and a future C-friendly ABI layer.
+- Batch/image-building consumers need richer exact features, calibration profiles, planner parity reports, and reproducible pinned kernels.
+- Python/PyO3 consumers should receive batch APIs over large buffers, not one tiny call per 256-byte block.
 
 ---
 
@@ -21,9 +73,9 @@ These questions arise in many domains. Bundling the answers inside `binary-bpe` 
 ### Design principles (carried over from `docs/encoder-substrate-axioms.md` and `docs/entropy-simd-primitives.md`)
 
 - **No domain assumptions.** No mention of tokens, merges, extents, or filesystem objects. Pure compute over `&[u8]`.
-- **Hardware acceleration is the default, not the exception.** Every algorithm has at least an AVX2 + scalar backend; key algorithms add AVX-512 and NEON. Runtime feature dispatch is set once on init.
+- **Hardware acceleration is the default direction, not a marketing label.** Every hot algorithm starts with a scalar reference and only exposes optimized backends after parity tests and benchmark labels exist. AVX2 is the first production target; AVX-512, NEON, SVE, and SVE2 remain scalar fallbacks until real kernels land.
 - **One-pass kernels where useful.** When several features can be computed in a single pass over the bytes, expose a fused kernel that does so — the per-block fingerprint is the canonical example.
-- **Bit-exact parity across backends.** `cargo test` enforces that the AVX2, AVX-512, NEON, and scalar backends produce identical results. Any backend-specific approximation (e.g., `c·log₂(c)` lookup tables) is shared across all backends.
+- **Reference parity with documented tolerances.** `cargo test` enforces that optimized backends match scalar exactly where the API is exact. Approximate or sampled estimators, such as large-extent fingerprint H4, must document their tolerance and keep a pinned exact scalar path.
 - **Cargo conventions.** Kebab-case crate name. Public modules. Doc comments on every public item. Examples directory. Criterion benchmarks.
 - **Pre-1.0 API.** Expect breaking changes between v0.1 → v0.2 as use cases shape the surface; stabilize at v1.0 once `tokenfs_writer`, `binary-bpe`, and a handful of external consumers have shipped against it.
 
@@ -339,7 +391,10 @@ Each algorithm dispatches via `cfg-if` + `is_x86_feature_detected!`/`is_aarch64_
 
 ### Correctness
 
-- **Bit-exact parity tests**: every public function has a `tests/parity.rs` test that runs on every backend (including scalar) and asserts identical output on the same input. CI matrices over backends.
+- **Parity tests**: every exact public function has tests that run on every
+  implemented backend (including scalar) and assert identical output on the same
+  input. Approximate/sampled public defaults assert documented tolerances and
+  keep a pinned exact scalar path.
 - **Property-based tests**: proptest over random inputs, ensuring invariants hold (entropy is in [0, log₂ N], divergence is non-negative, etc.).
 - **Calibration tests**: long-running, gated behind `--features=calibration`, that reproduce the F21/F22 selector accuracy on a fixed snapshot of the rootfs sample. Catches accidental algorithm drift between revisions.
 
@@ -359,7 +414,7 @@ Each algorithm dispatches via `cfg-if` + `is_x86_feature_detected!`/`is_aarch64_
 - Public API stable enough that `binary-bpe` can depend on it
 - README, examples for `classify_block` and `streaming_entropy`
 
-**Acceptance criteria**: F21 selector accuracy reproduces within 1% using this crate's primitives. F22 microbench targets met (≤1.5 µs/block AVX2, ≥1 GB/s extent throughput per-block-off).
+**Acceptance criteria**: F21 selector accuracy reproduces within 1% using this crate's primitives. F22 microbench gates are checked by `cargo xtask bench-real-f22` (current hard gate ≤1.8 µs/block AVX2 and ≥0.93 GiB/s extent throughput; optimization target ≤1.5 µs/block and quiet-host extent goal ≥1 GB/s).
 
 ### v0.2 — "distribution analysis" (target: +2 weeks)
 
@@ -479,25 +534,23 @@ The crate has its own GitHub repo at `mjbommar/tokenfs-algos`. The TokenFS paper
 - All §5 public API items have doc comments with at least one usage example.
 - Parity tests pass on AVX2 + scalar.
 - Calibration test reproduces F21 selector accuracy within 1%.
-- `cargo bench` shows F22 targets hit (1.5 µs/block, 1 GB/s extent).
+- `cargo xtask bench-real-f22` checks F22 hard gates (1.8 µs/block, 0.93 GiB/s current extent gate), with 1.5 µs/block and 1 GB/s extent retained as quiet-host optimization targets.
 - README has: motivation, quick-start, backend matrix, performance numbers, links to PLAN.md / ARCHITECTURE.md.
 - 5+ examples runnable via `cargo run --example`.
 - Published to crates.io (or held back behind a soft-launch period if we want to iterate without yanking).
 
 ---
 
-## 13. Next steps from this plan
+## 13. Active Next Steps
 
-In the order they should happen:
+In the order they should happen now:
 
-1. **Approve / revise this plan.** Read through and flag any module that should be added / removed / renamed before code is written. Especially §4 and §5.
-2. **Create the crate skeleton.** `cargo init --lib`, module stubs per §4, `Cargo.toml` per §8.
-3. **Migrate F22.** §9 step-by-step. Verify parity + calibration + bench targets in the new location.
-4. **Build out v0.1 modules** in priority order: `histogram` → `entropy` → `runlength` → `byteclass` → `windows` → `chunk` → `fingerprint`.
-5. **Wire `binary-bpe` to depend on `tokenfs-algos`** — this is F23b. The `ConditionalSimdEncoder` calls into the new crate's `fingerprint::block` API.
-6. **Publish v0.1.0** to crates.io once F23b lands and the API has held stable for a week of iteration.
-7. **Begin v0.2** work (divergence, CDC, AVX-512). At this point the upper layer (`content-fingerprint`) starts to become reasonable to build.
+1. **Keep calibration hard.** Maintain `cargo test -p tokenfs-algos --features calibration`, `cargo xtask bench-real-f21`, and `cargo xtask bench-real-f22` as explicit gates with thresholds and clear skip/fail behavior.
+2. **Rerun clean long baselines.** The latest dirty short run made F21 planner parity green and F22 extent green, but F22 block latency did not make the 1.5 us optimization target. Recheck on a quiet host before tuning.
+3. **Tune from stable misses only.** Planner policy changes should come from longer paper/real-data reports and should add tests for each durable rule.
+4. **Profile before new SIMD.** Add AVX2/AVX-512/NEON/SVE kernels only after flamegraphs or timing tables identify the next bottleneck.
+5. **Prepare downstream integration.** Wire `binary-bpe` and TokenFS consumers against `fingerprint`, `selector`, `chunk`, and `distribution` APIs once calibration gates are green.
 
 ---
 
-*This plan is intended to be revised before any code lands. Open a follow-up doc or PR comment if a section needs to change.*
+*This plan is intended to keep changing as code lands. Every implementation phase should either satisfy an acceptance gate above or update the gate with a concrete reason.*

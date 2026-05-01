@@ -56,7 +56,8 @@ enum PrimitiveKernel {
     ByteClassClassify,
     ByteClassClassifyScalar,
     ByteClassClassifyAvx2,
-    ByteClassUtf8Validate,
+    ByteClassUtf8FullScan,
+    ByteClassUtf8RejectLatency,
     RunLengthSummarize,
     StructureSummarize,
     EntropyH1FromHistogram,
@@ -71,6 +72,8 @@ enum PrimitiveKernel {
     HashMix64,
     ChunkGear,
     ChunkFastCdc,
+    ChunkGearQuality,
+    ChunkFastCdcQuality,
     DivergenceByteJs,
     DivergenceByteKs,
     DistributionNearestByteJs,
@@ -107,7 +110,8 @@ impl PrimitiveKernel {
             Self::SketchEntropyLut,
             Self::ByteClassClassify,
             Self::ByteClassClassifyScalar,
-            Self::ByteClassUtf8Validate,
+            Self::ByteClassUtf8FullScan,
+            Self::ByteClassUtf8RejectLatency,
             Self::RunLengthSummarize,
             Self::StructureSummarize,
             Self::EntropyH1FromHistogram,
@@ -122,6 +126,8 @@ impl PrimitiveKernel {
             Self::HashMix64,
             Self::ChunkGear,
             Self::ChunkFastCdc,
+            Self::ChunkGearQuality,
+            Self::ChunkFastCdcQuality,
             Self::DivergenceByteJs,
             Self::DivergenceByteKs,
             Self::DistributionNearestByteJs,
@@ -180,7 +186,8 @@ impl PrimitiveKernel {
             Self::ByteClassClassify => "byteclass-classify",
             Self::ByteClassClassifyScalar => "byteclass-classify-scalar",
             Self::ByteClassClassifyAvx2 => "byteclass-classify-avx2",
-            Self::ByteClassUtf8Validate => "byteclass-utf8-validate",
+            Self::ByteClassUtf8FullScan => "byteclass-utf8-fullscan",
+            Self::ByteClassUtf8RejectLatency => "byteclass-utf8-reject-latency",
             Self::RunLengthSummarize => "runlength-summarize",
             Self::StructureSummarize => "structure-summarize",
             Self::EntropyH1FromHistogram => "entropy-h1-from-histogram",
@@ -195,6 +202,8 @@ impl PrimitiveKernel {
             Self::HashMix64 => "hash-mix64",
             Self::ChunkGear => "chunk-gear",
             Self::ChunkFastCdc => "chunk-fastcdc",
+            Self::ChunkGearQuality => "chunk-gear-quality",
+            Self::ChunkFastCdcQuality => "chunk-fastcdc-quality",
             Self::DivergenceByteJs => "divergence-byte-js",
             Self::DivergenceByteKs => "divergence-byte-ks",
             Self::DistributionNearestByteJs => "distribution-nearest-byte-js",
@@ -234,7 +243,8 @@ impl PrimitiveKernel {
             Self::ByteClassClassify
             | Self::ByteClassClassifyScalar
             | Self::ByteClassClassifyAvx2
-            | Self::ByteClassUtf8Validate => "byteclass",
+            | Self::ByteClassUtf8FullScan
+            | Self::ByteClassUtf8RejectLatency => "byteclass",
             Self::RunLengthSummarize => "runlength",
             Self::StructureSummarize => "structure",
             Self::EntropyH1FromHistogram
@@ -246,12 +256,40 @@ impl PrimitiveKernel {
             | Self::EntropyJointH2Dense
             | Self::EntropyConditionalNextPrev => "entropy",
             Self::HashFnv1a64 | Self::HashMix64 => "hash",
-            Self::ChunkGear | Self::ChunkFastCdc => "chunk",
+            Self::ChunkGear
+            | Self::ChunkFastCdc
+            | Self::ChunkGearQuality
+            | Self::ChunkFastCdcQuality => "chunk",
             Self::DivergenceByteJs | Self::DivergenceByteKs => "divergence",
             Self::DistributionNearestByteJs
             | Self::DistributionNearestByteHellinger
             | Self::DistributionByteAllDistances => "distribution",
             Self::SelectorSignals => "selector",
+        }
+    }
+
+    fn applies_to(self, input: &PrimitiveInput) -> bool {
+        match self {
+            Self::ByteClassUtf8FullScan => byteclass::validate_utf8(&input.bytes).valid,
+            Self::ByteClassUtf8RejectLatency => !byteclass::validate_utf8(&input.bytes).valid,
+            Self::FingerprintBlockAuto
+            | Self::FingerprintBlockScalar
+            | Self::FingerprintBlockAvx2 => input.bytes.len() >= fingerprint::BLOCK_SIZE,
+            _ => true,
+        }
+    }
+
+    fn throughput_bytes(self, input: &PrimitiveInput) -> usize {
+        match self {
+            Self::ByteClassUtf8RejectLatency => {
+                let validation = byteclass::validate_utf8(&input.bytes);
+                validation
+                    .valid_up_to
+                    .saturating_add(usize::from(validation.error_len.max(1)))
+                    .min(input.bytes.len())
+                    .max(1)
+            }
+            _ => input.bytes.len(),
         }
     }
 }
@@ -262,9 +300,11 @@ fn bench_primitive_matrix(c: &mut Criterion) {
     let mut group = c.benchmark_group("primitive_matrix");
 
     for input in &inputs {
-        group.throughput(Throughput::Bytes(input.bytes.len() as u64));
-
         for kernel in &kernels {
+            if !kernel.applies_to(input) {
+                continue;
+            }
+            group.throughput(Throughput::Bytes(kernel.throughput_bytes(input) as u64));
             let id = format!(
                 "{}/primitive={}/case={}/source={}/content={}/entropy={}/pattern={}/bytes={}",
                 kernel.id(),
@@ -522,7 +562,9 @@ fn run_kernel(kernel: PrimitiveKernel, bytes: &[u8]) -> u64 {
             }
             fold_byteclass(byteclass::kernels::scalar::classify(bytes))
         }
-        PrimitiveKernel::ByteClassUtf8Validate => fold_utf8(byteclass::validate_utf8(bytes)),
+        PrimitiveKernel::ByteClassUtf8FullScan | PrimitiveKernel::ByteClassUtf8RejectLatency => {
+            fold_utf8(byteclass::validate_utf8(bytes))
+        }
         PrimitiveKernel::RunLengthSummarize => {
             let summary = runlength::summarize(bytes);
             summary.transitions ^ summary.bytes_in_runs_ge4 ^ summary.runs_ge4
@@ -559,6 +601,16 @@ fn run_kernel(kernel: PrimitiveKernel, bytes: &[u8]) -> u64 {
         PrimitiveKernel::ChunkFastCdc => {
             fold_chunks(chunk::fastcdc_chunks(bytes, fastcdc_config()))
         }
+        PrimitiveKernel::ChunkGearQuality => fold_chunk_quality(chunk::summarize_chunk_quality(
+            chunk::chunks(bytes, chunk_config()),
+            chunk_config().min_size,
+            chunk_config().max_size,
+        )),
+        PrimitiveKernel::ChunkFastCdcQuality => fold_chunk_quality(chunk::summarize_chunk_quality(
+            chunk::fastcdc_chunks(bytes, fastcdc_config()),
+            fastcdc_config().min_size,
+            fastcdc_config().max_size,
+        )),
         PrimitiveKernel::DivergenceByteJs => {
             let (left, right) = split_halves(bytes);
             let left = histogram::kernels::direct_u64::block(left);
@@ -661,6 +713,16 @@ where
             ^ (chunk.end as u64).rotate_left(13)
             ^ chunk.boundary_hash.rotate_left(23)
     })
+}
+
+fn fold_chunk_quality(quality: chunk::ChunkQuality) -> u64 {
+    quality.chunks as u64
+        ^ (quality.total_bytes as u64).rotate_left(7)
+        ^ (quality.min_len as u64).rotate_left(13)
+        ^ (quality.max_len as u64).rotate_left(19)
+        ^ quality.mean_len.to_bits().rotate_left(29)
+        ^ quality.below_min_fraction.to_bits().rotate_left(31)
+        ^ quality.above_max_fraction.to_bits().rotate_left(37)
 }
 
 fn fold_u32_bins(bins: &[u32]) -> u64 {

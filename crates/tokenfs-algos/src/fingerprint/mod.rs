@@ -4,10 +4,17 @@
 //! run-length fraction, and byte-entropy skew. The F22 crate primitive keeps
 //! the same cheap-feature spirit while replacing expensive `H3` with a
 //! hardware-friendly CRC32-hashed 4-gram entropy estimate.
+//!
+//! [`block`] and [`kernels::scalar::block`] are exact parity surfaces. For
+//! extents, [`kernels::scalar::extent`] is the exact reference path. The
+//! ergonomic [`extent`] path computes exact H1, run-length, top-16 coverage,
+//! and skew for all inputs, and uses exact H4 hash bins up to 64 KiB. Larger
+//! extents sample H4 hash windows to keep FUSE/read-path latency bounded. The
+//! current sampled-H4 regression tolerance is 2.5 bits on a periodic-text
+//! fixture; use the scalar extent path when exact H4 is required.
 
 use crate::{
     dispatch::{KernelIsa, KernelStatefulness, PrimitiveFamily, WorkingSetClass},
-    histogram::ByteHistogram,
     math, sketch,
 };
 
@@ -19,6 +26,12 @@ pub const QUAD_HASH_BINS: usize = 4096;
 
 /// Number of hash bins for block-level 4-gram entropy.
 pub const QUAD_HASH_BLOCK_BINS: usize = 256;
+
+/// Largest extent for exact H4 hash-bin counting on the default extent path.
+pub const EXTENT_HASH_EXACT_MAX_BYTES: usize = 64 * 1024;
+
+/// H4 hash-bin sampling stride for large extents on the default extent path.
+pub const EXTENT_HASH_SAMPLE_STRIDE: usize = 4;
 
 /// Compact per-block fingerprint.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -108,7 +121,7 @@ const FINGERPRINT_KERNEL_CATALOG: [FingerprintKernelInfo; 3] = [
         statefulness: KernelStatefulness::Stateless,
         block_bytes: BLOCK_SIZE,
         hot_path_allocates: false,
-        description: "default fingerprint path; may use runtime-dispatched CRC32C hash bins",
+        description: "default fingerprint path; exact scalar-compatible blocks, sampled large-extent H4",
     },
     FingerprintKernelInfo {
         family: PrimitiveFamily::Fingerprint,
@@ -128,7 +141,7 @@ const FINGERPRINT_KERNEL_CATALOG: [FingerprintKernelInfo; 3] = [
         statefulness: KernelStatefulness::Stateless,
         block_bytes: BLOCK_SIZE,
         hot_path_allocates: false,
-        description: "x86 AVX2/SSE4.2 fused F22 block path with scalar extent fallback",
+        description: "x86 AVX2/SSE4.2 fused F22 block path with runtime-dispatched extent path",
     },
 ];
 
@@ -156,6 +169,10 @@ pub mod kernels {
         }
 
         /// Computes an aggregate F22/content fingerprint for any byte slice.
+        ///
+        /// H1, run-length, top-16 coverage, and skew are exact. H4 is exact
+        /// up to [`crate::fingerprint::EXTENT_HASH_EXACT_MAX_BYTES`] and
+        /// sampled on larger extents.
         #[must_use]
         pub fn extent(bytes: &[u8]) -> ExtentFingerprint {
             extent_auto(bytes)
@@ -172,7 +189,8 @@ pub mod kernels {
             block_scalar(bytes)
         }
 
-        /// Computes an aggregate F22/content fingerprint for any byte slice.
+        /// Computes an exact aggregate F22/content fingerprint for any byte
+        /// slice.
         #[must_use]
         pub fn extent(bytes: &[u8]) -> ExtentFingerprint {
             extent_scalar(bytes)
@@ -225,8 +243,8 @@ pub mod kernels {
 
         /// Computes an aggregate F22/content fingerprint for any byte slice.
         ///
-        /// The extent path currently reuses the default runtime-dispatched
-        /// sub-primitives; the fused AVX2 implementation is block-scoped.
+        /// The extent path uses the runtime-dispatched default extent
+        /// accumulator; the AVX2-specific implementation is block-scoped.
         #[must_use]
         pub fn extent(bytes: &[u8]) -> ExtentFingerprint {
             extent_auto(bytes)
@@ -406,35 +424,110 @@ fn block_with_hash4(
 /// Computes an F22/content aggregate fingerprint for any byte slice.
 ///
 /// This is the ergonomic default and may use runtime-dispatched sub-primitives.
-/// Use [`kernels::scalar::extent`] when a pinned scalar reference is required.
+/// H1, run-length, top-16 coverage, and skew are exact for all inputs. H4 is
+/// exact up to [`EXTENT_HASH_EXACT_MAX_BYTES`] and sampled every
+/// [`EXTENT_HASH_SAMPLE_STRIDE`] hash windows for larger inputs.
+/// The sampled large-extent H4 tolerance currently has a regression bound of
+/// 2.5 bits on a periodic-text fixture; it is an estimator, not a replacement
+/// for exact H4.
+///
+/// Use [`kernels::scalar::extent`] when an exact pinned scalar reference is
+/// required.
 #[must_use]
 pub fn extent(bytes: &[u8]) -> ExtentFingerprint {
     kernels::auto::extent(bytes)
 }
 
 fn extent_auto(bytes: &[u8]) -> ExtentFingerprint {
-    extent_with_hash4(bytes, sketch::crc32_hash4_bins)
+    #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        if kernels::avx2::is_available() {
+            // SAFETY: availability was checked immediately above.
+            return unsafe { extent_fused_sse42_unchecked(bytes) };
+        }
+    }
+
+    extent_fused_auto_scalar(bytes)
 }
 
 fn extent_scalar(bytes: &[u8]) -> ExtentFingerprint {
-    extent_with_hash4(bytes, sketch::kernels::scalar::crc32_hash4_bins)
+    extent_fused_exact_scalar(bytes)
 }
 
-fn extent_with_hash4(
-    bytes: &[u8],
-    hash4_bins: fn(&[u8], &mut [u32; QUAD_HASH_BINS]),
-) -> ExtentFingerprint {
+fn extent_fused_auto_scalar(bytes: &[u8]) -> ExtentFingerprint {
+    extent_fused_with_crc32(
+        bytes,
+        sketch::kernels::scalar::crc32c_u32,
+        extent_hash_stride(bytes),
+    )
+}
+
+fn extent_fused_exact_scalar(bytes: &[u8]) -> ExtentFingerprint {
+    extent_fused_with_crc32(bytes, sketch::kernels::scalar::crc32c_u32, 1)
+}
+
+#[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+#[target_feature(enable = "sse4.2")]
+unsafe fn extent_fused_sse42_unchecked(bytes: &[u8]) -> ExtentFingerprint {
+    extent_fused_with_crc32(
+        bytes,
+        |seed, value| crc32_u32_intrinsic(seed, value),
+        extent_hash_stride(bytes),
+    )
+}
+
+const fn extent_hash_stride(bytes: &[u8]) -> usize {
+    if bytes.len() > EXTENT_HASH_EXACT_MAX_BYTES {
+        EXTENT_HASH_SAMPLE_STRIDE
+    } else {
+        1
+    }
+}
+
+fn extent_fused_with_crc32<F>(bytes: &[u8], crc32: F, hash_stride: usize) -> ExtentFingerprint
+where
+    F: FnMut(u32, u32) -> u32,
+{
     if bytes.is_empty() {
         return ExtentFingerprint::default();
     }
 
-    let histogram = ByteHistogram::from_block(bytes);
-    let h1 = crate::entropy::shannon::h1(&histogram);
-    let mut bins = [0_u32; QUAD_HASH_BINS];
-    hash4_bins(bytes, &mut bins);
-    let h4 = sketch::entropy_from_counts_u32(&bins, bytes.len().saturating_sub(3).max(1) as u64);
-    let (_, rl_bytes) = runlength(bytes);
-    let top16_coverage = top_k_coverage_u64(histogram.counts(), 16, histogram.total());
+    let mut histogram = [0_u64; 256];
+    let mut current_byte = bytes[0];
+    let mut current_run = 0_usize;
+    let mut rl_bytes = 0_u32;
+
+    for (index, &byte) in bytes.iter().enumerate() {
+        histogram[byte as usize] += 1;
+
+        if index == 0 || byte == current_byte {
+            current_byte = byte;
+            current_run += 1;
+        } else {
+            if current_run >= 4 {
+                rl_bytes = rl_bytes.saturating_add(current_run as u32);
+            }
+            current_byte = byte;
+            current_run = 1;
+        }
+    }
+    if current_run >= 4 {
+        rl_bytes = rl_bytes.saturating_add(current_run as u32);
+    }
+
+    let h1 = entropy_from_counts_u64(&histogram, bytes.len() as u64);
+    let h4 = if bytes.len() < 4 || (h1 >= 7.875 && rl_bytes == 0) {
+        h1
+    } else {
+        let mut bins = [0_u32; QUAD_HASH_BINS];
+        let observations = if hash_stride <= 1 {
+            hash4_bins_with_crc32(bytes, &mut bins, crc32)
+        } else {
+            hash4_bins_strided_with_crc32(bytes, &mut bins, hash_stride, crc32)
+        };
+        sketch::entropy_from_counts_u32(&bins, observations.max(1))
+    };
+    let top16_coverage = top_k_coverage_u64(&histogram, 16, bytes.len() as u64);
 
     ExtentFingerprint {
         h1,
@@ -443,6 +536,122 @@ fn extent_with_hash4(
         top16_coverage,
         byte_entropy_skew: h1 / 8.0,
     }
+}
+
+#[inline(always)]
+fn hash4_bins_with_crc32<F>(bytes: &[u8], bins: &mut [u32; QUAD_HASH_BINS], mut crc32: F) -> u64
+where
+    F: FnMut(u32, u32) -> u32,
+{
+    if bytes.len() < 4 {
+        return 0;
+    }
+
+    let mut c0 = [0_u32; QUAD_HASH_BINS];
+    let mut c1 = [0_u32; QUAD_HASH_BINS];
+    let mut c2 = [0_u32; QUAD_HASH_BINS];
+    let mut c3 = [0_u32; QUAD_HASH_BINS];
+    let mask = (QUAD_HASH_BINS as u32) - 1;
+    let ngrams = bytes.len() - 3;
+    let groups = ngrams / 4;
+
+    for group in 0..groups {
+        let base = group * 4;
+        let q0 = u32::from_le_bytes([
+            bytes[base],
+            bytes[base + 1],
+            bytes[base + 2],
+            bytes[base + 3],
+        ]);
+        let q1 = u32::from_le_bytes([
+            bytes[base + 1],
+            bytes[base + 2],
+            bytes[base + 3],
+            bytes[base + 4],
+        ]);
+        let q2 = u32::from_le_bytes([
+            bytes[base + 2],
+            bytes[base + 3],
+            bytes[base + 4],
+            bytes[base + 5],
+        ]);
+        let q3 = u32::from_le_bytes([
+            bytes[base + 3],
+            bytes[base + 4],
+            bytes[base + 5],
+            bytes[base + 6],
+        ]);
+
+        c0[(crc32(0, q0) & mask) as usize] += 1;
+        c1[(crc32(0, q1) & mask) as usize] += 1;
+        c2[(crc32(0, q2) & mask) as usize] += 1;
+        c3[(crc32(0, q3) & mask) as usize] += 1;
+    }
+
+    for offset in (groups * 4)..ngrams {
+        let q = u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]);
+        c0[(crc32(0, q) & mask) as usize] += 1;
+    }
+
+    for index in 0..QUAD_HASH_BINS {
+        bins[index] = c0[index] + c1[index] + c2[index] + c3[index];
+    }
+
+    ngrams as u64
+}
+
+#[inline(always)]
+fn hash4_bins_strided_with_crc32<F>(
+    bytes: &[u8],
+    bins: &mut [u32; QUAD_HASH_BINS],
+    stride: usize,
+    mut crc32: F,
+) -> u64
+where
+    F: FnMut(u32, u32) -> u32,
+{
+    if bytes.len() < 4 {
+        return 0;
+    }
+
+    let mask = (QUAD_HASH_BINS as u32) - 1;
+    let ngrams = bytes.len() - 3;
+    let stride = stride.max(1);
+    let mut observations = 0_u64;
+    let mut offset = 0_usize;
+    while offset < ngrams {
+        let q = u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]);
+        bins[(crc32(0, q) & mask) as usize] += 1;
+        observations += 1;
+        offset += stride;
+    }
+    observations
+}
+
+fn entropy_from_counts_u64(counts: &[u64], total: u64) -> f32 {
+    if total == 0 {
+        return 0.0;
+    }
+
+    let total = total as f64;
+    let mut entropy = 0.0_f64;
+    for &count in counts {
+        if count != 0 {
+            let p = count as f64 / total;
+            entropy -= p * math::log2_f64(p);
+        }
+    }
+    entropy as f32
 }
 
 fn quantize_q4(bits_per_byte: f32) -> u8 {
@@ -590,7 +799,7 @@ mod tests {
     }
 
     #[test]
-    fn public_default_matches_pinned_scalar() {
+    fn public_default_matches_pinned_scalar_for_blocks_and_small_extents() {
         let mut bytes = [0_u8; BLOCK_SIZE];
         for (index, byte) in bytes.iter_mut().enumerate() {
             *byte = (index.wrapping_mul(37) ^ (index >> 1)) as u8;
@@ -598,6 +807,30 @@ mod tests {
 
         assert_eq!(block(&bytes), kernels::scalar::block(&bytes));
         assert_eq!(extent(&bytes), kernels::scalar::extent(&bytes));
+    }
+
+    #[test]
+    fn large_default_extent_keeps_exact_stable_fields() {
+        let bytes = (0..(super::EXTENT_HASH_EXACT_MAX_BYTES * 2))
+            .map(|index| {
+                let motif = b"tokenfs-algos-f22-fingerprint-calibration:";
+                motif[index % motif.len()].wrapping_add(((index / motif.len()) & 7) as u8)
+            })
+            .collect::<Vec<_>>();
+
+        let default = extent(&bytes);
+        let exact = kernels::scalar::extent(&bytes);
+
+        assert_eq!(default.h1, exact.h1);
+        assert_eq!(default.rl_fraction, exact.rl_fraction);
+        assert_eq!(default.top16_coverage, exact.top16_coverage);
+        assert_eq!(default.byte_entropy_skew, exact.byte_entropy_skew);
+        assert!(
+            (default.h4 - exact.h4).abs() <= 2.5,
+            "default_h4={}, exact_h4={}",
+            default.h4,
+            exact.h4
+        );
     }
 
     #[test]

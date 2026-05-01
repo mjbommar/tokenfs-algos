@@ -20,11 +20,16 @@ cargo xtask bench-adaptive
 cargo xtask bench-workloads
 cargo xtask bench-workloads-adaptive
 cargo xtask bench-calibrate
+cargo xtask bench-real-f21
+cargo xtask bench-real-f22
 cargo xtask bench-compare target/bench-history/runs/<old>.jsonl target/bench-history/runs/<new>.jsonl
 cargo xtask bench-report
 cargo xtask profile
 cargo xtask profile-flamegraph -- --profile-time 10 workload_matrix/adaptive-prefix-1k
 cargo run -p tokenfs-algos --example dispatch_explain
+cargo run -p tokenfs-algos --example classify_block
+cargo run -p tokenfs-algos --example cdc_chunking
+cargo run -p tokenfs-algos --example content_match
 ```
 
 Real-data benchmarks are opt-in and keep large corpora out of git:
@@ -42,9 +47,26 @@ If no path is provided, the real-data benchmark/profile tasks use
 `TOKENFS_ALGOS_REAL_DATA`, then fall back to
 `~/ubuntu-26.04-desktop-amd64.iso`.
 
-The first implementation target is the scalar byte histogram, followed by
-entropy, run-length statistics, byte classification, and the F22 fingerprint
-kernel.
+Paper-data calibration is a hard gate when the `calibration` feature is enabled:
+
+```bash
+cargo test -p tokenfs-algos --features calibration --test fingerprint_f22 -- --nocapture
+```
+
+The calibration feature requires the F21/F22 artifacts to exist locally or be
+provided through `TOKENFS_ALGOS_F22_DATA` and `TOKENFS_ALGOS_F21_ANALYSIS`.
+
+The current implementation includes scalar/reference byte histograms, entropy,
+run-length and structure signals, byte classification and UTF-8 validation,
+Gear and normalized FastCDC chunking, calibrated distribution lookup, selector
+signals, and the F22/content fingerprint path.
+
+The normal fingerprint API is `fingerprint::{block, extent}`. Pinned reference
+paths live under `fingerprint::kernels::scalar::*`. The default extent path keeps
+H1, run-length, top-16 coverage, and skew exact, and samples H4 on extents larger
+than 64 KiB with a current 2.5-bit sampled-H4 regression bound on a
+periodic-text fixture; use the scalar pinned extent when calibration or forensic
+work needs the exact H4 hash-bin oracle.
 
 The workload benchmark matrix and logged result format are documented in
 `docs/BENCHMARK_WORKLOAD_MATRIX.md`. Processor-aware dispatch and kernel
@@ -52,4 +74,5 @@ promotion strategy are documented in `docs/PROCESSOR_AWARE_DISPATCH.md`,
 `docs/PRIMITIVE_KERNEL_BUFFET.md`, and
 `docs/AUTOTUNING_AND_BENCH_HISTORY.md`. Paper-linked primitive migration and
 consumer latency budgets are tracked in `docs/PAPER_PRIMITIVE_MIGRATION.md` and
-`docs/CONSUMER_LATENCY_BUDGETS.md`.
+`docs/CONSUMER_LATENCY_BUDGETS.md`. Current calibration gates are summarized in
+`docs/CALIBRATION_GATES_2026-05-01.md`.

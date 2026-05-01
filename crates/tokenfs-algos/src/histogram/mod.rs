@@ -14,7 +14,7 @@ use crate::dispatch::{
 };
 
 pub use byte::ByteHistogram;
-pub use pair::BytePairHistogram;
+pub use pair::{BytePairHistogram, BytePairScratch};
 
 /// Result of a planned histogram call with the selected plan attached.
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -16,6 +16,25 @@ pub struct Chunk {
     pub boundary_hash: u64,
 }
 
+/// Aggregate quality statistics for a chunk stream.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ChunkQuality {
+    /// Number of chunks produced.
+    pub chunks: usize,
+    /// Total bytes covered by the chunk stream.
+    pub total_bytes: usize,
+    /// Smallest chunk length.
+    pub min_len: usize,
+    /// Largest chunk length.
+    pub max_len: usize,
+    /// Mean chunk length.
+    pub mean_len: f64,
+    /// Fraction of chunks smaller than the configured minimum.
+    pub below_min_fraction: f64,
+    /// Fraction of chunks larger than the configured maximum.
+    pub above_max_fraction: f64,
+}
+
 impl Chunk {
     /// Returns the chunk length in bytes.
     #[must_use]
@@ -27,6 +46,20 @@ impl Chunk {
     #[must_use]
     pub const fn is_empty(self) -> bool {
         self.start >= self.end
+    }
+}
+
+impl Default for ChunkQuality {
+    fn default() -> Self {
+        Self {
+            chunks: 0,
+            total_bytes: 0,
+            min_len: 0,
+            max_len: 0,
+            mean_len: 0.0,
+            below_min_fraction: 0.0,
+            above_max_fraction: 0.0,
+        }
     }
 }
 
@@ -339,6 +372,48 @@ pub fn fastcdc_find_boundary(bytes: &[u8], config: FastCdcConfig) -> usize {
     fastcdc_boundary_with_state(bytes, config, 0).bytes
 }
 
+/// Summarizes chunk quality for a produced chunk stream.
+#[must_use]
+pub fn summarize_chunk_quality<I>(chunks: I, min_size: usize, max_size: usize) -> ChunkQuality
+where
+    I: IntoIterator<Item = Chunk>,
+{
+    let mut count = 0_usize;
+    let mut total = 0_usize;
+    let mut min_len = usize::MAX;
+    let mut max_len = 0_usize;
+    let mut below_min = 0_usize;
+    let mut above_max = 0_usize;
+
+    for chunk in chunks {
+        let len = chunk.len();
+        count += 1;
+        total = total.saturating_add(len);
+        min_len = min_len.min(len);
+        max_len = max_len.max(len);
+        if len < min_size {
+            below_min += 1;
+        }
+        if len > max_size {
+            above_max += 1;
+        }
+    }
+
+    if count == 0 {
+        return ChunkQuality::default();
+    }
+
+    ChunkQuality {
+        chunks: count,
+        total_bytes: total,
+        min_len,
+        max_len,
+        mean_len: total as f64 / count as f64,
+        below_min_fraction: below_min as f64 / count as f64,
+        above_max_fraction: above_max as f64 / count as f64,
+    }
+}
+
 fn find_boundary_with_state(bytes: &[u8], config: ChunkConfig, initial_hash: u64) -> Boundary {
     if bytes.is_empty() {
         return Boundary {
@@ -455,7 +530,7 @@ fn mask_for_bits(bits: u32) -> u64 {
 mod tests {
     use super::{
         ChunkConfig, FastCdcConfig, chunks, fastcdc_chunks, fastcdc_find_boundary, find_boundary,
-        gear_hash,
+        gear_hash, summarize_chunk_quality,
     };
 
     #[test]
@@ -540,5 +615,19 @@ mod tests {
             "average={average}, chunks={}",
             parts.len()
         );
+    }
+
+    #[test]
+    fn chunk_quality_summarizes_bounds() {
+        let bytes = (0_usize..65_536)
+            .map(|i| (i.wrapping_mul(31) ^ (i >> 2)) as u8)
+            .collect::<Vec<_>>();
+        let config = ChunkConfig::with_sizes(256, 1024, 4096);
+        let quality =
+            summarize_chunk_quality(chunks(&bytes, config), config.min_size, config.max_size);
+
+        assert!(quality.chunks > 0);
+        assert_eq!(quality.total_bytes, bytes.len());
+        assert_eq!(quality.above_max_fraction, 0.0);
     }
 }

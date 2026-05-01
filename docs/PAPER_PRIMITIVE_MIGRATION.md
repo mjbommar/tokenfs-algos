@@ -37,8 +37,8 @@ Important pieces:
    extents.
 3. Done: add `paper::f22` compatibility aliases and pinned
    `fingerprint::kernels::scalar` paths.
-4. Done: add optional F21/F22 sidecar calibration tests that skip when data is
-   unavailable.
+4. Done: add F21/F22 sidecar calibration tests. They skip on ordinary test
+   runs, but become hard failures when `--features calibration` is enabled.
 5. Done: move the F22 AVX2/SSE4.2 fused block path after scalar parity is stable.
 6. Add planner-oracle benchmark rows: for each F21 extent, compare the planner
    selection against the F21/F22 oracle outcome.
@@ -80,7 +80,8 @@ For v0.1, keep dispatch static and transparent:
 - NEON/AVX-512/SVE/SVE2 are reported as scalar fallback until parity-tested
   kernels exist on those backends;
 - planner rules are documented and inspectable;
-- calibration tests are opt-in when real sidecar/parquet data exists.
+- calibration tests are hard gates when `--features calibration` is enabled and
+  real sidecar/parquet paths are required.
 
 Defer persistent autotuning cache and generated dispatch tables to v0.2. The
 kernel set needs to stabilize before a cache-backed planner can be trusted.

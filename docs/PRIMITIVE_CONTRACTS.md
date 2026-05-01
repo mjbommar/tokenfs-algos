@@ -31,6 +31,13 @@ The first line is the normal product API. The pinned `kernels::*` paths are for
 tests, benchmarks, paper replication, and users who need bit-for-bit backend
 control.
 
+When the normal product API intentionally uses an approximation for latency,
+that approximation must be documented at the function boundary and paired with a
+pinned exact scalar path. The current example is `fingerprint::extent`: H1,
+run-length, top-16 coverage, and skew are exact, while large-extent H4 is sampled
+unless callers choose `fingerprint::kernels::scalar::extent`. The current
+large-extent sampled-H4 regression bound is 2.5 bits on a periodic-text fixture.
+
 ## Backend Order
 
 Kernel families should land in this order:
