@@ -62,6 +62,8 @@ pub enum FingerprintKernel {
     Auto,
     /// Portable scalar reference kernel.
     Scalar,
+    /// x86 AVX2/SSE4.2 fused block kernel.
+    Avx2,
 }
 
 impl FingerprintKernel {
@@ -71,6 +73,7 @@ impl FingerprintKernel {
         match self {
             Self::Auto => "auto",
             Self::Scalar => "scalar",
+            Self::Avx2 => "avx2",
         }
     }
 }
@@ -96,7 +99,7 @@ pub struct FingerprintKernelInfo {
     pub description: &'static str,
 }
 
-const FINGERPRINT_KERNEL_CATALOG: [FingerprintKernelInfo; 2] = [
+const FINGERPRINT_KERNEL_CATALOG: [FingerprintKernelInfo; 3] = [
     FingerprintKernelInfo {
         family: PrimitiveFamily::Fingerprint,
         kernel: FingerprintKernel::Auto,
@@ -116,6 +119,16 @@ const FINGERPRINT_KERNEL_CATALOG: [FingerprintKernelInfo; 2] = [
         block_bytes: BLOCK_SIZE,
         hot_path_allocates: false,
         description: "portable scalar reference path for F22 calibration and parity",
+    },
+    FingerprintKernelInfo {
+        family: PrimitiveFamily::Fingerprint,
+        kernel: FingerprintKernel::Avx2,
+        isa: KernelIsa::X86Avx2,
+        working_set: WorkingSetClass::L1,
+        statefulness: KernelStatefulness::Stateless,
+        block_bytes: BLOCK_SIZE,
+        hot_path_allocates: false,
+        description: "x86 AVX2/SSE4.2 fused F22 block path with scalar extent fallback",
     },
 ];
 
@@ -165,6 +178,60 @@ pub mod kernels {
             extent_scalar(bytes)
         }
     }
+
+    /// x86 AVX2/SSE4.2 fused block fingerprint kernel.
+    #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+    pub mod avx2 {
+        use super::{BLOCK_SIZE, BlockFingerprint, ExtentFingerprint, extent_auto};
+
+        /// Returns true when the fused AVX2/SSE4.2 block kernel is available.
+        #[cfg(feature = "std")]
+        #[must_use]
+        pub fn is_available() -> bool {
+            std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("sse4.2")
+        }
+
+        /// Returns true when the fused AVX2/SSE4.2 block kernel is available.
+        #[cfg(not(feature = "std"))]
+        #[must_use]
+        pub const fn is_available() -> bool {
+            false
+        }
+
+        /// Computes a compact F22/content fingerprint for one 256-byte block.
+        ///
+        /// If the current CPU does not support AVX2 and SSE4.2, this falls
+        /// back to the runtime-dispatched default path.
+        #[must_use]
+        pub fn block(bytes: &[u8; BLOCK_SIZE]) -> BlockFingerprint {
+            if is_available() {
+                // SAFETY: availability was checked immediately above.
+                unsafe { super::super::block_avx2_unchecked(bytes) }
+            } else {
+                super::block_auto(bytes)
+            }
+        }
+
+        /// Computes a compact F22/content fingerprint without checking CPU
+        /// features.
+        ///
+        /// # Safety
+        ///
+        /// The caller must ensure the current CPU supports AVX2 and SSE4.2.
+        #[must_use]
+        pub unsafe fn block_unchecked(bytes: &[u8; BLOCK_SIZE]) -> BlockFingerprint {
+            unsafe { super::super::block_avx2_unchecked(bytes) }
+        }
+
+        /// Computes an aggregate F22/content fingerprint for any byte slice.
+        ///
+        /// The extent path currently reuses the default runtime-dispatched
+        /// sub-primitives; the fused AVX2 implementation is block-scoped.
+        #[must_use]
+        pub fn extent(bytes: &[u8]) -> ExtentFingerprint {
+            extent_auto(bytes)
+        }
+    }
 }
 
 /// Computes a compact F22/content fingerprint for one 256-byte block.
@@ -177,11 +244,134 @@ pub fn block(bytes: &[u8; BLOCK_SIZE]) -> BlockFingerprint {
 }
 
 fn block_auto(bytes: &[u8; BLOCK_SIZE]) -> BlockFingerprint {
+    #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        if kernels::avx2::is_available() {
+            // SAFETY: availability was checked immediately above.
+            return unsafe { block_avx2_unchecked(bytes) };
+        }
+    }
+
     block_with_hash4(bytes, sketch::crc32_hash4_bins)
 }
 
 fn block_scalar(bytes: &[u8; BLOCK_SIZE]) -> BlockFingerprint {
     block_with_hash4(bytes, sketch::kernels::scalar::crc32_hash4_bins)
+}
+
+#[cfg(all(feature = "avx2", target_arch = "x86"))]
+use core::arch::x86::_mm_crc32_u32 as crc32_u32_intrinsic;
+
+#[cfg(all(feature = "avx2", target_arch = "x86_64"))]
+use core::arch::x86_64::_mm_crc32_u32 as crc32_u32_intrinsic;
+
+#[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+#[target_feature(enable = "avx2,sse4.2")]
+unsafe fn block_avx2_unchecked(bytes: &[u8; BLOCK_SIZE]) -> BlockFingerprint {
+    let histogram = histogram_byte_block_avx2(bytes);
+    let h1 = sketch::entropy_from_counts_u32(&histogram, BLOCK_SIZE as u64);
+    let h1_q4 = quantize_q4(h1);
+    let (rl_runs_ge4, _) = runlength(bytes);
+
+    let h4_q4 = if h1_q4 >= 126 && rl_runs_ge4 == 0 {
+        h1_q4
+    } else {
+        let bins = unsafe { histogram_hash4_block_avx2(bytes) };
+        let h4 = sketch::entropy_from_counts_u32(&bins, (BLOCK_SIZE - 3) as u64);
+        quantize_q4(h4)
+    };
+
+    BlockFingerprint {
+        h1_q4,
+        h4_q4,
+        rl_runs_ge4,
+        top4_coverage_q8: top_k_coverage_q8(&histogram, 4, BLOCK_SIZE as u32),
+        byte_class: byte_class_bitmap(&histogram),
+        reserved: 0,
+    }
+}
+
+#[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+fn histogram_byte_block_avx2(bytes: &[u8; BLOCK_SIZE]) -> [u32; 256] {
+    let mut h0 = [0_u32; 256];
+    let mut h1 = [0_u32; 256];
+    let mut h2 = [0_u32; 256];
+    let mut h3 = [0_u32; 256];
+
+    for index in 0..64 {
+        h0[bytes[index] as usize] += 1;
+        h1[bytes[64 + index] as usize] += 1;
+        h2[bytes[128 + index] as usize] += 1;
+        h3[bytes[192 + index] as usize] += 1;
+    }
+
+    let mut out = [0_u32; 256];
+    for index in 0..256 {
+        out[index] = h0[index] + h1[index] + h2[index] + h3[index];
+    }
+    out
+}
+
+#[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+#[target_feature(enable = "sse4.2")]
+unsafe fn histogram_hash4_block_avx2(bytes: &[u8; BLOCK_SIZE]) -> [u32; QUAD_HASH_BLOCK_BINS] {
+    let mut c0 = [0_u32; QUAD_HASH_BLOCK_BINS];
+    let mut c1 = [0_u32; QUAD_HASH_BLOCK_BINS];
+    let mut c2 = [0_u32; QUAD_HASH_BLOCK_BINS];
+    let mut c3 = [0_u32; QUAD_HASH_BLOCK_BINS];
+    let mask = (QUAD_HASH_BLOCK_BINS as u32) - 1;
+    let ngrams = BLOCK_SIZE - 3;
+    let groups = ngrams / 4;
+
+    for group in 0..groups {
+        let base = group * 4;
+        let q0 = u32::from_le_bytes([
+            bytes[base],
+            bytes[base + 1],
+            bytes[base + 2],
+            bytes[base + 3],
+        ]);
+        let q1 = u32::from_le_bytes([
+            bytes[base + 1],
+            bytes[base + 2],
+            bytes[base + 3],
+            bytes[base + 4],
+        ]);
+        let q2 = u32::from_le_bytes([
+            bytes[base + 2],
+            bytes[base + 3],
+            bytes[base + 4],
+            bytes[base + 5],
+        ]);
+        let q3 = u32::from_le_bytes([
+            bytes[base + 3],
+            bytes[base + 4],
+            bytes[base + 5],
+            bytes[base + 6],
+        ]);
+
+        c0[(crc32_u32_intrinsic(0, q0) & mask) as usize] += 1;
+        c1[(crc32_u32_intrinsic(0, q1) & mask) as usize] += 1;
+        c2[(crc32_u32_intrinsic(0, q2) & mask) as usize] += 1;
+        c3[(crc32_u32_intrinsic(0, q3) & mask) as usize] += 1;
+    }
+
+    let tail = groups * 4;
+    if tail < ngrams {
+        let q = u32::from_le_bytes([
+            bytes[tail],
+            bytes[tail + 1],
+            bytes[tail + 2],
+            bytes[tail + 3],
+        ]);
+        c0[(crc32_u32_intrinsic(0, q) & mask) as usize] += 1;
+    }
+
+    let mut out = [0_u32; QUAD_HASH_BLOCK_BINS];
+    for index in 0..QUAD_HASH_BLOCK_BINS {
+        out[index] = c0[index] + c1[index] + c2[index] + c3[index];
+    }
+    out
 }
 
 fn block_with_hash4(
@@ -423,6 +613,26 @@ mod tests {
                 .iter()
                 .any(|info| info.kernel == FingerprintKernel::Scalar)
         );
+        assert!(
+            catalog
+                .iter()
+                .any(|info| info.kernel == FingerprintKernel::Avx2)
+        );
         assert!(catalog.iter().all(|info| !info.hot_path_allocates));
+    }
+
+    #[test]
+    #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+    fn avx2_block_matches_scalar_when_available() {
+        if !kernels::avx2::is_available() {
+            return;
+        }
+
+        let mut bytes = [0_u8; BLOCK_SIZE];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = (index.wrapping_mul(41) ^ (index >> 3).wrapping_mul(19)) as u8;
+        }
+
+        assert_eq!(kernels::avx2::block(&bytes), kernels::scalar::block(&bytes));
     }
 }

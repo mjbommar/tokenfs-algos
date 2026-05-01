@@ -12,12 +12,12 @@ on an i9 P-core, an ARM laptop, or a small VM.
 | Family | Purpose | First kernels |
 |---|---|---|
 | Byte histogram | 256-bin byte counts for entropy and classification. | direct, local, striped, run-length, adaptive. |
-| Entropy | H1 and windowed entropy over histograms. | scalar H1, chunk/window summaries. |
+| Entropy | H1 and windowed entropy over histograms. | scalar H1, exact H2..H8, hashed sketches for hot paths. |
 | Run-length stats | Repetition and compressibility signals. | longest run, run count, adjacent-equal ratio. |
 | Byte-class stats | ASCII/control/UTF-8-ish/binary byte classes. | scalar classification table now, SIMD later. |
-| Fingerprint | File/window fingerprints for TokenFS indexing. | F22 scalar block/extent fingerprint now, AVX2 later. |
+| Fingerprint | File/window fingerprints for TokenFS indexing. | F22 scalar block/extent and AVX2/SSE4.2 fused block fingerprint. |
 | Divergence | Compare byte distributions across windows/files. | histogram distance, KL/JS candidates later. |
-| Windows/chunks | Shared chunking and rolling state. | fixed-size windows, stream state. |
+| Windows/chunks | Shared chunking and rolling state. | fixed-size windows, strided windows, Gear/FastCDC-style chunking. |
 | Heavy hitters | Approximate frequent-byte or frequent-token summaries. | Misra-Gries top-K from F23a. |
 | Hash-bin counters | Approximate n-gram distributions without full maps. | CRC32C 4-gram bins from F22/F23a. |
 | Entropy reductions | Fast entropy from bounded integer counts. | `c * log2(c)` lookup table from F23a. |
@@ -36,6 +36,7 @@ Current and near-term histogram kernels:
 | `stripe4-u32` | Four local tables. | Low-cardinality data. | Larger working set. |
 | `stripe8-u32` | Eight local tables. | Low-cardinality and repeated data. | Larger L1 pressure. |
 | `run-length-u64` | Count runs. | Huge runs/zero tails. | Poor high-entropy branch behavior. |
+| `avx2-stripe4-u32` | Four private stripes behind x86 AVX2 dispatch. | Reproducible AVX2 candidate for benchmarking. | Not a general winner yet; x86 lacks byte-histogram gather/scatter magic. |
 | `adaptive-prefix-1k` | Sample first 1 KiB. | Best general stateless choice so far. | Prefix may miss later macro changes. |
 | `adaptive-spread-4k` | Four 1 KiB samples. | Meso-structured blocks. | Too expensive for small reads. |
 | `adaptive-chunked-64k` | Per-64 KiB prefix choice. | Macro-mixed files. | Extra per-region overhead. |
@@ -97,7 +98,7 @@ before it graduates from experiment to public primitive.
 
 | Candidate | Source | Why it matters | Initial status |
 |---|---|---|---|
-| F22 block fingerprint | `../tokenfs-paper/tools/rust/entropy_primitives` | 8-byte per-256B block fingerprint used by paper calibration. | Scalar block/extent API migrated. |
+| F22 block fingerprint | `../tokenfs-paper/tools/rust/entropy_primitives` | 8-byte per-256B block fingerprint used by paper calibration. | Scalar block/extent and AVX2/SSE4.2 fused block API migrated. |
 | F21 parquet/sidecar extents | TokenFS paper corpus data | Ground truth for planner-oracle comparison over real extents. | Bench fixture hooks added; calibration data remains optional. |
 | CRC32C 4-gram hash bins | F22/F23a | Approximate H4/n-gram entropy without large maps. | Scalar primitive added in `sketch`. |
 | `c * log2(c)` LUT | F22/F23a | Removes repeated entropy `log2` calls for bounded counts. | Scalar API added; table specialization remains. |
@@ -122,6 +123,9 @@ here so the crate does not silently drift away from the paper.
    benchmark/report artifacts.
 9. Done: add explicit `auto` / `sse42` / `scalar` CRC32 hash-bin benchmark
    labels so runtime dispatch can be compared against pinned backends.
-10. Next: move F22 AVX2 dispatch after scalar parity and calibration stabilize.
-11. Next: promote the best scalar adaptive strategy behind a public conservative
+10. Done: move F22 AVX2 block dispatch after scalar parity and calibration
+   stabilized.
+11. Done: add exact H2..H8 entropy APIs for calibration and research use,
+   while keeping hash-bin sketches as the allocation-free hot path.
+12. Next: promote the best scalar adaptive strategy behind a public conservative
    API once the planner interface stabilizes.

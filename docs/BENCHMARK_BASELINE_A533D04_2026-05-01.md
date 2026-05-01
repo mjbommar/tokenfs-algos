@@ -178,18 +178,46 @@ classifier; it should not blindly switch all F22 random reads to stripe4.
 
 ## Profiling Status
 
-`perf` and `cargo-flamegraph` are installed on this host, but profiling is
-blocked by the current kernel setting:
+Initial profiling was blocked by the host kernel setting:
 
 ```text
 /proc/sys/kernel/perf_event_paranoid = 4
 ```
 
-`perf stat` and flamegraph capture both fail without lower
-`perf_event_paranoid` or equivalent privileges such as `CAP_PERFMON` or
-`CAP_SYS_ADMIN`. Because no usable flamegraph was produced, this phase did not
-add a new optimized kernel. The evidence supported a narrow planner correction
-instead.
+On 2026-05-01, `sudo` was available for a temporary profiling window. The
+setting was lowered to `1`, `perf stat` and flamegraph capture were run, and
+the setting was restored to `4` afterward.
+
+Short primitive profile artifacts:
+
+```text
+target/profiles/1777636510-primitive-perf-stat.txt
+target/profiles/1777636643-primitive-flamegraph.svg
+target/profiles/1777636643-primitive-direct-flamegraph.svg
+target/profiles/1777636643-primitive-driver-flamegraph.svg
+```
+
+The Criterion flamegraphs are valid SVGs but still include harness/startup
+frames. For primitive-level reading, use the direct driver:
+
+```bash
+TOKENFS_ALGOS_PROFILE_ITERS=500 \
+cargo flamegraph \
+  -o target/profiles/primitive-driver-flamegraph.svg \
+  -p tokenfs-algos \
+  --example profile_primitives \
+  --features bench-internals \
+  -- all
+```
+
+The direct-driver flamegraph spent most captured samples in
+`add_block_stripe4_u32`; the all-kernel driver still showed some one-time buffer
+setup. The next profiling refinement is to run one kernel per process with a
+longer iteration count and ignore startup frames.
+
+Perf stat for the short primitive matrix reported about 1.5 instructions per
+cycle, roughly 2% branch-miss rate, and enough Criterion noise that the result
+should be treated as a bottleneck locator, not a durable benchmark baseline.
 
 Once profiling is enabled, profile these first:
 

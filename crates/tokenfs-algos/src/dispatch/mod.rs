@@ -155,6 +155,64 @@ pub enum KernelStatefulness {
     Chunked,
 }
 
+/// Implementation status for one primitive family on one backend.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum KernelAvailability {
+    /// There is a first-class implementation for this backend.
+    Native,
+    /// The backend is detected, but this primitive currently uses scalar code.
+    ScalarFallback,
+    /// The backend is not compiled or not applicable for this primitive.
+    NotAvailable,
+}
+
+/// Current implementation coverage for a backend.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct BackendKernelSupport {
+    /// Backend being described.
+    pub backend: Backend,
+    /// Byte-histogram implementation status.
+    pub byte_histogram: KernelAvailability,
+    /// F22/content fingerprint implementation status.
+    pub fingerprint: KernelAvailability,
+    /// Byte-class implementation status.
+    pub byte_class: KernelAvailability,
+    /// Sketch/hash-bin implementation status.
+    pub sketch: KernelAvailability,
+}
+
+/// Returns current primitive implementation coverage for `backend`.
+///
+/// This is intentionally conservative. Feature-shaped backends such as NEON,
+/// AVX-512, SVE, and SVE2 are reported as scalar fallback until a real,
+/// parity-tested kernel exists for the primitive family.
+#[must_use]
+pub const fn backend_kernel_support(backend: Backend) -> BackendKernelSupport {
+    match backend {
+        Backend::Avx2 => BackendKernelSupport {
+            backend,
+            byte_histogram: KernelAvailability::Native,
+            fingerprint: KernelAvailability::Native,
+            byte_class: KernelAvailability::Native,
+            sketch: KernelAvailability::Native,
+        },
+        Backend::Avx512 | Backend::Neon | Backend::Sve | Backend::Sve2 => BackendKernelSupport {
+            backend,
+            byte_histogram: KernelAvailability::ScalarFallback,
+            fingerprint: KernelAvailability::ScalarFallback,
+            byte_class: KernelAvailability::ScalarFallback,
+            sketch: KernelAvailability::ScalarFallback,
+        },
+        Backend::Scalar => BackendKernelSupport {
+            backend,
+            byte_histogram: KernelAvailability::Native,
+            fingerprint: KernelAvailability::Native,
+            byte_class: KernelAvailability::Native,
+            sketch: KernelAvailability::Native,
+        },
+    }
+}
+
 /// Catalog metadata for one histogram kernel.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct HistogramKernelInfo {
@@ -368,6 +426,8 @@ pub enum HistogramStrategy {
     Stripe8U32,
     /// Run-length count.
     RunLengthU64,
+    /// AVX2-dispatched general four-stripe counter with exact scalar fallback.
+    Avx2Stripe4U32,
     /// AVX2 palette counter with exact scalar fallback.
     Avx2PaletteU32,
     /// Cheap adaptive classifier using a 1 KiB prefix.
@@ -406,6 +466,7 @@ impl HistogramStrategy {
             Self::Stripe4U32 => "stripe4-u32",
             Self::Stripe8U32 => "stripe8-u32",
             Self::RunLengthU64 => "run-length-u64",
+            Self::Avx2Stripe4U32 => "avx2-stripe4-u32",
             Self::Avx2PaletteU32 => "avx2-palette-u32",
             Self::AdaptivePrefix1K => "adaptive-prefix-1k",
             Self::AdaptivePrefix4K => "adaptive-prefix-4k",
@@ -437,7 +498,7 @@ pub const fn histogram_kernel_catalog() -> &'static [HistogramKernelInfo] {
     &HISTOGRAM_KERNEL_CATALOG
 }
 
-const HISTOGRAM_KERNEL_CATALOG: [HistogramKernelInfo; 18] = [
+const HISTOGRAM_KERNEL_CATALOG: [HistogramKernelInfo; 19] = [
     HistogramKernelInfo {
         family: PrimitiveFamily::ByteHistogram,
         strategy: HistogramStrategy::DirectU64,
@@ -497,6 +558,18 @@ const HISTOGRAM_KERNEL_CATALOG: [HistogramKernelInfo; 18] = [
         sample_bytes: 0,
         private_table_bytes: 0,
         description: "run scanner that increments one counter per equal-byte run",
+    },
+    HistogramKernelInfo {
+        family: PrimitiveFamily::ByteHistogram,
+        strategy: HistogramStrategy::Avx2Stripe4U32,
+        isa: KernelIsa::X86Avx2,
+        working_set: WorkingSetClass::L1,
+        statefulness: KernelStatefulness::Stateless,
+        min_bytes: 1024,
+        preferred_chunk_bytes: 0,
+        sample_bytes: 0,
+        private_table_bytes: 4 * 256 * 4,
+        description: "AVX2-dispatched general four-stripe counter with exact scalar fallback",
     },
     HistogramKernelInfo {
         family: PrimitiveFamily::ByteHistogram,
@@ -1367,8 +1440,9 @@ fn detect_aarch64_backend() -> Backend {
 mod tests {
     use super::{
         ApiContext, Backend, CacheState, ContentKind, EntropyClass, EntropyScale,
-        HistogramStrategy, PlannerConfidenceSource, ProcessorProfile, ReadPattern, SourceHint,
-        WorkloadShape, histogram_kernel_catalog, plan_histogram,
+        HistogramStrategy, KernelAvailability, PlannerConfidenceSource, ProcessorProfile,
+        ReadPattern, SourceHint, WorkloadShape, backend_kernel_support, histogram_kernel_catalog,
+        plan_histogram,
     };
 
     #[test]
@@ -1747,6 +1821,19 @@ mod tests {
                     .map(|info| info.strategy.as_str())
                     .unwrap_or_default()
             );
+        }
+    }
+
+    #[test]
+    fn backend_support_is_honest_about_future_backends() {
+        let avx2 = backend_kernel_support(Backend::Avx2);
+        assert_eq!(avx2.byte_histogram, KernelAvailability::Native);
+        assert_eq!(avx2.fingerprint, KernelAvailability::Native);
+
+        for backend in [Backend::Avx512, Backend::Neon, Backend::Sve, Backend::Sve2] {
+            let support = backend_kernel_support(backend);
+            assert_eq!(support.byte_histogram, KernelAvailability::ScalarFallback);
+            assert_eq!(support.fingerprint, KernelAvailability::ScalarFallback);
         }
     }
 

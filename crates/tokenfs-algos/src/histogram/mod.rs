@@ -2,6 +2,7 @@
 
 pub mod byte;
 pub mod kernels;
+pub mod ngram;
 
 #[cfg(feature = "bench-internals")]
 pub mod bench_internals;
@@ -135,6 +136,16 @@ pub fn block_with_plan(bytes: &[u8], plan: &HistogramPlan) -> ByteHistogram {
         HistogramStrategy::Stripe4U32 => kernels::stripe4_u32::block(bytes),
         HistogramStrategy::Stripe8U32 => kernels::stripe8_u32::block(bytes),
         HistogramStrategy::RunLengthU64 => kernels::run_length_u64::block(bytes),
+        HistogramStrategy::Avx2Stripe4U32 => {
+            #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+            {
+                kernels::avx2_stripe4_u32::block(bytes)
+            }
+            #[cfg(not(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64"))))]
+            {
+                kernels::stripe4_u32::block(bytes)
+            }
+        }
         HistogramStrategy::Avx2PaletteU32 => {
             #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
             {

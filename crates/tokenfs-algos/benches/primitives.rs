@@ -32,9 +32,11 @@ enum PrimitiveKernel {
     HistogramLocalU32,
     HistogramStripe8U32,
     HistogramRunLengthU64,
+    HistogramAvx2Stripe4U32,
     HistogramAvx2PaletteU32,
     FingerprintBlockAuto,
     FingerprintBlockScalar,
+    FingerprintBlockAvx2,
     FingerprintExtentAuto,
     FingerprintExtentScalar,
     SketchMisraGriesK16,
@@ -57,6 +59,9 @@ enum PrimitiveKernel {
     RunLengthSummarize,
     StructureSummarize,
     EntropyH1FromHistogram,
+    EntropyH2Exact,
+    EntropyH4Exact,
+    EntropyH8Exact,
     DivergenceByteJs,
     DivergenceByteKs,
     DistributionNearestByteJs,
@@ -73,6 +78,7 @@ impl PrimitiveKernel {
             Self::HistogramLocalU32,
             Self::HistogramStripe8U32,
             Self::HistogramRunLengthU64,
+            Self::HistogramAvx2Stripe4U32,
             Self::HistogramAvx2PaletteU32,
             Self::FingerprintBlockAuto,
             Self::FingerprintBlockScalar,
@@ -95,6 +101,9 @@ impl PrimitiveKernel {
             Self::RunLengthSummarize,
             Self::StructureSummarize,
             Self::EntropyH1FromHistogram,
+            Self::EntropyH2Exact,
+            Self::EntropyH4Exact,
+            Self::EntropyH8Exact,
             Self::DivergenceByteJs,
             Self::DivergenceByteKs,
             Self::DistributionNearestByteJs,
@@ -114,6 +123,10 @@ impl PrimitiveKernel {
         if byteclass::kernels::avx2::is_available() {
             kernels.push(Self::ByteClassClassifyAvx2);
         }
+        #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+        if fingerprint::kernels::avx2::is_available() {
+            kernels.push(Self::FingerprintBlockAvx2);
+        }
         kernels.push(Self::SketchCrc32Hash4Scalar);
         kernels
     }
@@ -125,9 +138,11 @@ impl PrimitiveKernel {
             Self::HistogramLocalU32 => "histogram-local-u32",
             Self::HistogramStripe8U32 => "histogram-stripe8-u32",
             Self::HistogramRunLengthU64 => "histogram-runlength-u64",
+            Self::HistogramAvx2Stripe4U32 => "histogram-avx2-stripe4-u32",
             Self::HistogramAvx2PaletteU32 => "histogram-avx2-palette-u32",
             Self::FingerprintBlockAuto => "fingerprint-block-auto",
             Self::FingerprintBlockScalar => "fingerprint-block-scalar",
+            Self::FingerprintBlockAvx2 => "fingerprint-block-avx2",
             Self::FingerprintExtentAuto => "fingerprint-extent-auto",
             Self::FingerprintExtentScalar => "fingerprint-extent-scalar",
             Self::SketchMisraGriesK16 => "sketch-misra-gries-k16",
@@ -150,6 +165,9 @@ impl PrimitiveKernel {
             Self::RunLengthSummarize => "runlength-summarize",
             Self::StructureSummarize => "structure-summarize",
             Self::EntropyH1FromHistogram => "entropy-h1-from-histogram",
+            Self::EntropyH2Exact => "entropy-h2-exact",
+            Self::EntropyH4Exact => "entropy-h4-exact",
+            Self::EntropyH8Exact => "entropy-h8-exact",
             Self::DivergenceByteJs => "divergence-byte-js",
             Self::DivergenceByteKs => "divergence-byte-ks",
             Self::DistributionNearestByteJs => "distribution-nearest-byte-js",
@@ -166,8 +184,11 @@ impl PrimitiveKernel {
             | Self::HistogramLocalU32
             | Self::HistogramStripe8U32
             | Self::HistogramRunLengthU64
+            | Self::HistogramAvx2Stripe4U32
             | Self::HistogramAvx2PaletteU32 => "histogram",
-            Self::FingerprintBlockAuto | Self::FingerprintBlockScalar => "fingerprint-block",
+            Self::FingerprintBlockAuto
+            | Self::FingerprintBlockScalar
+            | Self::FingerprintBlockAvx2 => "fingerprint-block",
             Self::FingerprintExtentAuto | Self::FingerprintExtentScalar => "fingerprint-extent",
             Self::SketchMisraGriesK16
             | Self::SketchCountMin4x1024
@@ -188,7 +209,10 @@ impl PrimitiveKernel {
             | Self::ByteClassClassifyAvx2 => "byteclass",
             Self::RunLengthSummarize => "runlength",
             Self::StructureSummarize => "structure",
-            Self::EntropyH1FromHistogram => "entropy",
+            Self::EntropyH1FromHistogram
+            | Self::EntropyH2Exact
+            | Self::EntropyH4Exact
+            | Self::EntropyH8Exact => "entropy",
             Self::DivergenceByteJs | Self::DivergenceByteKs => "divergence",
             Self::DistributionNearestByteJs
             | Self::DistributionNearestByteHellinger
@@ -314,6 +338,16 @@ fn run_kernel(kernel: PrimitiveKernel, bytes: &[u8]) -> u64 {
         PrimitiveKernel::HistogramRunLengthU64 => {
             fold_histogram(histogram::kernels::run_length_u64::block(bytes))
         }
+        PrimitiveKernel::HistogramAvx2Stripe4U32 => {
+            #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+            {
+                fold_histogram(histogram::kernels::avx2_stripe4_u32::block(bytes))
+            }
+            #[cfg(not(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64"))))]
+            {
+                fold_histogram(histogram::kernels::stripe4_u32::block(bytes))
+            }
+        }
         PrimitiveKernel::HistogramAvx2PaletteU32 => {
             #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
             {
@@ -327,6 +361,16 @@ fn run_kernel(kernel: PrimitiveKernel, bytes: &[u8]) -> u64 {
         PrimitiveKernel::FingerprintBlockAuto => fingerprint_blocks(bytes, fingerprint::block),
         PrimitiveKernel::FingerprintBlockScalar => {
             fingerprint_blocks(bytes, fingerprint::kernels::scalar::block)
+        }
+        PrimitiveKernel::FingerprintBlockAvx2 => {
+            #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+            {
+                fingerprint_blocks(bytes, fingerprint::kernels::avx2::block)
+            }
+            #[cfg(not(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64"))))]
+            {
+                fingerprint_blocks(bytes, fingerprint::kernels::scalar::block)
+            }
         }
         PrimitiveKernel::FingerprintExtentAuto => fold_extent(fingerprint::extent(bytes)),
         PrimitiveKernel::FingerprintExtentScalar => {
@@ -459,6 +503,9 @@ fn run_kernel(kernel: PrimitiveKernel, bytes: &[u8]) -> u64 {
             let histogram = ByteHistogram::from_block(bytes);
             entropy::shannon::h1(&histogram).to_bits() as u64
         }
+        PrimitiveKernel::EntropyH2Exact => entropy::ngram::h2(bytes).to_bits() as u64,
+        PrimitiveKernel::EntropyH4Exact => entropy::ngram::h4(bytes).to_bits() as u64,
+        PrimitiveKernel::EntropyH8Exact => entropy::ngram::h8(bytes).to_bits() as u64,
         PrimitiveKernel::DivergenceByteJs => {
             let (left, right) = split_halves(bytes);
             let left = histogram::kernels::direct_u64::block(left);

@@ -22,6 +22,8 @@ pub enum HistogramKernel {
     Stripe8U32,
     /// Run-length scan that adds whole runs to one counter at a time.
     RunLengthU64,
+    /// AVX2-dispatched general four-stripe counter with exact scalar fallback.
+    Avx2Stripe4U32,
     /// AVX2 palette counter with exact scalar fallback.
     Avx2PaletteU32,
     /// Adaptive classifier using the first 1 KiB as a sample.
@@ -51,13 +53,14 @@ pub enum HistogramKernel {
 impl HistogramKernel {
     /// Returns all experimental kernels in a stable order.
     #[must_use]
-    pub const fn all() -> [Self; 17] {
+    pub const fn all() -> [Self; 18] {
         [
             Self::DirectU64,
             Self::LocalU32,
             Self::Stripe4U32,
             Self::Stripe8U32,
             Self::RunLengthU64,
+            Self::Avx2Stripe4U32,
             Self::Avx2PaletteU32,
             Self::AdaptivePrefix1K,
             Self::AdaptivePrefix4K,
@@ -100,6 +103,7 @@ impl HistogramKernel {
             Self::Stripe4U32 => "stripe4-u32",
             Self::Stripe8U32 => "stripe8-u32",
             Self::RunLengthU64 => "run-length-u64",
+            Self::Avx2Stripe4U32 => "avx2-stripe4-u32",
             Self::Avx2PaletteU32 => "avx2-palette-u32",
             Self::AdaptivePrefix1K => "adaptive-prefix-1k",
             Self::AdaptivePrefix4K => "adaptive-prefix-4k",
@@ -140,6 +144,23 @@ pub fn add_block_with_kernel(block: &[u8], histogram: &mut ByteHistogram, kernel
         HistogramKernel::Stripe4U32 => histogram_scalar::add_block_striped_u32::<4>(block, counts),
         HistogramKernel::Stripe8U32 => histogram_scalar::add_block_striped_u32::<8>(block, counts),
         HistogramKernel::RunLengthU64 => histogram_scalar::add_block_run_length_u64(block, counts),
+        HistogramKernel::Avx2Stripe4U32 => {
+            #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+            {
+                if crate::histogram::kernels::avx2_stripe4_u32::is_available() {
+                    // SAFETY: availability was checked immediately above.
+                    unsafe {
+                        crate::primitives::histogram_avx2::add_block_stripe4_u32(block, counts);
+                    }
+                } else {
+                    histogram_scalar::add_block_striped_u32::<4>(block, counts);
+                }
+            }
+            #[cfg(not(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64"))))]
+            {
+                histogram_scalar::add_block_striped_u32::<4>(block, counts);
+            }
+        }
         HistogramKernel::Avx2PaletteU32 => {
             #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
             {

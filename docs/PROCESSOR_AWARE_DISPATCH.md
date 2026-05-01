@@ -63,8 +63,11 @@ The first Rust catalog slice is now present in `tokenfs_algos::dispatch`:
 - metadata records ISA class, working-set class, statefulness, preferred chunk
   size, classifier sample size, and private table footprint.
 
-The current catalog is intentionally scalar. AVX2/AVX-512/NEON/SVE entries
-should be added only when those kernels exist and have parity tests.
+The catalog now includes pinned AVX2 entries where the implementation and parity
+tests exist, including `avx2-stripe4-u32` for byte histograms and the fused F22
+block fingerprint path. AVX-512/NEON/SVE/SVE2 are feature-shaped targets, but
+`backend_kernel_support()` reports them as scalar fallback until real kernels
+exist and pass backend parity tests.
 
 ## Compile-Time Families
 
@@ -103,6 +106,9 @@ Current implementation status:
   count;
 - on Linux with `std`, it also reads cache line, L1D, L2, and L3 sizes from
   `/sys/devices/system/cpu/cpu0/cache`;
+- `backend_kernel_support()` distinguishes native implemented backends from
+  scalar fallback backends, so future ISA support is not implied by feature
+  names alone;
 - `cargo run -p tokenfs-algos --example dispatch_explain` prints the detected
   profile, the catalog, and representative planner decisions.
 

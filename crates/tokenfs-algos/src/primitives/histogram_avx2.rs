@@ -17,6 +17,45 @@ const MAX_PALETTE: usize = 16;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const SAMPLE_BYTES: usize = 4096;
 
+/// Counts bytes with four private `u32` tables under an AVX2-dispatched entry.
+///
+/// This is the general exact AVX2 histogram candidate. x86 does not have a
+/// native byte histogram instruction, so this kernel still performs scalar
+/// table increments; the value is that it gives the planner a pinned,
+/// feature-dispatched general path distinct from the low-cardinality palette
+/// specialization.
+///
+/// # Safety
+///
+/// The caller must ensure the current CPU supports AVX2.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn add_block_stripe4_u32(bytes: &[u8], counts: &mut [u64; 256]) {
+    for chunk in bytes.chunks(u32::MAX as usize) {
+        let mut h0 = [0_u32; 256];
+        let mut h1 = [0_u32; 256];
+        let mut h2 = [0_u32; 256];
+        let mut h3 = [0_u32; 256];
+
+        let groups = chunk.len() / 4;
+        for group in 0..groups {
+            let base = group * 4;
+            h0[chunk[base] as usize] += 1;
+            h1[chunk[base + 1] as usize] += 1;
+            h2[chunk[base + 2] as usize] += 1;
+            h3[chunk[base + 3] as usize] += 1;
+        }
+
+        for &byte in &chunk[groups * 4..] {
+            h0[byte as usize] += 1;
+        }
+
+        for index in 0..256 {
+            counts[index] += u64::from(h0[index] + h1[index] + h2[index] + h3[index]);
+        }
+    }
+}
+
 /// Counts bytes with an AVX2 palette fast path and scalar fallback.
 ///
 /// This is exact. If the spread sample has more than 16 distinct bytes, the

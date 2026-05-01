@@ -39,7 +39,7 @@ Important pieces:
    `fingerprint::kernels::scalar` paths.
 4. Done: add optional F21/F22 sidecar calibration tests that skip when data is
    unavailable.
-5. Move the AVX2 path after scalar parity is stable.
+5. Done: move the F22 AVX2/SSE4.2 fused block path after scalar parity is stable.
 6. Add planner-oracle benchmark rows: for each F21 extent, compare the planner
    selection against the F21/F22 oracle outcome.
 
@@ -76,7 +76,9 @@ silently fabricating paper calibration data.
 For v0.1, keep dispatch static and transparent:
 
 - scalar always available;
-- AVX2/NEON selected by runtime feature detection when implemented;
+- AVX2 selected by runtime feature detection for implemented x86 kernels;
+- NEON/AVX-512/SVE/SVE2 are reported as scalar fallback until parity-tested
+  kernels exist on those backends;
 - planner rules are documented and inspectable;
 - calibration tests are opt-in when real sidecar/parquet data exists.
 
