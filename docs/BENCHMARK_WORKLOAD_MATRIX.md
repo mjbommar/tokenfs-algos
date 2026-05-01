@@ -64,6 +64,21 @@ SQLite/parquet, archive, compressed, binary, and dictionary files. F21/F22 paper
 fixtures can be passed with `TOKENFS_ALGOS_F21_DATA`, `TOKENFS_ALGOS_F22_DATA`,
 or discovered under `../tokenfs-paper/data/`.
 
+Magic-BPE processed-index samples are optional manual real workloads. Use
+`cargo xtask bench-real-magic-bpe /nas4/data/training/magic-bpe/project/data`
+and control scope with:
+
+- `TOKENFS_ALGOS_MAGIC_BPE_LIMIT`: total sample cap;
+- `TOKENFS_ALGOS_MAGIC_BPE_PER_MIME_LIMIT`: per-MIME cap;
+- `TOKENFS_ALGOS_MAGIC_BPE_SAMPLE_BYTES`: bytes retained per sample, with `0`
+  meaning no truncation;
+- `TOKENFS_ALGOS_MAGIC_BPE_SHUFFLE` and `TOKENFS_ALGOS_MAGIC_BPE_SEED`:
+  deterministic shuffle controls;
+- `TOKENFS_ALGOS_WORKLOAD_MAX_INPUTS`: final payload-row cap.
+
+Directory-backed real workloads can be limited with
+`TOKENFS_ALGOS_REAL_DIR_LIMIT`.
+
 ## Access Patterns
 
 The quick matrix runs:
@@ -162,6 +177,15 @@ cargo xtask bench-compare \
   target/bench-history/runs/<old>.jsonl \
   target/bench-history/runs/<new>.jsonl
 ```
+
+The comparison command writes:
+
+- `summary.md`: matched/unmatched counts, median and mean change, top
+  regressions/improvements, planner win/miss/gap summary, and grouped tables;
+- `comparison.csv`: row-level old/new throughput and workload dimensions;
+- `top-regressions.svg` and `top-improvements.svg`;
+- `median-change-by-kernel.svg`, `median-change-by-entropy.svg`, and
+  `median-change-by-thread.svg`.
 
 Generate visual and tabular artifacts for a run:
 

@@ -721,6 +721,21 @@ pub fn plan_histogram(profile: &ProcessorProfile, workload: &WorkloadShape) -> H
     let mixedish_entropy = matches!(workload.entropy, EntropyClass::Mixed | EntropyClass::Medium);
     let structured_scale = matches!(workload.scale, EntropyScale::Meso | EntropyScale::Macro);
 
+    if workload.source_hint == SourceHint::PaperExtent
+        && random_like
+        && call_bytes <= 4 * 1024
+        && total_bytes >= 64 * 1024
+        && mixedish_entropy
+    {
+        return plan(
+            HistogramStrategy::DirectU64,
+            workload.chunk_bytes,
+            0,
+            205,
+            "F22/rootfs random 4K calibration favored direct counting over stripe8",
+        );
+    }
+
     if threads <= 1 && call_bytes <= 4 * 1024 {
         if workload.entropy == EntropyClass::Low && call_bytes > 1 {
             return plan(
@@ -1602,6 +1617,27 @@ mod tests {
         let plan = plan_histogram(&profile, &workload);
 
         assert_eq!(plan.strategy, HistogramStrategy::Stripe8U32);
+    }
+
+    #[test]
+    fn planner_uses_direct_for_random_paper_4k_reads() {
+        let profile = ProcessorProfile::portable();
+        let mut workload = WorkloadShape::new(ApiContext::Random, 1024 * 1024);
+        workload.chunk_bytes = 4 * 1024;
+        workload.content = ContentKind::Binary;
+        workload.entropy = EntropyClass::Mixed;
+        workload.scale = EntropyScale::Macro;
+        workload.source_hint = SourceHint::PaperExtent;
+        workload.read_pattern = ReadPattern::Random;
+
+        let plan = plan_histogram(&profile, &workload);
+
+        assert_eq!(plan.strategy, HistogramStrategy::DirectU64);
+        assert_eq!(plan.sample_bytes, 0);
+        assert_eq!(
+            plan.confidence_source,
+            PlannerConfidenceSource::CalibrationRule
+        );
     }
 
     #[test]

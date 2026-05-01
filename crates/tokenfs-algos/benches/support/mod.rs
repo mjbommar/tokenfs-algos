@@ -904,7 +904,10 @@ fn magic_bpe_payloads_from_root(root: &Path) -> std::io::Result<Vec<Payload>> {
             payloads.len()
         );
         let mut payload = Payload::new(label, "magic-bpe", content, entropy, scale, pattern, bytes);
-        payload.byte_len = payload.byte_len.min(64 * 1024);
+        let sample_bytes = env_usize("TOKENFS_ALGOS_MAGIC_BPE_SAMPLE_BYTES").unwrap_or(64 * 1024);
+        if sample_bytes != 0 {
+            payload.byte_len = payload.byte_len.min(sample_bytes);
+        }
         let _ = &candidate.original_path;
         payloads.push(payload);
         *count += 1;
@@ -924,7 +927,8 @@ struct MagicBpeCandidate {
 fn real_workload_payloads_from_dir(path: &Path, size: usize) -> std::io::Result<Vec<Payload>> {
     let mut payloads = Vec::new();
     let mut files = Vec::new();
-    collect_representative_files(path, 64, &mut files)?;
+    let limit = env_usize("TOKENFS_ALGOS_REAL_DIR_LIMIT").unwrap_or(64);
+    collect_representative_files(path, limit, &mut files)?;
 
     for file_path in files {
         payloads.extend(real_workload_payloads_from_path(

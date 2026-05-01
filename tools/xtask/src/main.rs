@@ -388,16 +388,17 @@ fn bench_planner_parity_real(args: &[OsString]) -> Result<()> {
 
 fn bench_real_magic_bpe(args: &[OsString]) -> Result<()> {
     let (path, extra) = path_or_default(args, "/nas4/data/training/magic-bpe/project/data")?;
-    bench_workloads_with_env(
-        &extra,
-        vec![
-            ("TOKENFS_ALGOS_MAGIC_BPE_DATA".into(), path.into_os_string()),
-            ("TOKENFS_ALGOS_ONLY_MAGIC_BPE".into(), "1".into()),
-            ("TOKENFS_ALGOS_KERNEL_SWEEP".into(), "1".into()),
-            ("TOKENFS_ALGOS_THREAD_SWEEP".into(), "quick".into()),
-            ("TOKENFS_ALGOS_MATRIX_LEVEL".into(), "quick".into()),
-        ],
-    )
+    let mut env_vars = vec![
+        ("TOKENFS_ALGOS_MAGIC_BPE_DATA".into(), path.into_os_string()),
+        ("TOKENFS_ALGOS_ONLY_MAGIC_BPE".into(), "1".into()),
+        ("TOKENFS_ALGOS_KERNEL_SWEEP".into(), "1".into()),
+        ("TOKENFS_ALGOS_THREAD_SWEEP".into(), "quick".into()),
+        ("TOKENFS_ALGOS_MATRIX_LEVEL".into(), "quick".into()),
+    ];
+    if env::var_os("TOKENFS_ALGOS_WORKLOAD_MAX_INPUTS").is_none() {
+        env_vars.push(("TOKENFS_ALGOS_WORKLOAD_MAX_INPUTS".into(), "128".into()));
+    }
+    bench_workloads_with_env(&extra, env_vars)
 }
 
 fn calibrate_magic_bpe(args: &[OsString]) -> Result<()> {
@@ -590,8 +591,16 @@ fn bench_compare(args: &[OsString]) -> Result<()> {
 
     let old_path = PathBuf::from(args[0].clone());
     let new_path = PathBuf::from(args[1].clone());
-    let old = read_bench_log_records(&old_path)?;
-    let new = read_bench_log_records(&new_path)?;
+    let old_records = read_bench_report_records(&old_path)?;
+    let new_records = read_bench_report_records(&new_path)?;
+    let old: HashMap<&str, &BenchReportRecord> = old_records
+        .iter()
+        .map(|record| (record.full_id.as_str(), record))
+        .collect();
+    let new: HashMap<&str, &BenchReportRecord> = new_records
+        .iter()
+        .map(|record| (record.full_id.as_str(), record))
+        .collect();
 
     let mut deltas = Vec::new();
     for (key, old_record) in &old {
@@ -603,14 +612,7 @@ fn bench_compare(args: &[OsString]) -> Result<()> {
         } else {
             (new_record.gib_per_s - old_record.gib_per_s) / old_record.gib_per_s * 100.0
         };
-        deltas.push(BenchDelta {
-            label: old_record.label.clone(),
-            old_gib_per_s: old_record.gib_per_s,
-            new_gib_per_s: new_record.gib_per_s,
-            old_mean_ns: old_record.mean_ns,
-            new_mean_ns: new_record.mean_ns,
-            change_pct,
-        });
+        deltas.push(BenchCompareRow::new(old_record, new_record, change_pct));
     }
 
     deltas.sort_by(|left, right| {
@@ -625,12 +627,12 @@ fn bench_compare(args: &[OsString]) -> Result<()> {
     println!();
     println!("- old: `{}`", old_path.display());
     println!("- new: `{}`", new_path.display());
-    println!("- old_records: `{}`", old.len());
-    println!("- new_records: `{}`", new.len());
+    println!("- old_records: `{}`", old_records.len());
+    println!("- new_records: `{}`", new_records.len());
     println!("- matched_records: `{}`", deltas.len());
     println!(
         "- unmatched_records: `{}`",
-        old.len() + new.len() - (2 * deltas.len())
+        old_records.len() + new_records.len() - (2 * deltas.len())
     );
     println!();
 
@@ -638,6 +640,15 @@ fn bench_compare(args: &[OsString]) -> Result<()> {
         println!("No matching benchmark IDs found.");
         return Ok(());
     }
+
+    let report_dir = write_bench_compare_report(
+        &old_path,
+        &new_path,
+        &deltas,
+        &new_records,
+        old_records.len(),
+        new_records.len(),
+    )?;
 
     println!("| Benchmark | Old GiB/s | New GiB/s | Change | Old Mean | New Mean |");
     println!("|---|---:|---:|---:|---:|---:|");
@@ -652,6 +663,8 @@ fn bench_compare(args: &[OsString]) -> Result<()> {
             format_duration_ns(delta.new_mean_ns),
         );
     }
+    println!();
+    println!("- report: `{}`", report_dir.display());
 
     Ok(())
 }
@@ -1052,19 +1065,78 @@ struct RunMetadata {
     processor: Value,
 }
 
-struct BenchLogRecord {
+struct BenchCompareRow {
+    full_id: String,
     label: String,
-    gib_per_s: f64,
-    mean_ns: f64,
-}
-
-struct BenchDelta {
-    label: String,
+    kernel: String,
+    workload: String,
+    primitive: String,
+    case: String,
+    source: String,
+    content: String,
+    entropy: String,
+    scale: String,
+    access: String,
+    chunk: String,
+    threads: String,
+    pattern: String,
+    planned_kernel: String,
+    planned_confidence_source: String,
+    bytes: String,
     old_gib_per_s: f64,
     new_gib_per_s: f64,
     old_mean_ns: f64,
     new_mean_ns: f64,
     change_pct: f64,
+}
+
+impl BenchCompareRow {
+    fn new(
+        old_record: &BenchReportRecord,
+        new_record: &BenchReportRecord,
+        change_pct: f64,
+    ) -> Self {
+        let metadata = |new_value: &str, old_value: &str| {
+            if new_value.is_empty() {
+                old_value.to_owned()
+            } else {
+                new_value.to_owned()
+            }
+        };
+        let workload = workload_label(new_record);
+        let label = if new_record.kernel.is_empty() {
+            workload.clone()
+        } else {
+            format!("{} | {}", new_record.kernel, workload)
+        };
+        Self {
+            full_id: new_record.full_id.clone(),
+            label,
+            kernel: metadata(&new_record.kernel, &old_record.kernel),
+            workload,
+            primitive: metadata(&new_record.primitive, &old_record.primitive),
+            case: metadata(&new_record.case, &old_record.case),
+            source: metadata(&new_record.source, &old_record.source),
+            content: metadata(&new_record.content, &old_record.content),
+            entropy: metadata(&new_record.entropy, &old_record.entropy),
+            scale: metadata(&new_record.scale, &old_record.scale),
+            access: metadata(&new_record.access, &old_record.access),
+            chunk: metadata(&new_record.chunk, &old_record.chunk),
+            threads: metadata(&new_record.threads, &old_record.threads),
+            pattern: metadata(&new_record.pattern, &old_record.pattern),
+            planned_kernel: metadata(&new_record.planned_kernel, &old_record.planned_kernel),
+            planned_confidence_source: metadata(
+                &new_record.planned_confidence_source,
+                &old_record.planned_confidence_source,
+            ),
+            bytes: metadata(&new_record.bytes, &old_record.bytes),
+            old_gib_per_s: old_record.gib_per_s,
+            new_gib_per_s: new_record.gib_per_s,
+            old_mean_ns: old_record.mean_ns,
+            new_mean_ns: new_record.mean_ns,
+            change_pct,
+        }
+    }
 }
 
 struct BenchReportRecord {
@@ -1089,6 +1161,37 @@ struct BenchReportRecord {
     throughput_bytes: u64,
     mean_ns: f64,
     gib_per_s: f64,
+}
+
+struct GroupChangeSummary {
+    key: String,
+    count: usize,
+    median_change_pct: f64,
+    mean_change_pct: f64,
+    regressions: usize,
+    improvements: usize,
+    median_old_gib_per_s: f64,
+    median_new_gib_per_s: f64,
+}
+
+struct PlannerCompareSummary {
+    workloads: usize,
+    wins: usize,
+    misses: usize,
+    missing_planned_kernel: usize,
+    median_gap_pct_of_best: f64,
+    mean_gap_pct_of_best: f64,
+    top_misses: Vec<PlannerCompareMiss>,
+}
+
+struct PlannerCompareMiss {
+    workload: String,
+    planned_kernel: String,
+    winner_kernel: String,
+    planned_gib_per_s: f64,
+    winner_gib_per_s: f64,
+    gap_pct_of_best: f64,
+    confidence_source: String,
 }
 
 #[derive(Clone)]
@@ -1590,80 +1693,6 @@ fn read_json_file(path: &Path) -> Result<Value> {
         .map_err(|error| format!("failed to parse `{}`: {error}", path.display()))
 }
 
-fn read_bench_log_records(path: &Path) -> Result<HashMap<String, BenchLogRecord>> {
-    let file = File::open(path)
-        .map_err(|error| format!("failed to open `{}`: {error}", path.display()))?;
-    let mut records = HashMap::new();
-
-    for (index, line) in BufReader::new(file).lines().enumerate() {
-        let line_number = index + 1;
-        let line = line.map_err(|error| {
-            format!(
-                "failed to read line {line_number} from `{}`: {error}",
-                path.display()
-            )
-        })?;
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let value = serde_json::from_str::<Value>(&line).map_err(|error| {
-            format!(
-                "failed to parse line {line_number} from `{}`: {error}",
-                path.display()
-            )
-        })?;
-        let full_id = value
-            .get("full_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                format!(
-                    "missing `full_id` on line {line_number} from `{}`",
-                    path.display()
-                )
-            })?;
-        let kernel = value.get("kernel").and_then(Value::as_str).unwrap_or("");
-        let workload_id = value
-            .get("workload_id")
-            .and_then(Value::as_str)
-            .unwrap_or(full_id);
-        let gib_per_s = value
-            .get("gib_per_s")
-            .and_then(Value::as_f64)
-            .ok_or_else(|| {
-                format!(
-                    "missing `gib_per_s` on line {line_number} from `{}`",
-                    path.display()
-                )
-            })?;
-        let mean_ns = value
-            .get("mean_ns")
-            .and_then(Value::as_f64)
-            .ok_or_else(|| {
-                format!(
-                    "missing `mean_ns` on line {line_number} from `{}`",
-                    path.display()
-                )
-            })?;
-        let label = if kernel.is_empty() {
-            workload_id.to_owned()
-        } else {
-            format!("{kernel}/{workload_id}")
-        };
-
-        records.insert(
-            full_id.to_owned(),
-            BenchLogRecord {
-                label,
-                gib_per_s,
-                mean_ns,
-            },
-        );
-    }
-
-    Ok(records)
-}
-
 fn read_bench_report_records(path: &Path) -> Result<Vec<BenchReportRecord>> {
     let file = File::open(path)
         .map_err(|error| format!("failed to open `{}`: {error}", path.display()))?;
@@ -1812,6 +1841,677 @@ fn write_timing_csv(path: &Path, records: &[BenchReportRecord]) -> Result<()> {
         .map_err(write_error(path))?;
     }
 
+    Ok(())
+}
+
+fn write_bench_compare_report(
+    old_path: &Path,
+    new_path: &Path,
+    rows: &[BenchCompareRow],
+    new_records: &[BenchReportRecord],
+    old_record_count: usize,
+    new_record_count: usize,
+) -> Result<PathBuf> {
+    let report_id = format!(
+        "{}--{}",
+        file_stem_string(old_path),
+        file_stem_string(new_path)
+    );
+    let report_dir = bench_history_dir().join("comparisons").join(report_id);
+    fs::create_dir_all(&report_dir).map_err(|error| {
+        format!(
+            "failed to create benchmark comparison directory `{}`: {error}",
+            report_dir.display()
+        )
+    })?;
+
+    let comparison_csv = report_dir.join("comparison.csv");
+    let summary_md = report_dir.join("summary.md");
+    let top_regressions_svg = report_dir.join("top-regressions.svg");
+    let top_improvements_svg = report_dir.join("top-improvements.svg");
+    let kernel_delta_svg = report_dir.join("median-change-by-kernel.svg");
+    let entropy_delta_svg = report_dir.join("median-change-by-entropy.svg");
+    let thread_delta_svg = report_dir.join("median-change-by-thread.svg");
+
+    write_bench_comparison_csv(&comparison_csv, rows)?;
+    write_bench_comparison_visuals(
+        &top_regressions_svg,
+        &top_improvements_svg,
+        &kernel_delta_svg,
+        &entropy_delta_svg,
+        &thread_delta_svg,
+        rows,
+    )?;
+    write_bench_comparison_summary(
+        &summary_md,
+        old_path,
+        new_path,
+        rows,
+        new_records,
+        old_record_count,
+        new_record_count,
+        &comparison_csv,
+        &[
+            &top_regressions_svg,
+            &top_improvements_svg,
+            &kernel_delta_svg,
+            &entropy_delta_svg,
+            &thread_delta_svg,
+        ],
+    )?;
+
+    eprintln!(
+        "xtask: wrote benchmark comparison `{}`",
+        summary_md.display()
+    );
+    eprintln!(
+        "xtask: wrote benchmark comparison table `{}`",
+        comparison_csv.display()
+    );
+
+    Ok(report_dir)
+}
+
+fn write_bench_comparison_csv(path: &Path, rows: &[BenchCompareRow]) -> Result<()> {
+    let mut file = File::create(path)
+        .map_err(|error| format!("failed to create `{}`: {error}", path.display()))?;
+    writeln!(
+        file,
+        "full_id,label,kernel,workload,primitive,case,source,content,entropy,scale,access,chunk,threads,pattern,planned_kernel,planned_confidence_source,bytes,old_gib_per_s,new_gib_per_s,change_pct,old_mean_ns,new_mean_ns"
+    )
+    .map_err(write_error(path))?;
+
+    for row in rows {
+        writeln!(
+            file,
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.6},{:.6},{:.3},{:.6},{:.6}",
+            csv_cell(&row.full_id),
+            csv_cell(&row.label),
+            csv_cell(&row.kernel),
+            csv_cell(&row.workload),
+            csv_cell(&row.primitive),
+            csv_cell(&row.case),
+            csv_cell(&row.source),
+            csv_cell(&row.content),
+            csv_cell(&row.entropy),
+            csv_cell(&row.scale),
+            csv_cell(&row.access),
+            csv_cell(&row.chunk),
+            csv_cell(&row.threads),
+            csv_cell(&row.pattern),
+            csv_cell(&row.planned_kernel),
+            csv_cell(&row.planned_confidence_source),
+            csv_cell(&row.bytes),
+            row.old_gib_per_s,
+            row.new_gib_per_s,
+            row.change_pct,
+            row.old_mean_ns,
+            row.new_mean_ns,
+        )
+        .map_err(write_error(path))?;
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_bench_comparison_summary(
+    path: &Path,
+    old_path: &Path,
+    new_path: &Path,
+    rows: &[BenchCompareRow],
+    new_records: &[BenchReportRecord],
+    old_record_count: usize,
+    new_record_count: usize,
+    comparison_csv: &Path,
+    svgs: &[&Path],
+) -> Result<()> {
+    let mut file = File::create(path)
+        .map_err(|error| format!("failed to create `{}`: {error}", path.display()))?;
+    let changes = rows.iter().map(|row| row.change_pct).collect::<Vec<_>>();
+    let median_change = median(changes.clone());
+    let mean_change = mean(&changes);
+    let regression_count = rows.iter().filter(|row| row.change_pct <= -5.0).count();
+    let improvement_count = rows.iter().filter(|row| row.change_pct >= 5.0).count();
+    let planner_summary = planner_compare_summary(new_records);
+
+    writeln!(file, "# Benchmark Comparison").map_err(write_error(path))?;
+    writeln!(file).map_err(write_error(path))?;
+    writeln!(file, "- old: `{}`", old_path.display()).map_err(write_error(path))?;
+    writeln!(file, "- new: `{}`", new_path.display()).map_err(write_error(path))?;
+    writeln!(file, "- old_records: `{old_record_count}`").map_err(write_error(path))?;
+    writeln!(file, "- new_records: `{new_record_count}`").map_err(write_error(path))?;
+    writeln!(file, "- matched_records: `{}`", rows.len()).map_err(write_error(path))?;
+    writeln!(
+        file,
+        "- unmatched_records: `{}`",
+        old_record_count + new_record_count - (2 * rows.len())
+    )
+    .map_err(write_error(path))?;
+    writeln!(file, "- median_change: `{median_change:+.2}%`").map_err(write_error(path))?;
+    writeln!(file, "- mean_change: `{mean_change:+.2}%`").map_err(write_error(path))?;
+    writeln!(file, "- regressions_le_-5pct: `{regression_count}`").map_err(write_error(path))?;
+    writeln!(file, "- improvements_ge_5pct: `{improvement_count}`").map_err(write_error(path))?;
+    writeln!(file).map_err(write_error(path))?;
+
+    writeln!(file, "## Artifacts").map_err(write_error(path))?;
+    writeln!(file).map_err(write_error(path))?;
+    writeln!(file, "- comparison_csv: `{}`", comparison_csv.display())
+        .map_err(write_error(path))?;
+    for svg in svgs {
+        writeln!(file, "- svg: `{}`", svg.display()).map_err(write_error(path))?;
+    }
+    writeln!(file).map_err(write_error(path))?;
+
+    writeln!(file, "## Planner Summary").map_err(write_error(path))?;
+    writeln!(file).map_err(write_error(path))?;
+    if planner_summary.workloads == 0 {
+        writeln!(file, "No planner metadata was present in the new run.")
+            .map_err(write_error(path))?;
+    } else {
+        writeln!(file, "- workloads: `{}`", planner_summary.workloads)
+            .map_err(write_error(path))?;
+        writeln!(file, "- planner_wins: `{}`", planner_summary.wins).map_err(write_error(path))?;
+        writeln!(file, "- planner_misses: `{}`", planner_summary.misses)
+            .map_err(write_error(path))?;
+        writeln!(
+            file,
+            "- missing_planned_kernel_rows: `{}`",
+            planner_summary.missing_planned_kernel
+        )
+        .map_err(write_error(path))?;
+        writeln!(
+            file,
+            "- median_gap_pct_of_best: `{:.2}%`",
+            planner_summary.median_gap_pct_of_best
+        )
+        .map_err(write_error(path))?;
+        writeln!(
+            file,
+            "- mean_gap_pct_of_best: `{:.2}%`",
+            planner_summary.mean_gap_pct_of_best
+        )
+        .map_err(write_error(path))?;
+        writeln!(file).map_err(write_error(path))?;
+        writeln!(
+            file,
+            "| Workload | Planner | Winner | Planner GiB/s | Winner GiB/s | Gap vs best | Confidence |"
+        )
+        .map_err(write_error(path))?;
+        writeln!(file, "|---|---|---|---:|---:|---:|---|").map_err(write_error(path))?;
+        for miss in planner_summary.top_misses.iter().take(20) {
+            writeln!(
+                file,
+                "| {} | {} | {} | {:.2} | {:.2} | {:.1}% | {} |",
+                markdown_cell(&short_label(&miss.workload, 70)),
+                markdown_cell(&miss.planned_kernel),
+                markdown_cell(&miss.winner_kernel),
+                miss.planned_gib_per_s,
+                miss.winner_gib_per_s,
+                miss.gap_pct_of_best,
+                markdown_cell(&miss.confidence_source),
+            )
+            .map_err(write_error(path))?;
+        }
+    }
+    writeln!(file).map_err(write_error(path))?;
+
+    write_comparison_top_table(&mut file, path, "Top Regressions", rows, true)?;
+    write_comparison_top_table(&mut file, path, "Top Improvements", rows, false)?;
+    write_comparison_group_table(
+        &mut file,
+        path,
+        "By Kernel",
+        &comparison_group_summaries(rows, |row| &row.kernel),
+    )?;
+    write_comparison_group_table(
+        &mut file,
+        path,
+        "By Workload",
+        &comparison_group_summaries(rows, |row| &row.workload),
+    )?;
+    write_comparison_group_table(
+        &mut file,
+        path,
+        "By Size",
+        &comparison_group_summaries(rows, |row| &row.bytes),
+    )?;
+    write_comparison_group_table(
+        &mut file,
+        path,
+        "By Entropy",
+        &comparison_group_summaries(rows, |row| &row.entropy),
+    )?;
+    write_comparison_group_table(
+        &mut file,
+        path,
+        "By Threads",
+        &comparison_group_summaries(rows, |row| &row.threads),
+    )?;
+
+    Ok(())
+}
+
+fn write_bench_comparison_visuals(
+    top_regressions_svg: &Path,
+    top_improvements_svg: &Path,
+    kernel_delta_svg: &Path,
+    entropy_delta_svg: &Path,
+    thread_delta_svg: &Path,
+    rows: &[BenchCompareRow],
+) -> Result<()> {
+    let mut regressions = rows
+        .iter()
+        .filter(|row| row.change_pct < 0.0)
+        .collect::<Vec<_>>();
+    regressions.sort_by(|left, right| {
+        left.change_pct
+            .partial_cmp(&right.change_pct)
+            .unwrap_or(Ordering::Equal)
+    });
+    let regression_bars = regressions
+        .iter()
+        .take(25)
+        .map(|row| {
+            (
+                row.label.clone(),
+                row.change_pct,
+                format!("{:+.1}%", row.change_pct),
+            )
+        })
+        .collect::<Vec<_>>();
+    write_delta_bar_chart_svg(
+        top_regressions_svg,
+        "Top Regressions",
+        "Signed throughput delta; red means the new run is slower.",
+        &regression_bars,
+    )?;
+
+    let mut improvements = rows
+        .iter()
+        .filter(|row| row.change_pct > 0.0)
+        .collect::<Vec<_>>();
+    improvements.sort_by(|left, right| {
+        right
+            .change_pct
+            .partial_cmp(&left.change_pct)
+            .unwrap_or(Ordering::Equal)
+    });
+    let improvement_bars = improvements
+        .iter()
+        .take(25)
+        .map(|row| {
+            (
+                row.label.clone(),
+                row.change_pct,
+                format!("{:+.1}%", row.change_pct),
+            )
+        })
+        .collect::<Vec<_>>();
+    write_delta_bar_chart_svg(
+        top_improvements_svg,
+        "Top Improvements",
+        "Signed throughput delta; green means the new run is faster.",
+        &improvement_bars,
+    )?;
+
+    write_group_delta_svg(
+        kernel_delta_svg,
+        "Median Change By Kernel",
+        "Median throughput delta grouped by kernel.",
+        &comparison_group_summaries(rows, |row| &row.kernel),
+    )?;
+    write_group_delta_svg(
+        entropy_delta_svg,
+        "Median Change By Entropy",
+        "Median throughput delta grouped by entropy class.",
+        &comparison_group_summaries(rows, |row| &row.entropy),
+    )?;
+    write_group_delta_svg(
+        thread_delta_svg,
+        "Median Change By Thread Count",
+        "Median throughput delta grouped by thread count.",
+        &comparison_group_summaries(rows, |row| &row.threads),
+    )?;
+
+    Ok(())
+}
+
+fn write_comparison_top_table(
+    file: &mut File,
+    path: &Path,
+    title: &str,
+    rows: &[BenchCompareRow],
+    regressions: bool,
+) -> Result<()> {
+    let mut selected = rows
+        .iter()
+        .filter(|row| {
+            if regressions {
+                row.change_pct < 0.0
+            } else {
+                row.change_pct > 0.0
+            }
+        })
+        .collect::<Vec<_>>();
+    selected.sort_by(|left, right| {
+        if regressions {
+            left.change_pct
+                .partial_cmp(&right.change_pct)
+                .unwrap_or(Ordering::Equal)
+        } else {
+            right
+                .change_pct
+                .partial_cmp(&left.change_pct)
+                .unwrap_or(Ordering::Equal)
+        }
+    });
+
+    writeln!(file, "## {title}").map_err(write_error(path))?;
+    writeln!(file).map_err(write_error(path))?;
+    writeln!(
+        file,
+        "| Benchmark | Old GiB/s | New GiB/s | Change | Old Mean | New Mean |"
+    )
+    .map_err(write_error(path))?;
+    writeln!(file, "|---|---:|---:|---:|---:|---:|").map_err(write_error(path))?;
+    for row in selected.iter().take(20) {
+        writeln!(
+            file,
+            "| {} | {:.2} | {:.2} | {:+.1}% | {} | {} |",
+            markdown_cell(&short_label(&row.label, 90)),
+            row.old_gib_per_s,
+            row.new_gib_per_s,
+            row.change_pct,
+            format_duration_ns(row.old_mean_ns),
+            format_duration_ns(row.new_mean_ns),
+        )
+        .map_err(write_error(path))?;
+    }
+    writeln!(file).map_err(write_error(path))?;
+    Ok(())
+}
+
+fn write_comparison_group_table(
+    file: &mut File,
+    path: &Path,
+    title: &str,
+    summaries: &[GroupChangeSummary],
+) -> Result<()> {
+    let mut rows = summaries.iter().collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .median_change_pct
+            .abs()
+            .partial_cmp(&left.median_change_pct.abs())
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| left.key.cmp(&right.key))
+    });
+
+    writeln!(file, "## {title}").map_err(write_error(path))?;
+    writeln!(file).map_err(write_error(path))?;
+    writeln!(
+        file,
+        "| Group | Rows | Median Change | Mean Change | Regressions | Improvements | Old GiB/s | New GiB/s |"
+    )
+    .map_err(write_error(path))?;
+    writeln!(file, "|---|---:|---:|---:|---:|---:|---:|---:|").map_err(write_error(path))?;
+    for summary in rows.iter().take(30) {
+        writeln!(
+            file,
+            "| {} | {} | {:+.1}% | {:+.1}% | {} | {} | {:.2} | {:.2} |",
+            markdown_cell(&short_label(&summary.key, 70)),
+            summary.count,
+            summary.median_change_pct,
+            summary.mean_change_pct,
+            summary.regressions,
+            summary.improvements,
+            summary.median_old_gib_per_s,
+            summary.median_new_gib_per_s,
+        )
+        .map_err(write_error(path))?;
+    }
+    writeln!(file).map_err(write_error(path))?;
+    Ok(())
+}
+
+fn comparison_group_summaries(
+    rows: &[BenchCompareRow],
+    key: fn(&BenchCompareRow) -> &str,
+) -> Vec<GroupChangeSummary> {
+    let mut groups: BTreeMap<String, Vec<&BenchCompareRow>> = BTreeMap::new();
+    for row in rows {
+        groups
+            .entry(dimension_value(key(row)))
+            .or_default()
+            .push(row);
+    }
+
+    groups
+        .into_iter()
+        .map(|(key, rows)| {
+            let changes = rows.iter().map(|row| row.change_pct).collect::<Vec<_>>();
+            let old = rows.iter().map(|row| row.old_gib_per_s).collect::<Vec<_>>();
+            let new = rows.iter().map(|row| row.new_gib_per_s).collect::<Vec<_>>();
+            GroupChangeSummary {
+                key,
+                count: rows.len(),
+                median_change_pct: median(changes.clone()),
+                mean_change_pct: mean(&changes),
+                regressions: rows.iter().filter(|row| row.change_pct <= -5.0).count(),
+                improvements: rows.iter().filter(|row| row.change_pct >= 5.0).count(),
+                median_old_gib_per_s: median(old),
+                median_new_gib_per_s: median(new),
+            }
+        })
+        .collect()
+}
+
+fn planner_compare_summary(records: &[BenchReportRecord]) -> PlannerCompareSummary {
+    let mut workloads: BTreeMap<String, Vec<&BenchReportRecord>> = BTreeMap::new();
+    for record in records {
+        if !record.planned_kernel.trim().is_empty() {
+            workloads
+                .entry(workload_label(record))
+                .or_default()
+                .push(record);
+        }
+    }
+
+    let mut wins = 0_usize;
+    let mut misses = 0_usize;
+    let mut missing_planned_kernel = 0_usize;
+    let mut gaps = Vec::new();
+    let mut top_misses = Vec::new();
+
+    for (workload, mut rows) in workloads {
+        rows.sort_by(|left, right| {
+            right
+                .gib_per_s
+                .partial_cmp(&left.gib_per_s)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| left.kernel.cmp(&right.kernel))
+        });
+        let Some(best) = rows.first().copied() else {
+            continue;
+        };
+        let planned_kernel = rows
+            .iter()
+            .find(|row| !row.planned_kernel.is_empty())
+            .map_or("", |row| row.planned_kernel.as_str());
+        let confidence_source = rows
+            .iter()
+            .find(|row| !row.planned_confidence_source.is_empty())
+            .map_or("", |row| row.planned_confidence_source.as_str());
+        let Some(planned) = rows
+            .iter()
+            .find(|row| row.kernel == planned_kernel)
+            .copied()
+        else {
+            missing_planned_kernel += 1;
+            continue;
+        };
+        let gap = (best.gib_per_s - planned.gib_per_s).max(0.0);
+        let gap_pct_of_best = if best.gib_per_s > 0.0 {
+            gap / best.gib_per_s * 100.0
+        } else {
+            0.0
+        };
+        gaps.push(gap_pct_of_best);
+        if best.kernel == planned_kernel {
+            wins += 1;
+        } else {
+            misses += 1;
+            top_misses.push(PlannerCompareMiss {
+                workload,
+                planned_kernel: planned_kernel.to_owned(),
+                winner_kernel: best.kernel.clone(),
+                planned_gib_per_s: planned.gib_per_s,
+                winner_gib_per_s: best.gib_per_s,
+                gap_pct_of_best,
+                confidence_source: confidence_source.to_owned(),
+            });
+        }
+    }
+
+    top_misses.sort_by(|left, right| {
+        right
+            .gap_pct_of_best
+            .partial_cmp(&left.gap_pct_of_best)
+            .unwrap_or(Ordering::Equal)
+    });
+
+    PlannerCompareSummary {
+        workloads: wins + misses + missing_planned_kernel,
+        wins,
+        misses,
+        missing_planned_kernel,
+        median_gap_pct_of_best: median(gaps.clone()),
+        mean_gap_pct_of_best: mean(&gaps),
+        top_misses,
+    }
+}
+
+fn write_group_delta_svg(
+    path: &Path,
+    title: &str,
+    subtitle: &str,
+    summaries: &[GroupChangeSummary],
+) -> Result<()> {
+    let mut bars = summaries
+        .iter()
+        .map(|summary| {
+            (
+                format!("{} (n={})", summary.key, summary.count),
+                summary.median_change_pct,
+                format!("{:+.1}%", summary.median_change_pct),
+            )
+        })
+        .collect::<Vec<_>>();
+    bars.sort_by(|left, right| {
+        right
+            .1
+            .abs()
+            .partial_cmp(&left.1.abs())
+            .unwrap_or(Ordering::Equal)
+    });
+    bars.truncate(30);
+    write_delta_bar_chart_svg(path, title, subtitle, &bars)
+}
+
+fn write_delta_bar_chart_svg(
+    path: &Path,
+    title: &str,
+    subtitle: &str,
+    bars: &[(String, f64, String)],
+) -> Result<()> {
+    let width = 1040.0_f64;
+    let bar_height = 30.0_f64;
+    let top = 68.0_f64;
+    let left = 300.0_f64;
+    let plot_width = 600.0_f64;
+    let center = left + plot_width / 2.0;
+    let height = top + bars.len().max(1) as f64 * bar_height + 48.0;
+    let max_abs = bars
+        .iter()
+        .fold(0.0_f64, |max, (_, value, _)| max.max(value.abs()))
+        .max(1.0);
+    let mut file = File::create(path)
+        .map_err(|error| format!("failed to create `{}`: {error}", path.display()))?;
+
+    writeln!(
+        file,
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height:.0}\" viewBox=\"0 0 {width} {height:.0}\">"
+    )
+    .map_err(write_error(path))?;
+    write_svg_background(&mut file, path)?;
+    writeln!(
+        file,
+        "<text x=\"18\" y=\"28\" font-family=\"sans-serif\" font-size=\"18\" font-weight=\"700\">{}</text>",
+        html_escape(title)
+    )
+    .map_err(write_error(path))?;
+    writeln!(
+        file,
+        "<text x=\"18\" y=\"52\" font-family=\"sans-serif\" font-size=\"12\" fill=\"#57606a\">{}</text>",
+        html_escape(subtitle)
+    )
+    .map_err(write_error(path))?;
+    writeln!(
+        file,
+        "<line x1=\"{center:.1}\" y1=\"{top:.1}\" x2=\"{center:.1}\" y2=\"{:.1}\" stroke=\"#8c959f\" stroke-width=\"1\" />",
+        height - 34.0
+    )
+    .map_err(write_error(path))?;
+
+    if bars.is_empty() {
+        writeln!(
+            file,
+            "<text x=\"18\" y=\"{top:.1}\" font-family=\"sans-serif\" font-size=\"12\" fill=\"#57606a\">No matching rows.</text>"
+        )
+        .map_err(write_error(path))?;
+    }
+
+    for (index, (label, value, value_label)) in bars.iter().enumerate() {
+        let y = top + index as f64 * bar_height;
+        let half_width = (value.abs() / max_abs) * (plot_width / 2.0);
+        let x = if *value >= 0.0 {
+            center
+        } else {
+            center - half_width
+        };
+        let fill = if *value >= 0.0 { "#2da44e" } else { "#cf222e" };
+        writeln!(
+            file,
+            "<text x=\"18\" y=\"{:.1}\" font-family=\"sans-serif\" font-size=\"12\">{}</text>",
+            y + 19.0,
+            html_escape(&short_label(label, 40))
+        )
+        .map_err(write_error(path))?;
+        writeln!(
+            file,
+            "<rect x=\"{x:.1}\" y=\"{:.1}\" width=\"{half_width:.1}\" height=\"22\" fill=\"{fill}\"><title>{}: {}</title></rect>",
+            y + 4.0,
+            html_escape(label),
+            html_escape(value_label)
+        )
+        .map_err(write_error(path))?;
+        let text_x = if *value >= 0.0 {
+            center + half_width + 8.0
+        } else {
+            (center - half_width - 8.0).max(left - 70.0)
+        };
+        let anchor = if *value >= 0.0 { "start" } else { "end" };
+        writeln!(
+            file,
+            "<text x=\"{text_x:.1}\" y=\"{:.1}\" text-anchor=\"{anchor}\" font-family=\"sans-serif\" font-size=\"12\">{}</text>",
+            y + 20.0,
+            html_escape(value_label)
+        )
+        .map_err(write_error(path))?;
+    }
+
+    writeln!(file, "</svg>").map_err(write_error(path))?;
     Ok(())
 }
 
@@ -3212,6 +3912,10 @@ fn csv_cell(value: &str) -> String {
     }
 }
 
+fn markdown_cell(value: &str) -> String {
+    value.replace('|', "\\|").replace('\n', " ")
+}
+
 fn html_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -3224,6 +3928,13 @@ fn local_href(path: &Path) -> String {
     path.file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_default()
+        .to_owned()
+}
+
+fn file_stem_string(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("unknown")
         .to_owned()
 }
 
@@ -3266,6 +3977,13 @@ fn median(mut values: Vec<f64>) -> f64 {
     } else {
         values[middle]
     }
+}
+
+fn mean(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.iter().sum::<f64>() / values.len() as f64
 }
 
 fn axis_label_width(values: &[String]) -> f64 {
@@ -3995,7 +4713,7 @@ fn help() {
            bench-planner-parity-real [path]\n\
                     planner-vs-all-kernels matrix including F21/F22/rootfs data\n\
            bench-real-magic-bpe [path]\n\
-                    optional Magic-BPE processed-index matrix; limit/shuffle via TOKENFS_ALGOS_MAGIC_BPE_*\n\
+                    optional Magic-BPE processed-index matrix; limit/shuffle via TOKENFS_ALGOS_MAGIC_BPE_*; row cap via TOKENFS_ALGOS_WORKLOAD_MAX_INPUTS\n\
            bench-cache-hot-cold\n\
                     hot-repeat, cold-sweep, and same-file-repeat access patterns\n\
            bench-profile\n\

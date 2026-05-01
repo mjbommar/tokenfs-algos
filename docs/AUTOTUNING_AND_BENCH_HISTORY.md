@@ -92,8 +92,9 @@ The first processor-aware slice is implemented:
 - workload manifests include planner recommendations and explanations;
 - the latest Markdown summary shows the planner choice beside the measured best
   kernel for each workload row;
-- `cargo xtask bench-compare <old.jsonl> <new.jsonl>` prints the largest
-  matched throughput changes between two history runs;
+- `cargo xtask bench-compare <old.jsonl> <new.jsonl>` writes a comparison
+  report with CSV, Markdown, top regression/improvement SVGs, grouped deltas by
+  kernel/workload/size/entropy/thread count, and a planner win/miss/gap summary;
 - `cargo xtask bench-report [run.jsonl]` emits heatmap HTML, planner-vs-best
   and winner-count charts, thread-scaling charts, per-dimension cross-tab SVGs,
   a throughput histogram SVG, and timing CSV artifacts under
@@ -126,3 +127,12 @@ The next useful tooling increments are:
 3. Feed calibration results back into the planner before falling through to
    static heuristics.
 4. Add stable named Criterion baselines once scalar adaptive promotion starts.
+
+## Perf Permission Note
+
+On Linux, flamegraphs and hardware counters require a permissive enough
+`perf_event_paranoid` setting or equivalent capabilities. A setting of `4`
+blocks even user-space profiling on this host, so benchmark reports remain the
+source of evidence until profiling is enabled. Do not add optimized kernels just
+because a benchmark row is slow; first capture `perf stat` or a flamegraph when
+the host permits it.
