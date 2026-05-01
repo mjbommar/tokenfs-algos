@@ -1,25 +1,37 @@
 #![allow(missing_docs)]
 
-use std::{env, sync::OnceLock};
+use std::{
+    env,
+    fs::File,
+    io::{Read, Seek, SeekFrom},
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use tokenfs_algos::{
-    byteclass, entropy, fingerprint, histogram::ByteHistogram, runlength, selector, sketch,
-    structure,
+    byteclass, entropy, fingerprint,
+    histogram::{self, ByteHistogram},
+    runlength, selector, sketch, structure,
 };
 
 #[derive(Clone)]
 struct PrimitiveInput {
-    case: &'static str,
-    source: &'static str,
-    content: &'static str,
-    entropy: &'static str,
-    pattern: &'static str,
+    case: String,
+    source: String,
+    content: String,
+    entropy: String,
+    pattern: String,
     bytes: Vec<u8>,
 }
 
 #[derive(Clone, Copy)]
 enum PrimitiveKernel {
+    HistogramDefault,
+    HistogramDirectU64,
+    HistogramLocalU32,
+    HistogramStripe8U32,
+    HistogramRunLengthU64,
     FingerprintBlockAuto,
     FingerprintBlockScalar,
     FingerprintExtentAuto,
@@ -31,6 +43,8 @@ enum PrimitiveKernel {
     SketchCrc32Hash4Scalar,
     SketchEntropyLut,
     ByteClassClassify,
+    ByteClassClassifyScalar,
+    ByteClassClassifyAvx2,
     RunLengthSummarize,
     StructureSummarize,
     EntropyH1FromHistogram,
@@ -40,6 +54,11 @@ enum PrimitiveKernel {
 impl PrimitiveKernel {
     fn all() -> Vec<Self> {
         let mut kernels = vec![
+            Self::HistogramDefault,
+            Self::HistogramDirectU64,
+            Self::HistogramLocalU32,
+            Self::HistogramStripe8U32,
+            Self::HistogramRunLengthU64,
             Self::FingerprintBlockAuto,
             Self::FingerprintBlockScalar,
             Self::FingerprintExtentAuto,
@@ -49,6 +68,7 @@ impl PrimitiveKernel {
             Self::SketchCrc32Hash4Auto,
             Self::SketchEntropyLut,
             Self::ByteClassClassify,
+            Self::ByteClassClassifyScalar,
             Self::RunLengthSummarize,
             Self::StructureSummarize,
             Self::EntropyH1FromHistogram,
@@ -58,12 +78,25 @@ impl PrimitiveKernel {
         if sketch::kernels::sse42::is_available() {
             kernels.push(Self::SketchCrc32Hash4Sse42);
         }
+        #[cfg(all(
+            feature = "std",
+            feature = "avx2",
+            any(target_arch = "x86", target_arch = "x86_64")
+        ))]
+        if byteclass::kernels::avx2::is_available() {
+            kernels.push(Self::ByteClassClassifyAvx2);
+        }
         kernels.push(Self::SketchCrc32Hash4Scalar);
         kernels
     }
 
     fn id(self) -> &'static str {
         match self {
+            Self::HistogramDefault => "histogram-default",
+            Self::HistogramDirectU64 => "histogram-direct-u64",
+            Self::HistogramLocalU32 => "histogram-local-u32",
+            Self::HistogramStripe8U32 => "histogram-stripe8-u32",
+            Self::HistogramRunLengthU64 => "histogram-runlength-u64",
             Self::FingerprintBlockAuto => "fingerprint-block-auto",
             Self::FingerprintBlockScalar => "fingerprint-block-scalar",
             Self::FingerprintExtentAuto => "fingerprint-extent-auto",
@@ -75,6 +108,8 @@ impl PrimitiveKernel {
             Self::SketchCrc32Hash4Scalar => "sketch-crc32-hash4-scalar",
             Self::SketchEntropyLut => "sketch-entropy-lut",
             Self::ByteClassClassify => "byteclass-classify",
+            Self::ByteClassClassifyScalar => "byteclass-classify-scalar",
+            Self::ByteClassClassifyAvx2 => "byteclass-classify-avx2",
             Self::RunLengthSummarize => "runlength-summarize",
             Self::StructureSummarize => "structure-summarize",
             Self::EntropyH1FromHistogram => "entropy-h1-from-histogram",
@@ -84,6 +119,11 @@ impl PrimitiveKernel {
 
     fn primitive(self) -> &'static str {
         match self {
+            Self::HistogramDefault
+            | Self::HistogramDirectU64
+            | Self::HistogramLocalU32
+            | Self::HistogramStripe8U32
+            | Self::HistogramRunLengthU64 => "histogram",
             Self::FingerprintBlockAuto | Self::FingerprintBlockScalar => "fingerprint-block",
             Self::FingerprintExtentAuto | Self::FingerprintExtentScalar => "fingerprint-extent",
             Self::SketchMisraGriesK16
@@ -92,7 +132,9 @@ impl PrimitiveKernel {
             | Self::SketchCrc32Hash4Sse42
             | Self::SketchCrc32Hash4Scalar
             | Self::SketchEntropyLut => "sketch",
-            Self::ByteClassClassify => "byteclass",
+            Self::ByteClassClassify
+            | Self::ByteClassClassifyScalar
+            | Self::ByteClassClassifyAvx2 => "byteclass",
             Self::RunLengthSummarize => "runlength",
             Self::StructureSummarize => "structure",
             Self::EntropyH1FromHistogram => "entropy",
@@ -155,52 +197,68 @@ fn primitive_inputs() -> Vec<PrimitiveInput> {
     for size in sizes {
         inputs.extend([
             PrimitiveInput {
-                case: "zeros",
-                source: "synthetic",
-                content: "binary",
-                entropy: "low",
-                pattern: "zeros",
+                case: "zeros".into(),
+                source: "synthetic".into(),
+                content: "binary".into(),
+                entropy: "low".into(),
+                pattern: "zeros".into(),
                 bytes: vec![0; size],
             },
             PrimitiveInput {
-                case: "prng",
-                source: "synthetic",
-                content: "binary",
-                entropy: "high",
-                pattern: "prng",
+                case: "prng".into(),
+                source: "synthetic".into(),
+                content: "binary".into(),
+                entropy: "high".into(),
+                pattern: "prng".into(),
                 bytes: deterministic_prng(size, size as u64 ^ 0xA17E_A17E),
             },
             PrimitiveInput {
-                case: "text",
-                source: "synthetic",
-                content: "text",
-                entropy: "medium",
-                pattern: "ascii-text",
+                case: "text".into(),
+                source: "synthetic".into(),
+                content: "text".into(),
+                entropy: "medium".into(),
+                pattern: "ascii-text".into(),
                 bytes: repeated_text(size),
             },
             PrimitiveInput {
-                case: "runs",
-                source: "synthetic",
-                content: "binary",
-                entropy: "low",
-                pattern: "long-runs",
+                case: "runs".into(),
+                source: "synthetic".into(),
+                content: "binary".into(),
+                entropy: "low".into(),
+                pattern: "long-runs".into(),
                 bytes: run_heavy(size),
             },
             PrimitiveInput {
-                case: "motif-64",
-                source: "synthetic",
-                content: "binary",
-                entropy: "medium",
-                pattern: "repeated-motif",
+                case: "motif-64".into(),
+                source: "synthetic".into(),
+                content: "binary".into(),
+                entropy: "medium".into(),
+                pattern: "repeated-motif".into(),
                 bytes: repeated_random_motif(size, 64),
             },
         ]);
+    }
+    if primitive_real_enabled() {
+        inputs.extend(real_primitive_inputs(&sizes));
     }
     inputs
 }
 
 fn run_kernel(kernel: PrimitiveKernel, bytes: &[u8]) -> u64 {
     match kernel {
+        PrimitiveKernel::HistogramDefault => fold_histogram(ByteHistogram::from_block(bytes)),
+        PrimitiveKernel::HistogramDirectU64 => {
+            fold_histogram(histogram::kernels::direct_u64::block(bytes))
+        }
+        PrimitiveKernel::HistogramLocalU32 => {
+            fold_histogram(histogram::kernels::local_u32::block(bytes))
+        }
+        PrimitiveKernel::HistogramStripe8U32 => {
+            fold_histogram(histogram::kernels::stripe8_u32::block(bytes))
+        }
+        PrimitiveKernel::HistogramRunLengthU64 => {
+            fold_histogram(histogram::kernels::run_length_u64::block(bytes))
+        }
         PrimitiveKernel::FingerprintBlockAuto => fingerprint_blocks(bytes, fingerprint::block),
         PrimitiveKernel::FingerprintBlockScalar => {
             fingerprint_blocks(bytes, fingerprint::kernels::scalar::block)
@@ -259,9 +317,23 @@ fn run_kernel(kernel: PrimitiveKernel, bytes: &[u8]) -> u64 {
             let lut = entropy_lut();
             sketch::entropy_from_counts_u32_lut(&counts, bytes.len() as u64, lut).to_bits() as u64
         }
-        PrimitiveKernel::ByteClassClassify => {
-            let counts = byteclass::classify(bytes);
-            counts.printable_ascii ^ counts.whitespace ^ counts.control ^ counts.high_bit
+        PrimitiveKernel::ByteClassClassify => fold_byteclass(byteclass::classify(bytes)),
+        PrimitiveKernel::ByteClassClassifyScalar => {
+            fold_byteclass(byteclass::kernels::scalar::classify(bytes))
+        }
+        PrimitiveKernel::ByteClassClassifyAvx2 => {
+            #[cfg(all(
+                feature = "std",
+                feature = "avx2",
+                any(target_arch = "x86", target_arch = "x86_64")
+            ))]
+            {
+                if byteclass::kernels::avx2::is_available() {
+                    // SAFETY: availability was checked immediately above.
+                    return fold_byteclass(unsafe { byteclass::kernels::avx2::classify(bytes) });
+                }
+            }
+            fold_byteclass(byteclass::kernels::scalar::classify(bytes))
         }
         PrimitiveKernel::RunLengthSummarize => {
             let summary = runlength::summarize(bytes);
@@ -285,6 +357,24 @@ fn run_kernel(kernel: PrimitiveKernel, bytes: &[u8]) -> u64 {
                 ^ u64::from(signals.skip_compression_candidate)
         }
     }
+}
+
+fn fold_histogram(histogram: ByteHistogram) -> u64 {
+    histogram
+        .counts()
+        .iter()
+        .enumerate()
+        .fold(histogram.total(), |acc, (byte, count)| {
+            acc ^ ((byte as u64 + 1) * count)
+        })
+}
+
+fn fold_byteclass(counts: byteclass::ByteClassCounts) -> u64 {
+    counts.printable_ascii
+        ^ counts.whitespace.rotate_left(7)
+        ^ counts.control.rotate_left(13)
+        ^ counts.high_bit.rotate_left(19)
+        ^ counts.other.rotate_left(29)
 }
 
 fn fingerprint_blocks(
@@ -357,6 +447,128 @@ fn repeated_text(size: usize) -> Vec<u8> {
     const TEXT: &[u8] =
         b"tokenfs-algos measures byte streams, entropy, fingerprints, and selectors.\n";
     TEXT.iter().copied().cycle().take(size).collect()
+}
+
+fn primitive_real_enabled() -> bool {
+    env::var_os("TOKENFS_ALGOS_PRIMITIVE_REAL").is_some()
+        || env::var_os("TOKENFS_ALGOS_PRIMITIVE_REAL_FILES").is_some()
+}
+
+fn real_primitive_inputs(sizes: &[usize]) -> Vec<PrimitiveInput> {
+    let mut inputs = Vec::new();
+    for spec in real_file_specs() {
+        for &size in sizes {
+            if let Some(bytes) = read_center_slice(&spec.path, size) {
+                inputs.push(PrimitiveInput {
+                    case: spec.case.clone(),
+                    source: spec.source.clone(),
+                    content: spec.content.clone(),
+                    entropy: spec.entropy.clone(),
+                    pattern: spec.pattern.clone(),
+                    bytes,
+                });
+            }
+        }
+    }
+    inputs
+}
+
+struct RealFileSpec {
+    path: PathBuf,
+    case: String,
+    source: String,
+    content: String,
+    entropy: String,
+    pattern: String,
+}
+
+fn real_file_specs() -> Vec<RealFileSpec> {
+    if let Some(paths) = env::var_os("TOKENFS_ALGOS_PRIMITIVE_REAL_FILES") {
+        return env::split_paths(&paths)
+            .enumerate()
+            .filter_map(|(index, path)| {
+                path.exists().then(|| RealFileSpec {
+                    path,
+                    case: format!("real-file-{index}"),
+                    source: "real-custom".into(),
+                    content: "binary".into(),
+                    entropy: "unknown".into(),
+                    pattern: "file-slice".into(),
+                })
+            })
+            .collect();
+    }
+
+    [
+        (
+            "~/ubuntu-26.04-desktop-amd64.iso",
+            "ubuntu-iso",
+            "real-iso",
+            "binary",
+            "high",
+            "compressed-iso",
+        ),
+        (
+            "/nas4/data/tokenfs-ubuntu/bench/cow/f22-extent-bytes.bin",
+            "f22-sidecar",
+            "real-f22",
+            "binary",
+            "mixed",
+            "rootfs-extents",
+        ),
+        (
+            "Cargo.lock",
+            "cargo-lock",
+            "repo",
+            "text",
+            "medium",
+            "structured-text",
+        ),
+        (
+            "crates/tokenfs-algos/src/lib.rs",
+            "rust-source",
+            "repo",
+            "text",
+            "medium",
+            "source-text",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(path, case, source, content, entropy, pattern)| {
+        let path = expand_tilde(path);
+        path.exists().then(|| RealFileSpec {
+            path,
+            case: case.into(),
+            source: source.into(),
+            content: content.into(),
+            entropy: entropy.into(),
+            pattern: pattern.into(),
+        })
+    })
+    .collect()
+}
+
+fn expand_tilde(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(rest);
+    }
+    PathBuf::from(path)
+}
+
+fn read_center_slice(path: &Path, size: usize) -> Option<Vec<u8>> {
+    let len = path.metadata().ok()?.len() as usize;
+    if len < size {
+        return None;
+    }
+
+    let offset = if len == size { 0 } else { (len - size) / 2 };
+    let mut file = File::open(path).ok()?;
+    file.seek(SeekFrom::Start(offset as u64)).ok()?;
+    let mut bytes = vec![0; size];
+    file.read_exact(&mut bytes).ok()?;
+    Some(bytes)
 }
 
 criterion_group!(benches, bench_primitive_matrix);

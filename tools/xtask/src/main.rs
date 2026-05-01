@@ -62,9 +62,13 @@ fn run() -> Result<()> {
         "bench-cache-hot-cold" => bench_cache_hot_cold(&rest),
         "bench-profile" => bench_profile_suite(&rest),
         "bench-primitives" => bench_primitives(&rest),
+        "bench-primitives-real" => bench_primitives_real(&rest),
+        "bench-histogram-primitive" => bench_primitive_filter(&rest, "histogram"),
+        "bench-histogram-primitive-real" => bench_primitive_filter_real(&rest, "histogram"),
         "bench-fingerprint" => bench_primitive_filter(&rest, "fingerprint"),
         "bench-sketch" => bench_primitive_filter(&rest, "sketch"),
         "bench-byteclass" => bench_primitive_filter(&rest, "byteclass"),
+        "bench-byteclass-real" => bench_primitive_filter_real(&rest, "byteclass"),
         "bench-runlength" => bench_primitive_filter(&rest, "runlength"),
         "bench-entropy" => bench_primitive_filter(&rest, "entropy"),
         "bench-selector" => bench_primitive_filter(&rest, "selector"),
@@ -75,6 +79,10 @@ fn run() -> Result<()> {
         "profile-real" => profile_real(&rest),
         "profile-flamegraph" => profile_flamegraph(&rest),
         "profile-flamegraph-real" => profile_flamegraph_real(&rest),
+        "profile-primitives" => profile_primitives(&rest),
+        "profile-primitives-real" => profile_primitives_real(&rest),
+        "profile-primitives-flamegraph" => profile_primitives_flamegraph(&rest),
+        "profile-primitives-flamegraph-real" => profile_primitives_flamegraph_real(&rest),
         "ci" => ci(),
         "help" | "-h" | "--help" => {
             help();
@@ -386,6 +394,26 @@ fn bench_primitives(extra: &[OsString]) -> Result<()> {
     bench_primitives_with_env(&args, Vec::new())
 }
 
+fn bench_primitives_real(extra: &[OsString]) -> Result<()> {
+    let args = default_or_extra(
+        extra,
+        [
+            "--",
+            "--sample-size",
+            "10",
+            "--warm-up-time",
+            "0.01",
+            "--measurement-time",
+            "0.02",
+            "primitive_matrix",
+        ],
+    );
+    bench_primitives_with_env(
+        &args,
+        vec![("TOKENFS_ALGOS_PRIMITIVE_REAL".into(), "1".into())],
+    )
+}
+
 fn bench_primitive_filter(extra: &[OsString], filter: &str) -> Result<()> {
     let args = default_or_extra(
         extra,
@@ -406,6 +434,32 @@ fn bench_primitive_filter(extra: &[OsString], filter: &str) -> Result<()> {
             "TOKENFS_ALGOS_PRIMITIVE_FILTER".into(),
             OsString::from(filter),
         )],
+    )
+}
+
+fn bench_primitive_filter_real(extra: &[OsString], filter: &str) -> Result<()> {
+    let args = default_or_extra(
+        extra,
+        [
+            "--",
+            "--sample-size",
+            "10",
+            "--warm-up-time",
+            "0.01",
+            "--measurement-time",
+            "0.02",
+            "primitive_matrix",
+        ],
+    );
+    bench_primitives_with_env(
+        &args,
+        vec![
+            (
+                "TOKENFS_ALGOS_PRIMITIVE_FILTER".into(),
+                OsString::from(filter),
+            ),
+            ("TOKENFS_ALGOS_PRIMITIVE_REAL".into(), "1".into()),
+        ],
     )
 }
 
@@ -645,6 +699,28 @@ fn profile_flamegraph_real(args: &[OsString]) -> Result<()> {
     )
 }
 
+fn profile_primitives(extra: &[OsString]) -> Result<()> {
+    profile_primitives_with_env(extra, Vec::new())
+}
+
+fn profile_primitives_real(extra: &[OsString]) -> Result<()> {
+    profile_primitives_with_env(
+        extra,
+        vec![("TOKENFS_ALGOS_PRIMITIVE_REAL".into(), "1".into())],
+    )
+}
+
+fn profile_primitives_flamegraph(extra: &[OsString]) -> Result<()> {
+    profile_primitives_flamegraph_with_env(extra, Vec::new())
+}
+
+fn profile_primitives_flamegraph_real(extra: &[OsString]) -> Result<()> {
+    profile_primitives_flamegraph_with_env(
+        extra,
+        vec![("TOKENFS_ALGOS_PRIMITIVE_REAL".into(), "1".into())],
+    )
+}
+
 fn profile_with_env(extra: &[OsString], env_vars: Vec<(OsString, OsString)>) -> Result<()> {
     ensure_profile_dir()?;
     cargo([
@@ -695,6 +771,59 @@ fn profile_with_env(extra: &[OsString], env_vars: Vec<(OsString, OsString)>) -> 
     Ok(())
 }
 
+fn profile_primitives_with_env(
+    extra: &[OsString],
+    env_vars: Vec<(OsString, OsString)>,
+) -> Result<()> {
+    ensure_profile_dir()?;
+    cargo([
+        "bench",
+        "-p",
+        "tokenfs-algos",
+        "--bench",
+        "primitives",
+        "--all-features",
+        "--no-run",
+    ])?;
+
+    if command_exists("perf") {
+        let perf_path = profile_output_path("primitive-perf-stat", "txt");
+        let mut args = vec![
+            OsString::from("stat"),
+            OsString::from("-d"),
+            OsString::from("-o"),
+            perf_path.clone().into_os_string(),
+            OsString::from("cargo"),
+            OsString::from("bench"),
+            OsString::from("-p"),
+            OsString::from("tokenfs-algos"),
+            OsString::from("--bench"),
+            OsString::from("primitives"),
+            OsString::from("--all-features"),
+        ];
+        args.extend(extra.iter().cloned());
+        match run_command_with_env("perf", args, env_vars.clone()) {
+            Ok(()) => eprintln!("xtask: wrote perf stat output `{}`", perf_path.display()),
+            Err(error) => {
+                eprintln!("xtask: primitive perf stat failed: {error}");
+                eprintln!("xtask: running primitive Criterion benchmark without perf counters");
+                bench_primitives_with_env_no_log(extra, env_vars.clone())?;
+            }
+        }
+    } else {
+        eprintln!("xtask: `perf` not found; running primitive Criterion benchmark only");
+        bench_primitives_with_env_no_log(extra, env_vars)?;
+    }
+
+    if command_exists("cargo-flamegraph") {
+        eprintln!(
+            "xtask: cargo-flamegraph is installed; run `cargo xtask profile-primitives-flamegraph` for SVG output"
+        );
+    }
+
+    Ok(())
+}
+
 fn profile_flamegraph_with_env(
     extra: &[OsString],
     env_vars: Vec<(OsString, OsString)>,
@@ -723,6 +852,37 @@ fn profile_flamegraph_with_env(
 
     run_command_with_env("cargo", args, env_vars)?;
     eprintln!("xtask: wrote flamegraph `{}`", output.display());
+    Ok(())
+}
+
+fn profile_primitives_flamegraph_with_env(
+    extra: &[OsString],
+    env_vars: Vec<(OsString, OsString)>,
+) -> Result<()> {
+    if !command_exists("cargo-flamegraph") {
+        return Err(
+            "`cargo-flamegraph` not found; install it with `cargo install flamegraph`".into(),
+        );
+    }
+
+    ensure_profile_dir()?;
+    let output = profile_output_path("primitive-flamegraph", "svg");
+    let mut args = vec![
+        OsString::from("flamegraph"),
+        OsString::from("-o"),
+        output.clone().into_os_string(),
+        OsString::from("-p"),
+        OsString::from("tokenfs-algos"),
+        OsString::from("--features"),
+        OsString::from("bench-internals"),
+        OsString::from("--bench"),
+        OsString::from("primitives"),
+        OsString::from("--"),
+    ];
+    args.extend(criterion_args(extra));
+
+    run_command_with_env("cargo", args, env_vars)?;
+    eprintln!("xtask: wrote primitive flamegraph `{}`", output.display());
     Ok(())
 }
 
@@ -3374,12 +3534,20 @@ fn help() {
                     perf profile over workload matrix when available\n\
            bench-primitives\n\
                     isolated primitive matrix with HTML/SVG-reportable metadata\n\
+           bench-primitives-real\n\
+                    primitive matrix including default ISO/F22/repo real-file slices\n\
+           bench-histogram-primitive\n\
+                    isolated histogram primitive benchmarks\n\
+           bench-histogram-primitive-real\n\
+                    isolated histogram primitive benchmarks with real-file slices\n\
            bench-fingerprint\n\
                     isolated fingerprint primitive benchmarks\n\
            bench-sketch\n\
                     isolated sketch primitive benchmarks\n\
            bench-byteclass\n\
                     isolated byte-class primitive benchmarks\n\
+           bench-byteclass-real\n\
+                    isolated byte-class primitive benchmarks with real-file slices\n\
            bench-runlength\n\
                     isolated run-length primitive benchmarks\n\
            bench-entropy\n\
@@ -3399,6 +3567,14 @@ fn help() {
                     generate a flamegraph SVG with cargo-flamegraph\n\
            profile-flamegraph-real [path]\n\
                     real-data flamegraph SVG with cargo-flamegraph\n\
+           profile-primitives\n\
+                    primitive benchmark under perf when available\n\
+           profile-primitives-real\n\
+                    primitive benchmark with real-file slices under perf when available\n\
+           profile-primitives-flamegraph\n\
+                    primitive flamegraph SVG with cargo-flamegraph\n\
+           profile-primitives-flamegraph-real\n\
+                    primitive flamegraph SVG with real-file slices\n\
            ci       local CI gate"
     );
 }
