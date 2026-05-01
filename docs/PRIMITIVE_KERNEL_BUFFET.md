@@ -91,6 +91,9 @@ anchor performance work to empirical claims rather than isolated throughput.
 Per [Paper Lineage Naming](PAPER_LINEAGE_NAMING.md), these labels are retained
 for reproducibility while public APIs use `selector`, `fingerprint`, and
 `sketch`.
+Per [Primitive Contracts](PRIMITIVE_CONTRACTS.md), each candidate needs a
+portable scalar path, pinned kernel path, tests, and isolated benchmark rows
+before it graduates from experiment to public primitive.
 
 | Candidate | Source | Why it matters | Initial status |
 |---|---|---|---|
@@ -114,6 +117,11 @@ here so the crate does not silently drift away from the paper.
    entropy-from-counts.
 7. Done: add run-length and byte-class primitives so classifiers can use real
    signals instead of only histogram-sample heuristics.
-8. Next: move F22 AVX2 dispatch after scalar parity and calibration stabilize.
-9. Next: promote the best scalar adaptive strategy behind a public conservative
+8. Done: add primitive contracts, pinned F22 scalar paths, paper compatibility
+   aliases, structure detectors, selector signals, and isolated primitive
+   benchmark/report artifacts.
+9. Done: add explicit `auto` / `sse42` / `scalar` CRC32 hash-bin benchmark
+   labels so runtime dispatch can be compared against pinned backends.
+10. Next: move F22 AVX2 dispatch after scalar parity and calibration stabilize.
+11. Next: promote the best scalar adaptive strategy behind a public conservative
    API once the planner interface stabilizes.

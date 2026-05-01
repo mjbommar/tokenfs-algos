@@ -38,6 +38,9 @@ APIs should use the product names defined in
 `docs/PAPER_LINEAGE_NAMING.md` (`selector`, `fingerprint`, `sketch`,
 `conditional dispatch`) while docs and calibration benches retain the paper
 labels.
+Hot primitive APIs follow `docs/PRIMITIVE_CONTRACTS.md`: ergonomic public path,
+pinned scalar path, no hot-path allocation, scalar parity tests, and stable
+benchmark labels.
 
 1. **F21 selector** — per-extent entropy fingerprint → predict best representation.
 2. **F22 fingerprint kernel** — per-256-byte-block fingerprint for the predictive selector and skip-compression fast-path.

@@ -9,6 +9,7 @@ whether the primitives preserve the empirical behavior used in the paper.
 Naming follows [Paper Lineage Naming](PAPER_LINEAGE_NAMING.md): `F21`, `F22`,
 and `F23` remain paper/calibration labels, while the crate APIs use product names
 such as `selector`, `fingerprint`, and `sketch`.
+Primitive implementation rules follow [Primitive Contracts](PRIMITIVE_CONTRACTS.md).
 
 ## Current Source
 
@@ -34,10 +35,12 @@ Important pieces:
    stable module names.
 2. Done: add parity tests against copied scalar fixtures and deterministic generated
    extents.
-3. Add optional F21 sidecar/parquet calibration tests that skip when data is
+3. Done: add `paper::f22` compatibility aliases and pinned
+   `fingerprint::kernels::scalar` paths.
+4. Done: add optional F21/F22 sidecar calibration tests that skip when data is
    unavailable.
-4. Move the AVX2 path after scalar parity is stable.
-5. Add planner-oracle benchmark rows: for each F21 extent, compare the planner
+5. Move the AVX2 path after scalar parity is stable.
+6. Add planner-oracle benchmark rows: for each F21 extent, compare the planner
    selection against the F21/F22 oracle outcome.
 
 ## Ground Truth Data

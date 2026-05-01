@@ -14,9 +14,12 @@ pub mod entropy;
 pub mod error;
 pub mod fingerprint;
 pub mod histogram;
+pub mod paper;
 pub mod prelude;
 pub mod runlength;
+pub mod selector;
 pub mod sketch;
+pub mod structure;
 pub mod windows;
 
 pub(crate) mod primitives;

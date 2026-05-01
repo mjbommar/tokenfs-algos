@@ -1,0 +1,107 @@
+# Primitive Contracts
+
+Date: 2026-04-30.
+
+This crate is a low-level primitive library. Every hot primitive should be
+usable by TokenFS, FUSE, kernel-adjacent callers, Python bindings, benchmarks,
+and paper-calibration code without changing semantics across backends.
+
+## Hot-Path Contract
+
+Every hot primitive must satisfy these rules:
+
+- The input is a byte slice or a fixed-size byte block.
+- The function is pure with respect to the input bytes.
+- The hot path does not allocate.
+- A portable scalar implementation is always available.
+- Optimized kernels match scalar exactly, or document a numeric tolerance.
+- Benchmark labels are stable enough to compare across commits.
+- The ergonomic public path may use planning or runtime dispatch.
+- A pinned kernel path is available for reproducibility and forensic runs.
+
+The intended API shape is:
+
+```rust
+tokenfs_algos::fingerprint::block(bytes);
+tokenfs_algos::fingerprint::kernels::scalar::block(bytes);
+tokenfs_algos::fingerprint::kernels::auto::block(bytes);
+```
+
+The first line is the normal product API. The pinned `kernels::*` paths are for
+tests, benchmarks, paper replication, and users who need bit-for-bit backend
+control.
+
+## Backend Order
+
+Kernel families should land in this order:
+
+1. `scalar`: safe, portable reference implementation.
+2. `scalar-unrolled` or `u64-chunked`: still portable, lower overhead.
+3. `sse4.2`: CRC32C and small x86 dispatch wins where relevant.
+4. `avx2`: first wide x86 backend for histogram/fingerprint/byteclass.
+5. `avx512`: later, only after AVX2 semantics are stable.
+6. `neon`: AArch64 production path.
+7. `sve` / `sve2`: later AArch64 wide-vector paths.
+
+Backends may be present as documented candidates before they are implemented,
+but public pinned modules should only expose kernels that have correctness tests.
+
+## Benchmark Contract
+
+Every primitive family should have isolated benchmarks:
+
+- `bench-fingerprint`
+- `bench-sketch`
+- `bench-byteclass`
+- `bench-runlength`
+- `bench-entropy`
+- `bench-selector`
+
+The benchmark log must include:
+
+- git commit and dirty state;
+- rustc version;
+- CPU model;
+- detected CPU features;
+- cache topology when available;
+- primitive family;
+- stable kernel label;
+- workload case/source/content/entropy/pattern/bytes;
+- throughput and timing.
+
+Reports should generate:
+
+- timing CSV;
+- HTML heatmap;
+- throughput histogram SVG;
+- winner-count SVG;
+- primitive-by-kernel SVG;
+- dimension charts for size, content, entropy, source, pattern, and threads when
+  the suite includes them.
+
+## Paper Lineage
+
+The paper labels remain calibration names:
+
+- `F21` -> selector
+- `F22` -> fingerprint
+- `F23a` -> sketch
+- `F23b` -> conditional dispatch
+
+See [Paper Lineage Naming](PAPER_LINEAGE_NAMING.md) for naming rules. Normal
+crate APIs use the product names; paper labels are retained in `paper::*`
+compatibility namespaces and benchmark fixture names.
+
+## v0.1 Gate
+
+Before treating a primitive as v0.1-ready:
+
+1. Scalar implementation exists.
+2. Public default path exists.
+3. Pinned scalar path exists.
+4. Known-value tests exist.
+5. Property/parity tests compare default vs scalar.
+6. Benchmark rows appear in `primitive_matrix`.
+7. Report artifacts show the primitive clearly.
+8. Paper calibration either passes or is explicitly skipped with a missing-path
+   message.

@@ -88,13 +88,35 @@ impl ProcessorProfile {
 pub enum PrimitiveFamily {
     /// Byte histogram kernels.
     ByteHistogram,
+    /// F22/content fingerprint kernels.
+    Fingerprint,
+    /// Sketch and approximate counting kernels.
+    Sketch,
+    /// Byte classification kernels.
+    ByteClass,
+    /// Run-length and structural detectors.
+    Structure,
+    /// Entropy reduction kernels.
+    Entropy,
+    /// Selector feature extraction kernels.
+    Selector,
 }
 
 /// ISA or backend class required by a cataloged kernel.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum KernelIsa {
+    /// Runtime-dispatched kernel; inspect backend/catalog docs for candidates.
+    RuntimeDispatch,
     /// Portable scalar kernel.
     PortableScalar,
+    /// Portable scalar kernel with manual unrolling/chunking.
+    PortableScalarChunked,
+    /// x86 SSE2 kernel.
+    X86Sse2,
+    /// x86 SSSE3 kernel.
+    X86Ssse3,
+    /// x86 SSE4.2 kernel.
+    X86Sse42,
     /// x86 AVX2 kernel.
     X86Avx2,
     /// x86 AVX-512 kernel.

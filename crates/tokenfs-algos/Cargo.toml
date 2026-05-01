@@ -37,5 +37,10 @@ name = "histogram"
 harness = false
 required-features = ["bench-internals"]
 
+[[bench]]
+name = "primitives"
+harness = false
+required-features = ["bench-internals"]
+
 [lints]
 workspace = true

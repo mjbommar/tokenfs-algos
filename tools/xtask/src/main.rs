@@ -61,6 +61,13 @@ fn run() -> Result<()> {
         "bench-planner-parity" => bench_planner_parity(&rest),
         "bench-cache-hot-cold" => bench_cache_hot_cold(&rest),
         "bench-profile" => bench_profile_suite(&rest),
+        "bench-primitives" => bench_primitives(&rest),
+        "bench-fingerprint" => bench_primitive_filter(&rest, "fingerprint"),
+        "bench-sketch" => bench_primitive_filter(&rest, "sketch"),
+        "bench-byteclass" => bench_primitive_filter(&rest, "byteclass"),
+        "bench-runlength" => bench_primitive_filter(&rest, "runlength"),
+        "bench-entropy" => bench_primitive_filter(&rest, "entropy"),
+        "bench-selector" => bench_primitive_filter(&rest, "selector"),
         "bench-compare" => bench_compare(&rest),
         "bench-report" => bench_report(&rest),
         "bench-log" => record_bench_history(None),
@@ -362,6 +369,46 @@ fn bench_profile_suite(extra: &[OsString]) -> Result<()> {
     )
 }
 
+fn bench_primitives(extra: &[OsString]) -> Result<()> {
+    let args = default_or_extra(
+        extra,
+        [
+            "--",
+            "--sample-size",
+            "10",
+            "--warm-up-time",
+            "0.01",
+            "--measurement-time",
+            "0.02",
+            "primitive_matrix",
+        ],
+    );
+    bench_primitives_with_env(&args, Vec::new())
+}
+
+fn bench_primitive_filter(extra: &[OsString], filter: &str) -> Result<()> {
+    let args = default_or_extra(
+        extra,
+        [
+            "--",
+            "--sample-size",
+            "10",
+            "--warm-up-time",
+            "0.01",
+            "--measurement-time",
+            "0.02",
+            "primitive_matrix",
+        ],
+    );
+    bench_primitives_with_env(
+        &args,
+        vec![(
+            "TOKENFS_ALGOS_PRIMITIVE_FILTER".into(),
+            OsString::from(filter),
+        )],
+    )
+}
+
 fn bench_compare(args: &[OsString]) -> Result<()> {
     if args.len() != 2 {
         return Err("usage: cargo xtask bench-compare <old.jsonl> <new.jsonl>".into());
@@ -534,6 +581,17 @@ fn bench_workloads_with_env(
     record_bench_history_since(Some("workload_matrix"), Some(started))
 }
 
+fn bench_primitives_with_env(
+    extra: &[OsString],
+    env_vars: Vec<(OsString, OsString)>,
+) -> Result<()> {
+    let started = SystemTime::now()
+        .checked_sub(Duration::from_secs(2))
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    bench_primitives_with_env_no_log(extra, env_vars)?;
+    record_bench_history_since(Some("primitive_matrix"), Some(started))
+}
+
 fn bench_with_env(extra: &[OsString], env_vars: Vec<(OsString, OsString)>) -> Result<()> {
     let mut args = cargo_args([
         "bench",
@@ -542,6 +600,22 @@ fn bench_with_env(extra: &[OsString], env_vars: Vec<(OsString, OsString)>) -> Re
         "--all-features",
         "--bench",
         "histogram",
+    ]);
+    args.extend(extra.iter().cloned());
+    run_command_with_env("cargo", args, env_vars)
+}
+
+fn bench_primitives_with_env_no_log(
+    extra: &[OsString],
+    env_vars: Vec<(OsString, OsString)>,
+) -> Result<()> {
+    let mut args = cargo_args([
+        "bench",
+        "-p",
+        "tokenfs-algos",
+        "--all-features",
+        "--bench",
+        "primitives",
     ]);
     args.extend(extra.iter().cloned());
     run_command_with_env("cargo", args, env_vars)
@@ -708,6 +782,7 @@ struct BenchReportRecord {
     group: String,
     kernel: String,
     workload_id: String,
+    primitive: String,
     case: String,
     source: String,
     content: String,
@@ -719,6 +794,7 @@ struct BenchReportRecord {
     pattern: String,
     planned_kernel: String,
     planned_confidence_q8: String,
+    bytes: String,
     throughput_bytes: u64,
     mean_ns: f64,
     gib_per_s: f64,
@@ -1356,6 +1432,7 @@ fn read_bench_report_records(path: &Path) -> Result<Vec<BenchReportRecord>> {
             group: json_string(&value, "group").unwrap_or_default(),
             kernel,
             workload_id,
+            primitive: bench_field(&value, "primitive"),
             case: bench_field(&value, "case"),
             source: bench_field(&value, "source"),
             content: bench_field(&value, "content"),
@@ -1367,6 +1444,7 @@ fn read_bench_report_records(path: &Path) -> Result<Vec<BenchReportRecord>> {
             pattern: bench_field(&value, "pattern"),
             planned_kernel: bench_field(&value, "planned_kernel"),
             planned_confidence_q8: bench_field(&value, "planned_confidence_q8"),
+            bytes: bench_field(&value, "bytes"),
             throughput_bytes,
             mean_ns,
             gib_per_s,
@@ -1408,17 +1486,18 @@ fn write_timing_csv(path: &Path, records: &[BenchReportRecord]) -> Result<()> {
         .map_err(|error| format!("failed to create `{}`: {error}", path.display()))?;
     writeln!(
         file,
-        "full_id,group,workload_id,case,source,content,entropy,scale,access,chunk,threads,pattern,kernel,planned_kernel,planned_confidence_q8,planner_match,throughput_bytes,mean_ns,gib_per_s"
+        "full_id,group,workload_id,primitive,case,source,content,entropy,scale,access,chunk,threads,pattern,kernel,planned_kernel,planned_confidence_q8,planner_match,bytes,throughput_bytes,mean_ns,gib_per_s"
     )
     .map_err(write_error(path))?;
 
     for record in records {
         writeln!(
             file,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.6},{:.6}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.6},{:.6}",
             csv_cell(&record.full_id),
             csv_cell(&record.group),
             csv_cell(&record.workload_id),
+            csv_cell(&record.primitive),
             csv_cell(&record.case),
             csv_cell(&record.source),
             csv_cell(&record.content),
@@ -1432,6 +1511,7 @@ fn write_timing_csv(path: &Path, records: &[BenchReportRecord]) -> Result<()> {
             csv_cell(&record.planned_kernel),
             csv_cell(&record.planned_confidence_q8),
             record.planned_kernel == record.kernel,
+            csv_cell(&record.bytes),
             record.throughput_bytes,
             record.mean_ns,
             record.gib_per_s,
@@ -1716,7 +1796,11 @@ fn write_dimension_visuals(
         .collect::<Vec<_>>();
 
     let path = report_dir.join("planner-vs-best.svg");
-    if write_planner_confusion_svg(&path, records)? {
+    if records
+        .iter()
+        .any(|record| !record.planned_kernel.is_empty())
+        && write_planner_confusion_svg(&path, records)?
+    {
         artifacts.push(ReportArtifact {
             file_name: local_href(&path),
             title: "Planner vs Best Kernel".into(),
@@ -1745,7 +1829,7 @@ fn write_dimension_visuals(
     }
 
     for dimension in dimension_specs() {
-        if dimension.id != "kernel" {
+        if dimension.id != "kernel" && dimension_has_values(&all_records, dimension.value) {
             let path = report_dir.join(format!("dimension-{}-by-kernel.svg", dimension.id));
             let title = format!("Median GiB/s: {} by Kernel", dimension.title);
             if write_dimension_heatmap_svg(
@@ -1768,7 +1852,7 @@ fn write_dimension_visuals(
             }
         }
 
-        if dimension.id != "threads" {
+        if dimension.id != "threads" && dimension_has_values(&parallel_records, dimension.value) {
             let path = report_dir.join(format!("dimension-{}-by-thread.svg", dimension.id));
             let title = format!("Median GiB/s: {} by Thread Count", dimension.title);
             if write_dimension_heatmap_svg(
@@ -1795,8 +1879,22 @@ fn write_dimension_visuals(
     Ok(artifacts)
 }
 
+fn dimension_has_values(
+    records: &[&BenchReportRecord],
+    value: fn(&BenchReportRecord) -> &str,
+) -> bool {
+    records
+        .iter()
+        .any(|record| !value(record).trim().is_empty())
+}
+
 fn dimension_specs() -> Vec<DimensionSpec> {
     vec![
+        DimensionSpec {
+            id: "primitive",
+            title: "Primitive",
+            value: dim_primitive,
+        },
         DimensionSpec {
             id: "case",
             title: "Case",
@@ -1843,11 +1941,20 @@ fn dimension_specs() -> Vec<DimensionSpec> {
             value: dim_pattern,
         },
         DimensionSpec {
+            id: "bytes",
+            title: "Bytes",
+            value: dim_bytes,
+        },
+        DimensionSpec {
             id: "kernel",
             title: "Kernel",
             value: dim_kernel,
         },
     ]
+}
+
+fn dim_primitive(record: &BenchReportRecord) -> &str {
+    &record.primitive
 }
 
 fn dim_case(record: &BenchReportRecord) -> &str {
@@ -1884,6 +1991,10 @@ fn dim_threads(record: &BenchReportRecord) -> &str {
 
 fn dim_pattern(record: &BenchReportRecord) -> &str {
     &record.pattern
+}
+
+fn dim_bytes(record: &BenchReportRecord) -> &str {
+    &record.bytes
 }
 
 fn dim_kernel(record: &BenchReportRecord) -> &str {
@@ -2573,6 +2684,16 @@ fn json_nested_string(value: &Value, object: &str, key: &str) -> Option<String> 
 }
 
 fn workload_label(record: &BenchReportRecord) -> String {
+    if !record.primitive.is_empty() {
+        return format!(
+            "{} | {} | {} | bytes={}",
+            empty_as_unknown(&record.primitive),
+            empty_as_unknown(&record.case),
+            empty_as_unknown(&record.pattern),
+            empty_as_unknown(&record.bytes),
+        );
+    }
+
     format!(
         "{} | {} | {} | chunk={} | threads={}",
         empty_as_unknown(&record.case),
@@ -3251,6 +3372,20 @@ fn help() {
                     hot-repeat, cold-sweep, and same-file-repeat access patterns\n\
            bench-profile\n\
                     perf profile over workload matrix when available\n\
+           bench-primitives\n\
+                    isolated primitive matrix with HTML/SVG-reportable metadata\n\
+           bench-fingerprint\n\
+                    isolated fingerprint primitive benchmarks\n\
+           bench-sketch\n\
+                    isolated sketch primitive benchmarks\n\
+           bench-byteclass\n\
+                    isolated byte-class primitive benchmarks\n\
+           bench-runlength\n\
+                    isolated run-length primitive benchmarks\n\
+           bench-entropy\n\
+                    isolated entropy primitive benchmarks\n\
+           bench-selector\n\
+                    isolated selector-signal benchmarks\n\
            bench-compare <old.jsonl> <new.jsonl>\n\
                     compare two benchmark history JSONL runs\n\
            bench-report [run.jsonl]\n\

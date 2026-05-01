@@ -1,11 +1,15 @@
-//! F22 byte-stream fingerprints.
+//! F22/content byte-stream fingerprints.
 //!
 //! The F21 paper prototype used `H1`, `H2`, `H3`, top-16 coverage,
 //! run-length fraction, and byte-entropy skew. The F22 crate primitive keeps
 //! the same cheap-feature spirit while replacing expensive `H3` with a
 //! hardware-friendly CRC32-hashed 4-gram entropy estimate.
 
-use crate::{histogram::ByteHistogram, sketch};
+use crate::{
+    dispatch::{KernelIsa, KernelStatefulness, PrimitiveFamily, WorkingSetClass},
+    histogram::ByteHistogram,
+    sketch,
+};
 
 /// F22 block size. A 64 KiB extent contains 256 such blocks.
 pub const BLOCK_SIZE: usize = 256;
@@ -51,9 +55,139 @@ pub struct ExtentFingerprint {
     pub byte_entropy_skew: f32,
 }
 
-/// Computes a compact F22 fingerprint for one 256-byte block.
+/// Fingerprint kernel exposed for pinned benchmarks and reproducibility.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FingerprintKernel {
+    /// Runtime-dispatched/default kernel.
+    Auto,
+    /// Portable scalar reference kernel.
+    Scalar,
+}
+
+impl FingerprintKernel {
+    /// Stable benchmark identifier.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Scalar => "scalar",
+        }
+    }
+}
+
+/// Catalog metadata for one fingerprint kernel.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FingerprintKernelInfo {
+    /// Primitive family.
+    pub family: PrimitiveFamily,
+    /// Stable kernel identifier.
+    pub kernel: FingerprintKernel,
+    /// ISA/backend requirement.
+    pub isa: KernelIsa,
+    /// Working-set class.
+    pub working_set: WorkingSetClass,
+    /// State model.
+    pub statefulness: KernelStatefulness,
+    /// Block size this kernel is tuned around.
+    pub block_bytes: usize,
+    /// Whether the hot path allocates.
+    pub hot_path_allocates: bool,
+    /// Short description.
+    pub description: &'static str,
+}
+
+const FINGERPRINT_KERNEL_CATALOG: [FingerprintKernelInfo; 2] = [
+    FingerprintKernelInfo {
+        family: PrimitiveFamily::Fingerprint,
+        kernel: FingerprintKernel::Auto,
+        isa: KernelIsa::RuntimeDispatch,
+        working_set: WorkingSetClass::L1,
+        statefulness: KernelStatefulness::Stateless,
+        block_bytes: BLOCK_SIZE,
+        hot_path_allocates: false,
+        description: "default fingerprint path; may use runtime-dispatched CRC32C hash bins",
+    },
+    FingerprintKernelInfo {
+        family: PrimitiveFamily::Fingerprint,
+        kernel: FingerprintKernel::Scalar,
+        isa: KernelIsa::PortableScalar,
+        working_set: WorkingSetClass::L1,
+        statefulness: KernelStatefulness::Stateless,
+        block_bytes: BLOCK_SIZE,
+        hot_path_allocates: false,
+        description: "portable scalar reference path for F22 calibration and parity",
+    },
+];
+
+/// Returns catalog metadata for currently known fingerprint kernels.
+#[must_use]
+pub const fn kernel_catalog() -> &'static [FingerprintKernelInfo] {
+    &FINGERPRINT_KERNEL_CATALOG
+}
+
+/// Pinned fingerprint kernels.
+pub mod kernels {
+    use super::{
+        BLOCK_SIZE, BlockFingerprint, ExtentFingerprint, block_auto, block_scalar, extent_auto,
+        extent_scalar,
+    };
+
+    /// Runtime-dispatched/default fingerprint kernel.
+    pub mod auto {
+        use super::{BLOCK_SIZE, BlockFingerprint, ExtentFingerprint, block_auto, extent_auto};
+
+        /// Computes a compact F22/content fingerprint for one 256-byte block.
+        #[must_use]
+        pub fn block(bytes: &[u8; BLOCK_SIZE]) -> BlockFingerprint {
+            block_auto(bytes)
+        }
+
+        /// Computes an aggregate F22/content fingerprint for any byte slice.
+        #[must_use]
+        pub fn extent(bytes: &[u8]) -> ExtentFingerprint {
+            extent_auto(bytes)
+        }
+    }
+
+    /// Portable scalar reference fingerprint kernel.
+    pub mod scalar {
+        use super::{BLOCK_SIZE, BlockFingerprint, ExtentFingerprint, block_scalar, extent_scalar};
+
+        /// Computes a compact F22/content fingerprint for one 256-byte block.
+        #[must_use]
+        pub fn block(bytes: &[u8; BLOCK_SIZE]) -> BlockFingerprint {
+            block_scalar(bytes)
+        }
+
+        /// Computes an aggregate F22/content fingerprint for any byte slice.
+        #[must_use]
+        pub fn extent(bytes: &[u8]) -> ExtentFingerprint {
+            extent_scalar(bytes)
+        }
+    }
+}
+
+/// Computes a compact F22/content fingerprint for one 256-byte block.
+///
+/// This is the ergonomic default and may use runtime-dispatched sub-primitives.
+/// Use [`kernels::scalar::block`] when a pinned scalar reference is required.
 #[must_use]
 pub fn block(bytes: &[u8; BLOCK_SIZE]) -> BlockFingerprint {
+    kernels::auto::block(bytes)
+}
+
+fn block_auto(bytes: &[u8; BLOCK_SIZE]) -> BlockFingerprint {
+    block_with_hash4(bytes, sketch::crc32_hash4_bins)
+}
+
+fn block_scalar(bytes: &[u8; BLOCK_SIZE]) -> BlockFingerprint {
+    block_with_hash4(bytes, sketch::kernels::scalar::crc32_hash4_bins)
+}
+
+fn block_with_hash4(
+    bytes: &[u8; BLOCK_SIZE],
+    hash4_bins: fn(&[u8], &mut [u32; QUAD_HASH_BLOCK_BINS]),
+) -> BlockFingerprint {
     let mut histogram = [0_u32; 256];
     for &byte in bytes {
         histogram[byte as usize] += 1;
@@ -65,7 +199,7 @@ pub fn block(bytes: &[u8; BLOCK_SIZE]) -> BlockFingerprint {
         h1
     } else {
         let mut bins = [0_u32; QUAD_HASH_BLOCK_BINS];
-        sketch::crc32_hash4_bins(bytes, &mut bins);
+        hash4_bins(bytes, &mut bins);
         sketch::entropy_from_counts_u32(&bins, (BLOCK_SIZE - 3) as u64)
     };
 
@@ -79,9 +213,27 @@ pub fn block(bytes: &[u8; BLOCK_SIZE]) -> BlockFingerprint {
     }
 }
 
-/// Computes an F22 aggregate fingerprint for any byte slice.
+/// Computes an F22/content aggregate fingerprint for any byte slice.
+///
+/// This is the ergonomic default and may use runtime-dispatched sub-primitives.
+/// Use [`kernels::scalar::extent`] when a pinned scalar reference is required.
 #[must_use]
 pub fn extent(bytes: &[u8]) -> ExtentFingerprint {
+    kernels::auto::extent(bytes)
+}
+
+fn extent_auto(bytes: &[u8]) -> ExtentFingerprint {
+    extent_with_hash4(bytes, sketch::crc32_hash4_bins)
+}
+
+fn extent_scalar(bytes: &[u8]) -> ExtentFingerprint {
+    extent_with_hash4(bytes, sketch::kernels::scalar::crc32_hash4_bins)
+}
+
+fn extent_with_hash4(
+    bytes: &[u8],
+    hash4_bins: fn(&[u8], &mut [u32; QUAD_HASH_BINS]),
+) -> ExtentFingerprint {
     if bytes.is_empty() {
         return ExtentFingerprint::default();
     }
@@ -89,7 +241,7 @@ pub fn extent(bytes: &[u8]) -> ExtentFingerprint {
     let histogram = ByteHistogram::from_block(bytes);
     let h1 = crate::entropy::shannon::h1(&histogram);
     let mut bins = [0_u32; QUAD_HASH_BINS];
-    sketch::crc32_hash4_bins(bytes, &mut bins);
+    hash4_bins(bytes, &mut bins);
     let h4 = sketch::entropy_from_counts_u32(&bins, bytes.len().saturating_sub(3).max(1) as u64);
     let (_, rl_bytes) = runlength(bytes);
     let top16_coverage = top_k_coverage_u64(histogram.counts(), 16, histogram.total());
@@ -156,7 +308,14 @@ fn top_k_coverage_q8(histogram: &[u32; 256], k: usize, total: u32) -> u8 {
         top += count;
         counts[index] = 0;
     }
-    ((top as f32 / total as f32) * 255.0).round() as u8
+    let value = ((top as f32 / total as f32) * 256.0).round();
+    if value >= 255.0 {
+        255
+    } else if value <= 0.0 {
+        0
+    } else {
+        value as u8
+    }
 }
 
 fn top_k_coverage_u64(histogram: &[u64; 256], k: usize, total: u64) -> f32 {
@@ -182,7 +341,8 @@ fn top_k_coverage_u64(histogram: &[u64; 256], k: usize, total: u64) -> f32 {
 
 fn byte_class_bitmap(histogram: &[u32; 256]) -> u8 {
     let total = histogram.iter().sum::<u32>().max(1);
-    let ascii = (0x20..=0x7e).map(|byte| histogram[byte]).sum::<u32>();
+    let half = total / 2;
+    let printable = (0x21..=0x7e).map(|byte| histogram[byte]).sum::<u32>();
     let whitespace = [b' ', b'\n', b'\r', b'\t']
         .into_iter()
         .map(|byte| histogram[byte as usize])
@@ -191,16 +351,16 @@ fn byte_class_bitmap(histogram: &[u32; 256]) -> u8 {
     let high = (0x80..=0xff).map(|byte| histogram[byte]).sum::<u32>();
 
     let mut bitmap = 0_u8;
-    if ascii * 2 >= total {
+    if printable >= half {
         bitmap |= 1 << 0;
     }
-    if whitespace * 4 >= total {
+    if whitespace >= half {
         bitmap |= 1 << 1;
     }
-    if control * 4 >= total {
+    if control >= half {
         bitmap |= 1 << 2;
     }
-    if high * 2 >= total {
+    if high >= half {
         bitmap |= 1 << 3;
     }
     bitmap
@@ -208,7 +368,7 @@ fn byte_class_bitmap(histogram: &[u32; 256]) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{BLOCK_SIZE, block, extent};
+    use super::{BLOCK_SIZE, FingerprintKernel, block, extent, kernel_catalog, kernels};
 
     #[test]
     fn zero_block_has_zero_entropy_and_one_run() {
@@ -237,5 +397,32 @@ mod tests {
     fn extent_skew_is_h1_over_eight() {
         let fp = extent(b"abcdabcdabcdabcd");
         assert!((fp.byte_entropy_skew - fp.h1 / 8.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn public_default_matches_pinned_scalar() {
+        let mut bytes = [0_u8; BLOCK_SIZE];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = (index.wrapping_mul(37) ^ (index >> 1)) as u8;
+        }
+
+        assert_eq!(block(&bytes), kernels::scalar::block(&bytes));
+        assert_eq!(extent(&bytes), kernels::scalar::extent(&bytes));
+    }
+
+    #[test]
+    fn catalog_exposes_default_and_scalar_paths() {
+        let catalog = kernel_catalog();
+        assert!(
+            catalog
+                .iter()
+                .any(|info| info.kernel == FingerprintKernel::Auto)
+        );
+        assert!(
+            catalog
+                .iter()
+                .any(|info| info.kernel == FingerprintKernel::Scalar)
+        );
+        assert!(catalog.iter().all(|info| !info.hot_path_allocates));
     }
 }
