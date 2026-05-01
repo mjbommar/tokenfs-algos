@@ -3,14 +3,14 @@
 use std::{
     env,
     fs::File,
-    io::{Read, Seek, SeekFrom},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::OnceLock,
 };
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use tokenfs_algos::{
-    byteclass, divergence, entropy, fingerprint,
+    byteclass, distribution, divergence, entropy, fingerprint,
     histogram::{self, ByteHistogram},
     runlength, selector, sketch, structure,
 };
@@ -42,6 +42,14 @@ enum PrimitiveKernel {
     SketchCrc32Hash4Auto,
     SketchCrc32Hash4Sse42,
     SketchCrc32Hash4Scalar,
+    NgramHash2Bins256,
+    NgramHash2Bins1024,
+    NgramHash4Bins256,
+    NgramHash4Bins1024,
+    NgramHash4Bins4096,
+    SketchDenseCosine1024,
+    SketchDenseL21024,
+    SketchDenseJsd1024,
     SketchEntropyLut,
     ByteClassClassify,
     ByteClassClassifyScalar,
@@ -51,6 +59,9 @@ enum PrimitiveKernel {
     EntropyH1FromHistogram,
     DivergenceByteJs,
     DivergenceByteKs,
+    DistributionNearestByteJs,
+    DistributionNearestByteHellinger,
+    DistributionByteAllDistances,
     SelectorSignals,
 }
 
@@ -70,6 +81,14 @@ impl PrimitiveKernel {
             Self::SketchMisraGriesK16,
             Self::SketchCountMin4x1024,
             Self::SketchCrc32Hash4Auto,
+            Self::NgramHash2Bins256,
+            Self::NgramHash2Bins1024,
+            Self::NgramHash4Bins256,
+            Self::NgramHash4Bins1024,
+            Self::NgramHash4Bins4096,
+            Self::SketchDenseCosine1024,
+            Self::SketchDenseL21024,
+            Self::SketchDenseJsd1024,
             Self::SketchEntropyLut,
             Self::ByteClassClassify,
             Self::ByteClassClassifyScalar,
@@ -78,6 +97,9 @@ impl PrimitiveKernel {
             Self::EntropyH1FromHistogram,
             Self::DivergenceByteJs,
             Self::DivergenceByteKs,
+            Self::DistributionNearestByteJs,
+            Self::DistributionNearestByteHellinger,
+            Self::DistributionByteAllDistances,
             Self::SelectorSignals,
         ];
         #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
@@ -113,6 +135,14 @@ impl PrimitiveKernel {
             Self::SketchCrc32Hash4Auto => "sketch-crc32-hash4-auto",
             Self::SketchCrc32Hash4Sse42 => "sketch-crc32-hash4-sse42",
             Self::SketchCrc32Hash4Scalar => "sketch-crc32-hash4-scalar",
+            Self::NgramHash2Bins256 => "ngram-hash2-bins256",
+            Self::NgramHash2Bins1024 => "ngram-hash2-bins1024",
+            Self::NgramHash4Bins256 => "ngram-hash4-bins256",
+            Self::NgramHash4Bins1024 => "ngram-hash4-bins1024",
+            Self::NgramHash4Bins4096 => "ngram-hash4-bins4096",
+            Self::SketchDenseCosine1024 => "sketch-dense-cosine-1024",
+            Self::SketchDenseL21024 => "sketch-dense-l2-1024",
+            Self::SketchDenseJsd1024 => "sketch-dense-jsd-1024",
             Self::SketchEntropyLut => "sketch-entropy-lut",
             Self::ByteClassClassify => "byteclass-classify",
             Self::ByteClassClassifyScalar => "byteclass-classify-scalar",
@@ -122,6 +152,9 @@ impl PrimitiveKernel {
             Self::EntropyH1FromHistogram => "entropy-h1-from-histogram",
             Self::DivergenceByteJs => "divergence-byte-js",
             Self::DivergenceByteKs => "divergence-byte-ks",
+            Self::DistributionNearestByteJs => "distribution-nearest-byte-js",
+            Self::DistributionNearestByteHellinger => "distribution-nearest-byte-hellinger",
+            Self::DistributionByteAllDistances => "distribution-byte-all-distances",
             Self::SelectorSignals => "selector-signals",
         }
     }
@@ -142,6 +175,14 @@ impl PrimitiveKernel {
             | Self::SketchCrc32Hash4Sse42
             | Self::SketchCrc32Hash4Scalar
             | Self::SketchEntropyLut => "sketch",
+            Self::NgramHash2Bins256
+            | Self::NgramHash2Bins1024
+            | Self::NgramHash4Bins256
+            | Self::NgramHash4Bins1024
+            | Self::NgramHash4Bins4096 => "ngram-sketch",
+            Self::SketchDenseCosine1024 | Self::SketchDenseL21024 | Self::SketchDenseJsd1024 => {
+                "sketch-distance"
+            }
             Self::ByteClassClassify
             | Self::ByteClassClassifyScalar
             | Self::ByteClassClassifyAvx2 => "byteclass",
@@ -149,6 +190,9 @@ impl PrimitiveKernel {
             Self::StructureSummarize => "structure",
             Self::EntropyH1FromHistogram => "entropy",
             Self::DivergenceByteJs | Self::DivergenceByteKs => "divergence",
+            Self::DistributionNearestByteJs
+            | Self::DistributionNearestByteHellinger
+            | Self::DistributionByteAllDistances => "distribution",
             Self::SelectorSignals => "selector",
         }
     }
@@ -330,6 +374,50 @@ fn run_kernel(kernel: PrimitiveKernel, bytes: &[u8]) -> u64 {
             bins.iter()
                 .fold(0_u64, |acc, count| acc + u64::from(*count))
         }
+        PrimitiveKernel::NgramHash2Bins256 => {
+            let sketch = sketch::HashBinSketch::<256>::from_ngrams::<2>(bytes);
+            fold_u32_bins(sketch.bins()) ^ sketch.observations()
+        }
+        PrimitiveKernel::NgramHash2Bins1024 => {
+            let sketch = sketch::HashBinSketch::<1024>::from_ngrams::<2>(bytes);
+            fold_u32_bins(sketch.bins()) ^ sketch.observations()
+        }
+        PrimitiveKernel::NgramHash4Bins256 => {
+            let sketch = sketch::HashBinSketch::<256>::from_ngrams::<4>(bytes);
+            fold_u32_bins(sketch.bins()) ^ sketch.observations()
+        }
+        PrimitiveKernel::NgramHash4Bins1024 => {
+            let sketch = sketch::HashBinSketch::<1024>::from_ngrams::<4>(bytes);
+            fold_u32_bins(sketch.bins()) ^ sketch.observations()
+        }
+        PrimitiveKernel::NgramHash4Bins4096 => {
+            let sketch = sketch::HashBinSketch::<4096>::from_ngrams::<4>(bytes);
+            fold_u32_bins(sketch.bins()) ^ sketch.observations()
+        }
+        PrimitiveKernel::SketchDenseCosine1024 => {
+            let (left, right) = split_halves(bytes);
+            let left = sketch::HashBinSketch::<1024>::from_ngrams::<4>(left);
+            let right = sketch::HashBinSketch::<1024>::from_ngrams::<4>(right);
+            divergence::cosine_distance_counts_u32(left.bins(), right.bins())
+                .unwrap_or(0.0)
+                .to_bits()
+        }
+        PrimitiveKernel::SketchDenseL21024 => {
+            let (left, right) = split_halves(bytes);
+            let left = sketch::HashBinSketch::<1024>::from_ngrams::<4>(left);
+            let right = sketch::HashBinSketch::<1024>::from_ngrams::<4>(right);
+            divergence::normalized_l2_distance_counts_u32(left.bins(), right.bins())
+                .unwrap_or(0.0)
+                .to_bits()
+        }
+        PrimitiveKernel::SketchDenseJsd1024 => {
+            let (left, right) = split_halves(bytes);
+            let left = sketch::HashBinSketch::<1024>::from_ngrams::<4>(left);
+            let right = sketch::HashBinSketch::<1024>::from_ngrams::<4>(right);
+            divergence::jensen_shannon_distance_counts_u32(left.bins(), right.bins(), 0.5)
+                .unwrap_or(0.0)
+                .to_bits()
+        }
         PrimitiveKernel::SketchEntropyLut => {
             let mut counts = [0_u32; 256];
             for &byte in bytes {
@@ -387,6 +475,36 @@ fn run_kernel(kernel: PrimitiveKernel, bytes: &[u8]) -> u64 {
                 .unwrap_or(0.0)
                 .to_bits()
         }
+        PrimitiveKernel::DistributionNearestByteJs => {
+            let query = distribution::ByteDistribution::from_bytes(bytes);
+            distribution::nearest_byte_distribution(
+                &query,
+                reference_distributions(),
+                distribution::ByteDistributionMetric::JensenShannon,
+            )
+            .map(|nearest| nearest.distance.to_bits() ^ nearest.index as u64)
+            .unwrap_or(0)
+        }
+        PrimitiveKernel::DistributionNearestByteHellinger => {
+            let query = distribution::ByteDistribution::from_bytes(bytes);
+            distribution::nearest_byte_distribution(
+                &query,
+                reference_distributions(),
+                distribution::ByteDistributionMetric::Hellinger,
+            )
+            .map(|nearest| nearest.distance.to_bits() ^ nearest.index as u64)
+            .unwrap_or(0)
+        }
+        PrimitiveKernel::DistributionByteAllDistances => {
+            let (left, right) = split_halves(bytes);
+            let left = distribution::ByteDistribution::from_bytes(left);
+            let right = distribution::ByteDistribution::from_bytes(right);
+            let distances = left.distances(&right);
+            distances.total_variation.to_bits()
+                ^ distances.ks.to_bits().rotate_left(7)
+                ^ distances.jensen_shannon.to_bits().rotate_left(13)
+                ^ distances.hellinger.to_bits().rotate_left(19)
+        }
         PrimitiveKernel::SelectorSignals => {
             let signals = selector::signals(bytes);
             signals.fingerprint.h1.to_bits() as u64
@@ -419,6 +537,12 @@ fn fold_byteclass(counts: byteclass::ByteClassCounts) -> u64 {
         ^ counts.other.rotate_left(29)
 }
 
+fn fold_u32_bins(bins: &[u32]) -> u64 {
+    bins.iter().enumerate().fold(0_u64, |acc, (index, count)| {
+        acc ^ ((index as u64 + 1) * u64::from(*count))
+    })
+}
+
 fn fingerprint_blocks(
     bytes: &[u8],
     block: fn(&[u8; fingerprint::BLOCK_SIZE]) -> fingerprint::BlockFingerprint,
@@ -448,6 +572,98 @@ fn fold_extent(fp: fingerprint::ExtentFingerprint) -> u64 {
 fn entropy_lut() -> &'static sketch::CLog2Lut<257> {
     static LUT: OnceLock<sketch::CLog2Lut<257>> = OnceLock::new();
     LUT.get_or_init(sketch::CLog2Lut::new)
+}
+
+fn reference_distributions() -> &'static [distribution::ByteDistributionReference<'static>] {
+    static REFERENCES: OnceLock<Vec<distribution::ByteDistributionReference<'static>>> =
+        OnceLock::new();
+    REFERENCES.get_or_init(|| {
+        if let Some(path) = env::var_os("TOKENFS_ALGOS_MAGIC_BPE_CALIBRATION")
+            && let Ok(references) = calibration_references_from_jsonl(&PathBuf::from(path))
+            && !references.is_empty()
+        {
+            return references;
+        }
+
+        vec![
+            distribution::ByteDistributionReference::new(
+                "zeros",
+                "application/x-zero",
+                distribution::ByteDistribution::from_bytes(&vec![0; 64 * 1024]),
+            ),
+            distribution::ByteDistributionReference::new(
+                "prng",
+                "application/octet-stream",
+                distribution::ByteDistribution::from_bytes(&deterministic_prng(
+                    64 * 1024,
+                    0xD157_2EED,
+                )),
+            ),
+            distribution::ByteDistributionReference::new(
+                "text",
+                "text/plain",
+                distribution::ByteDistribution::from_bytes(&repeated_text(64 * 1024)),
+            ),
+            distribution::ByteDistributionReference::new(
+                "runs",
+                "application/x-runs",
+                distribution::ByteDistribution::from_bytes(&run_heavy(64 * 1024)),
+            ),
+            distribution::ByteDistributionReference::new(
+                "motif-64",
+                "application/x-motif",
+                distribution::ByteDistribution::from_bytes(&repeated_random_motif(64 * 1024, 64)),
+            ),
+        ]
+    })
+}
+
+fn calibration_references_from_jsonl(
+    path: &Path,
+) -> std::io::Result<Vec<distribution::ByteDistributionReference<'static>>> {
+    let file = File::open(path)?;
+    let mut references = Vec::new();
+
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let Some(mime) = value.get("mime_type").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(count_values) = value.get("counts").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        if count_values.len() != 256 {
+            continue;
+        }
+        let mut counts = [0_u64; 256];
+        let mut valid = true;
+        for (index, count) in count_values.iter().enumerate() {
+            let Some(count) = count.as_u64() else {
+                valid = false;
+                break;
+            };
+            counts[index] = count;
+        }
+        if !valid {
+            continue;
+        }
+
+        let label: &'static str = Box::leak(format!("magic-bpe:{mime}").into_boxed_str());
+        let mime_type: &'static str = Box::leak(mime.to_owned().into_boxed_str());
+        references.push(distribution::ByteDistributionReference::new(
+            label,
+            mime_type,
+            distribution::ByteDistribution::from_counts(counts),
+        ));
+    }
+
+    Ok(references)
 }
 
 fn deterministic_prng(size: usize, seed: u64) -> Vec<u8> {

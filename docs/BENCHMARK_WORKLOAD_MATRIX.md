@@ -22,7 +22,10 @@ The manifest also records measured global byte entropy and 4 KiB chunk entropy:
 `h1_bits_per_byte`, `h1_4k_mean`, `h1_4k_min`, and `h1_4k_max`.
 It also records the current dispatch planner recommendation as
 `planned_kernel`, `planned_chunk_bytes`, `planned_sample_bytes`,
-`planned_confidence_q8`, and `plan_reason`.
+`planned_confidence_q8`, `planned_confidence_source`, and `plan_reason`.
+The confidence source is one of `static-rule`, `calibration-rule`, or
+`fallback`, so planner parity reports can distinguish durable calibrated rules
+from conservative defaults.
 
 ## Synthetic Payloads
 

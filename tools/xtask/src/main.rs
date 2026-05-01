@@ -74,6 +74,10 @@ fn run() -> Result<()> {
         "bench-runlength" => bench_primitive_filter(&rest, "runlength"),
         "bench-entropy" => bench_primitive_filter(&rest, "entropy"),
         "bench-divergence" => bench_primitive_filter(&rest, "divergence"),
+        "bench-distribution" => bench_primitive_filter(&rest, "distribution"),
+        "bench-distribution-real" => bench_primitive_filter_real(&rest, "distribution"),
+        "bench-ngram-sketch" => bench_primitive_filter(&rest, "ngram sketch-dense"),
+        "bench-ngram-sketch-real" => bench_primitive_filter_real(&rest, "ngram sketch-dense"),
         "bench-selector" => bench_primitive_filter(&rest, "selector"),
         "bench-compare" => bench_compare(&rest),
         "bench-report" => bench_report(&rest),
@@ -1080,6 +1084,7 @@ struct BenchReportRecord {
     pattern: String,
     planned_kernel: String,
     planned_confidence_q8: String,
+    planned_confidence_source: String,
     bytes: String,
     throughput_bytes: u64,
     mean_ns: f64,
@@ -1730,6 +1735,7 @@ fn read_bench_report_records(path: &Path) -> Result<Vec<BenchReportRecord>> {
             pattern: bench_field(&value, "pattern"),
             planned_kernel: bench_field(&value, "planned_kernel"),
             planned_confidence_q8: bench_field(&value, "planned_confidence_q8"),
+            planned_confidence_source: bench_field(&value, "planned_confidence_source"),
             bytes: bench_field(&value, "bytes"),
             throughput_bytes,
             mean_ns,
@@ -1772,14 +1778,14 @@ fn write_timing_csv(path: &Path, records: &[BenchReportRecord]) -> Result<()> {
         .map_err(|error| format!("failed to create `{}`: {error}", path.display()))?;
     writeln!(
         file,
-        "full_id,group,workload_id,primitive,case,source,content,entropy,scale,access,chunk,threads,pattern,kernel,planned_kernel,planned_confidence_q8,planner_match,bytes,throughput_bytes,mean_ns,gib_per_s"
+        "full_id,group,workload_id,primitive,case,source,content,entropy,scale,access,chunk,threads,pattern,kernel,planned_kernel,planned_confidence_q8,planned_confidence_source,planner_match,bytes,throughput_bytes,mean_ns,gib_per_s"
     )
     .map_err(write_error(path))?;
 
     for record in records {
         writeln!(
             file,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.6},{:.6}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.6},{:.6}",
             csv_cell(&record.full_id),
             csv_cell(&record.group),
             csv_cell(&record.workload_id),
@@ -1796,6 +1802,7 @@ fn write_timing_csv(path: &Path, records: &[BenchReportRecord]) -> Result<()> {
             csv_cell(&record.kernel),
             csv_cell(&record.planned_kernel),
             csv_cell(&record.planned_confidence_q8),
+            csv_cell(&record.planned_confidence_source),
             record.planned_kernel == record.kernel,
             csv_cell(&record.bytes),
             record.throughput_bytes,
@@ -1828,7 +1835,7 @@ fn write_planner_parity_csv(path: &Path, records: &[BenchReportRecord]) -> Resul
         .map_err(|error| format!("failed to create `{}`: {error}", path.display()))?;
     writeln!(
         file,
-        "workload,case,source,content,entropy,scale,access,chunk,threads,pattern,planned_kernel,planned_confidence_q8,winner_kernel,winner_gib_per_s,planned_gib_per_s,gap_gib_per_s,gap_pct,kernel_results"
+        "workload,case,source,content,entropy,scale,access,chunk,threads,pattern,planned_kernel,planned_confidence_q8,planned_confidence_source,winner_kernel,winner_gib_per_s,planned_gib_per_s,gap_gib_per_s,gap_pct,kernel_results"
     )
     .map_err(write_error(path))?;
 
@@ -1847,6 +1854,10 @@ fn write_planner_parity_csv(path: &Path, records: &[BenchReportRecord]) -> Resul
             .iter()
             .find(|row| !row.planned_kernel.is_empty())
             .map_or("", |row| row.planned_kernel.as_str());
+        let planned_confidence_source = rows
+            .iter()
+            .find(|row| !row.planned_confidence_source.is_empty())
+            .map_or("", |row| row.planned_confidence_source.as_str());
         let planned = rows.iter().find(|row| row.kernel == planned_kernel);
         let planned_gib = planned.map_or(0.0, |row| row.gib_per_s);
         let gap = best.gib_per_s - planned_gib;
@@ -1863,7 +1874,7 @@ fn write_planner_parity_csv(path: &Path, records: &[BenchReportRecord]) -> Resul
 
         writeln!(
             file,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{:.6},{:.6},{:.6},{:.3},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.6},{:.6},{:.6},{:.3},{}",
             csv_cell(&workload),
             csv_cell(&best.case),
             csv_cell(&best.source),
@@ -1876,6 +1887,7 @@ fn write_planner_parity_csv(path: &Path, records: &[BenchReportRecord]) -> Resul
             csv_cell(&best.pattern),
             csv_cell(planned_kernel),
             csv_cell(&best.planned_confidence_q8),
+            csv_cell(planned_confidence_source),
             csv_cell(&best.kernel),
             best.gib_per_s,
             planned_gib,
@@ -1963,7 +1975,7 @@ fn write_heatmap_html(
     .map_err(write_error(path))?;
     writeln!(
         file,
-        "<section class=\"guide\"><h2>How to read this</h2><p>Each row is one workload shape: case, access pattern, data pattern, chunk size, and thread count. <b>Planner</b> is the static planner recommendation from the workload manifest. <b>Best measured kernel</b> is the fastest measured kernel in this run. Cells marked <b>winner</b> are row winners. Green cells are closest to the row winner; red cells are furthest from it. The title tooltip on each cell includes mean time and full benchmark id.</p><p><b>Thread rows:</b> {}</p><p><b>Winner counts:</b> {}</p></section>",
+        "<section class=\"guide\"><h2>How to read this</h2><p>Each row is one workload shape: case, access pattern, data pattern, chunk size, and thread count. <b>Planner</b> is the planner recommendation from the workload manifest; timing CSV and planner parity CSV include confidence score and confidence source. <b>Best measured kernel</b> is the fastest measured kernel in this run. Cells marked <b>winner</b> are row winners. Green cells are closest to the row winner; red cells are furthest from it. The title tooltip on each cell includes mean time and full benchmark id.</p><p><b>Thread rows:</b> {}</p><p><b>Winner counts:</b> {}</p></section>",
         html_escape(&thread_summary),
         html_escape(&winner_summary)
     )
@@ -2329,6 +2341,11 @@ fn dimension_specs() -> Vec<DimensionSpec> {
             value: dim_threads,
         },
         DimensionSpec {
+            id: "confidence-source",
+            title: "Planner Confidence Source",
+            value: dim_confidence_source,
+        },
+        DimensionSpec {
             id: "pattern",
             title: "Pattern",
             value: dim_pattern,
@@ -2380,6 +2397,10 @@ fn dim_chunk(record: &BenchReportRecord) -> &str {
 
 fn dim_threads(record: &BenchReportRecord) -> &str {
     &record.threads
+}
+
+fn dim_confidence_source(record: &BenchReportRecord) -> &str {
+    &record.planned_confidence_source
 }
 
 fn dim_pattern(record: &BenchReportRecord) -> &str {
@@ -4001,6 +4022,14 @@ fn help() {
                     isolated entropy primitive benchmarks\n\
            bench-divergence\n\
                     isolated byte-distribution divergence benchmarks\n\
+           bench-distribution\n\
+                    isolated calibrated byte-distribution nearest-reference benchmarks\n\
+           bench-distribution-real\n\
+                    distribution benchmarks with real-file slices\n\
+           bench-ngram-sketch\n\
+                    isolated 2-gram/4-gram hash-bin sketch benchmarks\n\
+           bench-ngram-sketch-real\n\
+                    n-gram sketch benchmarks with real-file slices\n\
            bench-selector\n\
                     isolated selector-signal benchmarks\n\
            bench-compare <old.jsonl> <new.jsonl>\n\

@@ -3,9 +3,14 @@
 pub use crate::dispatch::{
     ApiContext, Backend, CacheProfile, CacheState, ContentKind, EntropyClass, EntropyScale,
     HistogramKernelInfo, HistogramPlan, HistogramStrategy, KernelIsa, KernelStatefulness,
-    PlanContext, PrimitiveFamily, ProcessorProfile, ReadPattern, SourceHint, WorkingSetClass,
-    WorkloadShape, clear_forced_backend, detected_backend, detected_cache_profile,
-    detected_processor_profile, force_backend, histogram_kernel_catalog, plan_histogram,
+    PlanContext, PlannerConfidenceSource, PrimitiveFamily, ProcessorProfile, ReadPattern,
+    SourceHint, WorkingSetClass, WorkloadShape, clear_forced_backend, detected_backend,
+    detected_cache_profile, detected_processor_profile, force_backend, histogram_kernel_catalog,
+    plan_histogram,
+};
+pub use crate::distribution::{
+    ByteDistribution, ByteDistributionDistances, ByteDistributionMetric, ByteDistributionReference,
+    NearestByteDistribution, nearest_byte_distribution,
 };
 pub use crate::entropy;
 pub use crate::fingerprint::{
@@ -19,5 +24,5 @@ pub use crate::histogram::{
     plan_block as plan_histogram_block,
 };
 pub use crate::selector::{RepresentationHint, SelectorSignals};
-pub use crate::sketch::{CLog2Lut, CountMinSketch, MisraGries};
+pub use crate::sketch::{CLog2Lut, CountMinSketch, HashBinSketch, MisraGries};
 pub use crate::structure::StructureSummary;

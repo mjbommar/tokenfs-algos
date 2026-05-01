@@ -130,6 +130,23 @@ This gives a fast path for "what does this block look like?" without building
 maps or parsing file formats. The calibrated MIME histograms become references;
 random blocks or streaming windows become query fingerprints.
 
+Follow-up implemented on 2026-05-01:
+
+- `tokenfs_algos::distribution` exposes `ByteDistribution`,
+  `ByteDistributionMetric`, `ByteDistributionReference`, and
+  `nearest_byte_distribution`.
+- `HashBinSketch<BINS>` and generic `crc32_hash_ngram_bins<N, BINS>` cover 2-
+  and 4-gram dense hash-bin sketches with scalar and SSE4.2 paths.
+- Dense sketch distance kernels cover cosine, normalized L2, raw L2, and
+  Jensen-Shannon over `u32` count arrays.
+- `bench-distribution` and `bench-ngram-sketch` run these primitives through the
+  reportable primitive matrix.
+- `HistogramPlan` now records `confidence_source` so parity logs distinguish
+  static rules, calibrated rules, and fallback rules.
+
+See `docs/DISTRIBUTION_NGRAM_PHASE_2026-05-01.md` for the full design and
+measurement protocol.
+
 ## Profiling Status
 
 Profiling attempt:

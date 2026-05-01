@@ -15,6 +15,19 @@ pub mod kernels {
         pub fn crc32_hash4_bins<const BINS: usize>(bytes: &[u8], bins: &mut [u32; BINS]) {
             super::super::crc32_hash4_bins_with(bytes, bins, crc32c_u32);
         }
+
+        /// Counts 2-grams into a CRC32C-hashed fixed bin array.
+        pub fn crc32_hash2_bins<const BINS: usize>(bytes: &[u8], bins: &mut [u32; BINS]) {
+            super::super::crc32_hash_ngram_bins_with::<2, BINS>(bytes, bins, crc32c_u32);
+        }
+
+        /// Counts `N`-grams, for `1 <= N <= 4`, into CRC32C-hashed bins.
+        pub fn crc32_hash_ngram_bins<const N: usize, const BINS: usize>(
+            bytes: &[u8],
+            bins: &mut [u32; BINS],
+        ) {
+            super::super::crc32_hash_ngram_bins_with::<N, BINS>(bytes, bins, crc32c_u32);
+        }
     }
 
     /// x86 SSE4.2 CRC32C sketch kernels.
@@ -53,6 +66,35 @@ pub mod kernels {
         #[target_feature(enable = "sse4.2")]
         pub unsafe fn crc32_hash4_bins<const BINS: usize>(bytes: &[u8], bins: &mut [u32; BINS]) {
             super::super::crc32_hash4_bins_with(bytes, bins, |seed, value| {
+                // SAFETY: this function's target_feature contract guarantees SSE4.2.
+                unsafe { crc32c_u32(seed, value) }
+            });
+        }
+
+        /// Counts 2-grams into a CRC32C-hashed fixed bin array.
+        ///
+        /// # Safety
+        ///
+        /// The caller must ensure that SSE4.2 is available on the current CPU.
+        #[target_feature(enable = "sse4.2")]
+        pub unsafe fn crc32_hash2_bins<const BINS: usize>(bytes: &[u8], bins: &mut [u32; BINS]) {
+            super::super::crc32_hash_ngram_bins_with::<2, BINS>(bytes, bins, |seed, value| {
+                // SAFETY: this function's target_feature contract guarantees SSE4.2.
+                unsafe { crc32c_u32(seed, value) }
+            });
+        }
+
+        /// Counts `N`-grams, for `1 <= N <= 4`, into CRC32C-hashed bins.
+        ///
+        /// # Safety
+        ///
+        /// The caller must ensure that SSE4.2 is available on the current CPU.
+        #[target_feature(enable = "sse4.2")]
+        pub unsafe fn crc32_hash_ngram_bins<const N: usize, const BINS: usize>(
+            bytes: &[u8],
+            bins: &mut [u32; BINS],
+        ) {
+            super::super::crc32_hash_ngram_bins_with::<N, BINS>(bytes, bins, |seed, value| {
                 // SAFETY: this function's target_feature contract guarantees SSE4.2.
                 unsafe { crc32c_u32(seed, value) }
             });
@@ -237,6 +279,79 @@ impl<const ROWS: usize, const COLS: usize> CountMinSketch<ROWS, COLS> {
     }
 }
 
+/// Fixed-size CRC32C hash-bin n-gram sketch.
+///
+/// The sketch is dense and array-backed. It is meant for fast comparisons
+/// against calibrated references without allocating maps in the hot path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HashBinSketch<const BINS: usize> {
+    bins: [u32; BINS],
+    ngram: u8,
+    observations: u64,
+}
+
+impl<const BINS: usize> Default for HashBinSketch<BINS> {
+    fn default() -> Self {
+        Self {
+            bins: [0; BINS],
+            ngram: 0,
+            observations: 0,
+        }
+    }
+}
+
+impl<const BINS: usize> HashBinSketch<BINS> {
+    /// Creates an empty sketch.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Builds a sketch from `N`-grams, for `1 <= N <= 4`.
+    #[must_use]
+    pub fn from_ngrams<const N: usize>(bytes: &[u8]) -> Self {
+        let mut sketch = Self::new();
+        sketch.update_ngrams::<N>(bytes);
+        sketch
+    }
+
+    /// Clears the sketch.
+    pub fn clear(&mut self) {
+        self.bins = [0; BINS];
+        self.ngram = 0;
+        self.observations = 0;
+    }
+
+    /// Adds `N`-gram observations from `bytes`, for `1 <= N <= 4`.
+    pub fn update_ngrams<const N: usize>(&mut self, bytes: &[u8]) {
+        if !(1..=4).contains(&N) {
+            return;
+        }
+        let observations = ngram_windows::<N>(bytes.len());
+        crc32_hash_ngram_bins::<N, BINS>(bytes, &mut self.bins);
+        self.ngram = N as u8;
+        self.observations = self.observations.saturating_add(observations);
+    }
+
+    /// Returns the dense bins.
+    #[must_use]
+    pub const fn bins(&self) -> &[u32; BINS] {
+        &self.bins
+    }
+
+    /// Returns the configured n-gram length.
+    #[must_use]
+    pub const fn ngram(&self) -> u8 {
+        self.ngram
+    }
+
+    /// Number of observed n-gram windows.
+    #[must_use]
+    pub const fn observations(&self) -> u64 {
+        self.observations
+    }
+}
+
 fn row_seed(row: usize) -> u32 {
     0x9e37_79b9_u32.wrapping_mul((row as u32).wrapping_add(1))
 }
@@ -297,24 +412,70 @@ pub fn crc32_hash4_bins<const BINS: usize>(bytes: &[u8], bins: &mut [u32; BINS])
     kernels::scalar::crc32_hash4_bins(bytes, bins);
 }
 
+/// Counts 2-grams into a CRC32C-hashed fixed bin array.
+pub fn crc32_hash2_bins<const BINS: usize>(bytes: &[u8], bins: &mut [u32; BINS]) {
+    crc32_hash_ngram_bins::<2, BINS>(bytes, bins);
+}
+
+/// Counts `N`-grams, for `1 <= N <= 4`, into CRC32C-hashed bins.
+pub fn crc32_hash_ngram_bins<const N: usize, const BINS: usize>(
+    bytes: &[u8],
+    bins: &mut [u32; BINS],
+) {
+    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        if kernels::sse42::is_available() {
+            // SAFETY: availability was checked immediately above.
+            unsafe { kernels::sse42::crc32_hash_ngram_bins::<N, BINS>(bytes, bins) };
+            return;
+        }
+    }
+
+    kernels::scalar::crc32_hash_ngram_bins::<N, BINS>(bytes, bins);
+}
+
 fn crc32_hash4_bins_with<const BINS: usize>(
     bytes: &[u8],
     bins: &mut [u32; BINS],
     crc32: fn(u32, u32) -> u32,
 ) {
-    if bytes.len() < 4 || BINS == 0 {
+    crc32_hash_ngram_bins_with::<4, BINS>(bytes, bins, crc32);
+}
+
+fn crc32_hash_ngram_bins_with<const N: usize, const BINS: usize>(
+    bytes: &[u8],
+    bins: &mut [u32; BINS],
+    crc32: fn(u32, u32) -> u32,
+) {
+    if BINS == 0 || !(1..=4).contains(&N) || bytes.len() < N {
         return;
     }
 
-    for window in bytes.windows(4) {
-        let quad = u32::from_le_bytes([window[0], window[1], window[2], window[3]]);
-        let hash = crc32(0, quad) as usize;
+    for window in bytes.windows(N) {
+        let word = pack_ngram_le(window);
+        let hash = crc32(0, word) as usize;
         let bin = if BINS.is_power_of_two() {
             hash & (BINS - 1)
         } else {
             hash % BINS
         };
         bins[bin] += 1;
+    }
+}
+
+fn pack_ngram_le(window: &[u8]) -> u32 {
+    let mut value = 0_u32;
+    for (offset, &byte) in window.iter().take(4).enumerate() {
+        value |= u32::from(byte) << (offset * 8);
+    }
+    value
+}
+
+fn ngram_windows<const N: usize>(len: usize) -> u64 {
+    if !(1..=4).contains(&N) || len < N {
+        0
+    } else {
+        (len - N + 1) as u64
     }
 }
 
@@ -440,8 +601,9 @@ pub fn concentration_ratio_u32(counts: &[u32], total: u64) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        CLog2Lut, CountMinSketch, MisraGries, concentration_ratio_u32, crc32_hash4_bins,
-        entropy_from_counts_u32, entropy_from_counts_u32_lut, top_k_coverage_u32,
+        CLog2Lut, CountMinSketch, HashBinSketch, MisraGries, concentration_ratio_u32,
+        crc32_hash_ngram_bins, crc32_hash2_bins, crc32_hash4_bins, entropy_from_counts_u32,
+        entropy_from_counts_u32_lut, top_k_coverage_u32,
     };
 
     #[test]
@@ -467,6 +629,31 @@ mod tests {
         let mut bins = [0_u32; 4096];
         crc32_hash4_bins(b"abcdef", &mut bins);
         assert_eq!(bins.iter().sum::<u32>(), 3);
+    }
+
+    #[test]
+    fn crc32_hash2_bins_counts_windows() {
+        let mut bins = [0_u32; 256];
+        crc32_hash2_bins(b"abcdef", &mut bins);
+        assert_eq!(bins.iter().sum::<u32>(), 5);
+    }
+
+    #[test]
+    fn generic_ngram_bins_match_pinned_hash4() {
+        let mut generic = [0_u32; 1024];
+        let mut hash4 = [0_u32; 1024];
+        crc32_hash_ngram_bins::<4, 1024>(b"abcdefghijklmnopqrstuvwxyz", &mut generic);
+        crc32_hash4_bins(b"abcdefghijklmnopqrstuvwxyz", &mut hash4);
+        assert_eq!(generic, hash4);
+    }
+
+    #[test]
+    fn hash_bin_sketch_records_dense_bins_and_observations() {
+        let sketch = HashBinSketch::<256>::from_ngrams::<2>(b"abcdef");
+
+        assert_eq!(sketch.ngram(), 2);
+        assert_eq!(sketch.observations(), 5);
+        assert_eq!(sketch.bins().iter().sum::<u32>(), 5);
     }
 
     #[test]
@@ -525,5 +712,20 @@ mod tests {
             super::kernels::sse42::crc32_hash4_bins(b"abcdefghijklmnopqrstuvwxyz", &mut sse_bins);
         }
         assert_eq!(scalar_bins, sse_bins);
+
+        let mut scalar_ngram = [0_u32; 256];
+        let mut sse_ngram = [0_u32; 256];
+        super::kernels::scalar::crc32_hash_ngram_bins::<2, 256>(
+            b"abcdefghijklmnopqrstuvwxyz",
+            &mut scalar_ngram,
+        );
+        // SAFETY: availability was checked immediately above.
+        unsafe {
+            super::kernels::sse42::crc32_hash_ngram_bins::<2, 256>(
+                b"abcdefghijklmnopqrstuvwxyz",
+                &mut sse_ngram,
+            );
+        }
+        assert_eq!(scalar_ngram, sse_ngram);
     }
 }

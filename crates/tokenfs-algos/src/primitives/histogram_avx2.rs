@@ -19,7 +19,7 @@ const SAMPLE_BYTES: usize = 4096;
 
 /// Counts bytes with an AVX2 palette fast path and scalar fallback.
 ///
-/// This is exact. If the prefix sample has more than 16 distinct bytes, the
+/// This is exact. If the spread sample has more than 16 distinct bytes, the
 /// function falls back to the scalar local-table kernel. Otherwise each 32-byte
 /// vector is compared against the sampled palette. Fully covered vectors are
 /// counted with movemask/popcnt; bytes outside the sampled palette are counted
@@ -31,7 +31,7 @@ const SAMPLE_BYTES: usize = 4096;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 pub(crate) unsafe fn add_block_palette_u32(bytes: &[u8], counts: &mut [u64; 256]) {
-    let Some((palette, palette_len)) = prefix_palette(bytes) else {
+    let Some((palette, palette_len)) = sampled_palette(bytes) else {
         histogram_scalar::add_block_local_u32(bytes, counts);
         return;
     };
@@ -77,20 +77,49 @@ pub(crate) unsafe fn add_block_palette_u32(bytes: &[u8], counts: &mut [u64; 256]
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-fn prefix_palette(bytes: &[u8]) -> Option<([u8; MAX_PALETTE], usize)> {
+fn sampled_palette(bytes: &[u8]) -> Option<([u8; MAX_PALETTE], usize)> {
     let mut palette = [0_u8; MAX_PALETTE];
     let mut palette_len = 0_usize;
 
-    for &byte in &bytes[..bytes.len().min(SAMPLE_BYTES)] {
-        if palette[..palette_len].contains(&byte) {
-            continue;
-        }
-        if palette_len == MAX_PALETTE {
-            return None;
-        }
-        palette[palette_len] = byte;
-        palette_len += 1;
+    if bytes.len() <= SAMPLE_BYTES {
+        add_palette_sample(
+            &bytes[..bytes.len().min(SAMPLE_BYTES)],
+            &mut palette,
+            &mut palette_len,
+        )?;
+        return Some((palette, palette_len));
+    }
+
+    let segment_len = SAMPLE_BYTES / 4;
+    for start in [
+        0,
+        bytes.len() / 3,
+        (bytes.len() * 2) / 3,
+        bytes.len().saturating_sub(segment_len),
+    ] {
+        let end = (start + segment_len).min(bytes.len());
+        add_palette_sample(&bytes[start..end], &mut palette, &mut palette_len)?;
     }
 
     Some((palette, palette_len))
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn add_palette_sample(
+    sample: &[u8],
+    palette: &mut [u8; MAX_PALETTE],
+    palette_len: &mut usize,
+) -> Option<()> {
+    for &byte in sample {
+        if palette[..*palette_len].contains(&byte) {
+            continue;
+        }
+        if *palette_len == MAX_PALETTE {
+            return None;
+        }
+        palette[*palette_len] = byte;
+        *palette_len += 1;
+    }
+
+    Some(())
 }

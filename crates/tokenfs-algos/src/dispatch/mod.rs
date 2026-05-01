@@ -667,8 +667,33 @@ pub struct HistogramPlan {
     pub sample_bytes: usize,
     /// Planner confidence on a 0..=255 scale.
     pub confidence_q8: u8,
+    /// Source of the confidence score.
+    pub confidence_source: PlannerConfidenceSource,
     /// Stable human-readable reason.
     pub reason: &'static str,
+}
+
+/// Planner confidence provenance.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum PlannerConfidenceSource {
+    /// Static rule from API/context and coarse workload metadata.
+    StaticRule,
+    /// Rule anchored in benchmark or paper-data calibration.
+    CalibrationRule,
+    /// Conservative fallback rule with intentionally low confidence.
+    Fallback,
+}
+
+impl PlannerConfidenceSource {
+    /// Stable identifier.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::StaticRule => "static-rule",
+            Self::CalibrationRule => "calibration-rule",
+            Self::Fallback => "fallback",
+        }
+    }
 }
 
 /// Plans a histogram strategy from processor and workload metadata.
@@ -1087,7 +1112,18 @@ fn plan(
         chunk_bytes,
         sample_bytes,
         confidence_q8,
+        confidence_source: confidence_source_for(reason, confidence_q8),
         reason,
+    }
+}
+
+fn confidence_source_for(reason: &str, confidence_q8: u8) -> PlannerConfidenceSource {
+    if reason.contains("calibration") || reason.contains("F22") || reason.contains("rootfs") {
+        PlannerConfidenceSource::CalibrationRule
+    } else if confidence_q8 <= 150 || reason.contains("fallback") {
+        PlannerConfidenceSource::Fallback
+    } else {
+        PlannerConfidenceSource::StaticRule
     }
 }
 
@@ -1316,8 +1352,8 @@ fn detect_aarch64_backend() -> Backend {
 mod tests {
     use super::{
         ApiContext, Backend, CacheState, ContentKind, EntropyClass, EntropyScale,
-        HistogramStrategy, ProcessorProfile, ReadPattern, SourceHint, WorkloadShape,
-        histogram_kernel_catalog, plan_histogram,
+        HistogramStrategy, PlannerConfidenceSource, ProcessorProfile, ReadPattern, SourceHint,
+        WorkloadShape, histogram_kernel_catalog, plan_histogram,
     };
 
     #[test]
@@ -1566,6 +1602,30 @@ mod tests {
         let plan = plan_histogram(&profile, &workload);
 
         assert_eq!(plan.strategy, HistogramStrategy::Stripe8U32);
+    }
+
+    #[test]
+    fn planner_confidence_source_marks_calibration_and_fallback_rules() {
+        let profile = ProcessorProfile::portable();
+        let mut paper = WorkloadShape::new(ApiContext::Block, 1024 * 1024);
+        paper.content = ContentKind::Binary;
+        paper.entropy = EntropyClass::Mixed;
+        paper.scale = EntropyScale::Macro;
+        paper.source_hint = SourceHint::PaperExtent;
+        let paper_plan = plan_histogram(&profile, &paper);
+
+        assert_eq!(
+            paper_plan.confidence_source,
+            PlannerConfidenceSource::CalibrationRule
+        );
+
+        let fallback = WorkloadShape::new(ApiContext::Block, 32 * 1024);
+        let fallback_plan = plan_histogram(&profile, &fallback);
+
+        assert_eq!(
+            fallback_plan.confidence_source,
+            PlannerConfidenceSource::Fallback
+        );
     }
 
     #[test]

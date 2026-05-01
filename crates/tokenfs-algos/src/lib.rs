@@ -9,6 +9,7 @@
 pub mod byteclass;
 pub mod chunk;
 pub mod dispatch;
+pub mod distribution;
 pub mod divergence;
 pub mod entropy;
 pub mod error;

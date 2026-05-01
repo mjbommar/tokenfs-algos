@@ -141,6 +141,7 @@ pub(crate) struct WorkloadInput {
     planned_chunk_bytes: usize,
     planned_sample_bytes: usize,
     planned_confidence_q8: u8,
+    planned_confidence_source: &'static str,
     plan_reason: &'static str,
 }
 
@@ -237,6 +238,7 @@ impl WorkloadInput {
             planned_chunk_bytes: plan.chunk_bytes,
             planned_sample_bytes: plan.sample_bytes,
             planned_confidence_q8: plan.confidence_q8,
+            planned_confidence_source: plan.confidence_source.as_str(),
             plan_reason: plan.reason,
         }
     }
@@ -1690,6 +1692,11 @@ fn workload_manifest_line(input: &WorkloadInput) -> String {
         &mut line,
         "planned_confidence_q8",
         usize::from(input.planned_confidence_q8),
+    );
+    write_json_str(
+        &mut line,
+        "planned_confidence_source",
+        input.planned_confidence_source,
     );
     write_json_str(&mut line, "plan_reason", input.plan_reason);
     line.push('}');
