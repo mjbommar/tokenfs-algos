@@ -49,25 +49,74 @@ pub const AVX2_LANE_WIDTH: usize = 4;
 /// Width of the gather lane for AVX-512 (8 × u64 in a single `__m512i`).
 pub const AVX512_LANE_WIDTH: usize = 8;
 
-/// Build a permutation table compatible with the gather kernels.
+/// Largest `K` for which [`build_table_from_seeds`] is stack-safe in a
+/// kernel-adjacent context.
+///
+/// The table footprint is `K * 256 * 8` bytes. At `K = 8` that is 16 KiB
+/// — at the upper end of the typical kernel stack budget (8-16 KiB, see
+/// `docs/v0.2_planning/02b_DEPLOYMENT_MATRIX.md`). For larger `K`
+/// (`K ∈ {16, 32, 64, 128, 256}`) callers in kernel-adjacent paths must
+/// use [`build_table_from_seeds_into`] with caller-provided heap or
+/// thread-local scratch.
+pub const MINHASH_TABLE_BY_VALUE_SAFE_K_MAX: usize = 8;
+
+/// Builds a permutation table compatible with the gather kernels.
 ///
 /// `seeds[k]` parameterizes the hash for slot `k`; the result satisfies
 /// `table[b][k] == crate::hash::mix_word(b as u64 ^ seeds[k])`. The table
 /// occupies `K * 256 * 8` bytes — see the module-level state-footprint
 /// table.
+///
+/// **WARNING (kernel stack)**: returns `[[u64; K]; 256]` *by value*. At
+/// `K = 64` that is 128 KiB; at `K = 256` (the new MinHash-bench width)
+/// it is 512 KiB. Neither is safe to allocate on a kernel stack
+/// (typical 8-16 KiB budget, see
+/// `docs/v0.2_planning/02b_DEPLOYMENT_MATRIX.md`). Kernel-adjacent
+/// callers and any path that crosses an FFI/cgo boundary with a
+/// constrained stack should call [`build_table_from_seeds_into`]
+/// instead, which takes caller-provided storage.
+///
+/// For `K <= MINHASH_TABLE_BY_VALUE_SAFE_K_MAX` (256 * K * 8 bytes
+/// stays at or under the 16 KiB upper bound) the by-value form is
+/// stack-safe. Beyond that, prefer the `_into` variant.
 #[must_use]
 pub fn build_table_from_seeds<const K: usize>(seeds: &[u64; K]) -> [[u64; K]; TABLE_ROWS] {
     let mut table = [[0_u64; K]; TABLE_ROWS];
+    build_table_from_seeds_into::<K>(seeds, &mut table);
+    table
+}
+
+/// Kernel-safe variant of [`build_table_from_seeds`]: writes the
+/// `K`-row × 256-byte minhash table into caller-provided scratch
+/// instead of returning the (potentially large) array by value.
+///
+/// Same semantics as [`build_table_from_seeds`] — the resulting table
+/// satisfies `scratch[b][k] == crate::hash::mix_word(b as u64 ^ seeds[k])`
+/// — but no large stack allocation happens at the call site. The
+/// caller decides where the table lives (heap `Box`, mmap, thread-local
+/// pool, postgres memory context, kernel `kmalloc`'d slab, etc.) so the
+/// kernel-stack hazard documented on [`build_table_from_seeds`] does
+/// not apply.
+///
+/// `scratch` is fully overwritten — its prior contents are discarded —
+/// so the caller may reuse a single buffer across many calls without
+/// pre-clearing it.
+///
+/// For the safe-by-value `K` threshold, see
+/// [`MINHASH_TABLE_BY_VALUE_SAFE_K_MAX`].
+pub fn build_table_from_seeds_into<const K: usize>(
+    seeds: &[u64; K],
+    scratch: &mut [[u64; K]; TABLE_ROWS],
+) {
     let mut byte = 0_usize;
     while byte < TABLE_ROWS {
         let mut k = 0;
         while k < K {
-            table[byte][k] = crate::hash::mix_word((byte as u64) ^ seeds[k]);
+            scratch[byte][k] = crate::hash::mix_word((byte as u64) ^ seeds[k]);
             k += 1;
         }
         byte += 1;
     }
-    table
 }
 
 /// Reference scalar K-min update over a byte slice using a precomputed
@@ -846,6 +895,9 @@ pub fn update_minhash_kway_auto<const K: usize>(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::boxed::Box;
+
     use super::*;
 
     #[test]
@@ -884,6 +936,115 @@ mod tests {
                 "row 0 column {k}"
             );
         }
+    }
+
+    /// Helper: heap-allocate a zeroed `Box<[[u64; K]; TABLE_ROWS]>`
+    /// without ever materialising the array on the stack. We use
+    /// `Box::<T>::new_uninit()` then `write_bytes(0)` over the heap
+    /// memory before `assume_init`. Callers that just want the table
+    /// filled by `build_table_from_seeds_into` could skip the zero
+    /// step, but zeroing first lets the test prove the `_into`
+    /// function actually overwrites the scratch.
+    #[cfg(any(feature = "std", feature = "alloc"))]
+    fn alloc_zeroed_table_box<const K: usize>() -> Box<[[u64; K]; TABLE_ROWS]> {
+        use core::mem::MaybeUninit;
+        let mut uninit: Box<MaybeUninit<[[u64; K]; TABLE_ROWS]>> = Box::new_uninit();
+        // SAFETY: `uninit.as_mut_ptr()` is a valid, properly aligned
+        // pointer to writable heap storage of `sizeof::<[[u64; K]; 256]>()`
+        // bytes. After `write_bytes(0)` every u64 is the bit-pattern 0
+        // (a valid u64), so `assume_init` is sound.
+        unsafe {
+            core::ptr::write_bytes(uninit.as_mut_ptr().cast::<u64>(), 0, K * TABLE_ROWS);
+            uninit.assume_init()
+        }
+    }
+
+    /// `build_table_from_seeds_into<K>` produces a bit-exact match with
+    /// the by-value [`build_table_from_seeds`] across every documented
+    /// `K` width (`8, 16, 32, 64, 128, 256`). This is the primary
+    /// parity guarantee for audit-R5 finding #156: the kernel-safe
+    /// variant must not drift in semantics from the legacy by-value form.
+    ///
+    /// At `K >= 16` the test only calls the `_into` form on two
+    /// independently heap-allocated buffers built with the same seeds.
+    /// Calling the by-value [`build_table_from_seeds`] directly here
+    /// would put the entire `[[u64; K]; 256]` array on the test stack
+    /// (32 KiB at K=16, up to 512 KiB at K=256) — exactly the hazard
+    /// audit-R5 #156 flags. Two heap copies built from the same seeds
+    /// must agree because the kernel is deterministic, and we
+    /// cross-check the first row of each against the per-(byte, k)
+    /// reference family directly.
+    #[cfg(any(feature = "std", feature = "alloc"))]
+    #[test]
+    fn build_table_from_seeds_into_matches_by_value() {
+        // Stack-safe width (table footprint <= 16 KiB): compare the
+        // by-value path directly against the `_into` path.
+        {
+            const K: usize = 8;
+            let seeds: [u64; K] = core::array::from_fn(|i| 0x9E37_79B9_u64.wrapping_add(i as u64));
+            let by_value = build_table_from_seeds::<K>(&seeds);
+            let mut into = [[0_u64; K]; TABLE_ROWS];
+            build_table_from_seeds_into::<K>(&seeds, &mut into);
+            assert_eq!(by_value, into, "K={K}");
+        }
+
+        // K >= 16: use only heap-allocated buffers so the test does
+        // not reproduce the audit hazard. Two `_into` calls with the
+        // same seeds must produce bit-exact results because the
+        // kernel is deterministic — that determinism is what
+        // justifies the boxed-wrapper optimisation in the public API.
+        macro_rules! check_k_heap {
+            ($k:literal) => {{
+                let seeds: [u64; $k] =
+                    core::array::from_fn(|i| 0x9E37_79B9_u64.wrapping_add(i as u64));
+                let mut a = alloc_zeroed_table_box::<$k>();
+                let mut b = alloc_zeroed_table_box::<$k>();
+                build_table_from_seeds_into::<$k>(&seeds, &mut a);
+                build_table_from_seeds_into::<$k>(&seeds, &mut b);
+                assert_eq!(*a, *b, "K={}", $k);
+                // Spot-check the first row matches the per-(byte, k)
+                // hash family directly — this proves both `_into`
+                // calls agreed on the *correct* table, not just on
+                // each other.
+                for k in 0..$k {
+                    assert_eq!(
+                        a[0][k],
+                        crate::hash::mix_word(seeds[k]),
+                        "K={} row 0 column {k}",
+                        $k
+                    );
+                }
+            }};
+        }
+        check_k_heap!(16);
+        check_k_heap!(32);
+        check_k_heap!(64);
+        check_k_heap!(128);
+        check_k_heap!(256);
+    }
+
+    /// `build_table_from_seeds_into<K>` overwrites prior scratch
+    /// contents — it does not OR/blend into existing data. Reusing a
+    /// scratch buffer across calls is therefore safe without
+    /// pre-clearing.
+    #[cfg(any(feature = "std", feature = "alloc"))]
+    #[test]
+    fn build_table_from_seeds_into_overwrites_prior_scratch() {
+        const K: usize = 16;
+        let seeds_a: [u64; K] = core::array::from_fn(|i| 0xAAAA_AAAA_u64.wrapping_add(i as u64));
+        let seeds_b: [u64; K] = core::array::from_fn(|i| 0xBBBB_BBBB_u64.wrapping_add(i as u64));
+        let mut scratch = alloc_zeroed_table_box::<K>();
+
+        // First fill with seeds_a, then overwrite with seeds_b.
+        build_table_from_seeds_into::<K>(&seeds_a, &mut scratch);
+        build_table_from_seeds_into::<K>(&seeds_b, &mut scratch);
+
+        // K=16 table is 32 KiB — uncomfortable on the test stack;
+        // build the expected reference into a heap buffer too rather
+        // than calling the by-value form.
+        let mut expected = alloc_zeroed_table_box::<K>();
+        build_table_from_seeds_into::<K>(&seeds_b, &mut expected);
+        assert_eq!(*scratch, *expected);
     }
 
     #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]

@@ -19,6 +19,9 @@
 //! Hashing uses [`crate::hash::mix64`] with per-slot seeds for deterministic
 //! reproducibility.
 
+#[cfg(all(feature = "alloc", not(feature = "std")))]
+use alloc::boxed::Box;
+
 use crate::hash::mix64;
 use crate::similarity::kernels_gather;
 
@@ -144,6 +147,18 @@ where
 /// State footprint: `K * 256 * 8` bytes — see
 /// [`kernels_gather`] for the L1/L2 trade-off discussion.
 ///
+/// **WARNING (kernel stack)**: returns the table *by value*. At
+/// `K = 64` that is 128 KiB on the call frame; at `K = 256` it is 512
+/// KiB. Neither is safe on a kernel-adjacent stack (typical 8-16 KiB
+/// budget). Callers in those environments must use
+/// [`build_byte_table_from_seeds_boxed`] (or, for total control over
+/// the storage, [`kernels_gather::build_table_from_seeds_into`]) to
+/// avoid the on-stack copy.
+///
+/// For `K <= MINHASH_TABLE_BY_VALUE_SAFE_K_MAX` (currently `K = 8`,
+/// 16 KiB table) the by-value form fits inside the documented kernel
+/// stack budget; beyond that, prefer the boxed variant.
+///
 /// **Hash family**: the table-based variant is **not** bit-equivalent
 /// to [`classic_from_bytes`], which streams whole inputs through
 /// [`mix64`]. It defines its own per-byte family:
@@ -156,6 +171,68 @@ pub fn build_byte_table_from_seeds<const K: usize>(
     seeds: &[u64; K],
 ) -> [[u64; K]; kernels_gather::TABLE_ROWS] {
     kernels_gather::build_table_from_seeds(seeds)
+}
+
+/// Heap-allocated companion of [`build_byte_table_from_seeds`].
+///
+/// Returns a `Box<[[u64; K]; 256]>` so the table never sits on the
+/// caller's stack frame. Bit-exact with [`build_byte_table_from_seeds`]
+/// for every `K`; mirrors the §77 caller-provided-scratch convention
+/// fixed for `crc32_hash4_bins_pipelined` (audit-round-3).
+///
+/// **Use this whenever the caller is on a constrained stack**
+/// (kernel module, postgres backend > shallow-call-chain primitive,
+/// FFI/cgo crossing a small Go goroutine, embedded). For the
+/// `K = 256` width (512 KiB table) this is the only stack-safe entry
+/// point.
+///
+/// Allocation is performed via `Box::<T>::new_uninit().assume_init()`
+/// after fully writing every entry — `Box::new([[0; K]; 256])` would
+/// stack-allocate the literal first and defeat the kernel-stack
+/// safety we set out to provide.
+///
+/// For total control over where the table lives (mmap, thread-local
+/// pool, postgres memory context, etc.), use
+/// [`kernels_gather::build_table_from_seeds_into`] directly with
+/// caller-supplied storage.
+#[cfg(any(feature = "std", feature = "alloc"))]
+#[must_use]
+pub fn build_byte_table_from_seeds_boxed<const K: usize>(
+    seeds: &[u64; K],
+) -> Box<[[u64; K]; kernels_gather::TABLE_ROWS]> {
+    use core::mem::MaybeUninit;
+
+    // Reserve heap space for the table without touching the stack:
+    // `Box::<T>::new_uninit()` allocates `sizeof::<T>()` on the heap
+    // and returns `Box<MaybeUninit<T>>`. We then write every entry
+    // through `as_mut_ptr` and `assume_init` once the table is fully
+    // initialised. This avoids the `Box::new([[0; K]; 256])` stack
+    // copy that, at K = 256, would burn 512 KiB of stack before the
+    // heap copy — exactly the hazard this function is designed to
+    // dodge.
+    let mut uninit: Box<MaybeUninit<[[u64; K]; kernels_gather::TABLE_ROWS]>> = Box::new_uninit();
+    // SAFETY: `uninit.as_mut_ptr()` is a valid, properly-aligned,
+    // non-null pointer to writable heap storage of exactly
+    // `[[u64; K]; TABLE_ROWS]` size. We cast to the raw element-type
+    // pointer to write through it (`u64` is `Copy` and trivially
+    // initialised). After every byte/k slot is filled,
+    // `assume_init` is sound because the entire 256 × K block has
+    // been written.
+    unsafe {
+        let row_ptr = uninit.as_mut_ptr().cast::<u64>();
+        let mut byte = 0_usize;
+        while byte < kernels_gather::TABLE_ROWS {
+            let mut k = 0;
+            while k < K {
+                row_ptr
+                    .add(byte * K + k)
+                    .write(crate::hash::mix_word((byte as u64) ^ seeds[k]));
+                k += 1;
+            }
+            byte += 1;
+        }
+        uninit.assume_init()
+    }
 }
 
 /// Updates an 8-way `Signature` from a byte slice using the
@@ -232,6 +309,14 @@ pub fn update_bytes_table_kway<const K: usize>(
 /// the SIMD-accelerated entry point for callers that already hold a
 /// gather table; pair with [`build_byte_table_from_seeds`] to
 /// pre-build the table from seeds.
+///
+/// **Allocation note (kernel stack)**: the table itself is borrowed.
+/// For `K > kernels_gather::MINHASH_TABLE_BY_VALUE_SAFE_K_MAX`
+/// (currently `K > 8`) the table footprint exceeds the kernel stack
+/// budget; build it via [`build_byte_table_from_seeds_boxed`] instead
+/// of [`build_byte_table_from_seeds`] so the table lives on the heap.
+/// `signature_simd` itself allocates only the small `Signature<K>`
+/// (16-byte slot + populated bitmap per slot), independent of `K`.
 #[must_use]
 pub fn signature_simd<const K: usize>(
     bytes: &[u8],
@@ -1162,5 +1247,86 @@ mod tests {
         check_k!(16);
         check_k!(32);
         check_k!(64);
+    }
+
+    /// `build_byte_table_from_seeds_boxed<K>` produces a bit-exact
+    /// match with the by-value [`build_byte_table_from_seeds`] across
+    /// every K width covered by the MinHash benches. This guards
+    /// audit-R5 finding #156: kernel-adjacent callers can swap the
+    /// boxed wrapper in without behavior drift.
+    ///
+    /// At `K >= 16` the test only calls the boxed form and
+    /// cross-checks against the per-byte scalar reference. Calling the
+    /// by-value [`build_byte_table_from_seeds`] at K = 128 / K = 256
+    /// here would put 256 KiB / 512 KiB of table on the test stack —
+    /// the very hazard the boxed wrapper exists to avoid.
+    #[test]
+    fn build_byte_table_from_seeds_boxed_matches_by_value() {
+        // K = 8 (16 KiB table) is at the upper edge of the kernel
+        // stack budget but safe in the test harness; compare directly
+        // against the by-value form.
+        {
+            const K: usize = 8;
+            let seeds: [u64; K] = core::array::from_fn(|i| 0xABCD_1234_u64.wrapping_add(i as u64));
+            let by_value = build_byte_table_from_seeds::<K>(&seeds);
+            let boxed = build_byte_table_from_seeds_boxed::<K>(&seeds);
+            assert_eq!(by_value, *boxed, "K={K}");
+        }
+
+        // K >= 16: build via the boxed wrapper and cross-check each
+        // entry against the per-(byte, k) reference family directly.
+        // This proves the boxed wrapper writes the *correct* table
+        // without ever materialising a large array on the test stack.
+        macro_rules! check_boxed_against_reference {
+            ($k:literal) => {{
+                let seeds: [u64; $k] =
+                    core::array::from_fn(|i| 0xABCD_1234_u64.wrapping_add(i as u64));
+                let boxed = build_byte_table_from_seeds_boxed::<$k>(&seeds);
+                for byte in 0..kernels_gather::TABLE_ROWS {
+                    for k in 0..$k {
+                        assert_eq!(
+                            boxed[byte][k],
+                            crate::hash::mix_word((byte as u64) ^ seeds[k]),
+                            "K={} byte={byte} k={k}",
+                            $k
+                        );
+                    }
+                }
+            }};
+        }
+        check_boxed_against_reference!(16);
+        check_boxed_against_reference!(32);
+        check_boxed_against_reference!(64);
+        check_boxed_against_reference!(128);
+        check_boxed_against_reference!(256);
+    }
+
+    /// Boxed table fed through `signature_simd<K>` produces the same
+    /// MinHash signature as the per-byte scalar reference at K = 128
+    /// and K = 256 — the widths the new bench exercises and that
+    /// audit-R5 #156 flagged. The table never lives on the test
+    /// stack.
+    #[test]
+    fn signature_simd_boxed_table_matches_reference_k128_k256() {
+        macro_rules! check_k {
+            ($k:literal) => {{
+                let seeds: [u64; $k] =
+                    core::array::from_fn(|i| 0xFEED_FACE_u64.wrapping_add(i as u64));
+                let table_a = build_byte_table_from_seeds_boxed::<$k>(&seeds);
+                let table_b = build_byte_table_from_seeds_boxed::<$k>(&seeds);
+                let payload = random_bytes(4096);
+                let sig_a = signature_simd::<$k>(&payload, &table_a);
+                let sig_b = signature_simd::<$k>(&payload, &table_b);
+                assert_eq!(sig_a.slots(), sig_b.slots(), "K={}", $k);
+
+                // Cross-check against the per-byte scalar reference so
+                // we know the boxed-table signature also matches the
+                // hand-rolled K-min update.
+                let expected = reference_signature_kway::<$k>(&payload, &seeds);
+                assert_eq!(sig_a.slots(), &expected, "K={}", $k);
+            }};
+        }
+        check_k!(128);
+        check_k!(256);
     }
 }
