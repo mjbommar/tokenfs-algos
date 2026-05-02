@@ -292,6 +292,23 @@ fn bench_sketch_crc32_hash4() {
                 }),
             );
         }
+        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+        if sketch::kernels::neon::is_available() {
+            let mut bins_neon = [0_u32; 4096];
+            emit(
+                "sketch-crc32-hash4-bins",
+                "neon",
+                n,
+                measure(|| {
+                    bins_neon.fill(0);
+                    // SAFETY: availability checked immediately above.
+                    unsafe {
+                        sketch::kernels::neon::crc32_hash4_bins(black_box(&bytes), &mut bins_neon);
+                    }
+                    black_box(&bins_neon);
+                }),
+            );
+        }
     }
 }
 
