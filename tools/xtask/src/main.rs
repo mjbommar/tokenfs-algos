@@ -84,6 +84,7 @@ fn run() -> Result<()> {
         "bench-compare" => bench_compare(&rest),
         "bench-report" => bench_report(&rest),
         "bench-log" => record_bench_history(None),
+        "bench-history" => bench_history(&rest),
         "calibrate-magic-bpe" => calibrate_magic_bpe(&rest),
         "profile" => profile(&rest),
         "profile-real" => profile_real(&rest),
@@ -898,6 +899,188 @@ fn bench_report(args: &[OsString]) -> Result<()> {
     );
 
     Ok(())
+}
+
+fn bench_history(args: &[OsString]) -> Result<()> {
+    let label = parse_bench_history_label(args)?;
+    let label = match label {
+        Some(label) => label,
+        None => capture_command("git", &["rev-parse", "--short", "HEAD"]).map_err(|error| {
+            format!("no --label provided and `git rev-parse --short HEAD` failed: {error}")
+        })?,
+    };
+
+    if label.is_empty() {
+        return Err("bench-history label resolved to empty string".into());
+    }
+
+    let criterion_root = Path::new("target/criterion");
+    if !criterion_root.exists() {
+        return Err("no criterion data — run `cargo bench` first".into());
+    }
+
+    let snapshot_root = Path::new("benches/_history").join(&label);
+    fs::create_dir_all(&snapshot_root).map_err(|error| {
+        format!(
+            "failed to create snapshot directory `{}`: {error}",
+            snapshot_root.display()
+        )
+    })?;
+
+    let mut copied = Vec::new();
+    snapshot_criterion_dir(criterion_root, &snapshot_root, &mut copied)?;
+
+    if copied.is_empty() {
+        return Err(format!(
+            "no estimates.json or sample.json files found under `{}`",
+            criterion_root.display()
+        ));
+    }
+
+    let mut bench_groups: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut param_rows: BTreeSet<PathBuf> = BTreeSet::new();
+    for relative in &copied {
+        if let Some(parent) = relative.parent() {
+            // Strip the trailing `base/` or `new/` segment to recover the param dir.
+            let param_dir = match parent.file_name().and_then(|name| name.to_str()) {
+                Some("base") | Some("new") => parent.parent().map(Path::to_path_buf),
+                _ => Some(parent.to_path_buf()),
+            };
+            if let Some(param_dir) = param_dir {
+                if let Some(group_dir) = param_dir.iter().next() {
+                    bench_groups.insert(PathBuf::from(group_dir));
+                }
+                param_rows.insert(param_dir);
+            }
+        }
+        println!(
+            "xtask: copied `{}` to `{}`",
+            criterion_root.join(relative).display(),
+            snapshot_root.join(relative).display()
+        );
+    }
+
+    println!(
+        "snapshotted {} bench{} \u{00d7} {} parameter row{} to {}/",
+        bench_groups.len(),
+        if bench_groups.len() == 1 { "" } else { "es" },
+        param_rows.len(),
+        if param_rows.len() == 1 { "" } else { "s" },
+        snapshot_root.display(),
+    );
+
+    Ok(())
+}
+
+fn parse_bench_history_label(args: &[OsString]) -> Result<Option<String>> {
+    let mut label = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let arg_str = arg.to_string_lossy();
+        match arg_str.as_ref() {
+            "--label" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "expected value after `--label`".to_owned())?;
+                label = Some(value.to_string_lossy().into_owned());
+            }
+            "--help" | "-h" => {
+                return Err("usage: cargo xtask bench-history [--label <label>]".into());
+            }
+            other => {
+                return Err(format!("unknown argument `{other}`"));
+            }
+        }
+    }
+    Ok(label)
+}
+
+fn snapshot_criterion_dir(
+    source_root: &Path,
+    dest_root: &Path,
+    copied: &mut Vec<PathBuf>,
+) -> Result<()> {
+    snapshot_criterion_walk(source_root, source_root, dest_root, copied)
+}
+
+fn snapshot_criterion_walk(
+    source_root: &Path,
+    current: &Path,
+    dest_root: &Path,
+    copied: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let entries = fs::read_dir(current)
+        .map_err(|error| format!("failed to read directory `{}`: {error}", current.display()))?;
+
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "failed to read directory entry under `{}`: {error}",
+                current.display()
+            )
+        })?;
+        let entry_path = entry.path();
+        if entry_path.is_dir() {
+            // Skip Criterion's `change/` and `report/` subdirectories: they
+            // hold rendered HTML/PNG noise rather than canonical measurements.
+            if let Some(name) = entry_path.file_name().and_then(|name| name.to_str())
+                && matches!(name, "change" | "report")
+            {
+                continue;
+            }
+            snapshot_criterion_walk(source_root, &entry_path, dest_root, copied)?;
+            continue;
+        }
+
+        let Some(file_name) = entry_path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+
+        if !is_canonical_criterion_file(&entry_path, file_name) {
+            continue;
+        }
+
+        let relative = entry_path
+            .strip_prefix(source_root)
+            .map_err(|error| {
+                format!(
+                    "failed to compute relative path for `{}`: {error}",
+                    entry_path.display()
+                )
+            })?
+            .to_path_buf();
+        let dest_path = dest_root.join(&relative);
+        if let Some(parent) = dest_path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                format!(
+                    "failed to create snapshot subdirectory `{}`: {error}",
+                    parent.display()
+                )
+            })?;
+        }
+
+        fs::copy(&entry_path, &dest_path).map_err(|error| {
+            format!(
+                "failed to copy `{}` to `{}`: {error}",
+                entry_path.display(),
+                dest_path.display()
+            )
+        })?;
+        copied.push(relative);
+    }
+
+    Ok(())
+}
+
+fn is_canonical_criterion_file(path: &Path, file_name: &str) -> bool {
+    let parent_name = path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str());
+    matches!(
+        (parent_name, file_name),
+        (Some("base") | Some("new"), "estimates.json") | (Some("new"), "sample.json")
+    )
 }
 
 fn bench_workloads_with_env(
@@ -5011,6 +5194,8 @@ fn help() {
                     generate heatmap, histogram, and timing-table artifacts\n\
            bench-log\n\
                     log the current target/criterion results to benchmark history\n\
+           bench-history [--label <label>]\n\
+                    snapshot target/criterion estimates.json/sample.json into benches/_history/<label>/\n\
            calibrate-magic-bpe [path]\n\
                     write MIME-grouped byte-histogram calibration JSONL from Magic-BPE samples\n\
            profile  benchmark under perf when available\n\
