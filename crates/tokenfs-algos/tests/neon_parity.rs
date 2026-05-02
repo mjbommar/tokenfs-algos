@@ -16,7 +16,9 @@
 #![cfg(all(feature = "neon", target_arch = "aarch64"))]
 
 use proptest::prelude::*;
-use tokenfs_algos::{bits, byteclass, fingerprint, hash, runlength, similarity, sketch, vector};
+use tokenfs_algos::{
+    bitmap, bits, byteclass, fingerprint, hash, runlength, similarity, sketch, vector,
+};
 
 fn synthetic_corpus() -> Vec<Vec<u8>> {
     let mut cases: Vec<Vec<u8>> = vec![
@@ -827,5 +829,130 @@ proptest! {
             let serial = vector::hamming_u64(&query, row).unwrap();
             prop_assert_eq!(*slot as u64, serial);
         }
+    }
+}
+
+// =====================================================================
+// bitmap module — Roaring-style SIMD container kernels
+// =====================================================================
+
+fn bitmap_words_seeded(seed: u64) -> [u64; 1024] {
+    let mut state = seed;
+    let mut bm = [0_u64; 1024];
+    for word in &mut bm {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        *word = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+    }
+    bm
+}
+
+#[test]
+fn neon_bitmap_x_bitmap_and_card_parity() {
+    let a = bitmap_words_seeded(0xC0FF_EE00);
+    let b = bitmap_words_seeded(0xDEAD_BEEF);
+    let mut out_simd = [0_u64; 1024];
+    let mut out_scalar = [0_u64; 1024];
+    let card_scalar = bitmap::kernels::bitmap_x_bitmap_scalar::and_into(&a, &b, &mut out_scalar);
+    // SAFETY: NEON is mandatory on AArch64.
+    let card_simd =
+        unsafe { bitmap::kernels::bitmap_x_bitmap_neon::and_into(&a, &b, &mut out_simd) };
+    assert_eq!(card_simd, card_scalar);
+    assert_eq!(out_simd[..], out_scalar[..]);
+}
+
+#[test]
+fn neon_bitmap_x_bitmap_or_card_parity() {
+    let a = bitmap_words_seeded(0x1234_5678);
+    let b = bitmap_words_seeded(0x9abc_def0);
+    let mut out_simd = [0_u64; 1024];
+    let mut out_scalar = [0_u64; 1024];
+    let card_scalar = bitmap::kernels::bitmap_x_bitmap_scalar::or_into(&a, &b, &mut out_scalar);
+    // SAFETY: NEON is mandatory on AArch64.
+    let card_simd =
+        unsafe { bitmap::kernels::bitmap_x_bitmap_neon::or_into(&a, &b, &mut out_simd) };
+    assert_eq!(card_simd, card_scalar);
+    assert_eq!(out_simd[..], out_scalar[..]);
+}
+
+#[test]
+fn neon_bitmap_x_bitmap_xor_card_parity() {
+    let a = bitmap_words_seeded(0xAAAA_5555);
+    let b = bitmap_words_seeded(0x5555_AAAA);
+    let mut out_simd = [0_u64; 1024];
+    let mut out_scalar = [0_u64; 1024];
+    let card_scalar = bitmap::kernels::bitmap_x_bitmap_scalar::xor_into(&a, &b, &mut out_scalar);
+    // SAFETY: NEON is mandatory on AArch64.
+    let card_simd =
+        unsafe { bitmap::kernels::bitmap_x_bitmap_neon::xor_into(&a, &b, &mut out_simd) };
+    assert_eq!(card_simd, card_scalar);
+    assert_eq!(out_simd[..], out_scalar[..]);
+}
+
+#[test]
+fn neon_bitmap_x_bitmap_andnot_card_parity() {
+    let a = bitmap_words_seeded(0x0F0F_0F0F);
+    let b = bitmap_words_seeded(0xF0F0_F0F0);
+    let mut out_simd = [0_u64; 1024];
+    let mut out_scalar = [0_u64; 1024];
+    let card_scalar = bitmap::kernels::bitmap_x_bitmap_scalar::andnot_into(&a, &b, &mut out_scalar);
+    // SAFETY: NEON is mandatory on AArch64.
+    let card_simd =
+        unsafe { bitmap::kernels::bitmap_x_bitmap_neon::andnot_into(&a, &b, &mut out_simd) };
+    assert_eq!(card_simd, card_scalar);
+    assert_eq!(out_simd[..], out_scalar[..]);
+}
+
+#[test]
+fn neon_bitmap_just_cardinality_parity() {
+    let a = bitmap_words_seeded(0x1357_9bdf);
+    let b = bitmap_words_seeded(0x2468_ace0);
+    // SAFETY: NEON is mandatory on AArch64.
+    unsafe {
+        assert_eq!(
+            bitmap::kernels::bitmap_x_bitmap_neon::and_cardinality(&a, &b),
+            bitmap::kernels::bitmap_x_bitmap_scalar::and_cardinality(&a, &b)
+        );
+        assert_eq!(
+            bitmap::kernels::bitmap_x_bitmap_neon::or_cardinality(&a, &b),
+            bitmap::kernels::bitmap_x_bitmap_scalar::or_cardinality(&a, &b)
+        );
+        assert_eq!(
+            bitmap::kernels::bitmap_x_bitmap_neon::xor_cardinality(&a, &b),
+            bitmap::kernels::bitmap_x_bitmap_scalar::xor_cardinality(&a, &b)
+        );
+        assert_eq!(
+            bitmap::kernels::bitmap_x_bitmap_neon::andnot_cardinality(&a, &b),
+            bitmap::kernels::bitmap_x_bitmap_scalar::andnot_cardinality(&a, &b)
+        );
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 64,
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn proptest_neon_bitmap_kernel_pairs(
+        seed_a in any::<u64>(),
+        seed_b in any::<u64>(),
+    ) {
+        let a = bitmap_words_seeded(seed_a);
+        let b = bitmap_words_seeded(seed_b);
+
+        let mut out_neon = [0_u64; 1024];
+        let mut out_scalar = [0_u64; 1024];
+
+        // SAFETY: NEON is mandatory on AArch64.
+        let card_simd = unsafe {
+            bitmap::kernels::bitmap_x_bitmap_neon::and_into(&a, &b, &mut out_neon)
+        };
+        let card_scalar =
+            bitmap::kernels::bitmap_x_bitmap_scalar::and_into(&a, &b, &mut out_scalar);
+        prop_assert_eq!(card_simd, card_scalar);
+        prop_assert_eq!(out_neon.as_slice(), out_scalar.as_slice());
     }
 }

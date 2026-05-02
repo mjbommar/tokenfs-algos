@@ -15,7 +15,7 @@
 use proptest::prelude::*;
 
 use tokenfs_algos::{
-    bits, byteclass,
+    bitmap, bits, byteclass,
     fingerprint::{self, BLOCK_SIZE},
     hash,
     histogram::{self, ByteHistogram},
@@ -1364,5 +1364,266 @@ proptest! {
             let serial = vector::hamming_u64(&query, row).unwrap();
             prop_assert_eq!(*slot as u64, serial);
         }
+    }
+}
+
+// =====================================================================
+// bitmap module — Roaring-style SIMD container kernels
+// =====================================================================
+
+fn bitmap_words_seeded(seed: u64) -> [u64; 1024] {
+    let mut state = seed;
+    let mut bm = [0_u64; 1024];
+    for word in &mut bm {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        *word = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+    }
+    bm
+}
+
+fn sorted_unique_u16(seed: u64, density: u16, n: usize) -> Vec<u16> {
+    let mut state = seed;
+    let mut out = Vec::with_capacity(n);
+    let mut last: u32 = 0;
+    for _ in 0..n {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        state = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+        let step = (state as u16 % density.max(1)).max(1);
+        last += u32::from(step);
+        if last >= 65_536 {
+            break;
+        }
+        out.push(last as u16);
+    }
+    out
+}
+
+#[test]
+fn avx2_bitmap_x_bitmap_and_card_parity() {
+    if !avx2_available() {
+        return;
+    }
+    let a = bitmap_words_seeded(0xC0FF_EE00);
+    let b = bitmap_words_seeded(0xDEAD_BEEF);
+    let mut out_simd = [0_u64; 1024];
+    let mut out_scalar = [0_u64; 1024];
+    let card_scalar = bitmap::kernels::bitmap_x_bitmap_scalar::and_into(&a, &b, &mut out_scalar);
+    // SAFETY: availability checked above.
+    let card_simd =
+        unsafe { bitmap::kernels::bitmap_x_bitmap_avx2::and_into(&a, &b, &mut out_simd) };
+    assert_eq!(card_simd, card_scalar);
+    assert_eq!(out_simd[..], out_scalar[..]);
+}
+
+#[test]
+fn avx2_bitmap_x_bitmap_or_card_parity() {
+    if !avx2_available() {
+        return;
+    }
+    let a = bitmap_words_seeded(0x1234_5678);
+    let b = bitmap_words_seeded(0x9abc_def0);
+    let mut out_simd = [0_u64; 1024];
+    let mut out_scalar = [0_u64; 1024];
+    let card_scalar = bitmap::kernels::bitmap_x_bitmap_scalar::or_into(&a, &b, &mut out_scalar);
+    // SAFETY: availability checked above.
+    let card_simd =
+        unsafe { bitmap::kernels::bitmap_x_bitmap_avx2::or_into(&a, &b, &mut out_simd) };
+    assert_eq!(card_simd, card_scalar);
+    assert_eq!(out_simd[..], out_scalar[..]);
+}
+
+#[test]
+fn avx2_bitmap_x_bitmap_xor_card_parity() {
+    if !avx2_available() {
+        return;
+    }
+    let a = bitmap_words_seeded(0xAAAA_5555);
+    let b = bitmap_words_seeded(0x5555_AAAA);
+    let mut out_simd = [0_u64; 1024];
+    let mut out_scalar = [0_u64; 1024];
+    let card_scalar = bitmap::kernels::bitmap_x_bitmap_scalar::xor_into(&a, &b, &mut out_scalar);
+    // SAFETY: availability checked above.
+    let card_simd =
+        unsafe { bitmap::kernels::bitmap_x_bitmap_avx2::xor_into(&a, &b, &mut out_simd) };
+    assert_eq!(card_simd, card_scalar);
+    assert_eq!(out_simd[..], out_scalar[..]);
+}
+
+#[test]
+fn avx2_bitmap_x_bitmap_andnot_card_parity() {
+    if !avx2_available() {
+        return;
+    }
+    let a = bitmap_words_seeded(0x0F0F_0F0F);
+    let b = bitmap_words_seeded(0xF0F0_F0F0);
+    let mut out_simd = [0_u64; 1024];
+    let mut out_scalar = [0_u64; 1024];
+    let card_scalar = bitmap::kernels::bitmap_x_bitmap_scalar::andnot_into(&a, &b, &mut out_scalar);
+    // SAFETY: availability checked above.
+    let card_simd =
+        unsafe { bitmap::kernels::bitmap_x_bitmap_avx2::andnot_into(&a, &b, &mut out_simd) };
+    assert_eq!(card_simd, card_scalar);
+    assert_eq!(out_simd[..], out_scalar[..]);
+}
+
+#[test]
+fn avx2_bitmap_just_cardinality_parity() {
+    if !avx2_available() {
+        return;
+    }
+    let a = bitmap_words_seeded(0x1357_9bdf);
+    let b = bitmap_words_seeded(0x2468_ace0);
+    // SAFETY: availability checked above.
+    unsafe {
+        assert_eq!(
+            bitmap::kernels::bitmap_x_bitmap_avx2::and_cardinality(&a, &b),
+            bitmap::kernels::bitmap_x_bitmap_scalar::and_cardinality(&a, &b)
+        );
+        assert_eq!(
+            bitmap::kernels::bitmap_x_bitmap_avx2::or_cardinality(&a, &b),
+            bitmap::kernels::bitmap_x_bitmap_scalar::or_cardinality(&a, &b)
+        );
+        assert_eq!(
+            bitmap::kernels::bitmap_x_bitmap_avx2::xor_cardinality(&a, &b),
+            bitmap::kernels::bitmap_x_bitmap_scalar::xor_cardinality(&a, &b)
+        );
+        assert_eq!(
+            bitmap::kernels::bitmap_x_bitmap_avx2::andnot_cardinality(&a, &b),
+            bitmap::kernels::bitmap_x_bitmap_scalar::andnot_cardinality(&a, &b)
+        );
+    }
+}
+
+#[test]
+fn sse42_array_x_array_intersect_parity() {
+    if !sse42_available() {
+        return;
+    }
+    for seed in [0_u64, 1, 0xDEAD_BEEF, 0xC0FFEE, 0xBAD_CAB] {
+        for density in [3_u16, 30, 300] {
+            let a = sorted_unique_u16(seed, density, 4096);
+            let b = sorted_unique_u16(seed.wrapping_add(1), density, 4096);
+            let mut out_simd = Vec::new();
+            // SAFETY: availability checked above.
+            unsafe {
+                bitmap::kernels::array_x_array_sse42::intersect(&a, &b, &mut out_simd);
+            }
+            let mut out_scalar = Vec::new();
+            bitmap::kernels::array_x_array_scalar::intersect(&a, &b, &mut out_scalar);
+            assert_eq!(
+                out_simd, out_scalar,
+                "Schlegel intersect diverged at seed={seed} density={density}"
+            );
+            // SAFETY: availability checked above.
+            let card =
+                unsafe { bitmap::kernels::array_x_array_sse42::intersect_cardinality(&a, &b) };
+            assert_eq!(card as usize, out_scalar.len());
+        }
+    }
+}
+
+#[test]
+fn sse42_array_x_array_intersect_with_zero_element() {
+    // Regression test for the pcmpistrm-vs-pcmpestrm bug where a 0
+    // element in either input is treated as the implicit string
+    // terminator. Both kernels must include 0 as a valid match.
+    if !sse42_available() {
+        return;
+    }
+    let a: Vec<u16> = (0..16).collect();
+    let b: Vec<u16> = (0..16).collect();
+    let mut out_simd = Vec::new();
+    // SAFETY: availability checked above.
+    unsafe {
+        bitmap::kernels::array_x_array_sse42::intersect(&a, &b, &mut out_simd);
+    }
+    assert_eq!(out_simd, a);
+}
+
+#[test]
+fn avx2_array_x_bitmap_intersect_parity() {
+    if !avx2_available() {
+        return;
+    }
+    for seed in [0_u64, 1, 0xC0FFEE] {
+        for density in [3_u16, 30, 300] {
+            let array = sorted_unique_u16(seed, density, 200);
+            let bm = bitmap_words_seeded(seed.wrapping_add(7));
+            let mut out_simd = Vec::new();
+            // SAFETY: availability checked above.
+            unsafe {
+                bitmap::kernels::array_x_bitmap_avx2::intersect_array_bitmap(
+                    &array,
+                    &bm,
+                    &mut out_simd,
+                );
+            }
+            let mut out_scalar = Vec::new();
+            bitmap::kernels::array_x_bitmap_scalar::intersect_array_bitmap(
+                &array,
+                &bm,
+                &mut out_scalar,
+            );
+            assert_eq!(
+                out_simd, out_scalar,
+                "array×bitmap diverged at seed={seed} density={density}"
+            );
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 64,
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn proptest_avx2_bitmap_kernel_pairs(
+        seed_a in any::<u64>(),
+        seed_b in any::<u64>(),
+    ) {
+        if !avx2_available() {
+            return Ok(());
+        }
+        let a = bitmap_words_seeded(seed_a);
+        let b = bitmap_words_seeded(seed_b);
+
+        let mut out_avx2 = [0_u64; 1024];
+        let mut out_scalar = [0_u64; 1024];
+
+        // SAFETY: availability checked above.
+        let card_simd = unsafe {
+            bitmap::kernels::bitmap_x_bitmap_avx2::and_into(&a, &b, &mut out_avx2)
+        };
+        let card_scalar =
+            bitmap::kernels::bitmap_x_bitmap_scalar::and_into(&a, &b, &mut out_scalar);
+        prop_assert_eq!(card_simd, card_scalar);
+        prop_assert_eq!(out_avx2.as_slice(), out_scalar.as_slice());
+    }
+
+    #[test]
+    fn proptest_sse42_array_intersect(
+        seed_a in any::<u64>(),
+        seed_b in any::<u64>(),
+        n in 1_usize..200,
+    ) {
+        if !sse42_available() {
+            return Ok(());
+        }
+        let a = sorted_unique_u16(seed_a, 100, n);
+        let b = sorted_unique_u16(seed_b, 100, n);
+        let mut out_simd = Vec::new();
+        // SAFETY: availability checked above.
+        unsafe {
+            bitmap::kernels::array_x_array_sse42::intersect(&a, &b, &mut out_simd);
+        }
+        let mut out_scalar = Vec::new();
+        bitmap::kernels::array_x_array_scalar::intersect(&a, &b, &mut out_scalar);
+        prop_assert_eq!(out_simd, out_scalar);
     }
 }
