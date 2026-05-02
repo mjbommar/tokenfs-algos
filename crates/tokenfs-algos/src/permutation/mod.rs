@@ -188,6 +188,27 @@ impl Permutation {
     ///
     /// For zero-length inputs, the empty `Vec` is returned without
     /// inspecting `src`.
+    ///
+    /// # Safety contract
+    ///
+    /// If `self` is a valid bijection on `0..n` (constructed via
+    /// [`Permutation::try_from_vec`] or [`Permutation::identity`]), this
+    /// writes every dst slot exactly once and is safe.
+    ///
+    /// If `self` was constructed via [`Permutation::from_vec_unchecked`]
+    /// (an `unsafe` constructor) and is NOT a valid bijection:
+    ///
+    ///   * Duplicate destination indices: dst slots written multiple
+    ///     times; OTHER dst slots remain unmodified, leaking whatever
+    ///     was in `dst` on entry. Because [`Permutation::apply`] seeds
+    ///     `dst` with `src[0]` before writing, the visible leak is
+    ///     bounded to data that was already in `src`. Kernel/FUSE
+    ///     consumers loading from untrusted storage MUST validate via
+    ///     [`Permutation::validate_no_alloc`] or use
+    ///     [`Permutation::try_apply_into_strict`] before trusting the
+    ///     output.
+    ///   * Out-of-range indices: panics in debug, undefined-but-bounded
+    ///     behaviour in release (the `Vec` bounds-check still triggers).
     #[must_use]
     pub fn apply<T: Copy>(&self, src: &[T]) -> Vec<T> {
         assert_eq!(
@@ -220,6 +241,25 @@ impl Permutation {
     /// # Panics
     ///
     /// Panics if `src.len() != self.len()` or `dst.len() < self.len()`.
+    ///
+    /// # Safety contract
+    ///
+    /// If `self` is a valid bijection on `0..n` (constructed via
+    /// [`Permutation::try_from_vec`] or [`Permutation::identity`]), this
+    /// writes every dst slot exactly once and is safe.
+    ///
+    /// If `self` was constructed via [`Permutation::from_vec_unchecked`]
+    /// (an `unsafe` constructor) and is NOT a valid bijection:
+    ///
+    ///   * Duplicate destination indices: dst slots written multiple
+    ///     times; OTHER dst slots remain unmodified, leaking whatever
+    ///     was in `dst` on entry. **Kernel/FUSE consumers loading from
+    ///     untrusted storage MUST validate via
+    ///     [`Permutation::validate_no_alloc`] or use
+    ///     [`Permutation::try_apply_into_strict`] before relying on
+    ///     `dst`.**
+    ///   * Out-of-range indices: panics in debug, undefined-but-bounded
+    ///     behaviour in release (the `Vec` bounds-check still triggers).
     pub fn apply_into<T: Copy>(&self, src: &[T], dst: &mut [T]) {
         assert_eq!(
             src.len(),
@@ -237,6 +277,145 @@ impl Permutation {
         for (i, &new_id) in self.0.iter().enumerate() {
             dst[new_id as usize] = src[i];
         }
+    }
+
+    /// Validates that this [`Permutation`] is a valid bijection on
+    /// `0..self.len()`, using caller-provided u64-bitset scratch
+    /// instead of allocating a `Vec<bool>`.
+    ///
+    /// `scratch` must have at least `self.len().div_ceil(64)` u64
+    /// words. The first `len().div_ceil(64)` words of `scratch` are
+    /// zeroed on entry. Returns `true` if valid, `false` otherwise
+    /// (length overflow, out-of-range index, or duplicate index).
+    ///
+    /// Use this from kernel-mode consumers that loaded a
+    /// [`Permutation`] from untrusted on-disk data and need to
+    /// validate before calling [`Permutation::apply_into`]. The
+    /// bitset-based check matches [`Permutation::try_from_vec`] but
+    /// avoids the heap allocation it performs.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `scratch.len()` is below the required word count
+    /// (`self.len().div_ceil(64)`). The kernel-safe sibling that
+    /// returns an error instead of panicking is
+    /// [`Permutation::try_apply_into_strict`], which also performs
+    /// the apply.
+    pub fn validate_no_alloc(&self, scratch: &mut [u64]) -> bool {
+        let n = self.0.len();
+        if n > u32::MAX as usize {
+            return false;
+        }
+        let words_needed = n.div_ceil(64);
+        assert!(
+            scratch.len() >= words_needed,
+            "Permutation::validate_no_alloc: scratch words ({}) < needed ({words_needed})",
+            scratch.len(),
+        );
+        // Zero only the prefix we will use; leave any tail untouched
+        // so callers can re-use a larger scratch buffer cheaply.
+        for slot in scratch.iter_mut().take(words_needed) {
+            *slot = 0;
+        }
+        for &id in &self.0 {
+            let id = id as usize;
+            if id >= n {
+                return false;
+            }
+            let word = id >> 6;
+            let bit = 1_u64 << (id & 63);
+            // SAFETY: `id < n` and `word = id / 64 < n.div_ceil(64) =
+            // words_needed <= scratch.len()`, so the index is in bounds.
+            // We use checked indexing to keep the function panic-free
+            // on the hot path (the outer assert already verified the
+            // upper bound).
+            let cell = &mut scratch[word];
+            if *cell & bit != 0 {
+                return false;
+            }
+            *cell |= bit;
+        }
+        true
+    }
+
+    /// Like [`Permutation::apply_into`] but verifies during apply that
+    /// no destination slot is written twice. Uses caller-provided
+    /// u64-bitset scratch instead of allocating.
+    ///
+    /// `scratch` must have at least `self.len().div_ceil(64)` u64
+    /// words; the first `len().div_ceil(64)` words are zeroed on
+    /// entry. On error the function returns early — `dst` may be
+    /// partially written and must NOT be trusted by the caller.
+    ///
+    /// Kernel-mode consumers should prefer this over
+    /// [`Permutation::apply_into`] when the source [`Permutation`]
+    /// came from untrusted storage. It detects every failure mode of
+    /// [`Permutation::from_vec_unchecked`] without allocating.
+    ///
+    /// # Errors
+    ///
+    /// Returns:
+    ///
+    ///   * [`PermutationApplyError::SrcLenMismatch`] when
+    ///     `src.len() != self.len()`.
+    ///   * [`PermutationApplyError::DstTooSmall`] when
+    ///     `dst.len() < self.len()`.
+    ///   * [`PermutationApplyError::ScratchTooSmall`] when `scratch`
+    ///     has fewer than `self.len().div_ceil(64)` words.
+    ///   * [`PermutationApplyError::OutOfRangeDst`] when an entry of
+    ///     the permutation is `>= self.len()`.
+    ///   * [`PermutationApplyError::DuplicateDst`] when two entries
+    ///     of the permutation map to the same destination slot.
+    pub fn try_apply_into_strict<T: Copy>(
+        &self,
+        src: &[T],
+        dst: &mut [T],
+        scratch: &mut [u64],
+    ) -> Result<(), PermutationApplyError> {
+        let n = self.0.len();
+        if src.len() != n {
+            return Err(PermutationApplyError::SrcLenMismatch {
+                expected: n,
+                actual: src.len(),
+            });
+        }
+        if dst.len() < n {
+            return Err(PermutationApplyError::DstTooSmall {
+                needed: n,
+                actual: dst.len(),
+            });
+        }
+        let words_needed = n.div_ceil(64);
+        if scratch.len() < words_needed {
+            return Err(PermutationApplyError::ScratchTooSmall {
+                needed_words: words_needed,
+                actual_words: scratch.len(),
+            });
+        }
+        for slot in scratch.iter_mut().take(words_needed) {
+            *slot = 0;
+        }
+        for (i, &perm_i) in self.0.iter().enumerate() {
+            let id = perm_i as usize;
+            if id >= n {
+                return Err(PermutationApplyError::OutOfRangeDst {
+                    src_index: i,
+                    dst_slot: perm_i,
+                });
+            }
+            let word = id >> 6;
+            let bit = 1_u64 << (id & 63);
+            let cell = &mut scratch[word];
+            if *cell & bit != 0 {
+                return Err(PermutationApplyError::DuplicateDst {
+                    src_index: i,
+                    dst_slot: perm_i,
+                });
+            }
+            *cell |= bit;
+            dst[id] = src[i];
+        }
+        Ok(())
     }
 
     /// Returns the underlying permutation array.
@@ -269,6 +448,96 @@ impl Permutation {
         self.0
     }
 }
+
+/// Failure modes returned by [`Permutation::try_apply_into_strict`].
+///
+/// All variants are non-allocating and `Copy` so they can be propagated
+/// from kernel-mode call sites without touching the heap. They surface
+/// the offending source index and destination slot when applicable so a
+/// caller can log or telemetry-tag corrupted on-disk permutations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PermutationApplyError {
+    /// `src.len() != self.len()`. Source has the wrong number of
+    /// elements for this permutation.
+    SrcLenMismatch {
+        /// Permutation length.
+        expected: usize,
+        /// Caller-supplied source length.
+        actual: usize,
+    },
+    /// `dst.len() < self.len()`. Destination buffer cannot fit the
+    /// full permuted output.
+    DstTooSmall {
+        /// Permutation length (minimum required `dst.len()`).
+        needed: usize,
+        /// Caller-supplied destination length.
+        actual: usize,
+    },
+    /// `scratch.len() < self.len().div_ceil(64)`. Bitset scratch is
+    /// too small to track destination occupancy.
+    ScratchTooSmall {
+        /// Required number of u64 words.
+        needed_words: usize,
+        /// Caller-supplied number of u64 words.
+        actual_words: usize,
+    },
+    /// Duplicate destination index detected — perm is not a valid
+    /// bijection. The destination slot was already written by an
+    /// earlier source index.
+    DuplicateDst {
+        /// Source index whose mapping triggered the collision.
+        src_index: usize,
+        /// Destination slot that was already taken.
+        dst_slot: u32,
+    },
+    /// Out-of-range destination index — perm contains an entry
+    /// `>= self.len()`.
+    OutOfRangeDst {
+        /// Source index whose mapping is out of range.
+        src_index: usize,
+        /// The offending out-of-range destination slot.
+        dst_slot: u32,
+    },
+}
+
+impl core::fmt::Display for PermutationApplyError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::SrcLenMismatch { expected, actual } => write!(
+                f,
+                "Permutation::try_apply_into_strict: src.len() ({actual}) != perm.len() ({expected})"
+            ),
+            Self::DstTooSmall { needed, actual } => write!(
+                f,
+                "Permutation::try_apply_into_strict: dst.len() ({actual}) < perm.len() ({needed})"
+            ),
+            Self::ScratchTooSmall {
+                needed_words,
+                actual_words,
+            } => write!(
+                f,
+                "Permutation::try_apply_into_strict: scratch words ({actual_words}) < needed ({needed_words})"
+            ),
+            Self::DuplicateDst {
+                src_index,
+                dst_slot,
+            } => write!(
+                f,
+                "Permutation::try_apply_into_strict: duplicate dst slot {dst_slot} at src index {src_index}"
+            ),
+            Self::OutOfRangeDst {
+                src_index,
+                dst_slot,
+            } => write!(
+                f,
+                "Permutation::try_apply_into_strict: out-of-range dst slot {dst_slot} at src index {src_index}"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for PermutationApplyError {}
 
 /// A borrowed compressed sparse row (CSR) adjacency input for graph
 /// permutations.
@@ -430,5 +699,257 @@ mod tests {
     fn into_vec_returns_underlying_storage() {
         let perm = Permutation::try_from_vec(vec![2, 0, 1]).expect("valid perm");
         assert_eq!(perm.into_vec(), vec![2, 0, 1]);
+    }
+
+    // ----- audit-R6 #161 — heap-free validation + strict apply -----
+
+    #[test]
+    fn validate_no_alloc_accepts_identity_and_arbitrary_valid_perms() {
+        for n in [0_usize, 1, 2, 5, 17, 64, 65, 128, 129, 256] {
+            let perm = Permutation::identity(n);
+            let mut scratch = vec![0_u64; n.div_ceil(64).max(1)];
+            assert!(
+                perm.validate_no_alloc(&mut scratch),
+                "identity of length {n} must validate"
+            );
+        }
+        // Non-trivial valid permutation across the 64-bit word boundary.
+        // Reverse permutation: 0 -> n-1, 1 -> n-2, ...
+        for n in [1_usize, 2, 63, 64, 65, 128, 129] {
+            let mut v: Vec<u32> = (0..n as u32).rev().collect();
+            // Touch a couple of cross-word slots to be sure.
+            if n >= 70 {
+                v.swap(3, 70);
+            }
+            let perm = Permutation::try_from_vec(v).expect("valid");
+            let mut scratch = vec![0_u64; n.div_ceil(64).max(1)];
+            assert!(
+                perm.validate_no_alloc(&mut scratch),
+                "reverse perm of length {n} must validate"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_no_alloc_rejects_duplicates() {
+        // SAFETY: deliberately invalid — used only to exercise the validator.
+        let perm = unsafe { Permutation::from_vec_unchecked(vec![0_u32, 1, 1]) };
+        let mut scratch = [0_u64; 1];
+        assert!(!perm.validate_no_alloc(&mut scratch));
+    }
+
+    #[test]
+    fn validate_no_alloc_rejects_out_of_range() {
+        // SAFETY: deliberately invalid — used only to exercise the validator.
+        let perm = unsafe { Permutation::from_vec_unchecked(vec![0_u32, 1, 5]) };
+        let mut scratch = [0_u64; 1];
+        assert!(!perm.validate_no_alloc(&mut scratch));
+    }
+
+    #[test]
+    fn validate_no_alloc_rejects_dup_across_word_boundary() {
+        // Length 70 — bit 65 lives in word 1. Duplicate the value 65 to
+        // exercise a multi-word bitset write.
+        let mut v: Vec<u32> = (0..70_u32).collect();
+        v[3] = 65; // duplicates 65 (which is also at index 65)
+        // SAFETY: deliberately invalid — used only to exercise the validator.
+        let perm = unsafe { Permutation::from_vec_unchecked(v) };
+        let mut scratch = [0_u64; 2];
+        assert!(!perm.validate_no_alloc(&mut scratch));
+    }
+
+    #[test]
+    #[should_panic(expected = "scratch words")]
+    fn validate_no_alloc_panics_on_undersized_scratch() {
+        let perm = Permutation::identity(65);
+        let mut scratch = [0_u64; 1]; // need 2 words for n=65
+        let _ = perm.validate_no_alloc(&mut scratch);
+    }
+
+    #[test]
+    fn try_apply_into_strict_matches_apply_into_on_valid_perm() {
+        // Mid-size permutation that crosses the 64-bit word boundary.
+        let mut v: Vec<u32> = (0..70_u32).collect();
+        v.swap(3, 65);
+        v.swap(7, 12);
+        let perm = Permutation::try_from_vec(v).expect("valid");
+        let src: Vec<u32> = (1000..1070_u32).collect();
+
+        let mut dst_strict = vec![0_u32; 70];
+        let mut scratch = [0_u64; 2];
+        perm.try_apply_into_strict(&src, &mut dst_strict, &mut scratch)
+            .expect("valid perm must succeed");
+
+        let mut dst_unchecked = vec![0_u32; 70];
+        perm.apply_into(&src, &mut dst_unchecked);
+
+        assert_eq!(dst_strict, dst_unchecked);
+    }
+
+    #[test]
+    fn try_apply_into_strict_detects_duplicate_dst() {
+        // SAFETY: deliberately invalid — perm[0]=1 and perm[2]=1 both
+        // target slot 1.
+        let perm = unsafe { Permutation::from_vec_unchecked(vec![1_u32, 0, 1]) };
+        let src = [10_u8, 20, 30];
+        let mut dst = [0_u8; 3];
+        let mut scratch = [0_u64; 1];
+        let err = perm
+            .try_apply_into_strict(&src, &mut dst, &mut scratch)
+            .expect_err("duplicate must error");
+        assert_eq!(
+            err,
+            PermutationApplyError::DuplicateDst {
+                src_index: 2,
+                dst_slot: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn try_apply_into_strict_detects_out_of_range_dst() {
+        // SAFETY: deliberately invalid — perm[1]=5 is out of range for n=3.
+        let perm = unsafe { Permutation::from_vec_unchecked(vec![0_u32, 5, 2]) };
+        let src = [10_u8, 20, 30];
+        let mut dst = [0_u8; 3];
+        let mut scratch = [0_u64; 1];
+        let err = perm
+            .try_apply_into_strict(&src, &mut dst, &mut scratch)
+            .expect_err("out-of-range must error");
+        assert_eq!(
+            err,
+            PermutationApplyError::OutOfRangeDst {
+                src_index: 1,
+                dst_slot: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn try_apply_into_strict_rejects_src_len_mismatch() {
+        let perm = Permutation::identity(3);
+        let src = [10_u8, 20];
+        let mut dst = [0_u8; 3];
+        let mut scratch = [0_u64; 1];
+        let err = perm
+            .try_apply_into_strict(&src, &mut dst, &mut scratch)
+            .expect_err("src length mismatch must error");
+        assert_eq!(
+            err,
+            PermutationApplyError::SrcLenMismatch {
+                expected: 3,
+                actual: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn try_apply_into_strict_rejects_dst_too_small() {
+        let perm = Permutation::identity(3);
+        let src = [10_u8, 20, 30];
+        let mut dst = [0_u8; 2];
+        let mut scratch = [0_u64; 1];
+        let err = perm
+            .try_apply_into_strict(&src, &mut dst, &mut scratch)
+            .expect_err("dst too small must error");
+        assert_eq!(
+            err,
+            PermutationApplyError::DstTooSmall {
+                needed: 3,
+                actual: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn try_apply_into_strict_rejects_scratch_too_small() {
+        // n=65 needs 2 u64 words; pass 1.
+        let perm = Permutation::identity(65);
+        let src: Vec<u32> = (0..65_u32).collect();
+        let mut dst = vec![0_u32; 65];
+        let mut scratch = [0_u64; 1];
+        let err = perm
+            .try_apply_into_strict(&src, &mut dst, &mut scratch)
+            .expect_err("scratch too small must error");
+        assert_eq!(
+            err,
+            PermutationApplyError::ScratchTooSmall {
+                needed_words: 2,
+                actual_words: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn apply_into_leaks_dst_sentinel_on_invalid_perm() {
+        // audit-R6 #161 regression demonstration: when an invalid
+        // permutation built via from_vec_unchecked has duplicate dst
+        // indices, `apply_into` writes one slot twice and leaves
+        // another slot at its prior value. A kernel that trusts the
+        // result is exposed to whatever was previously in `dst`.
+        //
+        // Setup: perm = [1, 1, 2] is NOT a bijection. Slot 1 is
+        // written twice (by src[0]=10 then src[1]=20); slot 0 is
+        // never written and retains the sentinel.
+        // SAFETY: deliberately invalid — pinning the failure mode for
+        // the regression test.
+        let perm = unsafe { Permutation::from_vec_unchecked(vec![1_u32, 1, 2]) };
+        let src = [10_u8, 20, 30];
+        let mut dst = [0xAA_u8; 3];
+        perm.apply_into(&src, &mut dst);
+        // Failure mode: slot 0 retains the sentinel because it was
+        // never targeted by any src index. This is the leak the strict
+        // variant exists to defend against.
+        assert_eq!(
+            dst[0], 0xAA,
+            "dst[0] should remain at the prior sentinel value (the leak)"
+        );
+        assert_eq!(dst[1], 20); // perm[1] = 1, so src[1]=20 overwrites src[0].
+        assert_eq!(dst[2], 30);
+
+        // The strict variant catches this immediately.
+        let mut dst_strict = [0xAA_u8; 3];
+        let mut scratch = [0_u64; 1];
+        let err = perm
+            .try_apply_into_strict(&src, &mut dst_strict, &mut scratch)
+            .expect_err("strict variant must reject the corrupted perm");
+        assert_eq!(
+            err,
+            PermutationApplyError::DuplicateDst {
+                src_index: 1,
+                dst_slot: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn permutation_apply_error_display_renders_all_variants() {
+        // Smoke test the Display impl so the rustdoc covers all arms.
+        let cases = [
+            PermutationApplyError::SrcLenMismatch {
+                expected: 3,
+                actual: 2,
+            },
+            PermutationApplyError::DstTooSmall {
+                needed: 3,
+                actual: 2,
+            },
+            PermutationApplyError::ScratchTooSmall {
+                needed_words: 2,
+                actual_words: 1,
+            },
+            PermutationApplyError::DuplicateDst {
+                src_index: 2,
+                dst_slot: 1,
+            },
+            PermutationApplyError::OutOfRangeDst {
+                src_index: 1,
+                dst_slot: 9,
+            },
+        ];
+        for c in cases {
+            let s = format!("{c}");
+            assert!(s.starts_with("Permutation::try_apply_into_strict"));
+        }
     }
 }
