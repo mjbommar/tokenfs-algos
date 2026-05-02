@@ -94,13 +94,16 @@ impl std::error::Error for BitPackError {}
 /// Returns `ceil(n * w / 8)`, the number of bytes needed to pack `n`
 /// values of `w` bits each.
 ///
-/// `w` must satisfy `1 <= w <= 32`; higher widths overflow `usize` only
-/// for absurd `n` and are already rejected by [`BitPacker`] /
-/// [`DynamicBitPacker`].
+/// `w` must satisfy `1 <= w <= 32`; higher widths are rejected by
+/// [`BitPacker`] / [`DynamicBitPacker`]. The calculation is intentionally
+/// done in byte-sized chunks instead of `ceil(n * w / 8)` so it cannot
+/// under-estimate when `n * w` would overflow `usize`.
 #[inline]
 const fn encoded_len_bytes(n: usize, w: u32) -> usize {
-    let bits = n.saturating_mul(w as usize);
-    bits.div_ceil(8)
+    let width = w as usize;
+    let full_bytes = (n / 8).saturating_mul(width);
+    let rem_bits = (n % 8) * width;
+    full_bytes.saturating_add(rem_bits.div_ceil(8))
 }
 
 /// Const-generic bit packer for compile-time-known widths.
@@ -1315,6 +1318,12 @@ mod tests {
                 assert_eq!(encoded_len_bytes(n, w), expected);
             }
         }
+    }
+
+    #[test]
+    fn encoded_len_saturates_instead_of_underestimating_on_overflow() {
+        assert_eq!(encoded_len_bytes((usize::MAX / 4) + 1, 32), usize::MAX);
+        assert_eq!(encoded_len_bytes(usize::MAX, 32), usize::MAX);
     }
 
     // The panicking constructor `DynamicBitPacker::new` plus the
