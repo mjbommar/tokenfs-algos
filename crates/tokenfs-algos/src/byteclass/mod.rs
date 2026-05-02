@@ -633,6 +633,25 @@ pub mod kernels {
                 other: 0,
             }
         }
+
+        /// Validates UTF-8 with the AVX-512 VBMI fused-table DFA.
+        ///
+        /// Same triple as [`super::scalar::validate_utf8`] /
+        /// `core::str::from_utf8`. Single 256-entry vpermi2b lookup
+        /// replaces the AVX-512BW path's two-shuffle pair.
+        ///
+        /// # Safety
+        ///
+        /// Caller must ensure both AVX-512BW and AVX-512 VBMI are
+        /// available on the current CPU.
+        #[target_feature(enable = "avx512bw,avx512vbmi")]
+        #[must_use]
+        pub unsafe fn validate_utf8(bytes: &[u8]) -> crate::byteclass::Utf8Validation {
+            // SAFETY: target_feature(enable = "avx512bw,avx512vbmi") on
+            // this function propagates both requirements to the inner
+            // module-level entry point.
+            unsafe { crate::byteclass::utf8_avx512::validate_utf8_vbmi(bytes) }
+        }
     }
 
     /// AArch64 NEON byte-class classifier.
