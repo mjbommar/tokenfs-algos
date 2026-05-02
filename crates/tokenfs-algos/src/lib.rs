@@ -39,6 +39,8 @@ pub mod hash;
 pub mod histogram;
 pub mod identity;
 pub mod paper;
+#[cfg(any(feature = "std", feature = "alloc"))]
+pub mod permutation;
 pub mod prelude;
 pub mod runlength;
 pub mod search;

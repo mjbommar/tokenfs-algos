@@ -84,5 +84,9 @@ harness = false
 name = "hash_set_membership"
 harness = false
 
+[[bench]]
+name = "permutation_rcm"
+harness = false
+
 [lints]
 workspace = true
