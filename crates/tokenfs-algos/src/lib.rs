@@ -23,6 +23,7 @@ pub mod histogram;
 pub mod paper;
 pub mod prelude;
 pub mod runlength;
+pub mod search;
 pub mod selector;
 pub mod similarity;
 pub mod sketch;
