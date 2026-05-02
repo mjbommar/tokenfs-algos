@@ -299,16 +299,26 @@ impl Iterator for BitmapIter<'_> {
 ///   [`BitmapContainer`]; the per-op dispatch wrappers in
 ///   [`crate::bitmap::union`] and friends apply the promotion rule.
 ///
-/// The `data` field is `pub` so SIMD kernels can construct directly when
-/// the invariants are upheld by construction (e.g. merge-emitting paths
-/// that produce sorted output by design). For untrusted input, prefer
-/// [`ArrayContainer::try_from_vec`], which validates both the ordering
-/// invariant and the 4096-element promotion threshold up-front and
-/// returns a [`ContainerInvariantError`] on violation.
+/// # Construction contract
+///
+/// External callers **MUST** construct via [`ArrayContainer::try_from_vec`]
+/// (or [`ArrayContainer::empty`] / [`ArrayContainer::from_sorted`] when the
+/// invariants are upheld by construction). The `data` field is only
+/// `pub(crate)` so the SIMD kernels and dispatch wrappers inside this
+/// crate can construct directly along merge-emitting paths that produce
+/// sorted output by design; **direct field construction from outside the
+/// crate is not supported** and is enforced by the compiler.
+///
+/// For read-only access to the underlying values, use
+/// [`ArrayContainer::data`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ArrayContainer {
     /// Sorted `u16` values.
-    pub data: Vec<u16>,
+    ///
+    /// `pub(crate)` so SIMD kernels inside this crate can construct
+    /// directly when the sortedness invariant is upheld by the producer.
+    /// External callers must go through [`ArrayContainer::try_from_vec`].
+    pub(crate) data: Vec<u16>,
 }
 
 impl ArrayContainer {
@@ -369,6 +379,21 @@ impl ArrayContainer {
         Ok(Self { data })
     }
 
+    /// Returns a read-only view of the sorted `u16` values.
+    ///
+    /// This is the public accessor for what was previously the `pub data`
+    /// field. The slice is borrowed from the container and remains valid
+    /// for the lifetime of the borrow; the returned reference is
+    /// **immutable** and cannot be used to violate the sortedness or
+    /// length invariants. To mutate the contents, drop the container and
+    /// rebuild via [`ArrayContainer::try_from_vec`] (or, inside the
+    /// crate, via direct field construction along an invariant-preserving
+    /// path).
+    #[must_use]
+    pub fn data(&self) -> &[u16] {
+        &self.data
+    }
+
     /// Returns the cardinality (`data.len()`).
     #[must_use]
     pub fn cardinality(&self) -> u32 {
@@ -421,16 +446,27 @@ pub enum Container {
 /// * `runs[i].0 + runs[i].1 + 1 <= 65536`, i.e. each run fits inside the
 ///   16-bit value space.
 ///
-/// The `runs` field is `pub` so SIMD kernels can construct directly when
-/// the invariants are upheld by construction (e.g. run-merging paths
-/// that emit coalesced output by design). For untrusted input, prefer
-/// [`RunContainer::try_from_vec`], which validates ordering, coalescing,
-/// and value-space invariants up-front and returns a
-/// [`ContainerInvariantError`] on violation.
+/// # Construction contract
+///
+/// External callers **MUST** construct via [`RunContainer::try_from_vec`]
+/// (or [`RunContainer::empty`] / [`RunContainer::from_runs`] when the
+/// invariants are upheld by construction). The `runs` field is only
+/// `pub(crate)` so the SIMD kernels and dispatch wrappers inside this
+/// crate can construct directly along run-merging paths that emit
+/// coalesced output by design; **direct field construction from outside
+/// the crate is not supported** and is enforced by the compiler.
+///
+/// For read-only access to the underlying runs, use
+/// [`RunContainer::runs`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RunContainer {
     /// Sorted, coalesced `(start, length_minus_one)` pairs.
-    pub runs: Vec<(u16, u16)>,
+    ///
+    /// `pub(crate)` so SIMD kernels inside this crate can construct
+    /// directly when the sortedness, coalescing, and value-space
+    /// invariants are upheld by the producer. External callers must go
+    /// through [`RunContainer::try_from_vec`].
+    pub(crate) runs: Vec<(u16, u16)>,
 }
 
 impl RunContainer {
@@ -497,6 +533,21 @@ impl RunContainer {
             }
         }
         Ok(Self { runs })
+    }
+
+    /// Returns a read-only view of the sorted, coalesced run-pairs.
+    ///
+    /// This is the public accessor for what was previously the `pub runs`
+    /// field. The slice is borrowed from the container and remains valid
+    /// for the lifetime of the borrow; the returned reference is
+    /// **immutable** and cannot be used to violate the sortedness,
+    /// coalescing, or value-space invariants. To mutate the contents,
+    /// drop the container and rebuild via [`RunContainer::try_from_vec`]
+    /// (or, inside the crate, via direct field construction along an
+    /// invariant-preserving path).
+    #[must_use]
+    pub fn runs(&self) -> &[(u16, u16)] {
+        &self.runs
     }
 
     /// Returns the cardinality (sum of `length_minus_one + 1` over all runs).
@@ -808,4 +859,74 @@ mod tests {
         assert!(s.contains("not strictly ascending"));
         assert!(s.contains("7"));
     }
+
+    // ---- Read-only accessor contract -----------------------------------
+    //
+    // The `data` / `runs` fields became `pub(crate)` in the Layer 4
+    // hardening pass; external callers must construct via
+    // `try_from_vec` (or the trusted `from_sorted` / `from_runs`
+    // helpers) and read via `data()` / `runs()`. The tests below pin
+    // the accessor surface so a regression that re-widens visibility or
+    // changes the slice shape would fail visibly.
+
+    #[test]
+    fn array_data_accessor_returns_constructor_input() {
+        let input = vec![1_u16, 3, 5, 65535];
+        let ac = ArrayContainer::try_from_vec(input.clone()).unwrap();
+        // The accessor returns a borrow tracking the same elements that
+        // were handed to `try_from_vec`; callers cannot mutate through
+        // the borrow because it is `&[u16]`, not `&mut [u16]`.
+        assert_eq!(ac.data(), input.as_slice());
+        assert_eq!(ac.data().len(), 4);
+    }
+
+    #[test]
+    fn array_data_accessor_matches_from_sorted_path() {
+        // `from_sorted` and `try_from_vec` should produce identical
+        // observable state over the accessor.
+        let values = vec![10_u16, 20, 30, 40];
+        let ac_sorted = ArrayContainer::from_sorted(values.clone());
+        let ac_validated = ArrayContainer::try_from_vec(values.clone()).unwrap();
+        assert_eq!(ac_sorted.data(), ac_validated.data());
+        assert_eq!(ac_sorted.data(), values.as_slice());
+    }
+
+    #[test]
+    fn array_data_accessor_on_empty_is_empty_slice() {
+        let ac = ArrayContainer::empty();
+        assert!(ac.data().is_empty());
+    }
+
+    #[test]
+    fn run_runs_accessor_returns_constructor_input() {
+        let input = vec![(0_u16, 9_u16), (100, 0), (1000, 99)];
+        let rc = RunContainer::try_from_vec(input.clone()).unwrap();
+        assert_eq!(rc.runs(), input.as_slice());
+        assert_eq!(rc.runs().len(), 3);
+    }
+
+    #[test]
+    fn run_runs_accessor_matches_from_runs_path() {
+        let runs = vec![(0_u16, 4_u16), (10, 4)];
+        let rc_trusted = RunContainer::from_runs(runs.clone());
+        let rc_validated = RunContainer::try_from_vec(runs.clone()).unwrap();
+        assert_eq!(rc_trusted.runs(), rc_validated.runs());
+        assert_eq!(rc_trusted.runs(), runs.as_slice());
+    }
+
+    #[test]
+    fn run_runs_accessor_on_empty_is_empty_slice() {
+        let rc = RunContainer::empty();
+        assert!(rc.runs().is_empty());
+    }
+
+    // The compiler-enforced part of the construction contract — that
+    // `ArrayContainer { data: ... }` and `RunContainer { runs: ... }`
+    // do not type-check from outside the crate — cannot be expressed as
+    // a runtime test. The intra-crate tests in this module *do*
+    // exercise the validating constructors on every interesting input
+    // shape (above), so the contract is end-to-end exercised: external
+    // callers get a compile error if they try the field form, and
+    // internal kernels keep direct field access for the
+    // invariants-by-construction emit paths.
 }

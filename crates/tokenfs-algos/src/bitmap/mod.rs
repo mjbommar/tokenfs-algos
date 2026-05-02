@@ -37,7 +37,7 @@
 //! let b = ArrayContainer::from_sorted(vec![2_u16, 3, 5, 8, 10]);
 //! let result = Container::Array(a).intersect(&Container::Array(b));
 //! match result {
-//!     Container::Array(arr) => assert_eq!(arr.data, vec![3_u16, 5]),
+//!     Container::Array(arr) => assert_eq!(arr.data(), &[3_u16, 5][..]),
 //!     _ => unreachable!(),
 //! }
 //!
