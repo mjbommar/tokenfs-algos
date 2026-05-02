@@ -389,7 +389,10 @@ fn main() {
     // 6. Sanity: pick a random doc and verify the example intersection
     //    contains only doc ids that mention BOTH bigrams.
     let intersect_doc_ids: Vec<u16> = match example_result {
-        Container::Array(a) => a.data,
+        // External callers no longer have `pub` access to the raw `data`
+        // field; `data()` returns an immutable slice that we clone into a
+        // fresh owned `Vec<u16>` for downstream consumption.
+        Container::Array(a) => a.data().to_vec(),
         Container::Bitmap(b) => b.to_array(),
         Container::Run(_r) => Vec::new(), // not exercised by this corpus
     };

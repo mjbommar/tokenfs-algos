@@ -77,10 +77,14 @@ fn run_array_x_array(payload: &[u8]) {
     // The dispatch path may promote to a different container shape if the
     // result is dense; pull the sorted u16 list out of whatever variant
     // came back so the comparison is canonical.
+    //
+    // External callers (this fuzz harness included) use the read-only
+    // `data()` / `runs()` accessors; the raw `data` / `runs` fields are
+    // `pub(crate)` and only constructible from inside `tokenfs-algos`.
     let dispatched_list: Vec<u16> = match dispatched {
-        Container::Array(arr) => arr.data,
+        Container::Array(arr) => arr.data().to_vec(),
         Container::Bitmap(bm) => bm.to_array(),
-        Container::Run(run) => run_to_sorted_u16(&run.runs),
+        Container::Run(run) => run_to_sorted_u16(run.runs()),
     };
 
     assert_eq!(
