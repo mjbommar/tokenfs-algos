@@ -234,6 +234,18 @@ fn bench_byteclass_classify() {
                 }),
             );
         }
+        #[cfg(all(feature = "avx512", any(target_arch = "x86", target_arch = "x86_64")))]
+        if byteclass::kernels::avx512::is_available() {
+            emit(
+                "byteclass-classify",
+                "avx512",
+                n,
+                measure(|| {
+                    // SAFETY: availability checked immediately above.
+                    black_box(unsafe { byteclass::kernels::avx512::classify(black_box(&bytes)) });
+                }),
+            );
+        }
         #[cfg(all(feature = "neon", target_arch = "aarch64"))]
         emit(
             "byteclass-classify",
@@ -268,6 +280,20 @@ fn bench_byteclass_validate_utf8() {
                     // SAFETY: availability checked immediately above.
                     black_box(unsafe {
                         byteclass::kernels::avx2::validate_utf8(black_box(&bytes))
+                    });
+                }),
+            );
+        }
+        #[cfg(all(feature = "avx512", any(target_arch = "x86", target_arch = "x86_64")))]
+        if byteclass::kernels::avx512::is_available() {
+            emit(
+                "byteclass-validate-utf8",
+                "avx512",
+                n,
+                measure(|| {
+                    // SAFETY: availability checked immediately above.
+                    black_box(unsafe {
+                        byteclass::kernels::avx512::validate_utf8(black_box(&bytes))
                     });
                 }),
             );

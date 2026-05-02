@@ -207,7 +207,17 @@ pub const fn backend_kernel_support(backend: Backend) -> BackendKernelSupport {
             byte_class: KernelAvailability::Native,
             sketch: KernelAvailability::ScalarFallback,
         },
-        Backend::Avx512 | Backend::Sve | Backend::Sve2 => BackendKernelSupport {
+        Backend::Avx512 => BackendKernelSupport {
+            backend,
+            // Byte-class kernels exist behind the `avx512` cargo feature
+            // (see byteclass::kernels::avx512); the rest still fall back
+            // to scalar until parity-tested kernels land.
+            byte_histogram: KernelAvailability::ScalarFallback,
+            fingerprint: KernelAvailability::ScalarFallback,
+            byte_class: KernelAvailability::Native,
+            sketch: KernelAvailability::ScalarFallback,
+        },
+        Backend::Sve | Backend::Sve2 => BackendKernelSupport {
             backend,
             byte_histogram: KernelAvailability::ScalarFallback,
             fingerprint: KernelAvailability::ScalarFallback,
