@@ -15,14 +15,20 @@
 //! Merkle-leaf workload), see the [`batched`] submodule and its re-exports
 //! [`sha256_batch_st`], [`sha256_batch_par`], [`blake3_batch_st_32`], and
 //! [`blake3_batch_par_32`].
+//!
+//! For SIMD-accelerated "is `x` in this small u32 set?" membership scans,
+//! see the [`set_membership`] submodule and its re-exports
+//! [`contains_u32_simd`] and [`contains_u32_batch_simd`].
 
 pub mod batched;
+pub mod set_membership;
 pub mod sha256;
 
 #[cfg(feature = "blake3")]
 pub mod blake3;
 
 pub use batched::{BATCH_PARALLEL_THRESHOLD, sha256_batch_st};
+pub use set_membership::{contains_u32_batch_simd, contains_u32_simd};
 
 #[cfg(feature = "parallel")]
 pub use batched::sha256_batch_par;

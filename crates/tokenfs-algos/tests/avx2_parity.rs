@@ -16,6 +16,7 @@ use proptest::prelude::*;
 use tokenfs_algos::{
     bits, byteclass,
     fingerprint::{self, BLOCK_SIZE},
+    hash,
     histogram::{self, ByteHistogram},
     runlength, similarity,
 };
@@ -461,6 +462,187 @@ fn avx2_bits_popcount_u8_matches_scalar_on_unaligned_subslices() {
     }
 }
 
+fn deterministic_packed_values(n: usize, w: u32, seed: u64) -> Vec<u32> {
+    let mask = if w == 32 { u32::MAX } else { (1_u32 << w) - 1 };
+    let mut state = seed;
+    (0..n)
+        .map(|_| {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            (state.wrapping_mul(0x2545_f491_4f6c_dd1d) as u32) & mask
+        })
+        .collect()
+}
+
+#[test]
+fn avx2_bits_bit_pack_decode_matches_scalar_on_every_width() {
+    if !avx2_available() {
+        eprintln!("avx2 unavailable on this host; skipping bits::bit_pack parity test");
+        return;
+    }
+
+    // Cover every supported width plus several lengths so we exercise
+    // tail-handling at small `n` and the full SIMD path at large `n`.
+    let lengths = [0_usize, 1, 7, 8, 33, 257, 1024];
+    for w in 1_u32..=32 {
+        for &n in &lengths {
+            let values =
+                deterministic_packed_values(n, w, 0xF22_C0FFEE_u64 ^ ((w as u64) << 16) ^ n as u64);
+            let needed = bits::DynamicBitPacker::new(w).encoded_len(n);
+            let mut encoded = vec![0_u8; needed];
+            bits::bit_pack::kernels::scalar::encode_u32_slice(w, &values, &mut encoded);
+
+            let mut expected = vec![0_u32; n];
+            bits::bit_pack::kernels::scalar::decode_u32_slice(w, &encoded, n, &mut expected);
+
+            let mut actual = vec![0_u32; n];
+            // SAFETY: avx2_available() returned true above.
+            unsafe {
+                bits::bit_pack::kernels::avx2::decode_u32_slice(w, &encoded, n, &mut actual);
+            }
+            assert_eq!(
+                actual, expected,
+                "avx2 bits::bit_pack::decode diverged at w={w} n={n}"
+            );
+
+            // The auto-dispatched API must agree as well.
+            let mut dispatched = vec![0_u32; n];
+            bits::DynamicBitPacker::new(w).decode_u32_slice(&encoded, n, &mut dispatched);
+            assert_eq!(
+                dispatched, expected,
+                "dispatched bits::bit_pack::decode diverged at w={w} n={n}"
+            );
+        }
+    }
+}
+
+fn deterministic_u32_haystack(n: usize, seed: u64) -> Vec<u32> {
+    let mut state = seed;
+    (0..n)
+        .map(|_| {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_f491_4f6c_dd1d) as u32
+        })
+        .collect()
+}
+
+#[test]
+fn sse41_hash_set_membership_matches_scalar_on_size_grid() {
+    if !std::is_x86_feature_detected!("sse4.1") {
+        eprintln!("sse4.1 unavailable; skipping SSE4.1 set-membership parity test");
+        return;
+    }
+    // Cover SIMD block boundaries: 4 lanes (SSE/NEON), 8 (AVX2), 16
+    // (AVX-512), 32 (AVX2 8x4 unroll), and beyond.
+    for len in [
+        0_usize, 1, 3, 4, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 256, 1023,
+    ] {
+        let haystack = deterministic_u32_haystack(len, 0x5151_5eed ^ (len as u64));
+        for &needle in &[0_u32, 1, u32::MAX, 0x8000_0000] {
+            let expected = hash::set_membership::kernels::scalar::contains_u32(&haystack, needle);
+            // SAFETY: SSE4.1 availability checked above.
+            let actual =
+                unsafe { hash::set_membership::kernels::sse41::contains_u32(&haystack, needle) };
+            assert_eq!(actual, expected, "len {len} needle {needle}");
+        }
+        if len > 0 {
+            for &pos in &[0_usize, len / 2, len - 1] {
+                let needle = haystack[pos];
+                let expected =
+                    hash::set_membership::kernels::scalar::contains_u32(&haystack, needle);
+                // SAFETY: SSE4.1 availability checked above.
+                let actual = unsafe {
+                    hash::set_membership::kernels::sse41::contains_u32(&haystack, needle)
+                };
+                assert_eq!(actual, expected, "len {len} pos {pos}");
+            }
+        }
+    }
+}
+
+#[test]
+fn avx2_hash_set_membership_matches_scalar_on_size_grid() {
+    if !avx2_available() {
+        eprintln!("avx2 unavailable; skipping AVX2 set-membership parity test");
+        return;
+    }
+    for len in [
+        0_usize, 1, 3, 4, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 256, 1023,
+    ] {
+        let haystack = deterministic_u32_haystack(len, 0xA1A1_B2B2 ^ (len as u64));
+        for &needle in &[0_u32, 1, u32::MAX, 0x8000_0000] {
+            let expected = hash::set_membership::kernels::scalar::contains_u32(&haystack, needle);
+            // SAFETY: AVX2 availability checked above.
+            let actual =
+                unsafe { hash::set_membership::kernels::avx2::contains_u32(&haystack, needle) };
+            assert_eq!(actual, expected, "len {len} needle {needle}");
+        }
+        if len > 0 {
+            for &pos in &[0_usize, len / 2, len - 1] {
+                let needle = haystack[pos];
+                let expected =
+                    hash::set_membership::kernels::scalar::contains_u32(&haystack, needle);
+                // SAFETY: AVX2 availability checked above.
+                let actual =
+                    unsafe { hash::set_membership::kernels::avx2::contains_u32(&haystack, needle) };
+                assert_eq!(actual, expected, "len {len} pos {pos}");
+            }
+        }
+    }
+}
+
+#[test]
+fn dispatched_hash_set_membership_matches_scalar() {
+    // Exercise the auto-dispatched API end-to-end. Independent of feature
+    // detection: this should always produce scalar-equivalent results.
+    for len in [0_usize, 1, 7, 8, 16, 33, 256, 1023] {
+        let haystack = deterministic_u32_haystack(len, 0xC0DE_C0DE ^ (len as u64));
+        for &needle in &[0_u32, 1, u32::MAX, 0x8000_0000] {
+            let expected = hash::set_membership::kernels::scalar::contains_u32(&haystack, needle);
+            let dispatched = hash::contains_u32_simd(&haystack, needle);
+            assert_eq!(dispatched, expected, "len {len} needle {needle}");
+        }
+        if len > 0 {
+            let needle = haystack[len / 2];
+            assert!(hash::contains_u32_simd(&haystack, needle));
+        }
+    }
+}
+
+#[cfg(feature = "avx512")]
+#[test]
+fn avx512_hash_set_membership_matches_scalar_on_size_grid() {
+    if !std::is_x86_feature_detected!("avx512f") {
+        eprintln!("avx512f unavailable; skipping AVX-512 set-membership parity test");
+        return;
+    }
+    for len in [0_usize, 1, 3, 8, 15, 16, 17, 31, 32, 33, 64, 128, 256, 1023] {
+        let haystack = deterministic_u32_haystack(len, 0xBEEF_F00D ^ (len as u64));
+        for &needle in &[0_u32, 1, u32::MAX, 0x8000_0000] {
+            let expected = hash::set_membership::kernels::scalar::contains_u32(&haystack, needle);
+            // SAFETY: AVX-512F availability checked above.
+            let actual =
+                unsafe { hash::set_membership::kernels::avx512::contains_u32(&haystack, needle) };
+            assert_eq!(actual, expected, "len {len} needle {needle}");
+        }
+        if len > 0 {
+            for &pos in &[0_usize, len / 2, len - 1] {
+                let needle = haystack[pos];
+                let expected =
+                    hash::set_membership::kernels::scalar::contains_u32(&haystack, needle);
+                // SAFETY: AVX-512F availability checked above.
+                let actual = unsafe {
+                    hash::set_membership::kernels::avx512::contains_u32(&haystack, needle)
+                };
+                assert_eq!(actual, expected, "len {len} pos {pos}");
+            }
+        }
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: 96,
@@ -790,5 +972,39 @@ proptest! {
         let actual = unsafe { bits::kernels::avx2::popcount_u8_slice(&bytes) };
         prop_assert_eq!(actual, expected);
         prop_assert_eq!(bits::popcount_u8_slice(&bytes), expected);
+    }
+
+    #[test]
+    fn avx2_hash_set_membership_matches_scalar_for_random_inputs(
+        haystack in proptest::collection::vec(any::<u32>(), 0..1024),
+        needle in any::<u32>(),
+    ) {
+        if !avx2_available() {
+            return Ok(());
+        }
+        let expected = hash::set_membership::kernels::scalar::contains_u32(&haystack, needle);
+        // SAFETY: avx2_available() returned true above.
+        let actual = unsafe {
+            hash::set_membership::kernels::avx2::contains_u32(&haystack, needle)
+        };
+        prop_assert_eq!(actual, expected);
+        // The auto-dispatched API must agree as well.
+        prop_assert_eq!(hash::contains_u32_simd(&haystack, needle), expected);
+    }
+
+    #[test]
+    fn sse41_hash_set_membership_matches_scalar_for_random_inputs(
+        haystack in proptest::collection::vec(any::<u32>(), 0..512),
+        needle in any::<u32>(),
+    ) {
+        if !std::is_x86_feature_detected!("sse4.1") {
+            return Ok(());
+        }
+        let expected = hash::set_membership::kernels::scalar::contains_u32(&haystack, needle);
+        // SAFETY: sse4.1 availability checked above.
+        let actual = unsafe {
+            hash::set_membership::kernels::sse41::contains_u32(&haystack, needle)
+        };
+        prop_assert_eq!(actual, expected);
     }
 }

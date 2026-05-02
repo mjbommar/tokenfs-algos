@@ -15,7 +15,7 @@
 #![cfg(all(feature = "neon", target_arch = "aarch64"))]
 
 use proptest::prelude::*;
-use tokenfs_algos::{bits, byteclass, fingerprint, runlength, similarity, sketch};
+use tokenfs_algos::{bits, byteclass, fingerprint, hash, runlength, similarity, sketch};
 
 fn synthetic_corpus() -> Vec<Vec<u8>> {
     let mut cases: Vec<Vec<u8>> = vec![
@@ -324,6 +324,103 @@ fn neon_bits_popcount_u8_matches_scalar_on_unaligned_subslices() {
     }
 }
 
+fn deterministic_u32_haystack(n: usize, seed: u64) -> Vec<u32> {
+    let mut state = seed;
+    (0..n)
+        .map(|_| {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_f491_4f6c_dd1d) as u32
+        })
+        .collect()
+}
+
+fn deterministic_packed_values(n: usize, w: u32, seed: u64) -> Vec<u32> {
+    let mask = if w == 32 { u32::MAX } else { (1_u32 << w) - 1 };
+    let mut state = seed;
+    (0..n)
+        .map(|_| {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            (state.wrapping_mul(0x2545_f491_4f6c_dd1d) as u32) & mask
+        })
+        .collect()
+}
+
+#[test]
+fn neon_bits_bit_pack_decode_matches_scalar_on_every_width() {
+    let lengths = [0_usize, 1, 7, 8, 33, 257, 1024];
+    for w in 1_u32..=32 {
+        for &n in &lengths {
+            let values =
+                deterministic_packed_values(n, w, 0xF22_C0FFEE_u64 ^ ((w as u64) << 16) ^ n as u64);
+            let needed = bits::DynamicBitPacker::new(w).encoded_len(n);
+            let mut encoded = vec![0_u8; needed];
+            bits::bit_pack::kernels::scalar::encode_u32_slice(w, &values, &mut encoded);
+
+            let mut expected = vec![0_u32; n];
+            bits::bit_pack::kernels::scalar::decode_u32_slice(w, &encoded, n, &mut expected);
+
+            let mut actual = vec![0_u32; n];
+            // SAFETY: NEON is mandatory on AArch64.
+            unsafe {
+                bits::bit_pack::kernels::neon::decode_u32_slice(w, &encoded, n, &mut actual);
+            }
+            assert_eq!(
+                actual, expected,
+                "neon bits::bit_pack::decode diverged at w={w} n={n}"
+            );
+
+            let mut dispatched = vec![0_u32; n];
+            bits::DynamicBitPacker::new(w).decode_u32_slice(&encoded, n, &mut dispatched);
+            assert_eq!(
+                dispatched, expected,
+                "dispatched bits::bit_pack::decode diverged at w={w} n={n}"
+            );
+        }
+    }
+}
+
+#[test]
+fn neon_hash_set_membership_matches_scalar_on_size_grid() {
+    // Cover SIMD block boundaries for the 4-lane NEON kernel plus the
+    // x86-side shapes (8/16/32) so corpora are interchangeable across
+    // ISAs.
+    for len in [
+        0_usize, 1, 3, 4, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 256, 1023,
+    ] {
+        let haystack = deterministic_u32_haystack(len, 0xBEEF_F00D ^ (len as u64));
+        for &needle in &[0_u32, 1, u32::MAX, 0x8000_0000] {
+            let expected = hash::set_membership::kernels::scalar::contains_u32(&haystack, needle);
+            // SAFETY: NEON is mandatory on AArch64.
+            let actual =
+                unsafe { hash::set_membership::kernels::neon::contains_u32(&haystack, needle) };
+            assert_eq!(actual, expected, "len {len} needle {needle}");
+        }
+        if len > 0 {
+            for &pos in &[0_usize, len / 2, len - 1] {
+                let needle = haystack[pos];
+                let expected =
+                    hash::set_membership::kernels::scalar::contains_u32(&haystack, needle);
+                // SAFETY: NEON is mandatory on AArch64.
+                let actual =
+                    unsafe { hash::set_membership::kernels::neon::contains_u32(&haystack, needle) };
+                assert_eq!(actual, expected, "len {len} pos {pos}");
+            }
+        }
+        // Dispatched API must agree as well.
+        for &needle in &[0_u32, 1, u32::MAX] {
+            assert_eq!(
+                hash::contains_u32_simd(&haystack, needle),
+                hash::set_membership::kernels::scalar::contains_u32(&haystack, needle),
+                "dispatched neon set-membership diverged at len {len}"
+            );
+        }
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: 96,
@@ -509,5 +606,20 @@ proptest! {
         let actual = unsafe { bits::kernels::neon::popcount_u8_slice(&bytes) };
         prop_assert_eq!(actual, expected);
         prop_assert_eq!(bits::popcount_u8_slice(&bytes), expected);
+    }
+
+    #[test]
+    fn neon_hash_set_membership_matches_scalar_for_random_inputs(
+        haystack in proptest::collection::vec(any::<u32>(), 0..1024),
+        needle in any::<u32>(),
+    ) {
+        let expected = hash::set_membership::kernels::scalar::contains_u32(&haystack, needle);
+        // SAFETY: NEON is mandatory on AArch64.
+        let actual = unsafe {
+            hash::set_membership::kernels::neon::contains_u32(&haystack, needle)
+        };
+        prop_assert_eq!(actual, expected);
+        // The auto-dispatched API must agree as well.
+        prop_assert_eq!(hash::contains_u32_simd(&haystack, needle), expected);
     }
 }

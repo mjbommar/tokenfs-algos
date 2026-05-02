@@ -80,5 +80,9 @@ harness = false
 name = "bits_popcount"
 harness = false
 
+[[bench]]
+name = "hash_set_membership"
+harness = false
+
 [lints]
 workspace = true

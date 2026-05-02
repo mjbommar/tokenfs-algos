@@ -16,8 +16,10 @@
 //! Pinned per-backend kernels live under [`kernels`] for reproducible
 //! benchmarks and forensic comparisons.
 
+pub mod bit_pack;
 pub mod popcount;
 
+pub use bit_pack::{BitPacker, DynamicBitPacker};
 pub use popcount::{popcount_u8_slice, popcount_u64_slice};
 
 /// Pinned popcount kernels.
