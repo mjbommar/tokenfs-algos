@@ -40,6 +40,13 @@ tunes-json = ["std", "dep:serde_json"]
 # leaving it opt-in keeps the dependency surface tight for callers that
 # only need SHA-256 or non-cryptographic mixers.
 blake3 = ["dep:blake3", "std"]
+# Hilbert curve ordering for `permutation::hilbert_2d` / `hilbert_nd`.
+# Wraps the `fast_hilbert` (LUT-based 2D, no transitive deps) and
+# `hilbert` (Skilling N-D) crates. Opt-in because the `hilbert` crate
+# pulls non-trivial transitive deps (`num`, `rand`); the rest of the
+# permutation surface (RCM, the shared `Permutation` type) stays
+# dependency-free.
+permutation_hilbert = ["std", "dep:fast_hilbert", "dep:hilbert", "dep:num"]
 
 [dependencies]
 cfg-if.workspace = true
@@ -48,6 +55,18 @@ libm = "0.2"
 rayon = { version = "1", optional = true }
 serde_json = { version = "1", optional = true }
 blake3 = { version = "1", default-features = false, features = ["std"], optional = true }
+# Hilbert curve crates (gated on `permutation_hilbert` feature). Both
+# are MIT-licensed and well-tested. `fast_hilbert` is no_std-compatible
+# with no transitive deps; `hilbert` (Skilling) brings `num` (BigUint),
+# `rand`, `criterion`, and `spectral` — only present in the dep tree
+# when the feature is enabled.
+fast_hilbert = { version = "2", optional = true }
+hilbert = { version = "0.1", optional = true }
+# `num` is the BigUint backend used by the `hilbert` crate's
+# `hilbert_transform` return type. We only consume `num::BigUint` in
+# `permutation::hilbert::hilbert_nd` (sort key) so the dep is gated on
+# the same `permutation_hilbert` feature.
+num = { version = "0.4", optional = true, default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 criterion = "0.8"
