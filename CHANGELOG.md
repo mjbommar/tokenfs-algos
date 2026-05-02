@@ -4,6 +4,85 @@ All notable changes to this crate will be documented in this file. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.2.2] — 2026-05-02
+
+Audit-round-4 hardening pass — closes 5 findings from external code
+review. Additive only (no breaking changes); panic versions retain
+their contracts.
+
+### Added — fallible try_ variants for buffer-shape APIs
+
+Five new error types (`Clone, Copy, Debug, Eq, PartialEq` + `Display`
++ `std::error::Error` under `feature = "std"`) and 12 new public
+`try_*` APIs for kernel-adjacent callers that need DoS-safe error
+propagation instead of panics:
+
+- `bits::streamvbyte::StreamvbyteError` and `try_streamvbyte_encode_u32`
+  / `try_streamvbyte_decode_u32`.
+- `bits::bit_pack::BitPackError` and `BitPacker::try_encode_u32_slice`
+  / `try_decode_u32_slice` (both const-generic and dynamic forms).
+- `bits::rank_select::RankSelectError` and `RankSelectDict::try_build`.
+- `vector::batch::BatchShapeError` and `try_dot_f32_one_to_many` /
+  `try_l2_squared_f32_one_to_many` /
+  `try_cosine_similarity_f32_one_to_many` /
+  `try_hamming_u64_one_to_many` /
+  `try_jaccard_u64_one_to_many`.
+- `hash::set_membership::SetMembershipBatchError` and
+  `try_contains_u32_batch_simd`.
+
+Existing panic versions keep their contracts; their `# Panics` rustdoc
+blocks now link to the matching `try_*` variants. `RankSelectDict::build`
+delegates through `try_build` via `expect` to share the construction path.
+
+### Added — bitmap container invariant validation
+
+- `bitmap::ContainerInvariantError` enum + `ArrayContainer::try_from_vec`
+  + `RunContainer::try_from_vec` validating constructors. Direct
+  construction via the existing `pub` fields stays unchanged; rustdoc
+  on each container type now points untrusted-input callers at the
+  new `try_from_vec` path. Each error variant carries the offending
+  index for shrinker-friendly diagnostics.
+
+### Added — `no_std` smoke crate
+
+- New workspace member `crates/tokenfs-algos-no-std-smoke/` (`test = false`,
+  link-only) verifies kernel-claimed-safe primitives compile and link
+  under `no_std + alloc + features = ["alloc"]`. Exercises
+  `bits::popcount_u64_slice`, `hash::sha256_batch_st`,
+  `hash::contains_u32_simd`, `vector::dot_f32`, and
+  `Permutation::identity` + `apply_into`.
+
+### Changed — `identity::base32_lower_len` overflow safety
+
+- Switched from `input_bytes * 8` (wraps in release on `usize::MAX`/8+
+  inputs) to `input_bytes.saturating_mul(8)`. Matches the convention
+  established in `chunk::ChunkConfig` (audit-round-3 §78). Three
+  regression tests (zero, one-byte canonical, saturating).
+
+### Documented — `permutation_hilbert` supply-chain caveat
+
+- The optional `permutation_hilbert` Cargo feature transitively pulls
+  `hilbert 0.1`, which surfaces RUSTSEC-2022-0004 (`rustc-serialize 0.3`
+  stack overflow) and RUSTSEC-2021-0145 (`atty 0.2` unsound +
+  unmaintained). Neither vulnerable code path is reachable from our
+  wrappers; the default-features build is provably clean.
+- Added scoped `[advisories.ignore]` entries in `deny.toml` with
+  detailed reason strings linking back to the design doc.
+- Added `docs/v0.2_planning/14_PERMUTATION.md` § 8 supply-chain caveat
+  sub-section listing the dep paths, verification command, and TODO to
+  either fork upstream `hilbert` (drop misclassified runtime deps) or
+  ship our own minimal Skilling N-D implementation.
+- After the change: `cargo deny check` reports
+  `advisories ok, bans ok, licenses ok, sources ok`.
+
+### Notes
+
+- 737 lib tests on x86_64 (was 679 at v0.1.x baseline; +58 across the
+  audit-R4 surface).
+- All `cargo xtask check`, aarch64 cross-clippy, and `cargo deny check`
+  gates green.
+- `cargo check -p tokenfs-algos-no-std-smoke` passes.
+
 ## [0.2.1] — 2026-05-02
 
 v0.2 hardening pass — no API changes, only test/bench/fuzz coverage
