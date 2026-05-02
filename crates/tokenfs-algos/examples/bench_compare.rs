@@ -28,6 +28,7 @@ use std::time::Instant;
 use tokenfs_algos::hash::sha256;
 use tokenfs_algos::histogram::summary::byte_value_moments;
 use tokenfs_algos::histogram::topk::MisraGries;
+use tokenfs_algos::sketch::Crc32cHasher;
 use tokenfs_algos::{
     byteclass, fingerprint, histogram, runlength,
     search::{
@@ -64,6 +65,7 @@ fn main() {
     bench_minhash_update();
     bench_simhash_update();
     bench_hash_sha256();
+    bench_incremental_hash();
 }
 
 // ---------- environment header ----------
@@ -917,6 +919,70 @@ fn bench_hash_sha256() {
                 }),
             );
         }
+    }
+}
+
+/// Compare one-shot vs streaming hashers, fed in 4 KiB chunks. The per-update
+/// overhead should land within ~5% of the one-shot path; the streaming
+/// hashers do detect their backend at construction (constant cost) and
+/// dispatch through a `match` on every chunk (a single predicted branch).
+///
+/// Output rows for SHA-256 (`hash-sha256-stream`) and CRC32C
+/// (`hash-crc32c-stream`) include both the one-shot baseline and the
+/// streaming path so the speedup ratio can be derived directly.
+fn bench_incremental_hash() {
+    const CHUNK: usize = 4 * 1024;
+
+    for &n in PAYLOAD_SIZES_BYTES {
+        let bytes = make_random_bytes(n);
+
+        // SHA-256 one-shot baseline (auto-dispatched).
+        emit(
+            "hash-sha256-stream",
+            "auto-one-shot",
+            n,
+            measure(|| {
+                black_box(sha256::sha256(black_box(&bytes)));
+            }),
+        );
+
+        // SHA-256 streaming via Hasher fed in 4 KiB chunks.
+        emit(
+            "hash-sha256-stream",
+            "stream-4kib",
+            n,
+            measure(|| {
+                let mut h = sha256::Hasher::new();
+                for chunk in bytes.chunks(CHUNK) {
+                    h.update(black_box(chunk));
+                }
+                black_box(h.finalize());
+            }),
+        );
+
+        // CRC32C one-shot baseline (auto-dispatched).
+        emit(
+            "hash-crc32c-stream",
+            "auto-one-shot",
+            n,
+            measure(|| {
+                black_box(tokenfs_algos::sketch::crc32c_bytes(0, black_box(&bytes)));
+            }),
+        );
+
+        // CRC32C streaming via Crc32cHasher fed in 4 KiB chunks.
+        emit(
+            "hash-crc32c-stream",
+            "stream-4kib",
+            n,
+            measure(|| {
+                let mut h = Crc32cHasher::new();
+                for chunk in bytes.chunks(CHUNK) {
+                    h.update(black_box(chunk));
+                }
+                black_box(h.finalize());
+            }),
+        );
     }
 }
 

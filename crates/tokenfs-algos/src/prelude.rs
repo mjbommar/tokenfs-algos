@@ -18,6 +18,7 @@ pub use crate::fingerprint::{
     FingerprintKernelInfo, block as fingerprint_block, extent as fingerprint_extent,
     kernel_catalog as fingerprint_kernel_catalog,
 };
+pub use crate::hash::sha256::{Hasher as Sha256Hasher, HasherBackend as Sha256HasherBackend};
 pub use crate::hash::{fnv1a64, mix64};
 pub use crate::histogram::{
     ByteHistogram, BytePairHistogram, BytePairScratch, HistogramBlockSignals, PlannedByteHistogram,
@@ -35,5 +36,9 @@ pub use crate::search::shift_or::ShiftOr;
 pub use crate::search::two_way::TwoWay;
 pub use crate::selector::{RepresentationHint, SelectorSignals};
 pub use crate::similarity::fuzzy::{ctph, tlsh_like};
-pub use crate::sketch::{CLog2Lut, CountMinSketch, HashBinSketch, MisraGries};
+pub use crate::similarity::minhash::IncrementalSignature as MinHashIncrementalSignature;
+pub use crate::sketch::{
+    CLog2Lut, CountMinSketch, Crc32cBackend, Crc32cHasher, HashBinSketch, MisraGries, crc32c_bytes,
+    crc32c_u32,
+};
 pub use crate::structure::StructureSummary;
