@@ -346,9 +346,7 @@ impl<'h, 'm> Iterator for PackedDfaIter<'h, 'm> {
                 self.pending_idx += 1;
                 let plen = self.dfa.pattern_lens[pat] as usize;
                 let start = self.pending_end_pos - plen;
-                if self.haystack[start..self.pending_end_pos]
-                    == self.dfa.patterns[pat][..]
-                {
+                if self.haystack[start..self.pending_end_pos] == self.dfa.patterns[pat][..] {
                     return Some((start, pat));
                 }
             }
@@ -466,11 +464,9 @@ mod tests {
         // unrelated byte (e.g. '~', '7', '!') — see the issue write-up
         // for the exact reproduction. After the fix every non-pattern
         // byte must yield None.
-        let bytes: alloc::vec::Vec<u8> =
-            (b'A'..=b'Z').chain(b'0'..=b'6').collect();
+        let bytes: alloc::vec::Vec<u8> = (b'A'..=b'Z').chain(b'0'..=b'6').collect();
         assert_eq!(bytes.len(), 33);
-        let pats: alloc::vec::Vec<&[u8]> =
-            bytes.iter().map(core::slice::from_ref).collect();
+        let pats: alloc::vec::Vec<&[u8]> = bytes.iter().map(core::slice::from_ref).collect();
         let dfa = PackedDfa::new(&pats);
         // Every real pattern still matches.
         for (i, b) in bytes.iter().enumerate() {
@@ -499,10 +495,8 @@ mod tests {
     fn alphabet_overflow_find_iter_does_not_yield_false_positives() {
         // Same setup as the find() regression test; ensure find_iter
         // also post-verifies and rejects unrelated bytes.
-        let bytes: alloc::vec::Vec<u8> =
-            (b'A'..=b'Z').chain(b'0'..=b'6').collect();
-        let pats: alloc::vec::Vec<&[u8]> =
-            bytes.iter().map(core::slice::from_ref).collect();
+        let bytes: alloc::vec::Vec<u8> = (b'A'..=b'Z').chain(b'0'..=b'6').collect();
+        let pats: alloc::vec::Vec<&[u8]> = bytes.iter().map(core::slice::from_ref).collect();
         let dfa = PackedDfa::new(&pats);
         // Haystack is a string of bytes that are NOT in the pattern set;
         // the pre-fix DFA would report a phantom (offset, 32) for each.
@@ -519,10 +513,8 @@ mod tests {
         // A real overflow pattern ('6') buried in non-pattern noise:
         // verify the iterator yields only the real hit at the right
         // offset, not phantom matches at the surrounding bytes.
-        let bytes: alloc::vec::Vec<u8> =
-            (b'A'..=b'Z').chain(b'0'..=b'6').collect();
-        let pats: alloc::vec::Vec<&[u8]> =
-            bytes.iter().map(core::slice::from_ref).collect();
+        let bytes: alloc::vec::Vec<u8> = (b'A'..=b'Z').chain(b'0'..=b'6').collect();
+        let pats: alloc::vec::Vec<&[u8]> = bytes.iter().map(core::slice::from_ref).collect();
         let dfa = PackedDfa::new(&pats);
         let hay = b"~~~6~~~";
         let hits: alloc::vec::Vec<_> = dfa.find_iter(hay).collect();

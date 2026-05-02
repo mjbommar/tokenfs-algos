@@ -370,10 +370,7 @@ pub fn decode_multihash(bytes: &[u8]) -> Result<(MultihashCode, &[u8]), DecodeEr
 /// only failure mode (the buffer is allocated to the exact size needed,
 /// so `BufferTooSmall` cannot occur here).
 #[cfg(any(feature = "std", feature = "alloc"))]
-pub fn encode_multihash_vec(
-    code: MultihashCode,
-    digest: &[u8],
-) -> Result<Vec<u8>, EncodeError> {
+pub fn encode_multihash_vec(code: MultihashCode, digest: &[u8]) -> Result<Vec<u8>, EncodeError> {
     if digest.len() != code.digest_len() {
         return Err(EncodeError::DigestLengthMismatch {
             code,
