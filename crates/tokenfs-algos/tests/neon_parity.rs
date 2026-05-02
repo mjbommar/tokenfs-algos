@@ -15,7 +15,7 @@
 #![cfg(all(feature = "neon", target_arch = "aarch64"))]
 
 use proptest::prelude::*;
-use tokenfs_algos::{byteclass, fingerprint, runlength, similarity};
+use tokenfs_algos::{byteclass, fingerprint, runlength, similarity, sketch};
 
 fn synthetic_corpus() -> Vec<Vec<u8>> {
     let mut cases: Vec<Vec<u8>> = vec![
@@ -386,5 +386,47 @@ proptest! {
         let neon_direct = fingerprint::kernels::neon::block(arr);
         prop_assert_eq!(neon_dispatched, scalar, "auto-dispatched neon fingerprint diverged from scalar");
         prop_assert_eq!(neon_direct, scalar, "direct neon fingerprint diverged from scalar");
+    }
+
+    #[test]
+    fn neon_sketch_crc32_hash4_bins_matches_scalar_for_random_inputs(
+        bytes in proptest::collection::vec(any::<u8>(), 0..16_384),
+    ) {
+        // Power-of-two BINS picks the pipelined 4-stream code path.
+        let mut scalar_bins = [0_u32; 1024];
+        sketch::kernels::scalar::crc32_hash4_bins(&bytes, &mut scalar_bins);
+
+        let mut neon_bins = [0_u32; 1024];
+        // SAFETY: NEON is mandatory on AArch64 and the FEAT_CRC32 ext
+        // is universally present on every aarch64-linux production core.
+        // The cfg gates this whole proptest block to that environment.
+        unsafe {
+            sketch::kernels::neon::crc32_hash4_bins(&bytes, &mut neon_bins);
+        }
+        prop_assert_eq!(neon_bins, scalar_bins);
+
+        // The auto-dispatched public entry must agree as well.
+        let mut dispatched = [0_u32; 1024];
+        sketch::crc32_hash4_bins(&bytes, &mut dispatched);
+        prop_assert_eq!(dispatched, scalar_bins);
+    }
+
+    #[test]
+    fn neon_sketch_crc32_hash4_bins_non_power_of_two_matches_scalar(
+        bytes in proptest::collection::vec(any::<u8>(), 0..4_096),
+    ) {
+        // Non-power-of-two BINS forces the scalar fallback path inside
+        // the NEON kernel — verify that fallback still agrees with the
+        // pure-scalar reference.
+        let mut scalar_bins = [0_u32; 257];
+        sketch::kernels::scalar::crc32_hash4_bins(&bytes, &mut scalar_bins);
+
+        let mut neon_bins = [0_u32; 257];
+        // SAFETY: NEON is mandatory on AArch64; FEAT_CRC32 is universal
+        // on every aarch64-linux production core.
+        unsafe {
+            sketch::kernels::neon::crc32_hash4_bins(&bytes, &mut neon_bins);
+        }
+        prop_assert_eq!(neon_bins, scalar_bins);
     }
 }

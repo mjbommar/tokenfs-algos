@@ -218,6 +218,184 @@ pub mod kernels {
             }
         }
     }
+
+    /// AArch64 NEON CRC32C sketch kernels with pipelined hash4-bins
+    /// implementations.
+    ///
+    /// `crc32_hash4_bins_pipelined` is the productized fast path on
+    /// AArch64 hosts. Mirrors the SSE4.2 sibling byte-for-byte: maintain
+    /// 4 in-flight CRCs (`__crc32cw` has 3-cycle latency / 1-cycle
+    /// throughput on Cortex-A76 and Apple Firestorm-class cores, same
+    /// pipeline shape as Skylake's `_mm_crc32_u32`) and 4 separate
+    /// per-stream bin tables to break aliasing on the scatter, then merge
+    /// the 4 tables at the end. Output is bit-exact with the scalar
+    /// reference and the SSE4.2 path for any `(bytes, bins)` pair (CRC32C
+    /// is the same Castagnoli polynomial 0x1EDC6F41 across all backends).
+    #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+    pub mod neon {
+        use core::arch::aarch64::__crc32cw;
+
+        /// Returns true when the NEON CRC32C kernel is available.
+        ///
+        /// NEON is mandatory in the AArch64 base ABI; the only runtime
+        /// question is whether the CPU exposes the FEAT_CRC32 extension.
+        /// That extension is universally present on ARMv8.1-A and later,
+        /// and on every aarch64-linux core in production today; the check
+        /// exists for API symmetry with [`super::sse42::is_available`] and
+        /// for forward compatibility with hypothetical bare-ARMv8.0
+        /// targets, mirroring `fingerprint::neon::public::is_available`.
+        #[cfg(feature = "std")]
+        #[must_use]
+        #[inline]
+        pub fn is_available() -> bool {
+            std::arch::is_aarch64_feature_detected!("crc")
+        }
+
+        /// Returns true when the NEON CRC32C kernel is available.
+        #[cfg(not(feature = "std"))]
+        #[must_use]
+        #[inline]
+        pub const fn is_available() -> bool {
+            // Without `std`, `is_aarch64_feature_detected!` is unavailable.
+            // Conservatively report unavailable so callers fall back to the
+            // scalar reference.
+            false
+        }
+
+        /// Hardware CRC32C over one 32-bit word.
+        ///
+        /// # Safety
+        ///
+        /// The caller must ensure that the FEAT_CRC32 (`crc`) extension is
+        /// available on the current CPU.
+        #[must_use]
+        #[target_feature(enable = "crc")]
+        pub unsafe fn crc32c_u32(seed: u32, value: u32) -> u32 {
+            __crc32cw(seed, value)
+        }
+
+        /// Counts 4-grams into a CRC32C-hashed fixed bin array.
+        ///
+        /// # Safety
+        ///
+        /// The caller must ensure that the FEAT_CRC32 (`crc`) extension is
+        /// available on the current CPU.
+        #[target_feature(enable = "crc")]
+        pub unsafe fn crc32_hash4_bins<const BINS: usize>(bytes: &[u8], bins: &mut [u32; BINS]) {
+            // SAFETY: caller guarantees the `crc` feature is enabled, which
+            // satisfies the `target_feature` contract on the pipelined entry
+            // point that this delegates to.
+            unsafe { crc32_hash4_bins_pipelined::<BINS>(bytes, bins) };
+        }
+
+        /// Pipelined hash4-bins: 4 windows in flight per iteration, 4
+        /// per-stream bin tables merged at the end.
+        ///
+        /// Output is bit-exact with [`super::scalar::crc32_hash4_bins`] and
+        /// the SSE4.2 sibling [`super::sse42::crc32_hash4_bins_pipelined`]
+        /// for any `(bytes, bins)` pair.
+        ///
+        /// # Safety
+        ///
+        /// The caller must ensure that the FEAT_CRC32 (`crc`) extension is
+        /// available on the current CPU. `BINS` must be a power of two —
+        /// non-power-of-two `BINS` values would force a `% BINS` division
+        /// per window, which the scheduler can't pipeline. The function
+        /// falls back to the single-stream path for that case.
+        #[target_feature(enable = "crc")]
+        pub unsafe fn crc32_hash4_bins_pipelined<const BINS: usize>(
+            bytes: &[u8],
+            bins: &mut [u32; BINS],
+        ) {
+            // SAFETY: caller guarantees `crc`; we hold a mutable bins.
+            unsafe { hash4_bins_pipelined_impl::<BINS>(bytes, bins) }
+        }
+
+        #[target_feature(enable = "crc")]
+        unsafe fn hash4_bins_pipelined_impl<const BINS: usize>(
+            bytes: &[u8],
+            bins: &mut [u32; BINS],
+        ) {
+            if BINS == 0 || bytes.len() < 4 {
+                return;
+            }
+            // Non-power-of-two BINS would force `% BINS` per window; the
+            // scheduler can't pipeline a div, so fall back to the
+            // single-stream path which uses the same modulo expression.
+            if !BINS.is_power_of_two() {
+                super::super::crc32_hash4_bins_with(bytes, bins, |seed, value| {
+                    // SAFETY: this function's target_feature contract
+                    // guarantees the `crc` extension.
+                    unsafe { crc32c_u32(seed, value) }
+                });
+                return;
+            }
+            let mask = BINS - 1;
+
+            // Four per-stream bin tables avoid the scatter aliasing
+            // through one shared `bins` array. Merged at the end.
+            //
+            // Note: this is on the stack — at BINS=4096 (the F22 hash4
+            // size) that's 4*4096*4 = 64 KiB of stack. F22 callers run
+            // off a normal user stack so this is fine; if you ever wire
+            // this from a kernel-adjacent caller with a tiny stack,
+            // consider heap-allocating once and reusing.
+            let mut bin0 = [0_u32; BINS];
+            let mut bin1 = [0_u32; BINS];
+            let mut bin2 = [0_u32; BINS];
+            let mut bin3 = [0_u32; BINS];
+
+            // Total number of 4-byte sliding windows.
+            let n_windows = bytes.len() - 3;
+            let mut i = 0;
+
+            // Inner loop: 4 independent CRCs in flight, 4 independent bin
+            // increments. Each `__crc32cw(0, word)` has 3-cycle latency on
+            // Cortex-A76 / Apple Firestorm but 1-cycle throughput; with 4
+            // in flight the CRC unit stays saturated. Same shape as the
+            // SSE4.2 sibling (Skylake `_mm_crc32_u32`).
+            while i + 4 <= n_windows {
+                // Pack 4 windows. We deliberately use unaligned u32 reads
+                // because the windows overlap (stride 1).
+                let w0 = u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+                let w1 =
+                    u32::from_le_bytes([bytes[i + 1], bytes[i + 2], bytes[i + 3], bytes[i + 4]]);
+                let w2 =
+                    u32::from_le_bytes([bytes[i + 2], bytes[i + 3], bytes[i + 4], bytes[i + 5]]);
+                let w3 =
+                    u32::from_le_bytes([bytes[i + 3], bytes[i + 4], bytes[i + 5], bytes[i + 6]]);
+                // SAFETY: `crc` extension enabled by the surrounding
+                // target_feature.
+                let h0 = unsafe { crc32c_u32(0, w0) } as usize;
+                let h1 = unsafe { crc32c_u32(0, w1) } as usize;
+                let h2 = unsafe { crc32c_u32(0, w2) } as usize;
+                let h3 = unsafe { crc32c_u32(0, w3) } as usize;
+                bin0[h0 & mask] += 1;
+                bin1[h1 & mask] += 1;
+                bin2[h2 & mask] += 1;
+                bin3[h3 & mask] += 1;
+                i += 4;
+            }
+
+            // Tail: remaining windows go into bin0 (already in flight).
+            while i < n_windows {
+                let word = u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+                // SAFETY: `crc` extension enabled.
+                let h = unsafe { crc32c_u32(0, word) } as usize;
+                bin0[h & mask] += 1;
+                i += 1;
+            }
+
+            // Merge the 4 per-stream tables into the caller's bins.
+            for k in 0..BINS {
+                bins[k] = bins[k]
+                    .wrapping_add(bin0[k])
+                    .wrapping_add(bin1[k])
+                    .wrapping_add(bin2[k])
+                    .wrapping_add(bin3[k]);
+            }
+        }
+    }
 }
 
 /// Fixed-capacity Misra-Gries heavy-hitter sketch.
@@ -528,6 +706,15 @@ pub fn crc32_hash4_bins<const BINS: usize>(bytes: &[u8], bins: &mut [u32; BINS])
         if kernels::sse42::is_available() {
             // SAFETY: availability was checked immediately above.
             unsafe { kernels::sse42::crc32_hash4_bins_pipelined(bytes, bins) };
+            return;
+        }
+    }
+
+    #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+    {
+        if kernels::neon::is_available() {
+            // SAFETY: availability was checked immediately above.
+            unsafe { kernels::neon::crc32_hash4_bins(bytes, bins) };
             return;
         }
     }
@@ -850,5 +1037,45 @@ mod tests {
             );
         }
         assert_eq!(scalar_ngram, sse_ngram);
+    }
+
+    #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+    #[test]
+    fn neon_crc32_matches_scalar_when_available() {
+        if !super::kernels::neon::is_available() {
+            return;
+        }
+
+        let scalar = super::kernels::scalar::crc32c_u32(0x1234, 0xfeed_beef);
+        // SAFETY: availability was checked immediately above.
+        let neon = unsafe { super::kernels::neon::crc32c_u32(0x1234, 0xfeed_beef) };
+        assert_eq!(scalar, neon);
+
+        // Deterministic input — alphabet exercises the inner 4-stream
+        // loop plus the tail path (26 windows, 6 full groups + 2 tail).
+        let payload: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
+
+        let mut scalar_bins = [0_u32; 256];
+        let mut neon_bins = [0_u32; 256];
+        super::kernels::scalar::crc32_hash4_bins(payload, &mut scalar_bins);
+        // SAFETY: availability was checked immediately above.
+        unsafe {
+            super::kernels::neon::crc32_hash4_bins(payload, &mut neon_bins);
+        }
+        assert_eq!(
+            scalar_bins, neon_bins,
+            "neon hash4 bins diverged from scalar reference"
+        );
+
+        // Larger BINS exercises the F22 fingerprint hash4 size used in
+        // production (4096) — same dispatch path as the public entry.
+        let mut scalar_4k = [0_u32; 4096];
+        let mut neon_4k = [0_u32; 4096];
+        super::kernels::scalar::crc32_hash4_bins(payload, &mut scalar_4k);
+        // SAFETY: availability was checked immediately above.
+        unsafe {
+            super::kernels::neon::crc32_hash4_bins(payload, &mut neon_4k);
+        }
+        assert_eq!(scalar_4k, neon_4k);
     }
 }
