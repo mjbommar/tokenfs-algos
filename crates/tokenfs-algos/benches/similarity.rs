@@ -921,6 +921,16 @@ fn build_minhash_seeds<const K: usize>(seed_root: u64) -> [u64; K] {
 
 /// Per-K MinHash signature bench inner loop. Reports throughput in
 /// bytes/sec (one byte per K-min update step).
+///
+/// The gather table is built via
+/// [`minhash::build_byte_table_from_seeds_boxed`] (heap-allocated) for
+/// every `K`. The by-value [`minhash::build_byte_table_from_seeds`]
+/// would be a 256 KiB stack allocation at `K = 128` and 512 KiB at
+/// `K = 256` — well past the kernel-stack budget called out by
+/// audit-R5 finding #156 and the §77 caller-provided-scratch
+/// convention. Even in user-space benches, the boxed form is the
+/// safer default for the larger widths and keeps the bench API
+/// uniform across the K family.
 fn bench_minhash_signature_kway<const K: usize>(c: &mut Criterion, k: usize) {
     use tokenfs_algos::similarity::{kernels_gather, minhash};
 
@@ -930,7 +940,12 @@ fn bench_minhash_signature_kway<const K: usize>(c: &mut Criterion, k: usize) {
     for (label, n) in MINHASH_SIZES {
         let payload = make_bytes_for_minhash(n, 0xC0FF_EE00 ^ (k as u64));
         let seeds = build_minhash_seeds::<K>(0x9E37_79B9_u64);
-        let table = minhash::build_byte_table_from_seeds::<K>(&seeds);
+        // Heap-allocated table: see function rustdoc for why.
+        let boxed_table = minhash::build_byte_table_from_seeds_boxed::<K>(&seeds);
+        // Reborrow into the `&[[u64; K]; 256]` shape every kernel
+        // expects; `&*Box<T>` coerces but explicit `&*` keeps
+        // `black_box`'s `T` inference happy at every call site.
+        let table: &[[u64; K]; kernels_gather::TABLE_ROWS] = &boxed_table;
 
         group.throughput(Throughput::Bytes(n as u64));
 
@@ -941,7 +956,7 @@ fn bench_minhash_signature_kway<const K: usize>(c: &mut Criterion, k: usize) {
                 let mut sig = [u64::MAX; K];
                 kernels_gather::update_minhash_scalar::<K>(
                     black_box(&payload),
-                    black_box(&table),
+                    black_box(table),
                     &mut sig,
                 );
                 sig
@@ -951,7 +966,7 @@ fn bench_minhash_signature_kway<const K: usize>(c: &mut Criterion, k: usize) {
         // Auto-dispatched (best available SIMD backend).
         let id = format!("auto/n={label}");
         group.bench_with_input(BenchmarkId::from_parameter(id), &(), |bencher, _| {
-            bencher.iter(|| minhash::signature_simd::<K>(black_box(&payload), black_box(&table)));
+            bencher.iter(|| minhash::signature_simd::<K>(black_box(&payload), black_box(table)));
         });
 
         #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
@@ -964,7 +979,7 @@ fn bench_minhash_signature_kway<const K: usize>(c: &mut Criterion, k: usize) {
                     unsafe {
                         kernels_gather::avx2::update_minhash_kway::<K>(
                             black_box(&payload),
-                            black_box(&table),
+                            black_box(table),
                             &mut sig,
                         );
                     }
@@ -983,7 +998,7 @@ fn bench_minhash_signature_kway<const K: usize>(c: &mut Criterion, k: usize) {
                     unsafe {
                         kernels_gather::avx512::update_minhash_kway::<K>(
                             black_box(&payload),
-                            black_box(&table),
+                            black_box(table),
                             &mut sig,
                         );
                     }
@@ -1002,7 +1017,7 @@ fn bench_minhash_signature_kway<const K: usize>(c: &mut Criterion, k: usize) {
                     unsafe {
                         kernels_gather::neon::update_minhash_kway::<K>(
                             black_box(&payload),
-                            black_box(&table),
+                            black_box(table),
                             &mut sig,
                         );
                     }
