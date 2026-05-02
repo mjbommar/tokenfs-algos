@@ -34,6 +34,12 @@ sve = ["nightly"]
 sve2 = ["nightly"]
 # JSON loading for planner Tunes (see dispatch::planner::tunes::Tunes::from_json).
 tunes-json = ["std", "dep:serde_json"]
+# BLAKE3 content-addressable hash backend. Wraps the `blake3` crate
+# (CC0-1.0 OR Apache-2.0 OR Apache-2.0-with-LLVM-exception, MIT-compatible)
+# which already ships hand-tuned SSE4.1 / AVX2 / AVX-512 / NEON kernels;
+# leaving it opt-in keeps the dependency surface tight for callers that
+# only need SHA-256 or non-cryptographic mixers.
+blake3 = ["dep:blake3", "std"]
 
 [dependencies]
 cfg-if.workspace = true
@@ -41,6 +47,7 @@ bytemuck = { version = "1", optional = true }
 libm = "0.2"
 rayon = { version = "1", optional = true }
 serde_json = { version = "1", optional = true }
+blake3 = { version = "1", default-features = false, features = ["std"], optional = true }
 
 [dev-dependencies]
 criterion = "0.5"
