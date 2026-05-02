@@ -20,6 +20,7 @@
 //! reproducibility.
 
 use crate::hash::mix64;
+use crate::similarity::kernels_gather;
 
 /// Fixed-size MinHash signature. Each slot holds the minimum observed hash
 /// for one of `K` independent hash functions (classic) or `K` partitions
@@ -130,6 +131,66 @@ where
         items.into_iter().map(|bytes| mix64(bytes, base_seed)),
         base_seed,
     )
+}
+
+/// Per-byte MinHash signature backed by a precomputed gather table.
+///
+/// The table-based representation defines an alternative hash family
+/// where each input byte contributes `K` independent hash values via a
+/// single row of `T : [u8 -> [u64; K]]`. Building the table from seeds
+/// is one-shot (`build_byte_table_from_seeds`); per-byte updates are
+/// then table loads instead of per-byte hash evaluations.
+///
+/// State footprint: `K * 256 * 8` bytes — see
+/// [`kernels_gather`] for the L1/L2 trade-off discussion.
+///
+/// **Hash family**: the table-based variant is **not** bit-equivalent
+/// to [`classic_from_bytes`], which streams whole inputs through
+/// [`mix64`]. It defines its own per-byte family:
+/// `h_k(byte) = mix_word(byte ^ seeds[k])`. Two callers that build
+/// signatures with the same seeds — one via the scalar table-based
+/// path, one via the gather kernels — produce **bit-identical**
+/// signatures.
+#[must_use]
+pub fn build_byte_table_from_seeds<const K: usize>(
+    seeds: &[u64; K],
+) -> [[u64; K]; kernels_gather::TABLE_ROWS] {
+    kernels_gather::build_table_from_seeds(seeds)
+}
+
+/// Updates an 8-way `Signature` from a byte slice using the
+/// runtime-dispatched gather kernel.
+///
+/// The signature uses the per-byte hash family defined above. Falls
+/// through to the scalar implementation when no SIMD path is
+/// available.
+pub fn update_bytes_table_8(
+    sig: &mut Signature<8>,
+    table: &[[u64; 8]; kernels_gather::TABLE_ROWS],
+    bytes: &[u8],
+) {
+    if bytes.is_empty() {
+        return;
+    }
+    kernels_gather::update_minhash_8way_auto(bytes, table, &mut sig.slots);
+    for k in 0..8 {
+        if sig.slots[k] != u64::MAX {
+            sig.populated[k] = true;
+        }
+    }
+}
+
+/// Builds a fresh table-based 8-way MinHash signature from a byte
+/// slice and a precomputed gather table. Convenience wrapper over
+/// [`update_bytes_table_8`].
+#[must_use]
+pub fn classic_from_bytes_table_8(
+    bytes: &[u8],
+    table: &[[u64; 8]; kernels_gather::TABLE_ROWS],
+) -> Signature<8> {
+    let mut sig = Signature::<8>::new();
+    update_bytes_table_8(&mut sig, table, bytes);
+    sig
 }
 
 /// Builds a one-permutation MinHash (OPH) signature.
@@ -376,5 +437,51 @@ mod tests {
         let s_bytes = classic_from_bytes::<_, 64>(items.iter().copied(), 0x77);
         let s_hashed = classic_from_hashes::<_, 64>(items.iter().map(|b| mix64(b, 0x77)), 0x77);
         assert_eq!(s_bytes, s_hashed);
+    }
+
+    #[test]
+    fn table_based_8way_matches_per_byte_reference() {
+        // Hand-compute the per-byte hash family directly and compare
+        // against the dispatched gather path.
+        let seeds: [u64; 8] = [
+            0x1111_1111_u64,
+            0x2222_2222,
+            0x3333_3333,
+            0x4444_4444,
+            0x5555_5555,
+            0x6666_6666,
+            0x7777_7777,
+            0x8888_8888,
+        ];
+        let table = build_byte_table_from_seeds(&seeds);
+        let payload = b"the quick brown fox jumps over the lazy dog 0123456789!@#$%^&*()";
+
+        let actual = classic_from_bytes_table_8(payload, &table);
+
+        let mut expected = [u64::MAX; 8];
+        for &b in payload {
+            for k in 0..8 {
+                let h = crate::hash::mix_word((b as u64) ^ seeds[k]);
+                if h < expected[k] {
+                    expected[k] = h;
+                }
+            }
+        }
+        assert_eq!(actual.slots(), &expected);
+        // populated flags should all be true since we updated every slot.
+        for k in 0..8 {
+            assert!(actual.populated[k], "slot {k} should be populated");
+        }
+    }
+
+    #[test]
+    fn empty_input_does_not_populate_table_signature() {
+        let seeds: [u64; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+        let table = build_byte_table_from_seeds(&seeds);
+        let sig = classic_from_bytes_table_8(b"", &table);
+        for slot in sig.slots() {
+            assert_eq!(*slot, u64::MAX);
+        }
+        assert!(sig.is_empty());
     }
 }

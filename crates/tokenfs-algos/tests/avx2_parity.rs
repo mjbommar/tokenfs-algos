@@ -589,4 +589,103 @@ proptest! {
         let actual = fingerprint::kernels::avx2::block(&block);
         prop_assert_eq!(actual, expected);
     }
+
+    // ---------- gather-based MinHash kernel parity ----------
+
+    #[test]
+    fn avx2_gather_minhash_8way_matches_scalar_random(
+        bytes in proptest::collection::vec(any::<u8>(), 64..16_384),
+        seed_root in any::<u64>(),
+    ) {
+        if !avx2_available() {
+            return Ok(());
+        }
+        use tokenfs_algos::similarity::kernels_gather;
+        let seeds: [u64; 8] = core::array::from_fn(|i| seed_root.wrapping_add(i as u64));
+        let table = kernels_gather::build_table_from_seeds(&seeds);
+
+        let mut s_scalar = [u64::MAX; 8];
+        kernels_gather::update_minhash_scalar::<8>(&bytes, &table, &mut s_scalar);
+
+        let mut s_avx2 = [u64::MAX; 8];
+        // SAFETY: avx2_available() returned true above.
+        unsafe {
+            kernels_gather::avx2::update_minhash_8way(&bytes, &table, &mut s_avx2);
+        }
+        prop_assert_eq!(s_scalar, s_avx2);
+    }
+
+    /// `K = 16` proptest: only the scalar table-based reference exists at
+    /// this width, so we verify the auto dispatcher (which falls through
+    /// to scalar for non-8 widths) matches the per-byte reference.
+    #[test]
+    fn gather_minhash_16way_scalar_matches_per_byte_reference(
+        bytes in proptest::collection::vec(any::<u8>(), 64..16_384),
+        seed_root in any::<u64>(),
+    ) {
+        use tokenfs_algos::similarity::kernels_gather;
+        let seeds: [u64; 16] = core::array::from_fn(|i| seed_root.wrapping_add(i as u64));
+        let table = kernels_gather::build_table_from_seeds(&seeds);
+
+        let mut s_scalar = [u64::MAX; 16];
+        kernels_gather::update_minhash_scalar::<16>(&bytes, &table, &mut s_scalar);
+
+        let mut expected = [u64::MAX; 16];
+        for &b in &bytes {
+            for k in 0..16 {
+                let h = tokenfs_algos::hash::mix_word((b as u64) ^ seeds[k]);
+                if h < expected[k] { expected[k] = h; }
+            }
+        }
+        prop_assert_eq!(s_scalar, expected);
+    }
+
+    /// `K = 32` proptest: same shape as `K=16`. Verifies the table family
+    /// stays consistent at L1-spilling widths.
+    #[test]
+    fn gather_minhash_32way_scalar_matches_per_byte_reference(
+        bytes in proptest::collection::vec(any::<u8>(), 64..16_384),
+        seed_root in any::<u64>(),
+    ) {
+        use tokenfs_algos::similarity::kernels_gather;
+        let seeds: [u64; 32] = core::array::from_fn(|i| seed_root.wrapping_add(i as u64));
+        let table = kernels_gather::build_table_from_seeds(&seeds);
+
+        let mut s_scalar = [u64::MAX; 32];
+        kernels_gather::update_minhash_scalar::<32>(&bytes, &table, &mut s_scalar);
+
+        let mut expected = [u64::MAX; 32];
+        for &b in &bytes {
+            for k in 0..32 {
+                let h = tokenfs_algos::hash::mix_word((b as u64) ^ seeds[k]);
+                if h < expected[k] { expected[k] = h; }
+            }
+        }
+        prop_assert_eq!(s_scalar, expected);
+    }
+
+    /// Top-level `MinHash` table API parity check: the dispatched
+    /// `update_bytes_table_8` must produce the same `Signature<8>` as
+    /// the per-byte reference family. This is the contract the spec
+    /// calls out: callers using seeds can move to the gather path with
+    /// no change in output bits.
+    #[test]
+    fn minhash_update_bytes_table_8_matches_reference(
+        bytes in proptest::collection::vec(any::<u8>(), 64..16_384),
+        seed_root in any::<u64>(),
+    ) {
+        use tokenfs_algos::similarity::minhash;
+        let seeds: [u64; 8] = core::array::from_fn(|i| seed_root.wrapping_add(i as u64));
+        let table = minhash::build_byte_table_from_seeds(&seeds);
+        let actual = minhash::classic_from_bytes_table_8(&bytes, &table);
+
+        let mut expected = [u64::MAX; 8];
+        for &b in &bytes {
+            for k in 0..8 {
+                let h = tokenfs_algos::hash::mix_word((b as u64) ^ seeds[k]);
+                if h < expected[k] { expected[k] = h; }
+            }
+        }
+        prop_assert_eq!(actual.slots(), &expected);
+    }
 }

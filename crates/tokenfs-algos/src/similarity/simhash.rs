@@ -106,6 +106,42 @@ where
     from_weighted_hashes(features.into_iter().map(|(b, w)| (mix64(b, seed), w)))
 }
 
+#[cfg(any(feature = "std", feature = "alloc"))]
+mod table {
+    use super::Signature64;
+    use crate::similarity::kernels_gather;
+
+    /// Number of bits in this SimHash signature (matches `Signature64`).
+    pub const BITS: usize = kernels_gather::simhash::BITS;
+
+    /// Builds a per-byte SimHash contribution table from one seed per
+    /// bit. See [`kernels_gather::simhash`] for the table layout and
+    /// state footprint.
+    #[must_use]
+    pub fn build_byte_table_from_seeds(seeds: &[u64; BITS]) -> Box<kernels_gather::simhash::Table> {
+        kernels_gather::simhash::build_table_from_seeds(seeds)
+    }
+
+    /// Builds a 64-bit SimHash from a byte slice using the
+    /// runtime-dispatched gather kernel.
+    ///
+    /// Each byte contributes one ±1 to every accumulator lane via the
+    /// precomputed table. This is **not** bit-equivalent to
+    /// [`super::from_unweighted_bytes`], which streams whole inputs
+    /// through `mix64`. Two callers using the same seeds via either
+    /// the scalar table-based path or the dispatched gather path
+    /// produce **bit-identical** signatures.
+    #[must_use]
+    pub fn from_bytes_table(bytes: &[u8], table: &kernels_gather::simhash::Table) -> Signature64 {
+        let mut acc = [0_i32; BITS];
+        kernels_gather::simhash::update_accumulator_auto(bytes, table, &mut acc);
+        Signature64::from_bits(kernels_gather::simhash::finalize(&acc))
+    }
+}
+
+#[cfg(any(feature = "std", feature = "alloc"))]
+pub use table::{BITS as TABLE_BITS, build_byte_table_from_seeds, from_bytes_table};
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -196,5 +232,43 @@ mod tests {
         let cos = s.estimated_cosine(inverted);
         // Hamming = 64, theta = pi, cos(pi) = -1.
         assert!((cos - (-1.0)).abs() < 1e-9, "cos(pi)={cos}");
+    }
+
+    #[cfg(any(feature = "std", feature = "alloc"))]
+    #[test]
+    fn from_bytes_table_matches_per_byte_reference() {
+        let seeds: [u64; super::TABLE_BITS] =
+            core::array::from_fn(|i| 0x123_4567_89AB_CDEF_u64.wrapping_mul((i as u64) + 1));
+        let table = super::build_byte_table_from_seeds(&seeds);
+
+        let payload = b"the quick brown fox jumps over the lazy dog 0123456789";
+        let actual = super::from_bytes_table(payload, &table);
+
+        // Hand-compute reference.
+        let mut acc = [0_i32; super::TABLE_BITS];
+        for &b in payload {
+            for i in 0..super::TABLE_BITS {
+                let h = crate::hash::mix_word((b as u64) ^ seeds[i]);
+                acc[i] += if h & 1 == 1 { 1 } else { -1 };
+            }
+        }
+        let mut expected_bits = 0_u64;
+        for (i, &a) in acc.iter().enumerate() {
+            if a > 0 {
+                expected_bits |= 1_u64 << i;
+            }
+        }
+        assert_eq!(actual.bits(), expected_bits);
+    }
+
+    #[cfg(any(feature = "std", feature = "alloc"))]
+    #[test]
+    fn from_bytes_table_is_deterministic() {
+        let seeds: [u64; super::TABLE_BITS] = core::array::from_fn(|i| (i as u64) * 7);
+        let table = super::build_byte_table_from_seeds(&seeds);
+        let payload = b"hello, world!";
+        let s1 = super::from_bytes_table(payload, &table);
+        let s2 = super::from_bytes_table(payload, &table);
+        assert_eq!(s1, s2);
     }
 }
