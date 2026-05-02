@@ -747,16 +747,28 @@ pub mod kernels {
             let k14 = kv(14);
             let k15 = kv(15);
 
-            // 4-round bursts. The standard FEAT_SHA2 pattern is:
-            //   tmp  = vaddq_u32(msg, k);
+            // Canonical FEAT_SHA2 schedule from ARM's reference and
+            // OpenSSL/mbedTLS. Each 4-round burst computes:
+            //   tmp = vaddq_u32(msg, k_i);
+            //   msg = vsha256su0q_u32(msg, msg_next);  // partial sched
             //   prev = state_abcd;
             //   state_abcd = vsha256hq_u32(state_abcd, state_efgh, tmp);
             //   state_efgh = vsha256h2q_u32(state_efgh, prev, tmp);
-            // Schedule updates start after the first 16 rounds:
-            //   msg0 = vsha256su0q_u32(msg0, msg1);
-            //   msg0 = vsha256su1q_u32(msg0, msg2, msg3);
-
-            macro_rules! round4 {
+            //   msg = vsha256su1q_u32(msg, msg_far, msg_far2);  // finish
+            // The schedule update for `msg` produces W[i+16..i+20] which
+            // is consumed in the round-(i+16) burst. Last 16 rounds skip
+            // the schedule (no W[64+] needed).
+            macro_rules! sched_round {
+                ($msg:ident, $msg_next:ident, $msg_far:ident, $msg_far2:ident, $k:expr) => {{
+                    let tmp = vaddq_u32($msg, $k);
+                    $msg = vsha256su0q_u32($msg, $msg_next);
+                    let prev = state_abcd;
+                    state_abcd = vsha256hq_u32(state_abcd, state_efgh, tmp);
+                    state_efgh = vsha256h2q_u32(state_efgh, prev, tmp);
+                    $msg = vsha256su1q_u32($msg, $msg_far, $msg_far2);
+                }};
+            }
+            macro_rules! plain_round {
                 ($msg:expr, $k:expr) => {{
                     let tmp = vaddq_u32($msg, $k);
                     let prev = state_abcd;
@@ -765,52 +777,29 @@ pub mod kernels {
                 }};
             }
 
-            // Rounds 0-15: schedule starts up.
-            round4!(msg0, k0);
-            round4!(msg1, k1);
-            msg0 = vsha256su0q_u32(msg0, msg1);
-            round4!(msg2, k2);
-            msg1 = vsha256su0q_u32(msg1, msg2);
-            round4!(msg3, k3);
-            msg2 = vsha256su0q_u32(msg2, msg3);
-            msg0 = vsha256su1q_u32(msg0, msg2, msg3);
+            // Rounds 0-15 (schedule prep for rounds 16-31).
+            sched_round!(msg0, msg1, msg2, msg3, k0);
+            sched_round!(msg1, msg2, msg3, msg0, k1);
+            sched_round!(msg2, msg3, msg0, msg1, k2);
+            sched_round!(msg3, msg0, msg1, msg2, k3);
 
-            // Rounds 16-31
-            round4!(msg0, k4);
-            msg3 = vsha256su0q_u32(msg3, msg0);
-            msg1 = vsha256su1q_u32(msg1, msg3, msg0);
-            round4!(msg1, k5);
-            msg0 = vsha256su0q_u32(msg0, msg1);
-            msg2 = vsha256su1q_u32(msg2, msg0, msg1);
-            round4!(msg2, k6);
-            msg1 = vsha256su0q_u32(msg1, msg2);
-            msg3 = vsha256su1q_u32(msg3, msg1, msg2);
-            round4!(msg3, k7);
-            msg2 = vsha256su0q_u32(msg2, msg3);
-            msg0 = vsha256su1q_u32(msg0, msg2, msg3);
+            // Rounds 16-31 (schedule prep for rounds 32-47).
+            sched_round!(msg0, msg1, msg2, msg3, k4);
+            sched_round!(msg1, msg2, msg3, msg0, k5);
+            sched_round!(msg2, msg3, msg0, msg1, k6);
+            sched_round!(msg3, msg0, msg1, msg2, k7);
 
-            // Rounds 32-47
-            round4!(msg0, k8);
-            msg3 = vsha256su0q_u32(msg3, msg0);
-            msg1 = vsha256su1q_u32(msg1, msg3, msg0);
-            round4!(msg1, k9);
-            msg0 = vsha256su0q_u32(msg0, msg1);
-            msg2 = vsha256su1q_u32(msg2, msg0, msg1);
-            round4!(msg2, k10);
-            msg1 = vsha256su0q_u32(msg1, msg2);
-            msg3 = vsha256su1q_u32(msg3, msg1, msg2);
-            round4!(msg3, k11);
-            msg2 = vsha256su0q_u32(msg2, msg3);
-            msg0 = vsha256su1q_u32(msg0, msg2, msg3);
+            // Rounds 32-47 (schedule prep for rounds 48-63).
+            sched_round!(msg0, msg1, msg2, msg3, k8);
+            sched_round!(msg1, msg2, msg3, msg0, k9);
+            sched_round!(msg2, msg3, msg0, msg1, k10);
+            sched_round!(msg3, msg0, msg1, msg2, k11);
 
-            // Rounds 48-63: no further schedule updates needed for the
-            // last 12 rounds (the values are already final).
-            round4!(msg0, k12);
-            msg3 = vsha256su0q_u32(msg3, msg0);
-            msg1 = vsha256su1q_u32(msg1, msg3, msg0);
-            round4!(msg1, k13);
-            round4!(msg2, k14);
-            round4!(msg3, k15);
+            // Rounds 48-63: no schedule prep needed.
+            plain_round!(msg0, k12);
+            plain_round!(msg1, k13);
+            plain_round!(msg2, k14);
+            plain_round!(msg3, k15);
 
             state_abcd = vaddq_u32(state_abcd, abcd_save);
             state_efgh = vaddq_u32(state_efgh, efgh_save);
