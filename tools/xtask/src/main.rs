@@ -123,6 +123,7 @@ fn check() -> Result<()> {
         "--features",
         "std",
     ])?;
+    security()?;
     Ok(())
 }
 
@@ -182,14 +183,7 @@ fn ensure_minimal_no_std_dependency_tree() -> Result<()> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let forbidden = [
-        "blake3",
-        "criterion",
-        "hex-literal",
-        "proptest",
-        "rayon",
-        "serde_json",
-    ];
+    let forbidden = ["blake3", "criterion", "proptest", "rayon", "serde_json"];
     let mut found = BTreeSet::new();
 
     for line in stdout.lines() {

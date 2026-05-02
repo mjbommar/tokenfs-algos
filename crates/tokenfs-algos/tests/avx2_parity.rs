@@ -536,7 +536,13 @@ proptest! {
 
     #[test]
     fn avx2_similarity_dot_l2_f32_match_scalar(
-        a in proptest::collection::vec(-1000.0_f32..1000.0, 0..1024),
+        // Input range matches realistic tokenfs vectors: byte-histogram
+        // counts ([0, 256]) and normalized fingerprint deltas ([-1, 1]),
+        // so [-256, 256] covers both with margin. The previous range of
+        // [-1000, 1000] over 1024 elements drove partial sums to ~1e9 and
+        // forced a coarse tolerance; tightening here is the natural complement
+        // to the L1-norm-based scale that lets us assert at 1e-3 confidently.
+        a in proptest::collection::vec(-256.0_f32..256.0, 0..1024),
         seed in any::<u32>(),
     ) {
         if !avx2_available() {

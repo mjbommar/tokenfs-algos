@@ -353,7 +353,10 @@ proptest! {
 
     #[test]
     fn neon_similarity_dot_l2_f32_match_scalar(
-        a in proptest::collection::vec(-1000.0_f32..1000.0, 0..1024),
+        // See avx2_parity.rs for the rationale: range matches realistic
+        // tokenfs vectors (byte-histogram counts [0, 256] and normalized
+        // fingerprint deltas [-1, 1]).
+        a in proptest::collection::vec(-256.0_f32..256.0, 0..1024),
         seed in any::<u32>(),
     ) {
         let b: Vec<f32> = a.iter().enumerate()
