@@ -4,6 +4,77 @@ All notable changes to this crate will be documented in this file. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.2.3] — 2026-05-02
+
+v0.2.x candidate primitives + audit-round-5 hardening + Phase D Rabbit
+Order sequential baseline. All shipped via parallel `isolation: "worktree"`
+sub-agents.
+
+### Added — v0.2.x SIMD primitives
+
+- **`approx::BloomFilter::insert_simd` / `contains_simd` / `contains_batch_simd`**
+  + `try_contains_batch_simd` + `BloomBatchError` + `bloom_kernels` module
+  (scalar / AVX2 / AVX-512 / NEON). Sprint 42-43.
+- **`approx::HyperLogLog::merge_simd` / `count_simd` / `count_raw`**
+  + `try_merge_simd` + `HllMergeError` + `hll_kernels` module
+  (scalar / AVX2 / AVX-512 VPOPCNTQ / NEON). AVX2 merge ~25x scalar
+  (~50 GiB/s aggregate); count via `_mm256_max_epu8` per-bucket.
+  Sprint 44.
+- **`similarity::minhash::signature_simd<K>` / `signature_batch_simd<K>`**
+  + `try_signature_batch_simd<K>` + `update_minhash_kway_auto<K>`
+  dispatcher in `kernels_gather`. AVX2/AVX-512/NEON K-way kernels use
+  direct `_mm256_loadu_si256` / `_mm512_loadu_si512` / `vld1q_u64`
+  loads (gather micro-ops underperform contiguous loads on Alder
+  Lake / Ice Lake / Zen 3+). Sprint 45-46.
+
+### Added — Phase D Rabbit Order (sequential baseline)
+
+- **`permutation::rabbit::rabbit_order(graph)`** — first Rust port of
+  Arai et al. IPDPS 2016. Sequential single-pass: lowest-degree-first
+  iteration via `BinaryHeap`, integer-only modularity gain in `i128`
+  for determinism, sorted Vec-backed per-community adjacency with
+  two-pointer merge on absorption, dendrogram DFS pre-order emit.
+  Demonstrably better community grouping than RCM on K-clique-with-
+  bridges fixtures (every clique's members within span K). Sprint
+  47-49. SIMD modularity inner loop (Sprint 50-52) and concurrent
+  merging (Sprint 53-55) are follow-on Phase D sprints.
+
+### Audit-round-5 hardening
+
+- **#155 streamvbyte SIMD tables → `const fn` statics** — the SSSE3 /
+  AVX2 / NEON shuffle (4 KiB) and length (256 B) tables now live in
+  static rodata instead of `OnceLock`-initialized lazy globals. The
+  table module no longer requires `feature = "std"`, so kernel-mode
+  SIMD configs (`alloc,avx2` / `alloc,neon`) compile cleanly.
+- **#158 replace upstream `hilbert` 0.1 with in-tree Skilling N-D** —
+  drops `hilbert`, `num`, and 31 transitive crates including
+  `criterion 0.3`, `atty`, `rustc-serialize`, `spectral`. Eliminates
+  RUSTSEC-2022-0004 + RUSTSEC-2021-0145 entirely (no longer
+  suppressed in deny.toml). New `permutation::hilbert::skilling_hilbert_key`
+  + `interleave_be` (~156 lines). `cargo deny check advisories`
+  reports `advisories ok` with **zero ignores**. Closes audit-R4 #150.
+- **#159 bitmap container fields → `pub(crate)`** — `ArrayContainer.data`
+  and `RunContainer.runs` are now `pub(crate)`; external callers must
+  go through `try_from_vec` validating constructors (added in v0.2.2)
+  or read via the new `data()` / `runs()` accessors. **BREAKING**:
+  external direct field construction is now a compile error.
+- **#160 `Permutation::from_vec_unchecked` is now `unsafe fn`** with
+  full `# Safety` clause. All 6 internal call sites wrapped in
+  `unsafe { ... }` with `// SAFETY:` justification. **BREAKING**:
+  external callers must wrap invocations in `unsafe { }` or switch
+  to `try_from_vec`.
+
+### Notes
+
+- 804 lib tests on x86_64 (was 737 at v0.2.2; +67 across all v0.2.x +
+  R5 work).
+- 84 AVX2 parity tests.
+- All `cargo xtask check`, aarch64 cross-clippy, and
+  `cargo deny check advisories` gates green with zero suppressions.
+- Three audit-R5 items (#156 kernels_gather K=256 by-value; #157
+  panicking APIs at kernel boundary feature gate) are deferred to a
+  follow-on hardening pass.
+
 ## [0.2.2] — 2026-05-02
 
 Audit-round-4 hardening pass — closes 5 findings from external code
