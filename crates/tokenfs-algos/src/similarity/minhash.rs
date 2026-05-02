@@ -193,6 +193,180 @@ pub fn classic_from_bytes_table_8(
     sig
 }
 
+/// Streaming K-way table-based MinHash signature builder.
+///
+/// Wraps a [`Signature<K>`] plus a borrowed gather table so callers can feed
+/// bytes incrementally — one byte at a time, or in 4 KiB-ish chunks — and
+/// snapshot the running signature at any point. The hash family matches the
+/// table-based [`classic_from_bytes_table_8`] / [`update_bytes_table_8`]
+/// path: `h_k(byte) = mix_word(byte ^ seeds[k])`.
+///
+/// This is the right primitive for FUSE-style write paths and for any caller
+/// that needs both a "live" Jaccard estimate and a final signature without
+/// re-hashing the input.
+///
+/// ## Memory shape
+///
+/// The table itself is borrowed (`&[[u64; K]; 256]`); the builder owns only
+/// `Signature<K>` (16 bytes per slot plus a populated bitmap) so it stays
+/// `Copy`-ish and cheap to keep around per write handle.
+///
+/// ## Bit-exact across chunkings
+///
+/// Two streams that consume the same bytes (in any order — the hash family
+/// is order-independent) produce identical signatures regardless of chunk
+/// boundaries. This is verified by [`tests::stream_chunking_invariant`].
+///
+/// ## Example
+///
+/// ```
+/// use tokenfs_algos::similarity::minhash::{
+///     build_byte_table_from_seeds, IncrementalSignature,
+/// };
+///
+/// let seeds: [u64; 8] = core::array::from_fn(|i| 0x9E37_79B9_u64 ^ i as u64);
+/// let table = build_byte_table_from_seeds::<8>(&seeds);
+///
+/// let mut builder = IncrementalSignature::<8>::new(&table);
+/// for chunk in b"abcdef".chunks(2) {
+///     builder.update_bytes(chunk);
+/// }
+/// let sig = builder.finalize();
+/// assert!(!sig.is_empty());
+/// ```
+#[derive(Debug)]
+pub struct IncrementalSignature<'a, const K: usize> {
+    sig: Signature<K>,
+    table: &'a [[u64; K]; kernels_gather::TABLE_ROWS],
+}
+
+impl<'a, const K: usize> IncrementalSignature<'a, K> {
+    /// Construct an empty incremental signature backed by the given gather
+    /// table. The table is borrowed for the lifetime of the builder; build
+    /// it once via [`build_byte_table_from_seeds`] and reuse.
+    #[must_use]
+    pub fn new(table: &'a [[u64; K]; kernels_gather::TABLE_ROWS]) -> Self {
+        Self {
+            sig: Signature::<K>::new(),
+            table,
+        }
+    }
+
+    /// Construct an incremental signature seeded from an existing
+    /// [`Signature<K>`]. Useful for resuming a partial computation that was
+    /// snapshotted with [`Self::snapshot`] or merged via [`Self::merge`].
+    #[must_use]
+    pub fn from_signature(
+        table: &'a [[u64; K]; kernels_gather::TABLE_ROWS],
+        sig: Signature<K>,
+    ) -> Self {
+        Self { sig, table }
+    }
+
+    /// Feed a single byte into the running K-min update.
+    pub fn update_byte(&mut self, byte: u8) {
+        let row = &self.table[byte as usize];
+        for (k, &h) in row.iter().enumerate() {
+            if h < self.sig.slots[k] {
+                self.sig.slots[k] = h;
+                self.sig.populated[k] = true;
+            }
+        }
+    }
+
+    /// Feed `bytes` into the running K-min update.
+    ///
+    /// For `K == 8`, dispatches to the runtime-selected gather kernel
+    /// (`kernels_gather::update_minhash_8way_auto`). For other `K`, falls
+    /// back to the scalar reference. Either way the output matches
+    /// [`classic_from_bytes_table_8`] / [`update_bytes_table_8`] for the
+    /// concatenated input.
+    pub fn update_bytes(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        if K == 8 {
+            // Cast through `[u64; K]` -> `[u64; 8]` and `[[u64; K]; 256]`
+            // -> `[[u64; 8]; 256]`; both layouts are identical when `K == 8`
+            // because const-generic arrays are simply `K * size_of::<T>()`
+            // contiguous bytes (Rust 2024 / const generics MSRV).
+            // SAFETY: K == 8 so the type representations are byte-identical.
+            let table_8: &[[u64; 8]; kernels_gather::TABLE_ROWS] = unsafe {
+                &*(self.table as *const [[u64; K]; kernels_gather::TABLE_ROWS])
+                    .cast::<[[u64; 8]; kernels_gather::TABLE_ROWS]>()
+            };
+            // SAFETY: K == 8 so the slot array sizes match.
+            let sig_8: &mut [u64; 8] =
+                unsafe { &mut *(self.sig.slots.as_mut_ptr().cast::<[u64; 8]>()) };
+            kernels_gather::update_minhash_8way_auto(bytes, table_8, sig_8);
+            for k in 0..K {
+                if self.sig.slots[k] != u64::MAX {
+                    self.sig.populated[k] = true;
+                }
+            }
+        } else {
+            kernels_gather::update_minhash_scalar::<K>(bytes, self.table, &mut self.sig.slots);
+            for k in 0..K {
+                if self.sig.slots[k] != u64::MAX {
+                    self.sig.populated[k] = true;
+                }
+            }
+        }
+    }
+
+    /// Read the current signature mid-stream without consuming the builder.
+    ///
+    /// Useful for emitting periodic snapshots while the underlying byte
+    /// stream is still being written.
+    #[must_use]
+    pub fn snapshot(&self) -> Signature<K> {
+        self.sig
+    }
+
+    /// Return the final signature and consume the builder.
+    #[must_use]
+    pub fn finalize(self) -> Signature<K> {
+        self.sig
+    }
+
+    /// Reset the running signature to empty. The table reference is
+    /// preserved; reuse the builder for the next stream without re-binding.
+    pub fn reset(&mut self) {
+        self.sig = Signature::<K>::new();
+    }
+
+    /// Merge another signature into the running state via per-slot `min`.
+    ///
+    /// Lets a caller hash disjoint shards of the same input in parallel
+    /// (each shard accumulates its own [`IncrementalSignature`], all sharing
+    /// the same table) then fold the results: the final merged signature is
+    /// identical to one produced by feeding the concatenated input through a
+    /// single builder, because the K-min update is associative and
+    /// commutative under `min`.
+    pub fn merge(&mut self, other: &Signature<K>) {
+        for k in 0..K {
+            if other.slots[k] < self.sig.slots[k] {
+                self.sig.slots[k] = other.slots[k];
+            }
+            if other.populated[k] {
+                self.sig.populated[k] = true;
+            }
+        }
+    }
+
+    /// Number of slots `K`.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        K
+    }
+
+    /// True when the running signature has no populated slots.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.sig.is_empty()
+    }
+}
+
 /// Builds a one-permutation MinHash (OPH) signature.
 ///
 /// One hash function partitions the universe into `K` equal-sized buckets;
@@ -483,5 +657,204 @@ mod tests {
             assert_eq!(*slot, u64::MAX);
         }
         assert!(sig.is_empty());
+    }
+
+    // ----- IncrementalSignature streaming tests -----------------------------
+
+    fn make_test_seeds_8() -> [u64; 8] {
+        [
+            0x1111_1111_u64,
+            0x2222_2222,
+            0x3333_3333,
+            0x4444_4444,
+            0x5555_5555,
+            0x6666_6666,
+            0x7777_7777,
+            0x8888_8888,
+        ]
+    }
+
+    fn make_test_seeds_4() -> [u64; 4] {
+        [0xAA_u64, 0xBB, 0xCC, 0xDD]
+    }
+
+    fn random_bytes(n: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(n);
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        while out.len() < n {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            out.extend_from_slice(&state.to_le_bytes());
+        }
+        out.truncate(n);
+        out
+    }
+
+    #[test]
+    fn incremental_empty_signature_is_empty() {
+        let seeds = make_test_seeds_8();
+        let table = build_byte_table_from_seeds::<8>(&seeds);
+        let builder = IncrementalSignature::<8>::new(&table);
+        let sig = builder.finalize();
+        assert!(sig.is_empty());
+    }
+
+    #[test]
+    fn incremental_update_byte_matches_one_shot() {
+        let seeds = make_test_seeds_8();
+        let table = build_byte_table_from_seeds::<8>(&seeds);
+
+        let payload = b"the quick brown fox jumps over the lazy dog";
+
+        let mut builder = IncrementalSignature::<8>::new(&table);
+        for &b in payload {
+            builder.update_byte(b);
+        }
+        let stream_sig = builder.finalize();
+
+        let one_shot = classic_from_bytes_table_8(payload, &table);
+        assert_eq!(stream_sig.slots(), one_shot.slots());
+    }
+
+    #[test]
+    fn incremental_update_bytes_matches_one_shot() {
+        let seeds = make_test_seeds_8();
+        let table = build_byte_table_from_seeds::<8>(&seeds);
+
+        let payload = random_bytes(4096);
+
+        let mut builder = IncrementalSignature::<8>::new(&table);
+        builder.update_bytes(&payload);
+        let stream_sig = builder.finalize();
+
+        let one_shot = classic_from_bytes_table_8(&payload, &table);
+        assert_eq!(stream_sig.slots(), one_shot.slots());
+    }
+
+    /// Two streams chunked differently must produce identical signatures.
+    #[test]
+    fn stream_chunking_invariant() {
+        let seeds = make_test_seeds_8();
+        let table = build_byte_table_from_seeds::<8>(&seeds);
+
+        let payload = random_bytes(64 * 1024);
+        let one_shot = classic_from_bytes_table_8(&payload, &table);
+
+        for &chunk in &[1_usize, 7, 17, 63, 64, 65, 1024, 4096] {
+            let mut builder = IncrementalSignature::<8>::new(&table);
+            for block in payload.chunks(chunk) {
+                builder.update_bytes(block);
+            }
+            assert_eq!(
+                builder.finalize().slots(),
+                one_shot.slots(),
+                "chunk={chunk}"
+            );
+        }
+    }
+
+    /// The non-K=8 path delegates to the scalar reference. It must match the
+    /// per-byte hand-rolled K-min update.
+    #[test]
+    fn incremental_k4_matches_scalar_reference() {
+        let seeds = make_test_seeds_4();
+        let table = build_byte_table_from_seeds::<4>(&seeds);
+
+        let payload = random_bytes(4096);
+
+        let mut builder = IncrementalSignature::<4>::new(&table);
+        builder.update_bytes(&payload);
+        let stream_sig = builder.finalize();
+
+        let mut expected = [u64::MAX; 4];
+        for &b in &payload {
+            for k in 0..4 {
+                let h = crate::hash::mix_word((b as u64) ^ seeds[k]);
+                if h < expected[k] {
+                    expected[k] = h;
+                }
+            }
+        }
+        assert_eq!(stream_sig.slots(), &expected);
+    }
+
+    /// `snapshot()` returns the live signature without consuming the builder;
+    /// further updates must continue to refine it monotonically.
+    #[test]
+    fn snapshot_does_not_consume_builder() {
+        let seeds = make_test_seeds_8();
+        let table = build_byte_table_from_seeds::<8>(&seeds);
+
+        let mut builder = IncrementalSignature::<8>::new(&table);
+        builder.update_bytes(b"first half");
+        let snap = builder.snapshot();
+
+        builder.update_bytes(b" + second half");
+        let later = builder.snapshot();
+
+        // K-min slots only get smaller as more bytes are observed.
+        for k in 0..8 {
+            assert!(later.slots[k] <= snap.slots[k]);
+        }
+
+        // After all updates, the builder's signature equals what we'd get
+        // from a fresh one-shot pass over the concatenated input.
+        let final_sig = builder.finalize();
+        let one_shot = classic_from_bytes_table_8(b"first half + second half", &table);
+        assert_eq!(final_sig.slots(), one_shot.slots());
+    }
+
+    #[test]
+    fn reset_clears_signature() {
+        let seeds = make_test_seeds_8();
+        let table = build_byte_table_from_seeds::<8>(&seeds);
+
+        let mut builder = IncrementalSignature::<8>::new(&table);
+        builder.update_bytes(b"poison");
+        builder.reset();
+        builder.update_bytes(b"abcdef");
+
+        let one_shot = classic_from_bytes_table_8(b"abcdef", &table);
+        assert_eq!(builder.finalize().slots(), one_shot.slots());
+    }
+
+    /// Merging two shard-signatures matches the signature of the
+    /// concatenated input. K-min is associative + commutative under min.
+    #[test]
+    fn merge_matches_concatenation() {
+        let seeds = make_test_seeds_8();
+        let table = build_byte_table_from_seeds::<8>(&seeds);
+
+        let payload = random_bytes(8192);
+        let (left, right) = payload.split_at(payload.len() / 2);
+
+        let sig_left = classic_from_bytes_table_8(left, &table);
+        let sig_right = classic_from_bytes_table_8(right, &table);
+
+        let mut merged = IncrementalSignature::<8>::from_signature(&table, sig_left);
+        merged.merge(&sig_right);
+
+        let one_shot = classic_from_bytes_table_8(&payload, &table);
+        assert_eq!(merged.finalize().slots(), one_shot.slots());
+    }
+
+    /// `from_signature` round-trips: building a signature, snapshotting it,
+    /// resuming with `from_signature`, and feeding more bytes equals the
+    /// signature of the concatenated input.
+    #[test]
+    fn from_signature_resumes_correctly() {
+        let seeds = make_test_seeds_8();
+        let table = build_byte_table_from_seeds::<8>(&seeds);
+
+        let mut a = IncrementalSignature::<8>::new(&table);
+        a.update_bytes(b"first half");
+        let snapshot = a.snapshot();
+
+        let mut b = IncrementalSignature::<8>::from_signature(&table, snapshot);
+        b.update_bytes(b" rest");
+
+        let one_shot = classic_from_bytes_table_8(b"first half rest", &table);
+        assert_eq!(b.finalize().slots(), one_shot.slots());
     }
 }

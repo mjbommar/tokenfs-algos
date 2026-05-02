@@ -307,33 +307,13 @@ pub mod kernels {
             let full_blocks = bytes.len() / BLOCK_BYTES;
             let tail_start = full_blocks * BLOCK_BYTES;
 
-            // SAFETY: `state` has 8 dwords; all loads use 4-dword vectors.
-            let (mut state0, mut state1) = unsafe { state_from_words(&state) };
-
-            // Byte-swap mask for converting little-endian xmm dword loads
-            // into big-endian message words. `_mm_set_epi64x` is safe when
-            // its target features are active (we're already inside a
-            // `#[target_feature]` function).
-            let bswap = _mm_set_epi64x(
-                0x0c0d_0e0f_0809_0a0b_u64 as i64,
-                0x0405_0607_0001_0203_u64 as i64,
-            );
-
-            for block_index in 0..full_blocks {
-                let off = block_index * BLOCK_BYTES;
-                // SAFETY: bounds checked above; SHA-NI feature gate active.
-                let (s0, s1) =
-                    unsafe { compress_block_shani(state0, state1, bytes.as_ptr().add(off), bswap) };
-                state0 = s0;
-                state1 = s1;
+            if full_blocks > 0 {
+                // SAFETY: caller's target_feature contract guarantees SHA-NI;
+                // we read `full_blocks * BLOCK_BYTES` bytes and write 8 u32s.
+                unsafe {
+                    compress_blocks(&mut state, bytes.as_ptr(), full_blocks);
+                }
             }
-
-            // Convert the SHA-NI state back to scalar order, then run the
-            // scalar compress on the padding block(s). This guarantees
-            // bit-exact parity with the scalar kernel without re-implementing
-            // padding inside the SHA-NI path.
-            // SAFETY: SSE2 enabled.
-            unsafe { state_to_words(&mut state, state0, state1) };
 
             let tail = &bytes[tail_start..];
             let bit_len = (bytes.len() as u64).wrapping_mul(8);
@@ -365,6 +345,55 @@ pub mod kernels {
                 digest[i * 4..(i + 1) * 4].copy_from_slice(&word.to_be_bytes());
             }
             digest
+        }
+
+        /// Compress `n_blocks` consecutive 64-byte blocks read from `block_ptr`
+        /// into the scalar `state`. Loads the (ABEF, CDGH) vector pair once,
+        /// runs the SHA-NI block compressor `n_blocks` times, then writes the
+        /// scalar state back. This is the entry point used by the streaming
+        /// [`super::super::Hasher`] so a 4 KiB chunk pays the
+        /// `state_from_words`/`state_to_words` cost once instead of 64 times.
+        ///
+        /// # Safety
+        ///
+        /// `block_ptr` must point to at least `n_blocks * 64` readable bytes.
+        /// SHA-NI plus SSE4.1 + SSSE3 must be available; this is enforced by
+        /// the `#[target_feature]` gate plus the caller's runtime check.
+        #[target_feature(enable = "sha,sse4.1,ssse3")]
+        pub(crate) unsafe fn compress_blocks(
+            state: &mut [u32; 8],
+            block_ptr: *const u8,
+            n_blocks: usize,
+        ) {
+            if n_blocks == 0 {
+                return;
+            }
+            // SAFETY: state is a valid 8-dword array.
+            let (mut state0, mut state1) = unsafe { state_from_words(state) };
+
+            // Byte-swap mask for converting little-endian xmm dword loads
+            // into big-endian message words.
+            let bswap = _mm_set_epi64x(
+                0x0c0d_0e0f_0809_0a0b_u64 as i64,
+                0x0405_0607_0001_0203_u64 as i64,
+            );
+
+            for block_index in 0..n_blocks {
+                // SAFETY: caller guarantees `block_ptr + i*64 + 63` is readable.
+                let (s0, s1) = unsafe {
+                    compress_block_shani(
+                        state0,
+                        state1,
+                        block_ptr.add(block_index * BLOCK_BYTES),
+                        bswap,
+                    )
+                };
+                state0 = s0;
+                state1 = s1;
+            }
+
+            // SAFETY: state is a valid 8-dword writable destination.
+            unsafe { state_to_words(state, state0, state1) };
         }
 
         // -- helpers ------------------------------------------------------
@@ -697,23 +726,12 @@ pub mod kernels {
             let full_blocks = bytes.len() / BLOCK_BYTES;
             let tail_start = full_blocks * BLOCK_BYTES;
 
-            // SAFETY: state has 8 dwords; we load two 4-dword vectors.
-            let mut state_abcd = unsafe { vld1q_u32(state.as_ptr()) };
-            let mut state_efgh = unsafe { vld1q_u32(state.as_ptr().add(4)) };
-
-            for block_index in 0..full_blocks {
-                let off = block_index * BLOCK_BYTES;
-                // SAFETY: bounds checked above; FEAT_SHA2 enabled.
-                let (na, ne) =
-                    unsafe { compress_block_sha2(state_abcd, state_efgh, bytes.as_ptr().add(off)) };
-                state_abcd = na;
-                state_efgh = ne;
-            }
-
-            // SAFETY: 16-byte stores into 8-element u32 array.
-            unsafe {
-                vst1q_u32(state.as_mut_ptr(), state_abcd);
-                vst1q_u32(state.as_mut_ptr().add(4), state_efgh);
+            if full_blocks > 0 {
+                // SAFETY: caller guarantees FEAT_SHA2; we read full_blocks*64
+                // bytes and write 8 u32s into `state`.
+                unsafe {
+                    compress_blocks(&mut state, bytes.as_ptr(), full_blocks);
+                }
             }
 
             // Padding via the scalar compress for bit-exact output.
@@ -747,6 +765,51 @@ pub mod kernels {
                 digest[i * 4..(i + 1) * 4].copy_from_slice(&word.to_be_bytes());
             }
             digest
+        }
+
+        /// Compress `n_blocks` consecutive 64-byte blocks read from `block_ptr`
+        /// into the scalar `state`. Loads the (ABCD, EFGH) vector pair once,
+        /// runs the FEAT_SHA2 block compressor `n_blocks` times, then writes
+        /// the scalar state back. Used by the streaming
+        /// [`super::super::Hasher`] so a 4 KiB chunk pays the `vld1q_u32` /
+        /// `vst1q_u32` cost once instead of 64 times.
+        ///
+        /// # Safety
+        ///
+        /// `block_ptr` must point to at least `n_blocks * 64` readable bytes.
+        /// FEAT_SHA2 must be available (enforced by the `#[target_feature]`
+        /// gate plus the caller's runtime check).
+        #[target_feature(enable = "sha2")]
+        pub(crate) unsafe fn compress_blocks(
+            state: &mut [u32; 8],
+            block_ptr: *const u8,
+            n_blocks: usize,
+        ) {
+            if n_blocks == 0 {
+                return;
+            }
+            // SAFETY: state is a valid 8-dword array.
+            let mut state_abcd = unsafe { vld1q_u32(state.as_ptr()) };
+            let mut state_efgh = unsafe { vld1q_u32(state.as_ptr().add(4)) };
+
+            for block_index in 0..n_blocks {
+                // SAFETY: caller guarantees block_ptr+i*64+63 is readable.
+                let (na, ne) = unsafe {
+                    compress_block_sha2(
+                        state_abcd,
+                        state_efgh,
+                        block_ptr.add(block_index * BLOCK_BYTES),
+                    )
+                };
+                state_abcd = na;
+                state_efgh = ne;
+            }
+
+            // SAFETY: state is a valid 8-dword writable destination.
+            unsafe {
+                vst1q_u32(state.as_mut_ptr(), state_abcd);
+                vst1q_u32(state.as_mut_ptr().add(4), state_efgh);
+            }
         }
 
         /// Compress one 64-byte block using FEAT_SHA2.
@@ -936,9 +999,282 @@ pub mod kernels {
     }
 }
 
+/// Streaming SHA-256 hasher.
+///
+/// Mirrors the FIPS 180-4 chaining contract: bytes can arrive in any-sized
+/// chunks via [`Hasher::update`], partial blocks accumulate in an internal
+/// 64-byte buffer, and full blocks are routed to whichever per-backend
+/// `compress_blocks` is fastest on the host (detected once at [`Hasher::new`]).
+/// [`Hasher::finalize`] performs the canonical padding (0x80, zero-fill,
+/// big-endian 64-bit bit length) and emits the 32-byte digest. The streaming
+/// path is bit-exact with the one-shot [`sha256`] entry point for any chunking
+/// pattern.
+///
+/// We deliberately do **not** implement [`core::hash::Hasher`]: that trait
+/// returns a `u64`, while SHA-256 produces a 256-bit digest. Squeezing the
+/// digest down to 64 bits would silently weaken cryptographic strength for
+/// every caller that grabbed it through the trait, which is the exact bug
+/// `tokenfs-algos` exists to avoid.
+///
+/// # Example
+///
+/// ```
+/// use tokenfs_algos::hash::sha256::{Hasher, sha256};
+///
+/// let mut h = Hasher::new();
+/// h.update(b"hello, ");
+/// h.update(b"world");
+/// assert_eq!(h.finalize(), sha256(b"hello, world"));
+/// ```
+#[derive(Clone)]
+pub struct Hasher {
+    state: [u32; 8],
+    buffer: [u8; BLOCK_BYTES],
+    buffered: u8,
+    total_bits: u64,
+    backend: HasherBackend,
+}
+
+/// SHA-256 backend selected for a streaming [`Hasher`] instance.
+///
+/// The variant is decided once at [`Hasher::new`] via the same runtime feature
+/// detection used by the one-shot dispatcher; subsequent updates pay no
+/// per-call detection cost.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HasherBackend {
+    /// Portable scalar fallback. Always available.
+    Scalar,
+    /// x86 SHA-NI (`sha` + `sse4.1` + `ssse3`).
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    Shani,
+    /// AArch64 FEAT_SHA2 (`sha2`).
+    #[cfg(target_arch = "aarch64")]
+    AArch64Sha2,
+}
+
+impl Default for Hasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Hasher {
+    /// Construct a fresh streaming SHA-256 hasher seeded with the FIPS 180-4
+    /// initial state. The fastest available backend is detected here and
+    /// cached on the struct so [`Hasher::update`] pays no dispatch cost.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            state: H0,
+            buffer: [0_u8; BLOCK_BYTES],
+            buffered: 0,
+            total_bits: 0,
+            backend: detect_backend(),
+        }
+    }
+
+    /// Returns the backend selected for this hasher instance.
+    #[must_use]
+    pub const fn backend(&self) -> HasherBackend {
+        self.backend
+    }
+
+    /// Reset the hasher to its initial state. Backend selection is preserved.
+    pub fn reset(&mut self) {
+        self.state = H0;
+        self.buffer = [0_u8; BLOCK_BYTES];
+        self.buffered = 0;
+        self.total_bits = 0;
+    }
+
+    /// Feed `bytes` into the hash. Calls may be of any length, including
+    /// empty.
+    pub fn update(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.total_bits = self
+            .total_bits
+            .wrapping_add((bytes.len() as u64).wrapping_mul(8));
+
+        let mut input = bytes;
+        let buffered = self.buffered as usize;
+
+        // 1. Top off any partially-filled buffer first.
+        if buffered != 0 {
+            let need = BLOCK_BYTES - buffered;
+            if input.len() < need {
+                self.buffer[buffered..buffered + input.len()].copy_from_slice(input);
+                self.buffered = (buffered + input.len()) as u8;
+                return;
+            }
+            self.buffer[buffered..BLOCK_BYTES].copy_from_slice(&input[..need]);
+            input = &input[need..];
+            self.buffered = 0;
+            // SAFETY: pointer is to a valid 64-byte array.
+            unsafe {
+                self.compress_buffer();
+            }
+        }
+
+        // 2. Compress whole 64-byte blocks straight from the input. Routing the
+        //    entire run through one `compress_blocks` call lets the HW backends
+        //    amortize state load/store across the chunk.
+        let full_blocks = input.len() / BLOCK_BYTES;
+        if full_blocks != 0 {
+            let consumed = full_blocks * BLOCK_BYTES;
+            // SAFETY: bounds checked above; the per-backend compress is gated
+            // by the runtime detection performed in `detect_backend()`.
+            unsafe {
+                self.compress_blocks_dispatch(input.as_ptr(), full_blocks);
+            }
+            input = &input[consumed..];
+        }
+
+        // 3. Stash any tail bytes for the next update / finalize.
+        if !input.is_empty() {
+            self.buffer[..input.len()].copy_from_slice(input);
+            self.buffered = input.len() as u8;
+        }
+    }
+
+    /// Consume the hasher and emit the 32-byte digest.
+    #[must_use]
+    pub fn finalize(mut self) -> [u8; DIGEST_BYTES] {
+        self.finalize_in_place()
+    }
+
+    /// Emit the digest and reset the hasher to its initial state. Useful for
+    /// hash-of-hash trees / Merkle constructions where the same hasher is
+    /// reused across many sibling digests.
+    pub fn finalize_reset(&mut self) -> [u8; DIGEST_BYTES] {
+        let digest = self.finalize_in_place();
+        self.reset();
+        digest
+    }
+
+    fn finalize_in_place(&mut self) -> [u8; DIGEST_BYTES] {
+        // Build the FIPS 180-4 padding into the existing buffer (plus, if
+        // needed, one extra block-sized scratch). The buffer already contains
+        // the unconsumed tail bytes; we append 0x80, zero-fill, and write the
+        // big-endian 64-bit bit length into the last 8 bytes of the final
+        // padding block.
+        let buffered = self.buffered as usize;
+        let mut last = [0_u8; BLOCK_BYTES * 2];
+        last[..buffered].copy_from_slice(&self.buffer[..buffered]);
+        last[buffered] = 0x80;
+
+        let total = if buffered + 1 + 8 <= BLOCK_BYTES {
+            BLOCK_BYTES
+        } else {
+            BLOCK_BYTES * 2
+        };
+        let length_off = total - 8;
+        last[length_off..total].copy_from_slice(&self.total_bits.to_be_bytes());
+
+        // Padding is small and rare (one or two blocks per finalize), so
+        // delegating to the scalar reference here keeps the per-backend code
+        // small without measurable cost.
+        let pad_block: &[u8; BLOCK_BYTES] = (&last[..BLOCK_BYTES])
+            .try_into()
+            .expect("BLOCK_BYTES slice");
+        kernels::scalar::compress(&mut self.state, pad_block);
+        if total == BLOCK_BYTES * 2 {
+            let pad2: &[u8; BLOCK_BYTES] = (&last[BLOCK_BYTES..total])
+                .try_into()
+                .expect("BLOCK_BYTES slice");
+            kernels::scalar::compress(&mut self.state, pad2);
+        }
+
+        let mut digest = [0_u8; DIGEST_BYTES];
+        for (i, word) in self.state.iter().enumerate() {
+            digest[i * 4..(i + 1) * 4].copy_from_slice(&word.to_be_bytes());
+        }
+        digest
+    }
+
+    /// Dispatch one full-block compress through the cached backend. Used to
+    /// flush the internal accumulator when it tops off mid-`update`.
+    ///
+    /// # Safety
+    ///
+    /// Requires that `self.backend` was selected by `detect_backend()`, which
+    /// performs the appropriate runtime feature check.
+    unsafe fn compress_buffer(&mut self) {
+        let ptr = self.buffer.as_ptr();
+        // SAFETY: backend matches a runtime-detected capability.
+        unsafe {
+            self.compress_blocks_dispatch(ptr, 1);
+        }
+    }
+
+    /// Dispatch `n_blocks` full-block compressions through the cached backend.
+    ///
+    /// # Safety
+    ///
+    /// `block_ptr` must point to at least `n_blocks * 64` readable bytes and
+    /// `self.backend` must match a runtime-detected capability.
+    unsafe fn compress_blocks_dispatch(&mut self, block_ptr: *const u8, n_blocks: usize) {
+        match self.backend {
+            HasherBackend::Scalar => {
+                for i in 0..n_blocks {
+                    // SAFETY: caller guarantees `block_ptr + i*64 + 63` is
+                    // readable.
+                    let block_ref: &[u8; BLOCK_BYTES] =
+                        unsafe { &*(block_ptr.add(i * BLOCK_BYTES).cast::<[u8; BLOCK_BYTES]>()) };
+                    kernels::scalar::compress(&mut self.state, block_ref);
+                }
+            }
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            HasherBackend::Shani => {
+                // SAFETY: backend variant is only stored when
+                // `kernels::x86_shani::is_available()` returned true.
+                unsafe {
+                    kernels::x86_shani::compress_blocks(&mut self.state, block_ptr, n_blocks);
+                }
+            }
+            #[cfg(target_arch = "aarch64")]
+            HasherBackend::AArch64Sha2 => {
+                // SAFETY: backend variant is only stored when
+                // `kernels::aarch64_sha2::is_available()` returned true.
+                unsafe {
+                    kernels::aarch64_sha2::compress_blocks(&mut self.state, block_ptr, n_blocks);
+                }
+            }
+        }
+    }
+}
+
+impl core::fmt::Debug for Hasher {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Avoid leaking partial-input bytes via Debug; only expose shape.
+        f.debug_struct("Hasher")
+            .field("backend", &self.backend)
+            .field("buffered", &self.buffered)
+            .field("total_bits", &self.total_bits)
+            .finish_non_exhaustive()
+    }
+}
+
+fn detect_backend() -> HasherBackend {
+    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        if kernels::x86_shani::is_available() {
+            return HasherBackend::Shani;
+        }
+    }
+    #[cfg(all(feature = "std", target_arch = "aarch64"))]
+    {
+        if kernels::aarch64_sha2::is_available() {
+            return HasherBackend::AArch64Sha2;
+        }
+    }
+    HasherBackend::Scalar
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{kernels, sha256};
+    use super::{Hasher, HasherBackend, kernels, sha256};
 
     fn hex(bytes: &[u8]) -> String {
         let mut s = String::with_capacity(bytes.len() * 2);
@@ -1114,5 +1450,191 @@ mod tests {
                 input.len(),
             );
         }
+    }
+
+    // ----- streaming Hasher tests -------------------------------------------
+
+    /// A pseudo-random byte stream for parameterized streaming tests. Same
+    /// LCG used by `examples/bench_compare.rs::make_random_bytes` so the
+    /// inputs match the calibration corpus.
+    fn random_bytes(n: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(n);
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        while out.len() < n {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            out.extend_from_slice(&state.to_le_bytes());
+        }
+        out.truncate(n);
+        out
+    }
+
+    #[test]
+    fn hasher_empty_matches_one_shot() {
+        let h = Hasher::new();
+        assert_eq!(h.finalize(), sha256(b""));
+    }
+
+    #[test]
+    fn hasher_single_call_matches_one_shot() {
+        let payload = b"the quick brown fox jumps over the lazy dog";
+        let mut h = Hasher::new();
+        h.update(payload);
+        assert_eq!(h.finalize(), sha256(payload));
+    }
+
+    #[test]
+    fn hasher_nist_abc_matches_one_shot() {
+        let mut h = Hasher::new();
+        h.update(b"abc");
+        assert_eq!(
+            hex(&h.finalize()),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn hasher_nist_two_block_matches_one_shot() {
+        let mut h = Hasher::new();
+        h.update(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq");
+        assert_eq!(
+            hex(&h.finalize()),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+    }
+
+    #[test]
+    fn hasher_chunked_matches_one_shot_for_all_chunk_sizes() {
+        // 100 KiB random payload, chunked into 1, 17, 64, 65, 1024-byte
+        // updates. Must produce the same digest as a single-shot call.
+        let payload = random_bytes(100 * 1024);
+        let expected = sha256(&payload);
+        for &chunk in &[1_usize, 17, 63, 64, 65, 127, 128, 1024, 4096] {
+            let mut h = Hasher::new();
+            for block in payload.chunks(chunk) {
+                h.update(block);
+            }
+            assert_eq!(h.finalize(), expected, "mismatch for chunk={chunk}");
+        }
+    }
+
+    #[test]
+    fn hasher_empty_updates_are_no_ops() {
+        let payload = b"hello, world";
+        let expected = sha256(payload);
+        let mut h = Hasher::new();
+        h.update(b"");
+        h.update(payload);
+        h.update(b"");
+        assert_eq!(h.finalize(), expected);
+    }
+
+    #[test]
+    fn hasher_finalize_reset_matches_finalize_then_new() {
+        let payload = b"reset me and try again";
+        let mut h = Hasher::new();
+        h.update(payload);
+        let d1 = h.finalize_reset();
+        assert_eq!(d1, sha256(payload));
+        // After reset, the hasher should produce the empty digest.
+        assert_eq!(h.clone().finalize(), sha256(b""));
+        h.update(payload);
+        assert_eq!(h.finalize(), d1);
+    }
+
+    #[test]
+    fn hasher_reset_clears_state() {
+        let mut h = Hasher::new();
+        h.update(b"garbage");
+        h.reset();
+        h.update(b"abc");
+        assert_eq!(h.finalize(), sha256(b"abc"));
+    }
+
+    /// All NIST § B and the long-stress vector via the streaming path.
+    #[test]
+    fn hasher_nist_vectors_stream() {
+        let vectors: &[(&[u8], &str)] = &[
+            (
+                b"",
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+            (
+                b"abc",
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            ),
+            (
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+                "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+            ),
+        ];
+        for (input, expected_hex) in vectors {
+            // Try every plausible chunking pattern.
+            for &chunk in &[1_usize, 7, 32, 56, 64] {
+                let mut h = Hasher::new();
+                for block in input.chunks(chunk) {
+                    h.update(block);
+                }
+                assert_eq!(
+                    hex(&h.finalize()),
+                    *expected_hex,
+                    "stream NIST vector mismatch for len={} chunk={}",
+                    input.len(),
+                    chunk,
+                );
+            }
+        }
+
+        // 10000 'a' bytes — the stress vector, fed in 1000-byte chunks.
+        let bytes = vec![b'a'; 10_000];
+        let mut h = Hasher::new();
+        for block in bytes.chunks(1000) {
+            h.update(block);
+        }
+        assert_eq!(
+            hex(&h.finalize()),
+            "27dd1f61b867b6a0f6e9d8a41c43231de52107e53ae424de8f847b821db4b711"
+        );
+    }
+
+    /// Force the streaming hasher onto every available backend and confirm
+    /// they all produce the bit-exact digest for the same chunked input.
+    #[test]
+    fn hasher_cross_backend_parity() {
+        let payload = random_bytes(8_192);
+        // Reference: scalar one-shot.
+        let expected = kernels::scalar::sha256(&payload);
+
+        // Every backend variant we can construct on this host.
+        let mut backends: Vec<HasherBackend> = vec![HasherBackend::Scalar];
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if kernels::x86_shani::is_available() {
+            backends.push(HasherBackend::Shani);
+        }
+        #[cfg(target_arch = "aarch64")]
+        if kernels::aarch64_sha2::is_available() {
+            backends.push(HasherBackend::AArch64Sha2);
+        }
+
+        for backend in backends {
+            for &chunk in &[1_usize, 17, 64, 65, 4096] {
+                let mut h = Hasher::new();
+                // Force the variant we want to exercise; new() picked the
+                // host's fastest, so we override here for parity coverage.
+                h.backend = backend;
+                for block in payload.chunks(chunk) {
+                    h.update(block);
+                }
+                assert_eq!(h.finalize(), expected, "backend={backend:?} chunk={chunk}");
+            }
+        }
+    }
+
+    #[test]
+    fn hasher_default_matches_new() {
+        let a = Hasher::default().finalize();
+        let b = Hasher::new().finalize();
+        assert_eq!(a, b);
     }
 }

@@ -13,6 +13,23 @@ pub mod kernels {
             super::super::crc32c_u32_scalar(seed, value)
         }
 
+        /// Software CRC32C over one byte. Pure-Rust polynomial step that
+        /// matches `_mm_crc32_u8` / `__crc32cb` bit-for-bit.
+        #[must_use]
+        #[inline]
+        pub fn crc32c_u8(seed: u32, value: u8) -> u32 {
+            super::super::crc32c_byte(seed, value)
+        }
+
+        /// Software CRC32C over a contiguous byte slice. Bit-exact with the
+        /// SSE4.2 / NEON `crc32c_bytes` siblings (Castagnoli polynomial
+        /// 0x1EDC6F41) so the streaming [`super::super::Crc32cHasher`] is
+        /// portable across backends.
+        #[must_use]
+        pub fn crc32c_bytes(seed: u32, bytes: &[u8]) -> u32 {
+            super::super::crc32c_bytes_scalar(seed, bytes)
+        }
+
         /// Counts 4-grams into a CRC32C-hashed fixed bin array.
         pub fn crc32_hash4_bins<const BINS: usize>(bytes: &[u8], bins: &mut [u32; BINS]) {
             super::super::crc32_hash4_bins_with(bytes, bins, crc32c_u32);
@@ -112,6 +129,86 @@ pub mod kernels {
             {
                 core::arch::x86_64::_mm_crc32_u32(seed, value)
             }
+        }
+
+        /// Hardware CRC32C over one byte (`_mm_crc32_u8`).
+        ///
+        /// Used by the streaming [`super::super::Crc32cHasher`] tail and by any
+        /// caller that needs to feed unaligned head/tail bytes into a wider
+        /// CRC32C pipeline.
+        ///
+        /// # Safety
+        ///
+        /// The caller must ensure that SSE4.2 is available on the current CPU.
+        #[must_use]
+        #[target_feature(enable = "sse4.2")]
+        pub unsafe fn crc32c_u8(seed: u32, value: u8) -> u32 {
+            #[cfg(target_arch = "x86")]
+            {
+                core::arch::x86::_mm_crc32_u8(seed, value)
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                core::arch::x86_64::_mm_crc32_u8(seed, value)
+            }
+        }
+
+        /// Hardware CRC32C over a 64-bit word. Two CRC32C polynomial steps in
+        /// one instruction; preferred for the body of [`crc32c_bytes`].
+        ///
+        /// # Safety
+        ///
+        /// The caller must ensure that SSE4.2 is available on the current CPU.
+        /// Only available on `x86_64`.
+        #[cfg(target_arch = "x86_64")]
+        #[must_use]
+        #[target_feature(enable = "sse4.2")]
+        pub unsafe fn crc32c_u64(seed: u64, value: u64) -> u64 {
+            core::arch::x86_64::_mm_crc32_u64(seed, value)
+        }
+
+        /// CRC32C over a contiguous byte slice, suitable for streaming.
+        ///
+        /// Processes 8-byte groups via `_mm_crc32_u64` on `x86_64`, falling
+        /// back to `_mm_crc32_u32` and `_mm_crc32_u8` for the head/tail. The
+        /// result is bit-exact with the scalar table-style reference
+        /// [`super::super::crc32c_bytes`].
+        ///
+        /// # Safety
+        ///
+        /// The caller must ensure SSE4.2 is available on the current CPU.
+        #[must_use]
+        #[target_feature(enable = "sse4.2")]
+        pub unsafe fn crc32c_bytes(seed: u32, bytes: &[u8]) -> u32 {
+            let mut crc = seed;
+            let mut input = bytes;
+
+            #[cfg(target_arch = "x86_64")]
+            {
+                let mut crc64 = u64::from(crc);
+                while input.len() >= 8 {
+                    let value = u64::from_le_bytes([
+                        input[0], input[1], input[2], input[3], input[4], input[5], input[6],
+                        input[7],
+                    ]);
+                    // SAFETY: caller guarantees SSE4.2.
+                    crc64 = unsafe { crc32c_u64(crc64, value) };
+                    input = &input[8..];
+                }
+                crc = crc64 as u32;
+            }
+
+            while input.len() >= 4 {
+                let value = u32::from_le_bytes([input[0], input[1], input[2], input[3]]);
+                // SAFETY: caller guarantees SSE4.2.
+                crc = unsafe { crc32c_u32(crc, value) };
+                input = &input[4..];
+            }
+            for &b in input {
+                // SAFETY: caller guarantees SSE4.2.
+                crc = unsafe { crc32c_u8(crc, b) };
+            }
+            crc
         }
 
         /// Counts 4-grams into a CRC32C-hashed fixed bin array.
@@ -273,7 +370,7 @@ pub mod kernels {
     /// is the same Castagnoli polynomial 0x1EDC6F41 across all backends).
     #[cfg(all(feature = "neon", target_arch = "aarch64"))]
     pub mod neon {
-        use core::arch::aarch64::__crc32cw;
+        use core::arch::aarch64::{__crc32cb, __crc32cd, __crc32cw};
 
         /// Returns true when the NEON CRC32C kernel is available.
         ///
@@ -312,6 +409,72 @@ pub mod kernels {
         #[target_feature(enable = "crc")]
         pub unsafe fn crc32c_u32(seed: u32, value: u32) -> u32 {
             __crc32cw(seed, value)
+        }
+
+        /// Hardware CRC32C over one byte (`__crc32cb`).
+        ///
+        /// Used by the streaming [`super::super::Crc32cHasher`] tail and by
+        /// any caller that needs to feed unaligned head/tail bytes into a
+        /// wider CRC32C pipeline.
+        ///
+        /// # Safety
+        ///
+        /// The caller must ensure that the FEAT_CRC32 (`crc`) extension is
+        /// available on the current CPU.
+        #[must_use]
+        #[target_feature(enable = "crc")]
+        pub unsafe fn crc32c_u8(seed: u32, value: u8) -> u32 {
+            __crc32cb(seed, value)
+        }
+
+        /// Hardware CRC32C over a 64-bit word (`__crc32cd`). One CRC32C step
+        /// over an 8-byte chunk; preferred for the body of [`crc32c_bytes`].
+        ///
+        /// # Safety
+        ///
+        /// The caller must ensure that the FEAT_CRC32 (`crc`) extension is
+        /// available on the current CPU.
+        #[must_use]
+        #[target_feature(enable = "crc")]
+        pub unsafe fn crc32c_u64(seed: u32, value: u64) -> u32 {
+            __crc32cd(seed, value)
+        }
+
+        /// CRC32C over a contiguous byte slice, suitable for streaming.
+        ///
+        /// Processes 8-byte groups via `__crc32cd`, falling back to
+        /// `__crc32cw` for a 4-byte step and `__crc32cb` for the last 0-3
+        /// bytes. The result is bit-exact with the scalar table-style
+        /// reference [`super::super::crc32c_bytes`].
+        ///
+        /// # Safety
+        ///
+        /// The caller must ensure that the FEAT_CRC32 (`crc`) extension is
+        /// available on the current CPU.
+        #[must_use]
+        #[target_feature(enable = "crc")]
+        pub unsafe fn crc32c_bytes(seed: u32, bytes: &[u8]) -> u32 {
+            let mut crc = seed;
+            let mut input = bytes;
+            while input.len() >= 8 {
+                let value = u64::from_le_bytes([
+                    input[0], input[1], input[2], input[3], input[4], input[5], input[6], input[7],
+                ]);
+                // SAFETY: caller guarantees `crc` extension.
+                crc = unsafe { crc32c_u64(crc, value) };
+                input = &input[8..];
+            }
+            if input.len() >= 4 {
+                let value = u32::from_le_bytes([input[0], input[1], input[2], input[3]]);
+                // SAFETY: caller guarantees `crc` extension.
+                crc = unsafe { crc32c_u32(crc, value) };
+                input = &input[4..];
+            }
+            for &b in input {
+                // SAFETY: caller guarantees `crc` extension.
+                crc = unsafe { crc32c_u8(crc, b) };
+            }
+            crc
         }
 
         /// Counts 4-grams into a CRC32C-hashed fixed bin array.
@@ -734,6 +897,189 @@ fn crc32c_byte(seed: u32, byte: u8) -> u32 {
     crc
 }
 
+/// Pure-software CRC32C over a byte slice. The 4-byte / 1-byte split mirrors
+/// the SSE4.2 / NEON `crc32c_bytes` so all backends produce bit-exact output
+/// for the same `(seed, bytes)` pair.
+#[inline]
+fn crc32c_bytes_scalar(seed: u32, bytes: &[u8]) -> u32 {
+    let mut crc = seed;
+    let mut input = bytes;
+    while input.len() >= 4 {
+        let value = u32::from_le_bytes([input[0], input[1], input[2], input[3]]);
+        crc = crc32c_u32_scalar(crc, value);
+        input = &input[4..];
+    }
+    for &b in input {
+        crc = crc32c_byte(crc, b);
+    }
+    crc
+}
+
+/// CRC32C over a contiguous byte slice using the fastest available backend.
+///
+/// Output is bit-exact across scalar, SSE4.2, and NEON backends (Castagnoli
+/// polynomial 0x1EDC6F41). Use [`Crc32cHasher`] for incremental / streaming
+/// inputs.
+#[must_use]
+pub fn crc32c_bytes(seed: u32, bytes: &[u8]) -> u32 {
+    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        if kernels::sse42::is_available() {
+            // SAFETY: availability checked above.
+            return unsafe { kernels::sse42::crc32c_bytes(seed, bytes) };
+        }
+    }
+    #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+    {
+        if kernels::neon::is_available() {
+            // SAFETY: availability checked above.
+            return unsafe { kernels::neon::crc32c_bytes(seed, bytes) };
+        }
+    }
+    crc32c_bytes_scalar(seed, bytes)
+}
+
+/// Streaming CRC32C hasher.
+///
+/// Bytes can arrive in any-sized chunks via [`Crc32cHasher::update`]; the
+/// running CRC32C state is folded forward by the per-backend `crc32c_bytes`
+/// kernel selected at construction. Output is bit-exact with the one-shot
+/// [`crc32c_bytes`] entry point regardless of how the input is split, and
+/// bit-exact across the scalar / SSE4.2 / NEON backends (all use the
+/// Castagnoli polynomial 0x1EDC6F41).
+///
+/// This is the right primitive for FUSE-style write paths where bytes
+/// arrive in 4 KiB-ish chunks rather than as a single slice.
+///
+/// ## Convention
+///
+/// `Crc32cHasher` follows the **raw** Castagnoli CRC convention used
+/// elsewhere in this module: no implicit initial XOR with `0xFFFFFFFF`, no
+/// final complement. To reproduce the standard / iSCSI CRC32C value
+/// (e.g. RFC 3720 Appendix B.4: `crc32c("123456789") == 0xE3069283`),
+/// seed with `!0` and complement the output:
+///
+/// ```
+/// use tokenfs_algos::sketch::Crc32cHasher;
+/// let mut h = Crc32cHasher::with_seed(!0_u32);
+/// h.update(b"123456789");
+/// assert_eq!(h.finalize() ^ !0_u32, 0xE306_9283);
+/// ```
+#[derive(Clone, Debug)]
+pub struct Crc32cHasher {
+    state: u32,
+    backend: Crc32cBackend,
+}
+
+/// CRC32C backend selected for a streaming [`Crc32cHasher`] instance.
+///
+/// Decided once at construction via the same runtime feature detection used by
+/// the one-shot dispatcher; subsequent updates pay no per-call detection cost.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Crc32cBackend {
+    /// Portable scalar fallback. Always available.
+    Scalar,
+    /// x86 SSE4.2 (`_mm_crc32_u32` / `_mm_crc32_u64`). Only constructible
+    /// when the `std` feature is enabled (runtime detection requires
+    /// `std::is_x86_feature_detected!`).
+    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+    Sse42,
+    /// AArch64 FEAT_CRC32 (`__crc32cw` / `__crc32cd`). Only constructible
+    /// when the `neon` cargo feature is enabled.
+    #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+    Neon,
+}
+
+impl Default for Crc32cHasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Crc32cHasher {
+    /// Construct a fresh streaming CRC32C hasher with `state = 0`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_seed(0)
+    }
+
+    /// Construct a fresh streaming CRC32C hasher with the given seed.
+    ///
+    /// Useful for chaining hashers where the previous output is used as the
+    /// next seed (e.g., to compute the CRC32C of a logically-concatenated
+    /// sequence of disjoint slices).
+    #[must_use]
+    pub fn with_seed(seed: u32) -> Self {
+        Self {
+            state: seed,
+            backend: detect_crc32c_backend(),
+        }
+    }
+
+    /// Returns the backend selected for this hasher instance.
+    #[must_use]
+    pub const fn backend(&self) -> Crc32cBackend {
+        self.backend
+    }
+
+    /// Reset the running CRC32C state to zero. Backend selection preserved.
+    pub fn reset(&mut self) {
+        self.state = 0;
+    }
+
+    /// Feed `bytes` into the running CRC32C.
+    pub fn update(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.state = match self.backend {
+            Crc32cBackend::Scalar => crc32c_bytes_scalar(self.state, bytes),
+            #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+            Crc32cBackend::Sse42 => {
+                // SAFETY: variant only stored when `is_available` returned true.
+                unsafe { kernels::sse42::crc32c_bytes(self.state, bytes) }
+            }
+            #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+            Crc32cBackend::Neon => {
+                // SAFETY: variant only stored when `is_available` returned true.
+                unsafe { kernels::neon::crc32c_bytes(self.state, bytes) }
+            }
+        };
+    }
+
+    /// Consume the hasher and return the running CRC32C value.
+    #[must_use]
+    pub fn finalize(self) -> u32 {
+        self.state
+    }
+
+    /// Peek at the running CRC32C without consuming the hasher.
+    ///
+    /// Equivalent to `finalize()` but leaves the hasher available for further
+    /// updates; useful for emitting checkpoints in a streaming write path.
+    #[must_use]
+    pub const fn current(&self) -> u32 {
+        self.state
+    }
+}
+
+#[inline]
+fn detect_crc32c_backend() -> Crc32cBackend {
+    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        if kernels::sse42::is_available() {
+            return Crc32cBackend::Sse42;
+        }
+    }
+    #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+    {
+        if kernels::neon::is_available() {
+            return Crc32cBackend::Neon;
+        }
+    }
+    Crc32cBackend::Scalar
+}
+
 /// Counts 4-grams into a CRC32C-hashed fixed bin array.
 ///
 /// On SSE4.2 hosts, dispatches to the pipelined kernel that issues 4
@@ -951,9 +1297,9 @@ pub fn concentration_ratio_u32(counts: &[u32], total: u64) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        CLog2Lut, CountMinSketch, HashBinSketch, MisraGries, concentration_ratio_u32,
-        crc32_hash_ngram_bins, crc32_hash2_bins, crc32_hash4_bins, entropy_from_counts_u32,
-        entropy_from_counts_u32_lut, top_k_coverage_u32,
+        CLog2Lut, CountMinSketch, Crc32cBackend, Crc32cHasher, HashBinSketch, MisraGries,
+        concentration_ratio_u32, crc32_hash_ngram_bins, crc32_hash2_bins, crc32_hash4_bins,
+        crc32c_bytes, entropy_from_counts_u32, entropy_from_counts_u32_lut, top_k_coverage_u32,
     };
 
     #[test]
@@ -1117,5 +1463,182 @@ mod tests {
             super::kernels::neon::crc32_hash4_bins(payload, &mut neon_4k);
         }
         assert_eq!(scalar_4k, neon_4k);
+    }
+
+    // ----- streaming Crc32cHasher tests --------------------------------------
+
+    fn random_bytes(n: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(n);
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        while out.len() < n {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            out.extend_from_slice(&state.to_le_bytes());
+        }
+        out.truncate(n);
+        out
+    }
+
+    /// Raw CRC32C of the canonical "123456789" input, computed with the
+    /// "raw" convention used throughout this module (no init complement, no
+    /// final complement). The standard / iSCSI CRC32C check value is
+    /// `0xE3069283`; that value can be reproduced by seeding with `!0` and
+    /// complementing the output (see [`nist_iscsi_crc32c_check_value`]).
+    ///
+    /// The raw value here was cross-checked against the same scalar polynomial
+    /// implemented in Python; SSE4.2 and NEON parity is verified separately
+    /// via [`crc32c_cross_backend_parity`].
+    #[test]
+    fn raw_crc32c_check_value() {
+        assert_eq!(crc32c_bytes(0, b"123456789"), 0x58E3_FA20);
+        let mut h = Crc32cHasher::new();
+        h.update(b"123456789");
+        assert_eq!(h.finalize(), 0x58E3_FA20);
+    }
+
+    /// Standard / iSCSI CRC32C check value from RFC 3720 Appendix B.4 /
+    /// CRC-32C/ISCSI: `crc32c("123456789") == 0xE3069283` when seeded with
+    /// `0xFFFFFFFF` and final-complemented. This proves the streaming hasher
+    /// can reproduce the canonical convention by wrapping it appropriately.
+    #[test]
+    fn nist_iscsi_crc32c_check_value() {
+        let mut h = Crc32cHasher::with_seed(!0_u32);
+        h.update(b"123456789");
+        assert_eq!(h.finalize() ^ !0_u32, 0xE306_9283);
+    }
+
+    #[test]
+    fn empty_streaming_crc32c_is_seed() {
+        let h = Crc32cHasher::new();
+        assert_eq!(h.finalize(), 0);
+        let h = Crc32cHasher::with_seed(0xdead_beef);
+        assert_eq!(h.finalize(), 0xdead_beef);
+    }
+
+    #[test]
+    fn crc32c_streaming_matches_one_shot_for_all_chunk_sizes() {
+        let payload = random_bytes(64 * 1024);
+        let expected = crc32c_bytes(0, &payload);
+        for &chunk in &[1_usize, 7, 17, 64, 65, 1024, 4096] {
+            let mut h = Crc32cHasher::new();
+            for block in payload.chunks(chunk) {
+                h.update(block);
+            }
+            assert_eq!(h.finalize(), expected, "mismatch for chunk={chunk}");
+        }
+    }
+
+    #[test]
+    fn crc32c_streaming_matches_one_shot_with_seed() {
+        let payload = random_bytes(8 * 1024);
+        let seed = 0xCAFE_F00D_u32;
+        let expected = crc32c_bytes(seed, &payload);
+        let mut h = Crc32cHasher::with_seed(seed);
+        for block in payload.chunks(123) {
+            h.update(block);
+        }
+        assert_eq!(h.finalize(), expected);
+    }
+
+    #[test]
+    fn crc32c_current_does_not_consume() {
+        let mut h = Crc32cHasher::new();
+        h.update(b"abc");
+        let snap = h.current();
+        h.update(b"");
+        assert_eq!(h.current(), snap);
+        h.update(b"def");
+        let final_value = h.finalize();
+        assert_eq!(final_value, crc32c_bytes(0, b"abcdef"));
+    }
+
+    #[test]
+    fn crc32c_reset_returns_to_zero() {
+        let mut h = Crc32cHasher::new();
+        h.update(b"poison");
+        h.reset();
+        assert_eq!(h.current(), 0);
+        h.update(b"123456789");
+        // Raw CRC32C value (no init/final XOR); see [`raw_crc32c_check_value`]
+        // for context on why this differs from the iSCSI 0xE3069283.
+        assert_eq!(h.finalize(), 0x58E3_FA20);
+    }
+
+    /// Force the streaming hasher onto every available backend and confirm
+    /// they all produce the same CRC32C for the same chunked input.
+    #[test]
+    fn crc32c_cross_backend_parity() {
+        let payload = random_bytes(8_192);
+        let expected = super::crc32c_bytes_scalar(0, &payload);
+
+        let mut backends: Vec<Crc32cBackend> = vec![Crc32cBackend::Scalar];
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if super::kernels::sse42::is_available() {
+            backends.push(Crc32cBackend::Sse42);
+        }
+        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+        if super::kernels::neon::is_available() {
+            backends.push(Crc32cBackend::Neon);
+        }
+
+        for backend in backends {
+            for &chunk in &[1_usize, 17, 64, 65, 4096] {
+                let mut h = Crc32cHasher::new();
+                h.backend = backend;
+                for block in payload.chunks(chunk) {
+                    h.update(block);
+                }
+                assert_eq!(h.finalize(), expected, "backend={backend:?} chunk={chunk}");
+            }
+        }
+    }
+
+    #[test]
+    fn crc32c_default_matches_new() {
+        assert_eq!(
+            Crc32cHasher::default().finalize(),
+            Crc32cHasher::new().finalize()
+        );
+    }
+
+    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+    #[test]
+    fn sse42_crc32c_bytes_matches_scalar() {
+        if !super::kernels::sse42::is_available() {
+            return;
+        }
+        let payload = random_bytes(1024);
+        let scalar = super::crc32c_bytes_scalar(0, &payload);
+        // SAFETY: availability checked above.
+        let sse = unsafe { super::kernels::sse42::crc32c_bytes(0, &payload) };
+        assert_eq!(scalar, sse);
+        // Various lengths exercise the head/body/tail code paths
+        // (8-byte loop on x86_64, 4-byte step, 1-byte tail).
+        for len in [0_usize, 1, 3, 4, 5, 7, 8, 9, 16, 31, 32, 33, 100, 1023] {
+            let s = super::crc32c_bytes_scalar(0xdead, &payload[..len]);
+            // SAFETY: availability checked above.
+            let v = unsafe { super::kernels::sse42::crc32c_bytes(0xdead, &payload[..len]) };
+            assert_eq!(s, v, "len={len}");
+        }
+    }
+
+    #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+    #[test]
+    fn neon_crc32c_bytes_matches_scalar() {
+        if !super::kernels::neon::is_available() {
+            return;
+        }
+        let payload = random_bytes(1024);
+        let scalar = super::crc32c_bytes_scalar(0, &payload);
+        // SAFETY: availability checked above.
+        let neon = unsafe { super::kernels::neon::crc32c_bytes(0, &payload) };
+        assert_eq!(scalar, neon);
+        for len in [0_usize, 1, 3, 4, 5, 7, 8, 9, 16, 31, 32, 33, 100, 1023] {
+            let s = super::crc32c_bytes_scalar(0xdead, &payload[..len]);
+            // SAFETY: availability checked above.
+            let v = unsafe { super::kernels::neon::crc32c_bytes(0xdead, &payload[..len]) };
+            assert_eq!(s, v, "len={len}");
+        }
     }
 }

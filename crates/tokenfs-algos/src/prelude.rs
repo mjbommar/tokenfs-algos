@@ -27,6 +27,7 @@ pub use crate::hash::blake3::{
     BLOCK_BYTES as BLAKE3_BLOCK_BYTES, DIGEST_BYTES as BLAKE3_DIGEST_BYTES, Hasher as Blake3Hasher,
     blake3, blake3_derive_key, blake3_keyed, blake3_xof,
 };
+pub use crate::hash::sha256::{Hasher as Sha256Hasher, HasherBackend as Sha256HasherBackend};
 pub use crate::hash::{fnv1a64, mix64};
 pub use crate::histogram::{
     ByteHistogram, BytePairHistogram, BytePairScratch, HistogramBlockSignals, PlannedByteHistogram,
@@ -44,5 +45,9 @@ pub use crate::search::shift_or::ShiftOr;
 pub use crate::search::two_way::TwoWay;
 pub use crate::selector::{RepresentationHint, SelectorSignals};
 pub use crate::similarity::fuzzy::{ctph, tlsh_like};
-pub use crate::sketch::{CLog2Lut, CountMinSketch, HashBinSketch, MisraGries};
+pub use crate::similarity::minhash::IncrementalSignature as MinHashIncrementalSignature;
+pub use crate::sketch::{
+    CLog2Lut, CountMinSketch, Crc32cBackend, Crc32cHasher, HashBinSketch, MisraGries, crc32c_bytes,
+    crc32c_u32,
+};
 pub use crate::structure::StructureSummary;
