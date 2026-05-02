@@ -216,6 +216,75 @@ pub mod avx2 {
         unsafe { _mm256_storeu_si256(sig.as_mut_ptr().cast::<__m256i>(), sig_lo) };
         unsafe { _mm256_storeu_si256(sig.as_mut_ptr().add(4).cast::<__m256i>(), sig_hi) };
     }
+
+    /// Vectorized K-min `MinHash` update for general `K` on AVX2.
+    ///
+    /// Iterates the `K` slots in groups of 4 — each group is one
+    /// 32-byte `_mm256_loadu_si256` (loading four contiguous u64
+    /// hashes from `table[b][group_start..group_start+4]`) followed by
+    /// an unsigned-64 lane-wise min reduction into the running
+    /// signature vector for that group. Tail slots (when `K % 4 != 0`)
+    /// fall back to scalar updates per byte.
+    ///
+    /// **Why direct loads instead of `vpgatherqq`:** the per-byte K
+    /// slot indices are always sequential (0, 1, 2, ..., K-1), so a
+    /// scalar gather degenerates to a contiguous load. `vpgatherqq` is
+    /// micro-op-bound on Alder Lake, Zen 3, and Zen 4 — direct loads
+    /// retire ~2-4× faster on those parts. The 8-way kernel
+    /// [`update_minhash_8way`] is kept gather-based for ABI continuity
+    /// (it's been shipped) and for the parity test it provides on
+    /// CPUs where gather is competitive.
+    ///
+    /// `K` is a const generic so the compiler unrolls the per-group
+    /// loop and propagates the per-row stride constant.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure AVX2 is available at runtime.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn update_minhash_kway<const K: usize>(
+        bytes: &[u8],
+        table: &[[u64; K]; TABLE_ROWS],
+        sig: &mut [u64; K],
+    ) {
+        // Process slots 4 at a time.
+        let groups = K / 4;
+        let tail = K - groups * 4;
+
+        for &b in bytes {
+            // SAFETY: 0 <= b < 256; row stays inside the table allocation.
+            let row_ptr = unsafe { table.as_ptr().add(b as usize).cast::<u64>() };
+
+            // Vectorised groups of 4 — direct loads.
+            for g in 0..groups {
+                let base = g * 4;
+                // SAFETY: row is K × u64 = 8K bytes; load 32 bytes at
+                // `base * 8` byte offset, which is within the row.
+                let v = unsafe { _mm256_loadu_si256(row_ptr.add(base).cast::<__m256i>()) };
+                // SAFETY: 4 u64 = 32 writable bytes at sig[base..base+4].
+                let cur = unsafe { _mm256_loadu_si256(sig.as_ptr().add(base).cast::<__m256i>()) };
+                // SAFETY: AVX2 enabled.
+                let merged = unsafe { min_epu64_avx2(cur, v) };
+                // SAFETY: as above.
+                unsafe {
+                    _mm256_storeu_si256(sig.as_mut_ptr().add(base).cast::<__m256i>(), merged);
+                };
+            }
+
+            // Scalar tail for the up-to-3 leftover slots when K is not
+            // a multiple of 4.
+            if tail > 0 {
+                let row = unsafe { &*table.as_ptr().add(b as usize) };
+                let base = groups * 4;
+                for k in base..K {
+                    let h = row[k];
+                    if h < sig[k] {
+                        sig[k] = h;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// AVX-512 gather-based K-min `MinHash` update.
@@ -289,6 +358,215 @@ pub mod avx512 {
 
         // SAFETY: AVX-512F enabled; `sig` is 64 writable bytes.
         unsafe { _mm512_storeu_si512(sig.as_mut_ptr().cast::<__m512i>(), acc) };
+    }
+
+    /// Vectorized K-min `MinHash` update for general `K` on AVX-512.
+    ///
+    /// Iterates the `K` slots in groups of 8 — each group is one
+    /// 64-byte `_mm512_loadu_si512` (loading eight contiguous u64
+    /// hashes from `table[b][group_start..group_start+8]`) followed by
+    /// `_mm512_min_epu64`. Tail slots (when `K % 8 != 0`) fall back to
+    /// scalar updates.
+    ///
+    /// **Why direct loads instead of `vpgatherqq`:** the per-byte K
+    /// slot indices are always sequential (0, 1, 2, ..., K-1), so a
+    /// scalar gather degenerates to a contiguous 64-byte load.
+    /// `vpgatherqq` micro-op throughput is far below a contiguous
+    /// `vmovdqu64` on every shipping AVX-512 micro-arch (Ice Lake,
+    /// Sapphire Rapids, Tiger Lake, Zen 4) — the direct load is
+    /// strictly faster.
+    ///
+    /// `K` is a const generic so the compiler unrolls the per-group
+    /// loop and propagates the per-row stride constant. For
+    /// `K ∈ {16, 32, 64, 128, 256}` the unrolled inner loop is two,
+    /// four, eight, sixteen, or thirty-two load + min pairs per byte.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure AVX-512F is available at runtime.
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn update_minhash_kway<const K: usize>(
+        bytes: &[u8],
+        table: &[[u64; K]; TABLE_ROWS],
+        sig: &mut [u64; K],
+    ) {
+        let groups = K / 8;
+        let tail = K - groups * 8;
+
+        for &b in bytes {
+            // SAFETY: 0 <= b < 256; row stays inside the table allocation.
+            let row_ptr = unsafe { table.as_ptr().add(b as usize).cast::<u64>() };
+
+            for g in 0..groups {
+                let base = g * 8;
+                // SAFETY: row is K × u64 (8K bytes); load 64 bytes at
+                // `base * 8` byte offset, which is within the row.
+                let v = unsafe { _mm512_loadu_si512(row_ptr.add(base).cast::<__m512i>()) };
+                // SAFETY: 8 u64 = 64 writable bytes at sig[base..base+8].
+                let cur = unsafe { _mm512_loadu_si512(sig.as_ptr().add(base).cast::<__m512i>()) };
+                let merged = _mm512_min_epu64(cur, v);
+                // SAFETY: as above.
+                unsafe {
+                    _mm512_storeu_si512(sig.as_mut_ptr().add(base).cast::<__m512i>(), merged);
+                };
+            }
+
+            // Scalar tail for the up-to-7 leftover slots.
+            if tail > 0 {
+                let row = unsafe { &*table.as_ptr().add(b as usize) };
+                let base = groups * 8;
+                for k in base..K {
+                    let h = row[k];
+                    if h < sig[k] {
+                        sig[k] = h;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// AArch64 NEON gather-based K-min `MinHash` update.
+///
+/// NEON has no scatter-gather instruction; instead we lean on the row
+/// being a contiguous `[u64; K]` and load it in 128-bit chunks
+/// (`vld1q_u64` — 2 × u64 per load) followed by a synthesized
+/// lane-wise unsigned-64 minimum. The result is bit-identical with
+/// the AVX2 / AVX-512 paths.
+///
+/// AArch64 has no `vminq_u64` intrinsic in stable Rust; we synthesize
+/// it from `vcgtq_u64` (lane-wise unsigned greater-than → mask) and
+/// `vbslq_u64` (bitwise select) — two cycles per pair of u64 lanes,
+/// the same shape as the AVX2 fallback that emulates `_mm256_min_epu64`.
+#[cfg(all(feature = "neon", target_arch = "aarch64"))]
+pub mod neon {
+    use super::TABLE_ROWS;
+
+    use core::arch::aarch64::{uint64x2_t, vbslq_u64, vcgtq_u64, vld1q_u64, vst1q_u64};
+
+    /// Returns true when NEON is available at runtime.
+    ///
+    /// NEON is mandatory on AArch64; this exists for API symmetry with
+    /// the x86 `is_available` helpers.
+    #[must_use]
+    pub const fn is_available() -> bool {
+        true
+    }
+
+    /// Synthesized lane-wise unsigned 64-bit minimum on AArch64.
+    ///
+    /// AArch64 stable Rust exposes `vminq_u32` but not `vminq_u64`.
+    /// We use `vcgtq_u64(a, b)` which produces 0xFFFF... per lane where
+    /// `a > b` (unsigned), then `vbslq_u64(mask, b, a)` selects `b`
+    /// where the mask is set (the smaller of the pair).
+    ///
+    /// # Safety
+    ///
+    /// NEON is mandatory on AArch64; the helper is `#[inline]` so the
+    /// caller's `target_feature` propagates.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    unsafe fn min_u64x2(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
+        // mask lanes where a > b unsigned.
+        let mask = vcgtq_u64(a, b);
+        // bsl: if mask bit set, take b; else take a.
+        vbslq_u64(mask, b, a)
+    }
+
+    /// Vectorized K-min `MinHash` update for `K = 8` using NEON.
+    ///
+    /// Each input byte triggers four 128-bit `vld1q_u64` loads from
+    /// `table[b]` (covering all 8 u64 slots) and four lane-wise
+    /// minimum reductions into the running signature.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure NEON is available (always true on
+    /// AArch64) and that `sig` and `table` outlive the call.
+    #[target_feature(enable = "neon")]
+    pub unsafe fn update_minhash_8way(
+        bytes: &[u8],
+        table: &[[u64; 8]; TABLE_ROWS],
+        sig: &mut [u64; 8],
+    ) {
+        // Four 128-bit accumulators (2 × u64 each = 8 lanes total).
+        // SAFETY: `sig` is &mut [u64; 8] = 64 bytes; loads are 16-byte
+        // each from contiguous offsets 0/2/4/6.
+        let mut a0: uint64x2_t = unsafe { vld1q_u64(sig.as_ptr()) };
+        let mut a1: uint64x2_t = unsafe { vld1q_u64(sig.as_ptr().add(2)) };
+        let mut a2: uint64x2_t = unsafe { vld1q_u64(sig.as_ptr().add(4)) };
+        let mut a3: uint64x2_t = unsafe { vld1q_u64(sig.as_ptr().add(6)) };
+
+        for &b in bytes {
+            let row_ptr = unsafe { table.as_ptr().add(b as usize).cast::<u64>() };
+            // SAFETY: each row is 8 × u64 (64 bytes); loads cover the
+            // entire row in 4 × 16-byte halves.
+            let r0 = unsafe { vld1q_u64(row_ptr) };
+            let r1 = unsafe { vld1q_u64(row_ptr.add(2)) };
+            let r2 = unsafe { vld1q_u64(row_ptr.add(4)) };
+            let r3 = unsafe { vld1q_u64(row_ptr.add(6)) };
+            // SAFETY: NEON enabled by enclosing target_feature.
+            a0 = unsafe { min_u64x2(a0, r0) };
+            a1 = unsafe { min_u64x2(a1, r1) };
+            a2 = unsafe { min_u64x2(a2, r2) };
+            a3 = unsafe { min_u64x2(a3, r3) };
+        }
+
+        // SAFETY: 64 writable bytes at `sig`.
+        unsafe { vst1q_u64(sig.as_mut_ptr(), a0) };
+        unsafe { vst1q_u64(sig.as_mut_ptr().add(2), a1) };
+        unsafe { vst1q_u64(sig.as_mut_ptr().add(4), a2) };
+        unsafe { vst1q_u64(sig.as_mut_ptr().add(6), a3) };
+    }
+
+    /// Vectorized K-min `MinHash` update for general `K` using NEON.
+    ///
+    /// Iterates the `K` slots in groups of 2 — each group is one
+    /// `vld1q_u64` (loading two contiguous u64 hashes from
+    /// `table[b][group_start..group_start+2]`) followed by a
+    /// synthesised lane-wise minimum reduction. Tail slots (when `K`
+    /// is odd) fall back to scalar updates.
+    ///
+    /// `K` is a const generic so the compiler unrolls the per-group
+    /// loop and propagates the per-row stride constant.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure NEON is available (always true on
+    /// AArch64).
+    #[target_feature(enable = "neon")]
+    pub unsafe fn update_minhash_kway<const K: usize>(
+        bytes: &[u8],
+        table: &[[u64; K]; TABLE_ROWS],
+        sig: &mut [u64; K],
+    ) {
+        let groups = K / 2;
+        let tail = K - groups * 2;
+
+        for &b in bytes {
+            let row_ptr = unsafe { table.as_ptr().add(b as usize).cast::<u64>() };
+            for g in 0..groups {
+                let base = g * 2;
+                // SAFETY: row is K × u64; base + 2 <= K because g < K/2.
+                let r = unsafe { vld1q_u64(row_ptr.add(base)) };
+                // SAFETY: sig is K × u64 (8K bytes); load 16 bytes.
+                let cur = unsafe { vld1q_u64(sig.as_ptr().add(base)) };
+                // SAFETY: NEON enabled by enclosing target_feature.
+                let merged = unsafe { min_u64x2(cur, r) };
+                // SAFETY: 16 writable bytes at sig[base..base+2].
+                unsafe { vst1q_u64(sig.as_mut_ptr().add(base), merged) };
+            }
+            if tail > 0 {
+                let row = unsafe { &*table.as_ptr().add(b as usize) };
+                let base = groups * 2;
+                for k in base..K {
+                    let h = row[k];
+                    if h < sig[k] {
+                        sig[k] = h;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -494,8 +772,8 @@ pub mod simhash {
 ///
 /// Falls through to the scalar implementation when the requested SIMD
 /// path is unavailable. This is the entry point intended for library
-/// callers; the `avx2` / `avx512` modules above remain pinned for
-/// parity-testing and microbenchmarks.
+/// callers; the `avx2` / `avx512` / `neon` modules above remain pinned
+/// for parity-testing and microbenchmarks.
 pub fn update_minhash_8way_auto(bytes: &[u8], table: &[[u64; 8]; TABLE_ROWS], sig: &mut [u64; 8]) {
     #[cfg(all(feature = "avx512", any(target_arch = "x86", target_arch = "x86_64")))]
     {
@@ -513,7 +791,57 @@ pub fn update_minhash_8way_auto(bytes: &[u8], table: &[[u64; 8]; TABLE_ROWS], si
             return;
         }
     }
+    #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+    {
+        if neon::is_available() {
+            // SAFETY: NEON is mandatory on AArch64.
+            unsafe { neon::update_minhash_8way(bytes, table, sig) };
+            return;
+        }
+    }
     update_minhash_scalar::<8>(bytes, table, sig);
+}
+
+/// Auto-dispatched K-way K-min `MinHash` update for general `K`.
+///
+/// Picks AVX-512 → AVX2 → NEON → scalar in priority order based on
+/// runtime CPU detection, then dispatches the matching const-generic
+/// kernel. Bit-exact with [`update_minhash_scalar`] for every `K` and
+/// every input.
+///
+/// Use this entry point when `K` may vary at the call site; for
+/// `K = 8`, prefer [`update_minhash_8way_auto`] which avoids the
+/// const-generic indirection at the cost of a fixed signature width.
+pub fn update_minhash_kway_auto<const K: usize>(
+    bytes: &[u8],
+    table: &[[u64; K]; TABLE_ROWS],
+    sig: &mut [u64; K],
+) {
+    #[cfg(all(feature = "avx512", any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        if avx512::is_available() {
+            // SAFETY: availability checked above.
+            unsafe { avx512::update_minhash_kway::<K>(bytes, table, sig) };
+            return;
+        }
+    }
+    #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        if avx2::is_available() {
+            // SAFETY: availability checked above.
+            unsafe { avx2::update_minhash_kway::<K>(bytes, table, sig) };
+            return;
+        }
+    }
+    #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+    {
+        if neon::is_available() {
+            // SAFETY: NEON is mandatory on AArch64.
+            unsafe { neon::update_minhash_kway::<K>(bytes, table, sig) };
+            return;
+        }
+    }
+    update_minhash_scalar::<K>(bytes, table, sig);
 }
 
 #[cfg(test)]
@@ -633,5 +961,167 @@ mod tests {
             unsafe { avx512::update_minhash_8way(&bytes, &table, &mut s_avx512) };
             assert_eq!(s_scalar, s_avx512, "AVX-512 gather diverged at len={len}");
         }
+    }
+
+    /// Generic K-way scalar reference table-driven path matches a
+    /// per-byte hand-rolled K-min update across every documented `K`.
+    #[test]
+    fn scalar_kway_matches_per_byte_reference_k16_k32_k64() {
+        macro_rules! check_k {
+            ($k:literal) => {{
+                let seeds: [u64; $k] =
+                    core::array::from_fn(|i| 0xFACE_FEED_u64.wrapping_add(i as u64));
+                let table = build_table_from_seeds::<$k>(&seeds);
+                let bytes: Vec<u8> = (0..1024_usize)
+                    .map(|i| (i.wrapping_mul(7) ^ 0x42) as u8)
+                    .collect();
+                let mut s_scalar = [u64::MAX; $k];
+                update_minhash_scalar::<$k>(&bytes, &table, &mut s_scalar);
+
+                let mut expected = [u64::MAX; $k];
+                for &b in &bytes {
+                    for k in 0..$k {
+                        let h = crate::hash::mix_word((b as u64) ^ seeds[k]);
+                        if h < expected[k] {
+                            expected[k] = h;
+                        }
+                    }
+                }
+                assert_eq!(s_scalar, expected, "K={}", $k);
+            }};
+        }
+        check_k!(16);
+        check_k!(32);
+        check_k!(64);
+    }
+
+    #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+    #[test]
+    fn avx2_kway_matches_scalar_for_k16_k32_k64() {
+        if !avx2::is_available() {
+            eprintln!("AVX2 unavailable; skipping avx2 K-way gather parity test");
+            return;
+        }
+        macro_rules! check_k {
+            ($k:literal) => {{
+                let seeds: [u64; $k] =
+                    core::array::from_fn(|i| 0xCAFE_BABE_u64.wrapping_add(i as u64));
+                let table = build_table_from_seeds::<$k>(&seeds);
+                for len in [0_usize, 1, 7, 16, 64, 1024, 4096] {
+                    let bytes: Vec<u8> = (0..len)
+                        .map(|i| (i.wrapping_mul(31) ^ 0x5A) as u8)
+                        .collect();
+                    let mut s_scalar = [u64::MAX; $k];
+                    update_minhash_scalar::<$k>(&bytes, &table, &mut s_scalar);
+                    let mut s_avx2 = [u64::MAX; $k];
+                    // SAFETY: availability checked above.
+                    unsafe { avx2::update_minhash_kway::<$k>(&bytes, &table, &mut s_avx2) };
+                    assert_eq!(s_scalar, s_avx2, "AVX2 kway K={} len={}", $k, len);
+                }
+            }};
+        }
+        check_k!(16);
+        check_k!(32);
+        check_k!(64);
+    }
+
+    #[cfg(all(feature = "avx512", any(target_arch = "x86", target_arch = "x86_64")))]
+    #[test]
+    fn avx512_kway_matches_scalar_for_k16_k32_k64_k128() {
+        if !avx512::is_available() {
+            eprintln!("AVX-512F unavailable; skipping avx512 K-way gather parity test");
+            return;
+        }
+        macro_rules! check_k {
+            ($k:literal) => {{
+                let seeds: [u64; $k] =
+                    core::array::from_fn(|i| 0x9E37_79B9_u64.wrapping_add(i as u64));
+                let table = build_table_from_seeds::<$k>(&seeds);
+                for len in [0_usize, 1, 7, 16, 64, 1024, 4096] {
+                    let bytes: Vec<u8> = (0..len)
+                        .map(|i| (i.wrapping_mul(11) ^ 0xA5) as u8)
+                        .collect();
+                    let mut s_scalar = [u64::MAX; $k];
+                    update_minhash_scalar::<$k>(&bytes, &table, &mut s_scalar);
+                    let mut s_avx512 = [u64::MAX; $k];
+                    // SAFETY: availability checked above.
+                    unsafe { avx512::update_minhash_kway::<$k>(&bytes, &table, &mut s_avx512) };
+                    assert_eq!(s_scalar, s_avx512, "AVX-512 kway K={} len={}", $k, len);
+                }
+            }};
+        }
+        check_k!(16);
+        check_k!(32);
+        check_k!(64);
+        check_k!(128);
+    }
+
+    #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+    #[test]
+    fn neon_8way_matches_scalar() {
+        let seeds: [u64; 8] = core::array::from_fn(|i| 0xCAFE_BABE_u64 ^ (i as u64));
+        let table = build_table_from_seeds(&seeds);
+
+        for len in [0_usize, 1, 7, 16, 64, 1024, 4096, 65_535] {
+            let bytes: Vec<u8> = (0..len)
+                .map(|i| (i.wrapping_mul(31) ^ 0x5A) as u8)
+                .collect();
+            let mut s_scalar = [u64::MAX; 8];
+            update_minhash_scalar::<8>(&bytes, &table, &mut s_scalar);
+            let mut s_neon = [u64::MAX; 8];
+            // SAFETY: NEON is mandatory on AArch64.
+            unsafe { neon::update_minhash_8way(&bytes, &table, &mut s_neon) };
+            assert_eq!(s_scalar, s_neon, "NEON gather diverged at len={len}");
+        }
+    }
+
+    #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+    #[test]
+    fn neon_kway_matches_scalar_for_k16_k32_k64() {
+        macro_rules! check_k {
+            ($k:literal) => {{
+                let seeds: [u64; $k] =
+                    core::array::from_fn(|i| 0xBABE_FACE_u64.wrapping_add(i as u64));
+                let table = build_table_from_seeds::<$k>(&seeds);
+                for len in [0_usize, 1, 7, 16, 64, 1024, 4096] {
+                    let bytes: Vec<u8> = (0..len)
+                        .map(|i| (i.wrapping_mul(13) ^ 0xC3) as u8)
+                        .collect();
+                    let mut s_scalar = [u64::MAX; $k];
+                    update_minhash_scalar::<$k>(&bytes, &table, &mut s_scalar);
+                    let mut s_neon = [u64::MAX; $k];
+                    // SAFETY: NEON is mandatory on AArch64.
+                    unsafe { neon::update_minhash_kway::<$k>(&bytes, &table, &mut s_neon) };
+                    assert_eq!(s_scalar, s_neon, "NEON kway K={} len={}", $k, len);
+                }
+            }};
+        }
+        check_k!(16);
+        check_k!(32);
+        check_k!(64);
+    }
+
+    /// Auto dispatcher matches scalar across every K we benchmark.
+    #[test]
+    fn auto_kway_matches_scalar() {
+        macro_rules! check_k {
+            ($k:literal) => {{
+                let seeds: [u64; $k] =
+                    core::array::from_fn(|i| 0xDEAD_BEEF_u64.wrapping_add(i as u64));
+                let table = build_table_from_seeds::<$k>(&seeds);
+                let bytes: Vec<u8> = (0..2048_usize)
+                    .map(|i| (i.wrapping_mul(7) ^ 0xA5) as u8)
+                    .collect();
+                let mut s_scalar = [u64::MAX; $k];
+                update_minhash_scalar::<$k>(&bytes, &table, &mut s_scalar);
+                let mut s_auto = [u64::MAX; $k];
+                update_minhash_kway_auto::<$k>(&bytes, &table, &mut s_auto);
+                assert_eq!(s_scalar, s_auto, "auto K={}", $k);
+            }};
+        }
+        check_k!(8);
+        check_k!(16);
+        check_k!(32);
+        check_k!(64);
     }
 }

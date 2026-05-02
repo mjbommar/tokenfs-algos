@@ -2384,3 +2384,125 @@ fn avx512_approx_bloom_kernels_positions_match_scalar_on_size_grid() {
         }
     }
 }
+
+// =====================================================================
+// MinHash gather kernel parity (Sprint 45-46) — AVX2.
+// =====================================================================
+
+proptest! {
+    /// AVX2 `K = 16` K-way kernel: matches scalar reference exactly
+    /// across random byte streams.
+    #[test]
+    fn avx2_gather_minhash_kway_k16_matches_scalar(
+        bytes in proptest::collection::vec(any::<u8>(), 64..16_384),
+        seed_root in any::<u64>(),
+    ) {
+        if !avx2_available() {
+            return Ok(());
+        }
+        use tokenfs_algos::similarity::kernels_gather;
+        let seeds: [u64; 16] = core::array::from_fn(|i| seed_root.wrapping_add(i as u64));
+        let table = kernels_gather::build_table_from_seeds(&seeds);
+
+        let mut s_scalar = [u64::MAX; 16];
+        kernels_gather::update_minhash_scalar::<16>(&bytes, &table, &mut s_scalar);
+
+        let mut s_avx2 = [u64::MAX; 16];
+        // SAFETY: avx2_available() returned true above.
+        unsafe {
+            kernels_gather::avx2::update_minhash_kway::<16>(&bytes, &table, &mut s_avx2);
+        }
+        prop_assert_eq!(s_scalar, s_avx2);
+    }
+
+    /// AVX2 `K = 32` K-way kernel: matches scalar reference exactly.
+    #[test]
+    fn avx2_gather_minhash_kway_k32_matches_scalar(
+        bytes in proptest::collection::vec(any::<u8>(), 64..16_384),
+        seed_root in any::<u64>(),
+    ) {
+        if !avx2_available() {
+            return Ok(());
+        }
+        use tokenfs_algos::similarity::kernels_gather;
+        let seeds: [u64; 32] = core::array::from_fn(|i| seed_root.wrapping_add(i as u64));
+        let table = kernels_gather::build_table_from_seeds(&seeds);
+
+        let mut s_scalar = [u64::MAX; 32];
+        kernels_gather::update_minhash_scalar::<32>(&bytes, &table, &mut s_scalar);
+
+        let mut s_avx2 = [u64::MAX; 32];
+        // SAFETY: avx2_available() returned true above.
+        unsafe {
+            kernels_gather::avx2::update_minhash_kway::<32>(&bytes, &table, &mut s_avx2);
+        }
+        prop_assert_eq!(s_scalar, s_avx2);
+    }
+
+    /// `signature_simd<K>` top-level API parity: matches the per-byte
+    /// hand-rolled K-min reference at a representative `K` family
+    /// (8, 16, 32, 64, 128).
+    #[test]
+    fn minhash_signature_simd_matches_reference_k16(
+        bytes in proptest::collection::vec(any::<u8>(), 0..8_192),
+        seed_root in any::<u64>(),
+    ) {
+        use tokenfs_algos::similarity::minhash;
+        let seeds: [u64; 16] = core::array::from_fn(|i| seed_root.wrapping_add(i as u64));
+        let table = minhash::build_byte_table_from_seeds(&seeds);
+        let actual = minhash::signature_simd::<16>(&bytes, &table);
+
+        let mut expected = [u64::MAX; 16];
+        for &b in &bytes {
+            for k in 0..16 {
+                let h = tokenfs_algos::hash::mix_word((b as u64) ^ seeds[k]);
+                if h < expected[k] { expected[k] = h; }
+            }
+        }
+        prop_assert_eq!(actual.slots(), &expected);
+    }
+
+    #[test]
+    fn minhash_signature_simd_matches_reference_k32(
+        bytes in proptest::collection::vec(any::<u8>(), 0..8_192),
+        seed_root in any::<u64>(),
+    ) {
+        use tokenfs_algos::similarity::minhash;
+        let seeds: [u64; 32] = core::array::from_fn(|i| seed_root.wrapping_add(i as u64));
+        let table = minhash::build_byte_table_from_seeds(&seeds);
+        let actual = minhash::signature_simd::<32>(&bytes, &table);
+
+        let mut expected = [u64::MAX; 32];
+        for &b in &bytes {
+            for k in 0..32 {
+                let h = tokenfs_algos::hash::mix_word((b as u64) ^ seeds[k]);
+                if h < expected[k] { expected[k] = h; }
+            }
+        }
+        prop_assert_eq!(actual.slots(), &expected);
+    }
+
+    /// `signature_batch_simd<K>` matches per-slice `signature_simd`.
+    #[test]
+    fn minhash_signature_batch_simd_matches_per_slice(
+        slices in proptest::collection::vec(
+            proptest::collection::vec(any::<u8>(), 0..1_024),
+            1..8,
+        ),
+        seed_root in any::<u64>(),
+    ) {
+        use tokenfs_algos::similarity::minhash;
+        let seeds: [u64; 8] = core::array::from_fn(|i| seed_root.wrapping_add(i as u64));
+        let table = minhash::build_byte_table_from_seeds(&seeds);
+
+        let refs: Vec<&[u8]> = slices.iter().map(|v| v.as_slice()).collect();
+        let mut out = vec![minhash::Signature::<8>::new(); refs.len()];
+        minhash::signature_batch_simd::<8>(&refs, &table, &mut out);
+
+        for (i, payload) in slices.iter().enumerate() {
+            let single = minhash::signature_simd::<8>(payload, &table);
+            prop_assert_eq!(out[i].slots(), single.slots());
+        }
+    }
+
+}

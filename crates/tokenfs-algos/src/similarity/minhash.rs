@@ -193,6 +193,126 @@ pub fn classic_from_bytes_table_8(
     sig
 }
 
+/// Updates a `K`-way `Signature` from a byte slice using the runtime-
+/// dispatched gather kernel for general `K`.
+///
+/// Bit-identical with [`update_bytes_table_8`] for `K = 8` and with the
+/// per-byte scalar reference at every other `K`. Picks AVX-512 → AVX2
+/// → NEON → scalar in priority order.
+pub fn update_bytes_table_kway<const K: usize>(
+    sig: &mut Signature<K>,
+    table: &[[u64; K]; kernels_gather::TABLE_ROWS],
+    bytes: &[u8],
+) {
+    if bytes.is_empty() {
+        return;
+    }
+    kernels_gather::update_minhash_kway_auto::<K>(bytes, table, &mut sig.slots);
+    for k in 0..K {
+        if sig.slots[k] != u64::MAX {
+            sig.populated[k] = true;
+        }
+    }
+}
+
+/// SIMD-accelerated one-shot `K`-way MinHash signature over a byte
+/// slice using a precomputed per-byte gather table.
+///
+/// Equivalent to [`classic_from_bytes_table_8`] generalised over `K`,
+/// dispatched to the best available SIMD backend at runtime
+/// (AVX-512 → AVX2 → NEON → scalar). The table family is the per-byte
+/// hash defined by [`build_byte_table_from_seeds`].
+///
+/// For `K = 8` this matches [`classic_from_bytes_table_8`] bit-exactly;
+/// for general `K` it matches a hand-rolled K-min update over
+/// `mix_word(byte ^ seeds[k])` for every `k`.
+///
+/// Per the spec doc-set
+/// (`docs/v0.2_planning/03_EXECUTION_PLAN.md` § Sprint 45-46), this is
+/// the SIMD-accelerated entry point for callers that already hold a
+/// gather table; pair with [`build_byte_table_from_seeds`] to
+/// pre-build the table from seeds.
+#[must_use]
+pub fn signature_simd<const K: usize>(
+    bytes: &[u8],
+    table: &[[u64; K]; kernels_gather::TABLE_ROWS],
+) -> Signature<K> {
+    let mut sig = Signature::<K>::new();
+    update_bytes_table_kway::<K>(&mut sig, table, bytes);
+    sig
+}
+
+/// Batched form of [`signature_simd`]: compute one MinHash signature
+/// per input byte slice, writing into a caller-provided output buffer.
+///
+/// This is the **panicking** form. Use [`try_signature_batch_simd`] to
+/// recover from a length mismatch instead of panicking.
+///
+/// # Panics
+///
+/// Panics when `byte_slices.len() != out.len()`. Both lengths must
+/// match so the per-slice signatures land in the corresponding output
+/// slot.
+pub fn signature_batch_simd<const K: usize>(
+    byte_slices: &[&[u8]],
+    table: &[[u64; K]; kernels_gather::TABLE_ROWS],
+    out: &mut [Signature<K>],
+) {
+    assert_eq!(
+        byte_slices.len(),
+        out.len(),
+        "signature_batch_simd: byte_slices.len() ({}) must match out.len() ({})",
+        byte_slices.len(),
+        out.len()
+    );
+    for (slot, bytes) in out.iter_mut().zip(byte_slices.iter()) {
+        *slot = signature_simd::<K>(bytes, table);
+    }
+}
+
+/// Shape error returned by [`try_signature_batch_simd`] when input and
+/// output lengths disagree.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BatchShapeError {
+    /// Number of input byte slices supplied.
+    pub byte_slices_len: usize,
+    /// Number of output signature slots supplied.
+    pub out_len: usize,
+}
+
+impl core::fmt::Display for BatchShapeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "MinHash batch shape mismatch: byte_slices.len() = {}, out.len() = {}",
+            self.byte_slices_len, self.out_len
+        )
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for BatchShapeError {}
+
+/// Fallible form of [`signature_batch_simd`]. Returns a
+/// [`BatchShapeError`] when `byte_slices.len() != out.len()`; otherwise
+/// computes the batch and returns `Ok(())`.
+pub fn try_signature_batch_simd<const K: usize>(
+    byte_slices: &[&[u8]],
+    table: &[[u64; K]; kernels_gather::TABLE_ROWS],
+    out: &mut [Signature<K>],
+) -> Result<(), BatchShapeError> {
+    if byte_slices.len() != out.len() {
+        return Err(BatchShapeError {
+            byte_slices_len: byte_slices.len(),
+            out_len: out.len(),
+        });
+    }
+    for (slot, bytes) in out.iter_mut().zip(byte_slices.iter()) {
+        *slot = signature_simd::<K>(bytes, table);
+    }
+    Ok(())
+}
+
 /// Streaming K-way table-based MinHash signature builder.
 ///
 /// Wraps a [`Signature<K>`] plus a borrowed gather table so callers can feed
@@ -276,40 +396,19 @@ impl<'a, const K: usize> IncrementalSignature<'a, K> {
 
     /// Feed `bytes` into the running K-min update.
     ///
-    /// For `K == 8`, dispatches to the runtime-selected gather kernel
-    /// (`kernels_gather::update_minhash_8way_auto`). For other `K`, falls
-    /// back to the scalar reference. Either way the output matches
-    /// [`classic_from_bytes_table_8`] / [`update_bytes_table_8`] for the
-    /// concatenated input.
+    /// Dispatches to the runtime-selected gather kernel via
+    /// [`kernels_gather::update_minhash_kway_auto`] for every `K`. The
+    /// output matches [`classic_from_bytes_table_8`] /
+    /// [`update_bytes_table_8`] for the concatenated input at `K = 8`,
+    /// and the per-byte scalar reference at every other `K`.
     pub fn update_bytes(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
-        if K == 8 {
-            // Cast through `[u64; K]` -> `[u64; 8]` and `[[u64; K]; 256]`
-            // -> `[[u64; 8]; 256]`; both layouts are identical when `K == 8`
-            // because const-generic arrays are simply `K * size_of::<T>()`
-            // contiguous bytes (Rust 2024 / const generics MSRV).
-            // SAFETY: K == 8 so the type representations are byte-identical.
-            let table_8: &[[u64; 8]; kernels_gather::TABLE_ROWS] = unsafe {
-                &*(self.table as *const [[u64; K]; kernels_gather::TABLE_ROWS])
-                    .cast::<[[u64; 8]; kernels_gather::TABLE_ROWS]>()
-            };
-            // SAFETY: K == 8 so the slot array sizes match.
-            let sig_8: &mut [u64; 8] =
-                unsafe { &mut *(self.sig.slots.as_mut_ptr().cast::<[u64; 8]>()) };
-            kernels_gather::update_minhash_8way_auto(bytes, table_8, sig_8);
-            for k in 0..K {
-                if self.sig.slots[k] != u64::MAX {
-                    self.sig.populated[k] = true;
-                }
-            }
-        } else {
-            kernels_gather::update_minhash_scalar::<K>(bytes, self.table, &mut self.sig.slots);
-            for k in 0..K {
-                if self.sig.slots[k] != u64::MAX {
-                    self.sig.populated[k] = true;
-                }
+        kernels_gather::update_minhash_kway_auto::<K>(bytes, self.table, &mut self.sig.slots);
+        for k in 0..K {
+            if self.sig.slots[k] != u64::MAX {
+                self.sig.populated[k] = true;
             }
         }
     }
@@ -856,5 +955,212 @@ mod tests {
 
         let one_shot = classic_from_bytes_table_8(b"first half rest", &table);
         assert_eq!(b.finalize().slots(), one_shot.slots());
+    }
+
+    // ----- signature_simd / signature_batch_simd public API tests ----------
+
+    /// Hand-roll a per-byte K-min reference signature so the test
+    /// asserts against the per-byte family directly (rather than against
+    /// another scalar API that might share the same bug).
+    fn reference_signature_kway<const K: usize>(bytes: &[u8], seeds: &[u64; K]) -> [u64; K] {
+        let mut out = [u64::MAX; K];
+        for &b in bytes {
+            for k in 0..K {
+                let h = crate::hash::mix_word((b as u64) ^ seeds[k]);
+                if h < out[k] {
+                    out[k] = h;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn signature_simd_k8_matches_scalar_one_shot() {
+        let seeds = make_test_seeds_8();
+        let table = build_byte_table_from_seeds::<8>(&seeds);
+        let payload = random_bytes(4096);
+
+        let actual = signature_simd::<8>(&payload, &table);
+        let expected = reference_signature_kway::<8>(&payload, &seeds);
+        assert_eq!(actual.slots(), &expected);
+        // Equivalent to classic_from_bytes_table_8 too.
+        assert_eq!(
+            actual.slots(),
+            classic_from_bytes_table_8(&payload, &table).slots()
+        );
+    }
+
+    #[test]
+    fn signature_simd_k16_matches_scalar_reference() {
+        let seeds: [u64; 16] = core::array::from_fn(|i| 0xABCD_u64.wrapping_add(i as u64));
+        let table = build_byte_table_from_seeds::<16>(&seeds);
+        let payload = random_bytes(8192);
+
+        let actual = signature_simd::<16>(&payload, &table);
+        let expected = reference_signature_kway::<16>(&payload, &seeds);
+        assert_eq!(actual.slots(), &expected);
+    }
+
+    #[test]
+    fn signature_simd_k32_matches_scalar_reference() {
+        let seeds: [u64; 32] = core::array::from_fn(|i| 0x1234_5678_u64.wrapping_add(i as u64));
+        let table = build_byte_table_from_seeds::<32>(&seeds);
+        let payload = random_bytes(16_384);
+
+        let actual = signature_simd::<32>(&payload, &table);
+        let expected = reference_signature_kway::<32>(&payload, &seeds);
+        assert_eq!(actual.slots(), &expected);
+    }
+
+    #[test]
+    fn signature_simd_k64_matches_scalar_reference() {
+        let seeds: [u64; 64] = core::array::from_fn(|i| 0xFACE_FEED_u64.wrapping_add(i as u64));
+        let table = build_byte_table_from_seeds::<64>(&seeds);
+        let payload = random_bytes(4096);
+
+        let actual = signature_simd::<64>(&payload, &table);
+        let expected = reference_signature_kway::<64>(&payload, &seeds);
+        assert_eq!(actual.slots(), &expected);
+    }
+
+    /// Edge-case: the empty slice produces an empty signature (every
+    /// slot stays `u64::MAX`, none populated).
+    #[test]
+    fn signature_simd_empty_input_is_empty() {
+        let seeds: [u64; 16] = core::array::from_fn(|i| (i as u64) * 0xDEAD_BEEF);
+        let table = build_byte_table_from_seeds::<16>(&seeds);
+        let sig = signature_simd::<16>(b"", &table);
+        for slot in sig.slots() {
+            assert_eq!(*slot, u64::MAX);
+        }
+        assert!(sig.is_empty());
+    }
+
+    #[test]
+    fn signature_simd_single_byte_matches_table_row() {
+        let seeds: [u64; 16] = core::array::from_fn(|i| (i as u64) * 0xCAFE_F00D);
+        let table = build_byte_table_from_seeds::<16>(&seeds);
+
+        for b in [0_u8, 1, 0x42, 0xFF] {
+            let sig = signature_simd::<16>(&[b], &table);
+            for (k, &seed_k) in seeds.iter().enumerate() {
+                let expected = crate::hash::mix_word((b as u64) ^ seed_k);
+                assert_eq!(sig.slots()[k], expected, "single-byte b={b:#x} k={k}");
+            }
+        }
+    }
+
+    /// Inputs short enough that no full SIMD lane fires still match the
+    /// scalar reference exactly.
+    #[test]
+    fn signature_simd_short_input_matches_scalar() {
+        let seeds: [u64; 32] = core::array::from_fn(|i| 0xBABE_FACE_u64.wrapping_add(i as u64));
+        let table = build_byte_table_from_seeds::<32>(&seeds);
+        for len in [0_usize, 1, 2, 3, 4, 5, 7, 8, 15, 16, 31, 32, 33, 63] {
+            let payload: Vec<u8> = (0..len)
+                .map(|i| (i.wrapping_mul(13) ^ 0xC3) as u8)
+                .collect();
+            let actual = signature_simd::<32>(&payload, &table);
+            let expected = reference_signature_kway::<32>(&payload, &seeds);
+            assert_eq!(actual.slots(), &expected, "len={len}");
+        }
+    }
+
+    /// Very long inputs (multi-MB) still match scalar exactly.
+    #[test]
+    fn signature_simd_long_input_matches_scalar() {
+        let seeds: [u64; 16] = core::array::from_fn(|i| 0x2222_3333_u64.wrapping_add(i as u64));
+        let table = build_byte_table_from_seeds::<16>(&seeds);
+        let payload = random_bytes(1 << 20); // 1 MiB
+        let actual = signature_simd::<16>(&payload, &table);
+        let expected = reference_signature_kway::<16>(&payload, &seeds);
+        assert_eq!(actual.slots(), &expected);
+    }
+
+    #[test]
+    fn signature_batch_simd_matches_per_slice() {
+        let seeds: [u64; 16] = core::array::from_fn(|i| 0x99AA_u64.wrapping_add(i as u64));
+        let table = build_byte_table_from_seeds::<16>(&seeds);
+
+        let payloads: Vec<Vec<u8>> = (0..8).map(|i| random_bytes(64 + i * 257)).collect();
+        let refs: Vec<&[u8]> = payloads.iter().map(|v| v.as_slice()).collect();
+        let mut out = vec![Signature::<16>::new(); refs.len()];
+        signature_batch_simd::<16>(&refs, &table, &mut out);
+
+        for (i, payload) in payloads.iter().enumerate() {
+            let single = signature_simd::<16>(payload, &table);
+            assert_eq!(out[i].slots(), single.slots(), "row {i}");
+        }
+    }
+
+    #[test]
+    fn signature_batch_simd_empty_batch_is_noop() {
+        let seeds: [u64; 8] = make_test_seeds_8();
+        let table = build_byte_table_from_seeds::<8>(&seeds);
+        let refs: Vec<&[u8]> = Vec::new();
+        let mut out: Vec<Signature<8>> = Vec::new();
+        signature_batch_simd::<8>(&refs, &table, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "must match")]
+    fn signature_batch_simd_panics_on_shape_mismatch() {
+        let seeds: [u64; 8] = make_test_seeds_8();
+        let table = build_byte_table_from_seeds::<8>(&seeds);
+        let refs: Vec<&[u8]> = vec![b"a", b"b"];
+        let mut out = vec![Signature::<8>::new(); 1];
+        signature_batch_simd::<8>(&refs, &table, &mut out);
+    }
+
+    #[test]
+    fn try_signature_batch_simd_rejects_shape_mismatch() {
+        let seeds: [u64; 8] = make_test_seeds_8();
+        let table = build_byte_table_from_seeds::<8>(&seeds);
+        let refs: Vec<&[u8]> = vec![b"alpha", b"beta", b"gamma"];
+        let mut out = vec![Signature::<8>::new(); 2];
+        let err = try_signature_batch_simd::<8>(&refs, &table, &mut out).unwrap_err();
+        assert_eq!(err.byte_slices_len, 3);
+        assert_eq!(err.out_len, 2);
+    }
+
+    #[test]
+    fn try_signature_batch_simd_succeeds_on_matching_shape() {
+        let seeds: [u64; 8] = make_test_seeds_8();
+        let table = build_byte_table_from_seeds::<8>(&seeds);
+        let refs: Vec<&[u8]> = vec![b"hello", b"world", b"!"];
+        let mut out = vec![Signature::<8>::new(); 3];
+        let res = try_signature_batch_simd::<8>(&refs, &table, &mut out);
+        assert!(res.is_ok());
+        for (i, payload) in refs.iter().enumerate() {
+            assert_eq!(out[i].slots(), signature_simd::<8>(payload, &table).slots());
+        }
+    }
+
+    /// `update_bytes_table_kway` matches the per-byte scalar reference
+    /// across the K family the bench covers.
+    #[test]
+    fn update_bytes_table_kway_matches_reference() {
+        macro_rules! check_k {
+            ($k:literal) => {{
+                let seeds: [u64; $k] =
+                    core::array::from_fn(|i| 0x9876_5432_u64.wrapping_add(i as u64));
+                let table = build_byte_table_from_seeds::<$k>(&seeds);
+                let payload = random_bytes(2048);
+
+                let mut sig = Signature::<$k>::new();
+                update_bytes_table_kway::<$k>(&mut sig, &table, &payload);
+                let expected = reference_signature_kway::<$k>(&payload, &seeds);
+                assert_eq!(sig.slots(), &expected, "K={}", $k);
+                for k in 0..$k {
+                    assert!(sig.populated[k], "K={} slot {k} should be populated", $k);
+                }
+            }};
+        }
+        check_k!(8);
+        check_k!(16);
+        check_k!(32);
+        check_k!(64);
     }
 }

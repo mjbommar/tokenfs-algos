@@ -888,6 +888,277 @@ fn bench_dot_f32_cache_tiers(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------- MinHash signature SIMD (Sprint 45-46) ----------
+//
+// Per `docs/v0.2_planning/03_EXECUTION_PLAN.md` § "Sprint 45-46":
+// canonical input sizes 1 KB / 16 KB / 256 KB / 4 MB across
+// K ∈ {16, 32, 64, 128, 256} and backends {scalar, AVX2, AVX-512, NEON}.
+// The cache-tier sweep additionally walks `support::cache_tier_sizes()`
+// for the 4-tier reporting axis.
+
+const MINHASH_SIZES: [(&str, usize); 4] = [
+    ("1KB", 1024),
+    ("16KB", 16 * 1024),
+    ("256KB", 256 * 1024),
+    ("4MB", 4 * 1024 * 1024),
+];
+
+fn make_bytes_for_minhash(n: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed.wrapping_add(1);
+    (0..n)
+        .map(|_| {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_F491_4F6C_DD1D) as u8
+        })
+        .collect()
+}
+
+fn build_minhash_seeds<const K: usize>(seed_root: u64) -> [u64; K] {
+    core::array::from_fn(|i| seed_root.wrapping_add(i as u64))
+}
+
+/// Per-K MinHash signature bench inner loop. Reports throughput in
+/// bytes/sec (one byte per K-min update step).
+fn bench_minhash_signature_kway<const K: usize>(c: &mut Criterion, k: usize) {
+    use tokenfs_algos::similarity::{kernels_gather, minhash};
+
+    let group_name = format!("similarity_distance/minhash_signature/K={k}");
+    let mut group = c.benchmark_group(group_name);
+
+    for (label, n) in MINHASH_SIZES {
+        let payload = make_bytes_for_minhash(n, 0xC0FF_EE00 ^ (k as u64));
+        let seeds = build_minhash_seeds::<K>(0x9E37_79B9_u64);
+        let table = minhash::build_byte_table_from_seeds::<K>(&seeds);
+
+        group.throughput(Throughput::Bytes(n as u64));
+
+        // Scalar baseline.
+        let id = format!("scalar/n={label}");
+        group.bench_with_input(BenchmarkId::from_parameter(id), &(), |bencher, _| {
+            bencher.iter(|| {
+                let mut sig = [u64::MAX; K];
+                kernels_gather::update_minhash_scalar::<K>(
+                    black_box(&payload),
+                    black_box(&table),
+                    &mut sig,
+                );
+                sig
+            });
+        });
+
+        // Auto-dispatched (best available SIMD backend).
+        let id = format!("auto/n={label}");
+        group.bench_with_input(BenchmarkId::from_parameter(id), &(), |bencher, _| {
+            bencher.iter(|| minhash::signature_simd::<K>(black_box(&payload), black_box(&table)));
+        });
+
+        #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+        if kernels_gather::avx2::is_available() {
+            let id = format!("avx2/n={label}");
+            group.bench_with_input(BenchmarkId::from_parameter(id), &(), |bencher, _| {
+                bencher.iter(|| {
+                    let mut sig = [u64::MAX; K];
+                    // SAFETY: availability checked above.
+                    unsafe {
+                        kernels_gather::avx2::update_minhash_kway::<K>(
+                            black_box(&payload),
+                            black_box(&table),
+                            &mut sig,
+                        );
+                    }
+                    sig
+                });
+            });
+        }
+
+        #[cfg(all(feature = "avx512", any(target_arch = "x86", target_arch = "x86_64")))]
+        if kernels_gather::avx512::is_available() {
+            let id = format!("avx512/n={label}");
+            group.bench_with_input(BenchmarkId::from_parameter(id), &(), |bencher, _| {
+                bencher.iter(|| {
+                    let mut sig = [u64::MAX; K];
+                    // SAFETY: availability checked above.
+                    unsafe {
+                        kernels_gather::avx512::update_minhash_kway::<K>(
+                            black_box(&payload),
+                            black_box(&table),
+                            &mut sig,
+                        );
+                    }
+                    sig
+                });
+            });
+        }
+
+        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+        {
+            let id = format!("neon/n={label}");
+            group.bench_with_input(BenchmarkId::from_parameter(id), &(), |bencher, _| {
+                bencher.iter(|| {
+                    let mut sig = [u64::MAX; K];
+                    // SAFETY: NEON is mandatory on AArch64.
+                    unsafe {
+                        kernels_gather::neon::update_minhash_kway::<K>(
+                            black_box(&payload),
+                            black_box(&table),
+                            &mut sig,
+                        );
+                    }
+                    sig
+                });
+            });
+        }
+    }
+    group.finish();
+}
+
+fn bench_minhash_signature_k16(c: &mut Criterion) {
+    bench_minhash_signature_kway::<16>(c, 16);
+}
+fn bench_minhash_signature_k32(c: &mut Criterion) {
+    bench_minhash_signature_kway::<32>(c, 32);
+}
+fn bench_minhash_signature_k64(c: &mut Criterion) {
+    bench_minhash_signature_kway::<64>(c, 64);
+}
+fn bench_minhash_signature_k128(c: &mut Criterion) {
+    bench_minhash_signature_kway::<128>(c, 128);
+}
+fn bench_minhash_signature_k256(c: &mut Criterion) {
+    bench_minhash_signature_kway::<256>(c, 256);
+}
+
+/// Cache-tier sweep mirror for MinHash signatures at the canonical
+/// K = 32 width.
+fn bench_minhash_signature_cache_tiers(c: &mut Criterion) {
+    use tokenfs_algos::similarity::{kernels_gather, minhash};
+
+    const K: usize = 32;
+
+    let mut group = c.benchmark_group("similarity_distance/minhash_signature_cache_tiers");
+    let seeds = build_minhash_seeds::<K>(0x1234_5678_u64);
+    let table = minhash::build_byte_table_from_seeds::<K>(&seeds);
+
+    for (tier_label, byte_size) in support::cache_tier_sizes() {
+        let payload = make_bytes_for_minhash(*byte_size, 0xBEEF_CAFE);
+        group.throughput(Throughput::Bytes(*byte_size as u64));
+
+        let id = format!("scalar/{tier_label}");
+        group.bench_with_input(BenchmarkId::from_parameter(id), &(), |bencher, _| {
+            bencher.iter(|| {
+                let mut sig = [u64::MAX; K];
+                kernels_gather::update_minhash_scalar::<K>(
+                    black_box(&payload),
+                    black_box(&table),
+                    &mut sig,
+                );
+                sig
+            });
+        });
+
+        let id = format!("auto/{tier_label}");
+        group.bench_with_input(BenchmarkId::from_parameter(id), &(), |bencher, _| {
+            bencher.iter(|| minhash::signature_simd::<K>(black_box(&payload), black_box(&table)));
+        });
+
+        #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+        if kernels_gather::avx2::is_available() {
+            let id = format!("avx2/{tier_label}");
+            group.bench_with_input(BenchmarkId::from_parameter(id), &(), |bencher, _| {
+                bencher.iter(|| {
+                    let mut sig = [u64::MAX; K];
+                    // SAFETY: availability checked above.
+                    unsafe {
+                        kernels_gather::avx2::update_minhash_kway::<K>(
+                            black_box(&payload),
+                            black_box(&table),
+                            &mut sig,
+                        );
+                    }
+                    sig
+                });
+            });
+        }
+
+        #[cfg(all(feature = "avx512", any(target_arch = "x86", target_arch = "x86_64")))]
+        if kernels_gather::avx512::is_available() {
+            let id = format!("avx512/{tier_label}");
+            group.bench_with_input(BenchmarkId::from_parameter(id), &(), |bencher, _| {
+                bencher.iter(|| {
+                    let mut sig = [u64::MAX; K];
+                    // SAFETY: availability checked above.
+                    unsafe {
+                        kernels_gather::avx512::update_minhash_kway::<K>(
+                            black_box(&payload),
+                            black_box(&table),
+                            &mut sig,
+                        );
+                    }
+                    sig
+                });
+            });
+        }
+
+        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+        {
+            let id = format!("neon/{tier_label}");
+            group.bench_with_input(BenchmarkId::from_parameter(id), &(), |bencher, _| {
+                bencher.iter(|| {
+                    let mut sig = [u64::MAX; K];
+                    // SAFETY: NEON is mandatory on AArch64.
+                    unsafe {
+                        kernels_gather::neon::update_minhash_kway::<K>(
+                            black_box(&payload),
+                            black_box(&table),
+                            &mut sig,
+                        );
+                    }
+                    sig
+                });
+            });
+        }
+    }
+    group.finish();
+}
+
+/// Batched MinHash signatures: throughput when computing N signatures
+/// in a row from N separate byte slices.
+fn bench_minhash_signature_batch(c: &mut Criterion) {
+    use tokenfs_algos::similarity::minhash;
+
+    const K: usize = 32;
+
+    let mut group = c.benchmark_group("similarity_distance/minhash_signature_batch");
+    let seeds = build_minhash_seeds::<K>(0x4242_4242_u64);
+    let table = minhash::build_byte_table_from_seeds::<K>(&seeds);
+
+    for &batch in &[16_usize, 64, 256] {
+        let per_slice_bytes = 4096_usize;
+        let payloads: Vec<Vec<u8>> = (0..batch)
+            .map(|i| make_bytes_for_minhash(per_slice_bytes, i as u64))
+            .collect();
+        let refs: Vec<&[u8]> = payloads.iter().map(|v| v.as_slice()).collect();
+        let mut out = vec![minhash::Signature::<K>::new(); batch];
+
+        let total_bytes = (per_slice_bytes * batch) as u64;
+        group.throughput(Throughput::Bytes(total_bytes));
+
+        let id = format!("auto/batch={batch}/per={per_slice_bytes}");
+        group.bench_with_input(BenchmarkId::from_parameter(id), &(), |bencher, _| {
+            bencher.iter(|| {
+                minhash::signature_batch_simd::<K>(
+                    black_box(&refs),
+                    black_box(&table),
+                    black_box(&mut out),
+                );
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_dot_u32,
@@ -903,5 +1174,12 @@ criterion_group!(
     bench_batched_hamming_u64,
     bench_batched_jaccard_u64,
     bench_dot_f32_cache_tiers,
+    bench_minhash_signature_k16,
+    bench_minhash_signature_k32,
+    bench_minhash_signature_k64,
+    bench_minhash_signature_k128,
+    bench_minhash_signature_k256,
+    bench_minhash_signature_cache_tiers,
+    bench_minhash_signature_batch,
 );
 criterion_main!(benches);

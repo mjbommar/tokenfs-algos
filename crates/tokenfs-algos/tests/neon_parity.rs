@@ -1339,3 +1339,126 @@ fn neon_approx_bloom_filter_contains_simd_matches_scalar_path() {
         }
     }
 }
+
+// =====================================================================
+// NEON MinHash gather kernel parity (Sprint 45-46).
+//
+// Sister to the AVX2/AVX-512 K-way kernels in `kernels_gather`. NEON
+// has no scatter-gather instruction, so the kernel chunks the per-byte
+// row into 128-bit `vld1q_u64` pairs and reduces with a synthesised
+// lane-wise unsigned-64 minimum.
+// =====================================================================
+
+#[test]
+fn neon_gather_minhash_8way_matches_scalar_random() {
+    use similarity::kernels_gather;
+    let seeds: [u64; 8] = core::array::from_fn(|i| 0xCAFE_BABE_u64 ^ (i as u64));
+    let table = kernels_gather::build_table_from_seeds(&seeds);
+
+    for len in [0_usize, 1, 7, 16, 64, 1024, 4096, 65_535] {
+        let bytes: Vec<u8> = (0..len)
+            .map(|i| (i.wrapping_mul(31) ^ 0x5A) as u8)
+            .collect();
+        let mut s_scalar = [u64::MAX; 8];
+        kernels_gather::update_minhash_scalar::<8>(&bytes, &table, &mut s_scalar);
+        let mut s_neon = [u64::MAX; 8];
+        // SAFETY: NEON is mandatory on AArch64.
+        unsafe {
+            kernels_gather::neon::update_minhash_8way(&bytes, &table, &mut s_neon);
+        }
+        assert_eq!(s_scalar, s_neon, "NEON 8-way gather diverged at len={len}");
+    }
+}
+
+#[test]
+fn neon_gather_minhash_kway_k16_matches_scalar() {
+    use similarity::kernels_gather;
+    let seeds: [u64; 16] = core::array::from_fn(|i| 0xBABE_FACE_u64.wrapping_add(i as u64));
+    let table = kernels_gather::build_table_from_seeds(&seeds);
+
+    for len in [0_usize, 1, 7, 16, 64, 1024, 4096] {
+        let bytes: Vec<u8> = (0..len)
+            .map(|i| (i.wrapping_mul(13) ^ 0xC3) as u8)
+            .collect();
+        let mut s_scalar = [u64::MAX; 16];
+        kernels_gather::update_minhash_scalar::<16>(&bytes, &table, &mut s_scalar);
+        let mut s_neon = [u64::MAX; 16];
+        // SAFETY: NEON is mandatory on AArch64.
+        unsafe {
+            kernels_gather::neon::update_minhash_kway::<16>(&bytes, &table, &mut s_neon);
+        }
+        assert_eq!(s_scalar, s_neon, "NEON 16-way gather diverged at len={len}");
+    }
+}
+
+#[test]
+fn neon_gather_minhash_kway_k32_matches_scalar() {
+    use similarity::kernels_gather;
+    let seeds: [u64; 32] = core::array::from_fn(|i| 0x9ABC_DEF0_u64.wrapping_add(i as u64));
+    let table = kernels_gather::build_table_from_seeds(&seeds);
+
+    for len in [0_usize, 1, 7, 16, 64, 1024, 4096] {
+        let bytes: Vec<u8> = (0..len).map(|i| (i.wrapping_mul(7) ^ 0xA5) as u8).collect();
+        let mut s_scalar = [u64::MAX; 32];
+        kernels_gather::update_minhash_scalar::<32>(&bytes, &table, &mut s_scalar);
+        let mut s_neon = [u64::MAX; 32];
+        // SAFETY: NEON is mandatory on AArch64.
+        unsafe {
+            kernels_gather::neon::update_minhash_kway::<32>(&bytes, &table, &mut s_neon);
+        }
+        assert_eq!(s_scalar, s_neon, "NEON 32-way gather diverged at len={len}");
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 64,
+        ..ProptestConfig::default()
+    })]
+
+    /// `signature_simd<K>` top-level API parity on NEON: the dispatched
+    /// path must match the per-byte hand-rolled K-min reference.
+    #[test]
+    fn proptest_neon_minhash_signature_simd_matches_reference_k16(
+        bytes in proptest::collection::vec(any::<u8>(), 0..8_192),
+        seed_root in any::<u64>(),
+    ) {
+        use similarity::minhash;
+        let seeds: [u64; 16] = core::array::from_fn(|i| seed_root.wrapping_add(i as u64));
+        let table = minhash::build_byte_table_from_seeds(&seeds);
+        let actual = minhash::signature_simd::<16>(&bytes, &table);
+
+        let mut expected = [u64::MAX; 16];
+        for &b in &bytes {
+            for k in 0..16 {
+                let h = hash::mix_word((b as u64) ^ seeds[k]);
+                if h < expected[k] { expected[k] = h; }
+            }
+        }
+        prop_assert_eq!(actual.slots(), &expected);
+    }
+
+    /// `signature_batch_simd<K>` matches per-slice `signature_simd` on
+    /// NEON.
+    #[test]
+    fn proptest_neon_minhash_signature_batch_simd_matches_per_slice(
+        slices in proptest::collection::vec(
+            proptest::collection::vec(any::<u8>(), 0..1_024),
+            1..8,
+        ),
+        seed_root in any::<u64>(),
+    ) {
+        use similarity::minhash;
+        let seeds: [u64; 8] = core::array::from_fn(|i| seed_root.wrapping_add(i as u64));
+        let table = minhash::build_byte_table_from_seeds(&seeds);
+
+        let refs: Vec<&[u8]> = slices.iter().map(|v| v.as_slice()).collect();
+        let mut out = vec![minhash::Signature::<8>::new(); refs.len()];
+        minhash::signature_batch_simd::<8>(&refs, &table, &mut out);
+
+        for (i, payload) in slices.iter().enumerate() {
+            let single = minhash::signature_simd::<8>(payload, &table);
+            prop_assert_eq!(out[i].slots(), single.slots());
+        }
+    }
+}
