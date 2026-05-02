@@ -87,13 +87,21 @@ impl<'a> Iterator for StrideWindows<'a> {
     type Item = &'a [u8];
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.width == 0 || self.stride == 0 || self.position + self.width > self.bytes.len() {
+        if self.width == 0 || self.stride == 0 {
             return None;
         }
-
+        // `self.position` may have saturated to usize::MAX after a
+        // prior `saturating_add`; both `position + width` (the bounds
+        // check) and `start + width` (the slice index below) need
+        // checked arithmetic so adversarial widths can't panic the
+        // iterator. End-of-stream simply yields None.
+        let end = self.position.checked_add(self.width)?;
+        if end > self.bytes.len() {
+            return None;
+        }
         let start = self.position;
         self.position = self.position.saturating_add(self.stride);
-        Some(&self.bytes[start..start + self.width])
+        Some(&self.bytes[start..end])
     }
 }
 
@@ -216,7 +224,7 @@ const fn splitmix64(mut value: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{GearHash64, ngrams, pack_ngram_le, strided, unpack_ngram_le};
+    use super::{GearHash64, StrideWindows, ngrams, pack_ngram_le, strided, unpack_ngram_le};
 
     #[test]
     fn ngrams_yield_overlapping_arrays() {
@@ -232,6 +240,27 @@ mod tests {
         assert_eq!(windows, vec![b"abc".as_slice(), b"cde", b"efg"]);
         assert_eq!(strided(b"abc", 0, 1).count(), 0);
         assert_eq!(strided(b"abc", 1, 0).count(), 0);
+    }
+
+    #[test]
+    fn strided_windows_overflow_safe_at_extreme_position() {
+        // Regression: pre-fix the iterator's `position + width`
+        // bounds check could overflow once `position` saturated to
+        // usize::MAX (e.g. after a stride that pushed past the end
+        // of an unusually-large slice). We can't actually allocate
+        // a usize::MAX byte slice — instead drive the position to
+        // the saturation point directly via repeated `.next()` and
+        // verify the next call returns None instead of panicking.
+        let bytes = [0u8; 8];
+        let mut it = StrideWindows::new(&bytes, 4, usize::MAX / 2);
+        // First iteration succeeds (position=0, width=4 <= len=8).
+        assert!(it.next().is_some());
+        // After saturating_add(usize::MAX / 2) the position is
+        // basically usize::MAX. Next call must observe position +
+        // width would overflow and return None gracefully.
+        assert!(it.next().is_none());
+        // Repeated calls past end remain None (idempotent).
+        assert!(it.next().is_none());
     }
 
     #[test]

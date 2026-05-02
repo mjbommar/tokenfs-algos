@@ -271,14 +271,47 @@ pub mod kernels {
             bytes: &[u8],
             bins: &mut [u32; BINS],
         ) {
-            // SAFETY: caller guarantees SSE4.2; we hold a mutable bins.
-            unsafe { hash4_bins_pipelined_impl::<BINS>(bytes, bins) }
+            // Stack-allocated 4×BINS scratch. At BINS=4096 (F22 hash4
+            // size) that is 4*4096*4 = 64 KiB of stack — fine for
+            // user-space, NOT safe for kernel/embedded stacks. Use
+            // `crc32_hash4_bins_pipelined_with_scratch` to bring your
+            // own scratch (heap, mmap, thread-local, etc.) in those
+            // contexts.
+            let mut scratch = [[0_u32; BINS]; 4];
+            // SAFETY: caller guarantees SSE4.2; bins is mutable; scratch
+            // is exclusive to this call and freshly zeroed.
+            unsafe { hash4_bins_pipelined_impl::<BINS>(bytes, bins, &mut scratch) }
+        }
+
+        /// Heap/stack-agnostic variant: caller provides the 4×`BINS`
+        /// scratch. Use this from kernel-adjacent callers with a tight
+        /// stack (the inline-stack variant burns 64 KiB at BINS=4096).
+        ///
+        /// The scratch is zeroed at the top of the function so the
+        /// caller may reuse a single buffer across many calls without
+        /// pre-clearing it.
+        ///
+        /// # Safety
+        ///
+        /// Same SSE4.2 precondition as
+        /// [`crc32_hash4_bins_pipelined`]. `scratch` must be exclusive
+        /// to the call (the function writes into all 4 sub-arrays).
+        #[target_feature(enable = "sse4.2")]
+        pub unsafe fn crc32_hash4_bins_pipelined_with_scratch<const BINS: usize>(
+            bytes: &[u8],
+            bins: &mut [u32; BINS],
+            scratch: &mut [[u32; BINS]; 4],
+        ) {
+            // SAFETY: caller guarantees SSE4.2; scratch is exclusive
+            // and the impl zeroes it before use.
+            unsafe { hash4_bins_pipelined_impl::<BINS>(bytes, bins, scratch) }
         }
 
         #[target_feature(enable = "sse4.2")]
         unsafe fn hash4_bins_pipelined_impl<const BINS: usize>(
             bytes: &[u8],
             bins: &mut [u32; BINS],
+            scratch: &mut [[u32; BINS]; 4],
         ) {
             if BINS == 0 || bytes.len() < 4 {
                 return;
@@ -295,16 +328,14 @@ pub mod kernels {
 
             // Four per-stream bin tables avoid the scatter aliasing
             // through one shared `bins` array. Merged at the end.
-            //
-            // Note: this is on the stack — at BINS=4096 (the F22 hash4
-            // size) that's 4*4096*4 = 64 KiB of stack. F22 callers run
-            // off a normal user stack so this is fine; if you ever wire
-            // this from a kernel-adjacent caller with a tiny stack,
-            // consider heap-allocating once and reusing.
-            let mut bin0 = [0_u32; BINS];
-            let mut bin1 = [0_u32; BINS];
-            let mut bin2 = [0_u32; BINS];
-            let mut bin3 = [0_u32; BINS];
+            // The caller-provided scratch is zeroed here so it may be
+            // reused across calls without pre-clearing.
+            for table in scratch.iter_mut() {
+                for cell in table.iter_mut() {
+                    *cell = 0;
+                }
+            }
+            let [bin0, bin1, bin2, bin3] = scratch;
 
             // Total number of 4-byte sliding windows.
             let n_windows = bytes.len() - 3;
@@ -510,14 +541,39 @@ pub mod kernels {
             bytes: &[u8],
             bins: &mut [u32; BINS],
         ) {
-            // SAFETY: caller guarantees `crc`; we hold a mutable bins.
-            unsafe { hash4_bins_pipelined_impl::<BINS>(bytes, bins) }
+            // Stack-allocated 4×BINS scratch (64 KiB at BINS=4096 —
+            // see the SSE4.2 sibling for the same constraint and the
+            // `_with_scratch` companion).
+            let mut scratch = [[0_u32; BINS]; 4];
+            // SAFETY: caller guarantees `crc`; bins is mutable; scratch
+            // is exclusive and freshly zeroed.
+            unsafe { hash4_bins_pipelined_impl::<BINS>(bytes, bins, &mut scratch) }
+        }
+
+        /// Heap/stack-agnostic variant: caller provides the 4×`BINS`
+        /// scratch. Mirrors `super::sse42::crc32_hash4_bins_pipelined_with_scratch`.
+        ///
+        /// # Safety
+        ///
+        /// Same FEAT_CRC32 (`crc`) precondition as
+        /// [`crc32_hash4_bins_pipelined`]. `scratch` must be exclusive
+        /// to the call.
+        #[target_feature(enable = "crc")]
+        pub unsafe fn crc32_hash4_bins_pipelined_with_scratch<const BINS: usize>(
+            bytes: &[u8],
+            bins: &mut [u32; BINS],
+            scratch: &mut [[u32; BINS]; 4],
+        ) {
+            // SAFETY: caller guarantees `crc`; scratch is exclusive
+            // and the impl zeroes it before use.
+            unsafe { hash4_bins_pipelined_impl::<BINS>(bytes, bins, scratch) }
         }
 
         #[target_feature(enable = "crc")]
         unsafe fn hash4_bins_pipelined_impl<const BINS: usize>(
             bytes: &[u8],
             bins: &mut [u32; BINS],
+            scratch: &mut [[u32; BINS]; 4],
         ) {
             if BINS == 0 || bytes.len() < 4 {
                 return;
@@ -537,16 +593,13 @@ pub mod kernels {
 
             // Four per-stream bin tables avoid the scatter aliasing
             // through one shared `bins` array. Merged at the end.
-            //
-            // Note: this is on the stack — at BINS=4096 (the F22 hash4
-            // size) that's 4*4096*4 = 64 KiB of stack. F22 callers run
-            // off a normal user stack so this is fine; if you ever wire
-            // this from a kernel-adjacent caller with a tiny stack,
-            // consider heap-allocating once and reusing.
-            let mut bin0 = [0_u32; BINS];
-            let mut bin1 = [0_u32; BINS];
-            let mut bin2 = [0_u32; BINS];
-            let mut bin3 = [0_u32; BINS];
+            // Caller-provided scratch is zeroed here for reuse.
+            for table in scratch.iter_mut() {
+                for cell in table.iter_mut() {
+                    *cell = 0;
+                }
+            }
+            let [bin0, bin1, bin2, bin3] = scratch;
 
             // Total number of 4-byte sliding windows.
             let n_windows = bytes.len() - 3;
@@ -1423,6 +1476,71 @@ mod tests {
             );
         }
         assert_eq!(scalar_ngram, sse_ngram);
+    }
+
+    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+    #[test]
+    fn sse42_pipelined_with_scratch_matches_in_place_variant() {
+        // The new _with_scratch variant must produce bit-exact identical
+        // results to the existing stack-allocating wrapper. This pins
+        // the contract so kernel callers (heap-backed scratch) can swap
+        // freely with userland callers (stack-backed scratch).
+        if !super::kernels::sse42::is_available() {
+            return;
+        }
+        let bytes: Vec<u8> = (0_u8..=255).cycle().take(2048).collect();
+        let mut bins_inplace = [0_u32; 1024];
+        let mut bins_scratch = [0_u32; 1024];
+        let mut scratch = [[0_u32; 1024]; 4];
+        // SAFETY: SSE4.2 availability checked above.
+        unsafe {
+            super::kernels::sse42::crc32_hash4_bins_pipelined(&bytes, &mut bins_inplace);
+            super::kernels::sse42::crc32_hash4_bins_pipelined_with_scratch(
+                &bytes,
+                &mut bins_scratch,
+                &mut scratch,
+            );
+        }
+        assert_eq!(bins_inplace, bins_scratch);
+
+        // Reuse the scratch — the impl must zero it on entry, so a
+        // second call with dirty scratch (non-zero from the previous
+        // run) must still match the in-place variant.
+        let bytes2: Vec<u8> = (0_u8..=255).cycle().take(4096).collect();
+        let mut bins_inplace_2 = [0_u32; 1024];
+        let mut bins_scratch_2 = [0_u32; 1024];
+        // scratch is intentionally not re-zeroed; the impl handles it.
+        unsafe {
+            super::kernels::sse42::crc32_hash4_bins_pipelined(&bytes2, &mut bins_inplace_2);
+            super::kernels::sse42::crc32_hash4_bins_pipelined_with_scratch(
+                &bytes2,
+                &mut bins_scratch_2,
+                &mut scratch,
+            );
+        }
+        assert_eq!(bins_inplace_2, bins_scratch_2);
+    }
+
+    #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+    #[test]
+    fn neon_pipelined_with_scratch_matches_in_place_variant() {
+        if !super::kernels::neon::is_available() {
+            return;
+        }
+        let bytes: Vec<u8> = (0_u8..=255).cycle().take(2048).collect();
+        let mut bins_inplace = [0_u32; 1024];
+        let mut bins_scratch = [0_u32; 1024];
+        let mut scratch = [[0_u32; 1024]; 4];
+        // SAFETY: FEAT_CRC32 checked above.
+        unsafe {
+            super::kernels::neon::crc32_hash4_bins_pipelined(&bytes, &mut bins_inplace);
+            super::kernels::neon::crc32_hash4_bins_pipelined_with_scratch(
+                &bytes,
+                &mut bins_scratch,
+                &mut scratch,
+            );
+        }
+        assert_eq!(bins_inplace, bins_scratch);
     }
 
     #[cfg(all(feature = "neon", target_arch = "aarch64"))]

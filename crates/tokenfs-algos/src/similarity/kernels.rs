@@ -238,6 +238,23 @@ pub mod auto {
 /// for floating-point kernels.
 pub mod scalar {
     /// Inner product of two `u32` vectors. Returns `None` on length mismatch.
+    ///
+    /// # Overflow regime
+    ///
+    /// Each pairwise term is at most `u32::MAX * u32::MAX ≈ 2^64`,
+    /// which can saturate `u64` accumulation in a single pair when
+    /// both inputs are `u32::MAX`. The accumulator uses
+    /// `wrapping_add`, so adversarial inputs near `u32::MAX` can wrap
+    /// silently. **For security-relevant decisions on caller-controlled
+    /// data, use [`try_dot_u32`] instead — it returns
+    /// `Some(None)` on overflow.** The wrapping variant is kept for
+    /// backward-compatible bench/test code; SIMD parity tests pin the
+    /// same wrap behaviour.
+    ///
+    /// Practical safe regime: any vector of length `n` whose elements
+    /// average `m` accumulates at most `n * m^2`. For typical
+    /// embedding-style values (≤ 2^16 per element, ≤ 2^16 elements)
+    /// the sum stays well below `u64::MAX`.
     #[must_use]
     pub fn dot_u32(a: &[u32], b: &[u32]) -> Option<u64> {
         if a.len() != b.len() {
@@ -250,7 +267,36 @@ pub mod scalar {
         Some(sum)
     }
 
+    /// Overflow-checked counterpart of [`dot_u32`].
+    ///
+    /// Returns `None` on length mismatch; returns `Some(None)` if the
+    /// accumulator would overflow `u64` at any point during the
+    /// reduction; otherwise returns `Some(Some(sum))`.
+    #[must_use]
+    pub fn try_dot_u32(a: &[u32], b: &[u32]) -> Option<Option<u64>> {
+        if a.len() != b.len() {
+            return None;
+        }
+        let mut sum = 0_u64;
+        for (&x, &y) in a.iter().zip(b) {
+            let term = u64::from(x).checked_mul(u64::from(y))?;
+            sum = match sum.checked_add(term) {
+                Some(v) => v,
+                None => return Some(None),
+            };
+        }
+        Some(Some(sum))
+    }
+
     /// Manhattan / L1 distance of two `u32` vectors.
+    ///
+    /// # Overflow regime
+    ///
+    /// Each pairwise term is at most `u32::MAX = 2^32 - 1`. The `u64`
+    /// accumulator handles at most `2^32` such terms before potential
+    /// overflow; vectors longer than that with adversarial inputs can
+    /// wrap silently. Use [`try_l1_u32`] when correctness of an
+    /// adversarial-input result matters.
     #[must_use]
     pub fn l1_u32(a: &[u32], b: &[u32]) -> Option<u64> {
         if a.len() != b.len() {
@@ -263,7 +309,34 @@ pub mod scalar {
         Some(sum)
     }
 
+    /// Overflow-checked counterpart of [`l1_u32`].
+    ///
+    /// Returns `None` on length mismatch; `Some(None)` on accumulator
+    /// overflow; `Some(Some(sum))` otherwise.
+    #[must_use]
+    pub fn try_l1_u32(a: &[u32], b: &[u32]) -> Option<Option<u64>> {
+        if a.len() != b.len() {
+            return None;
+        }
+        let mut sum = 0_u64;
+        for (&x, &y) in a.iter().zip(b) {
+            sum = match sum.checked_add(u64::from(x.abs_diff(y))) {
+                Some(v) => v,
+                None => return Some(None),
+            };
+        }
+        Some(Some(sum))
+    }
+
     /// Squared L2 distance of two `u32` vectors.
+    ///
+    /// # Overflow regime
+    ///
+    /// Each pairwise term is at most `(u32::MAX)^2 ≈ 2^64`. With
+    /// adversarial inputs a single pair already saturates the `u64`
+    /// accumulator and any further term wraps. Use [`try_l2_squared_u32`]
+    /// when correctness on adversarial inputs matters; non-adversarial
+    /// callers (typical embedding distances) stay well below the cap.
     #[must_use]
     pub fn l2_squared_u32(a: &[u32], b: &[u32]) -> Option<u64> {
         if a.len() != b.len() {
@@ -275,6 +348,27 @@ pub mod scalar {
             sum = sum.wrapping_add(d * d);
         }
         Some(sum)
+    }
+
+    /// Overflow-checked counterpart of [`l2_squared_u32`].
+    ///
+    /// Returns `None` on length mismatch; `Some(None)` on overflow;
+    /// `Some(Some(sum))` otherwise.
+    #[must_use]
+    pub fn try_l2_squared_u32(a: &[u32], b: &[u32]) -> Option<Option<u64>> {
+        if a.len() != b.len() {
+            return None;
+        }
+        let mut sum = 0_u64;
+        for (&x, &y) in a.iter().zip(b) {
+            let d = u64::from(x.abs_diff(y));
+            let term = d.checked_mul(d)?;
+            sum = match sum.checked_add(term) {
+                Some(v) => v,
+                None => return Some(None),
+            };
+        }
+        Some(Some(sum))
     }
 
     /// Cosine similarity of two `u32` vectors as `f64` in `[-1, 1]` (in
@@ -565,7 +659,7 @@ pub mod avx2 {
         if norm_a == 0 || norm_b == 0 {
             return 0.0;
         }
-        let denom = ((norm_a as f64) * (norm_b as f64)).sqrt();
+        let denom = crate::math::sqrt_f64((norm_a as f64) * (norm_b as f64));
         (dot as f64) / denom
     }
 
@@ -666,7 +760,7 @@ pub mod avx2 {
         if norm_a == 0.0 || norm_b == 0.0 {
             return 0.0;
         }
-        dot / (norm_a * norm_b).sqrt()
+        dot / crate::math::sqrt_f32(norm_a * norm_b)
     }
 
     // Suppress dead-code warnings for store/load helpers that may become
@@ -819,7 +913,7 @@ pub mod neon {
         if norm_a == 0 || norm_b == 0 {
             return 0.0;
         }
-        let denom = ((norm_a as f64) * (norm_b as f64)).sqrt();
+        let denom = crate::math::sqrt_f64((norm_a as f64) * (norm_b as f64));
         (dot as f64) / denom
     }
 
@@ -886,7 +980,7 @@ pub mod neon {
         if norm_a == 0.0 || norm_b == 0.0 {
             return 0.0;
         }
-        dot / (norm_a * norm_b).sqrt()
+        dot / crate::math::sqrt_f32(norm_a * norm_b)
     }
 }
 
@@ -1035,6 +1129,6 @@ pub mod sve {
         if norm_a == 0.0 || norm_b == 0.0 {
             return 0.0;
         }
-        dot / (norm_a * norm_b).sqrt()
+        dot / crate::math::sqrt_f32(norm_a * norm_b)
     }
 }

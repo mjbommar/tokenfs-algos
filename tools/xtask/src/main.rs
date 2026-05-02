@@ -93,6 +93,7 @@ fn run() -> Result<()> {
         "profile-primitives-real" => profile_primitives_real(&rest),
         "profile-primitives-flamegraph" => profile_primitives_flamegraph(&rest),
         "profile-primitives-flamegraph-real" => profile_primitives_flamegraph_real(&rest),
+        "security" => security(),
         "ci" => ci(),
         "help" | "-h" | "--help" => {
             help();
@@ -129,6 +130,86 @@ fn test() -> Result<()> {
     cargo(["test", "--workspace", "--all-targets"])?;
     cargo(["test", "-p", "tokenfs-algos", "--release", "--all-features"])?;
     Ok(())
+}
+
+fn security() -> Result<()> {
+    cargo([
+        "check",
+        "-p",
+        "tokenfs-algos",
+        "--no-default-features",
+        "--lib",
+    ])?;
+    cargo([
+        "check",
+        "-p",
+        "tokenfs-algos",
+        "--no-default-features",
+        "--features",
+        "alloc",
+        "--lib",
+    ])?;
+    cargo([
+        "check",
+        "-p",
+        "tokenfs-algos",
+        "--no-default-features",
+        "--features",
+        "std",
+        "--lib",
+    ])?;
+    ensure_minimal_no_std_dependency_tree()?;
+    Ok(())
+}
+
+fn ensure_minimal_no_std_dependency_tree() -> Result<()> {
+    let output = Command::new("cargo")
+        .args([
+            "tree",
+            "-p",
+            "tokenfs-algos",
+            "--no-default-features",
+            "-e",
+            "normal",
+            "--prefix",
+            "none",
+        ])
+        .output()
+        .map_err(|error| format!("failed to run `cargo tree`: {error}"))?;
+
+    if !output.status.success() {
+        return Err(format!("`cargo tree` exited with {}", output.status));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let forbidden = [
+        "blake3",
+        "criterion",
+        "hex-literal",
+        "proptest",
+        "rayon",
+        "serde_json",
+    ];
+    let mut found = BTreeSet::new();
+
+    for line in stdout.lines() {
+        let Some(crate_name) = line.split_whitespace().next() else {
+            continue;
+        };
+        if forbidden.contains(&crate_name) {
+            found.insert(crate_name.to_owned());
+        }
+    }
+
+    if found.is_empty() {
+        eprintln!("xtask: no_std dependency tree only contains allowed core crates");
+        Ok(())
+    } else {
+        Err(format!(
+            "no_std dependency tree pulled in forbidden crates: {}",
+            found.into_iter().collect::<Vec<_>>().join(", ")
+        ))
+    }
 }
 
 fn bench(extra: &[OsString]) -> Result<()> {
@@ -4953,6 +5034,8 @@ fn help() {
                     primitive flamegraph SVG with cargo-flamegraph\n\
            profile-primitives-flamegraph-real\n\
                     primitive flamegraph SVG with real-file slices\n\
+           security\n\
+                    no_std/alloc/std core checks plus no_std dependency guard\n\
            ci       local CI gate"
     );
 }

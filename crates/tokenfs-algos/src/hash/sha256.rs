@@ -285,6 +285,7 @@ pub mod kernels {
                 && std::is_x86_feature_detected!("ssse3")
         }
 
+        /// Returns false because runtime SHA-NI detection requires `std`.
         #[cfg(not(feature = "std"))]
         #[must_use]
         pub const fn is_available() -> bool {
@@ -1026,6 +1027,40 @@ pub mod kernels {
 /// h.update(b"world");
 /// assert_eq!(h.finalize(), sha256(b"hello, world"));
 /// ```
+/// Error returned by [`Hasher::try_update`] when the cumulative
+/// SHA-256 message length would exceed FIPS 180-4's `2^64 - 1` bit
+/// cap. Past the cap the padding length field would wrap and the
+/// digest would collide with a shorter different input — a content-ID
+/// hazard rather than a memory hazard.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Sha256LengthOverflow {
+    /// Cumulative bit length already absorbed before the failed call.
+    pub current_bits: u64,
+    /// Length in bytes of the chunk that would have pushed past the cap.
+    pub attempted_chunk_bytes: usize,
+}
+
+impl core::fmt::Display for Sha256LengthOverflow {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "SHA-256 stream length overflow: {} bits already absorbed + {} more bytes would exceed 2^64 - 1 bits",
+            self.current_bits, self.attempted_chunk_bytes
+        )
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for Sha256LengthOverflow {}
+
+/// Streaming SHA-256 hasher.
+///
+/// See the doctest at the top of this module for the canonical
+/// `new() / update() / finalize()` shape. The detected backend is
+/// cached on the struct so repeated `update` calls pay no dispatch
+/// cost. Length tracking is checked: a cumulative message length
+/// past `2^64 - 1` bits panics in [`Self::update`] (or returns
+/// [`Sha256LengthOverflow`] from [`Self::try_update`]).
 #[derive(Clone)]
 pub struct Hasher {
     state: [u32; 8],
@@ -1089,13 +1124,42 @@ impl Hasher {
 
     /// Feed `bytes` into the hash. Calls may be of any length, including
     /// empty.
+    ///
+    /// # Length limit (panics)
+    ///
+    /// FIPS 180-4 caps the SHA-256 message length at `2^64 - 1` bits
+    /// (= ~2 EiB). This streaming Hasher panics if `update` would push
+    /// the cumulative length past that bound. Past the cap the padding
+    /// length field would wrap and the digest would collide with a
+    /// shorter, different input — a content-ID hazard, not a memory
+    /// hazard. Use [`Self::try_update`] in callers that want a
+    /// `Result` instead of a panic for adversarial input lengths.
     pub fn update(&mut self, bytes: &[u8]) {
+        self.try_update(bytes)
+            .expect("SHA-256 stream length exceeded 2^64 bits");
+    }
+
+    /// Fallible variant of [`Self::update`]: returns
+    /// [`Sha256LengthOverflow`] if the cumulative bit length would
+    /// exceed FIPS 180-4's `2^64 - 1` bit cap. Successful calls leave
+    /// the hasher state advanced; failed calls leave it unchanged.
+    pub fn try_update(&mut self, bytes: &[u8]) -> Result<(), Sha256LengthOverflow> {
         if bytes.is_empty() {
-            return;
+            return Ok(());
         }
+        let added_bits = (bytes.len() as u64)
+            .checked_mul(8)
+            .ok_or(Sha256LengthOverflow {
+                current_bits: self.total_bits,
+                attempted_chunk_bytes: bytes.len(),
+            })?;
         self.total_bits = self
             .total_bits
-            .wrapping_add((bytes.len() as u64).wrapping_mul(8));
+            .checked_add(added_bits)
+            .ok_or(Sha256LengthOverflow {
+                current_bits: self.total_bits,
+                attempted_chunk_bytes: bytes.len(),
+            })?;
 
         let mut input = bytes;
         let buffered = self.buffered as usize;
@@ -1106,7 +1170,7 @@ impl Hasher {
             if input.len() < need {
                 self.buffer[buffered..buffered + input.len()].copy_from_slice(input);
                 self.buffered = (buffered + input.len()) as u8;
-                return;
+                return Ok(());
             }
             self.buffer[buffered..BLOCK_BYTES].copy_from_slice(&input[..need]);
             input = &input[need..];
@@ -1136,6 +1200,7 @@ impl Hasher {
             self.buffer[..input.len()].copy_from_slice(input);
             self.buffered = input.len() as u8;
         }
+        Ok(())
     }
 
     /// Consume the hasher and emit the 32-byte digest.
@@ -1636,5 +1701,49 @@ mod tests {
         let a = Hasher::default().finalize();
         let b = Hasher::new().finalize();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn hasher_try_update_detects_2_to_64_bit_length_overflow() {
+        // Drive total_bits to just under 2^64. We can't actually feed
+        // 2 EiB of bytes through the hasher in a test, so simulate by
+        // manipulating the field directly via a sequence that gets
+        // close to the cap, then ask try_update to push past it.
+        let mut h = Hasher::new();
+        // Set the cumulative bit count to 2^64 - 16 by directly
+        // mutating the field via reset+manual update of the public
+        // surface. We do this by hand-setting through unsafe — for
+        // a test, the cleanest path is to use the public surface to
+        // get to a known state, then the next try_update with a
+        // chunk whose bit-length pushes past 2^64 must error.
+        //
+        // The easiest reproducible setup: ask try_update for a chunk
+        // whose `len * 8` itself overflows. That triggers the
+        // `checked_mul(8)` path. usize::MAX bytes is unrepresentable
+        // as a slice we can allocate, but on 64-bit we can pass a
+        // synthetic slice header pointing at a tiny buffer with a
+        // big length using an empty wrapper. Instead, exercise the
+        // `checked_add` path by setting total_bits via direct field
+        // access — gated by the test itself living in the same crate
+        // module.
+        h.total_bits = u64::MAX - 7; // one more byte = +8 bits = wraps
+        let err = h.try_update(b"x").expect_err("should overflow");
+        assert_eq!(err.current_bits, u64::MAX - 7);
+        assert_eq!(err.attempted_chunk_bytes, 1);
+        // The hasher state must NOT have advanced — total_bits unchanged.
+        assert_eq!(h.total_bits, u64::MAX - 7);
+        // A fresh hasher accepts the same byte without panicking.
+        let mut h2 = Hasher::new();
+        assert!(h2.try_update(b"x").is_ok());
+    }
+
+    #[test]
+    #[should_panic(expected = "SHA-256 stream length exceeded 2^64 bits")]
+    fn hasher_update_panics_on_overflow() {
+        // Mirrors the try_update test but exercises the panicking
+        // wrapper so the documented behavior is pinned.
+        let mut h = Hasher::new();
+        h.total_bits = u64::MAX - 7;
+        h.update(b"x");
     }
 }

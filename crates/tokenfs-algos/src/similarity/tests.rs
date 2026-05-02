@@ -46,6 +46,63 @@ fn l2_squared_u32_known_values() {
 }
 
 #[test]
+fn try_dot_u32_detects_overflow() {
+    // Two pairs of (u32::MAX, u32::MAX) overflow u64 in the
+    // accumulator on the second iteration. The wrapping variant
+    // returns Some(garbage); the checked variant returns Some(None).
+    let a = [u32::MAX, u32::MAX];
+    let b = [u32::MAX, u32::MAX];
+    let wrapped = scalar::dot_u32(&a, &b).unwrap();
+    assert_ne!(
+        wrapped,
+        u64::MAX,
+        "wrapping result should not equal u64::MAX"
+    );
+    assert_eq!(
+        scalar::try_dot_u32(&a, &b),
+        Some(None),
+        "checked variant must report overflow"
+    );
+    // Non-overflowing input still returns the right sum.
+    let c = [1_u32, 2, 3, 4];
+    let d = [4_u32, 3, 2, 1];
+    assert_eq!(scalar::try_dot_u32(&c, &d), Some(Some(20)));
+    // Length mismatch propagates as outer None.
+    assert_eq!(scalar::try_dot_u32(&[1_u32, 2], &[1_u32]), None);
+}
+
+#[test]
+fn try_l1_u32_handles_safe_values_and_length_mismatch() {
+    // L1 overflow requires more than 2^32 max-distance pairs, which is
+    // not a practical unit-test fixture. Keep this bounded test for
+    // the fallible API shape and length-mismatch behavior; dot/L2 have
+    // small overflow fixtures above because their per-pair term can be
+    // close to u64::MAX.
+    let a = [1_u32, 5, 3];
+    let b = [2_u32, 1, 7];
+    assert_eq!(scalar::try_l1_u32(&a, &b), Some(Some(9)));
+    assert_eq!(scalar::try_l1_u32(&[1_u32], &[1_u32, 2]), None);
+}
+
+#[test]
+fn try_l2_squared_u32_detects_overflow() {
+    // (u32::MAX)^2 ≈ 2^64 per pair → first pair already saturates u64.
+    let a = [u32::MAX, u32::MAX];
+    let b = [0_u32, u32::MAX];
+    // (u32::MAX)^2 = 0xFFFF_FFFE_0000_0001 ≈ 2^64 - 2^33; second pair is 0.
+    // So the SUM of (u32::MAX)^2 + 0 fits in u64 → returns Some.
+    assert!(scalar::try_l2_squared_u32(&a, &b).unwrap().is_some());
+    // But (u32::MAX)^2 + (u32::MAX)^2 = 2 × (2^64 - 2^33) overflows u64.
+    let a = [u32::MAX, u32::MAX];
+    let b = [0_u32, 0_u32];
+    assert_eq!(scalar::try_l2_squared_u32(&a, &b), Some(None));
+    // Sane input still works.
+    let c = [1_u32, 2, 3];
+    let d = [4_u32, 0, 7];
+    assert_eq!(scalar::try_l2_squared_u32(&c, &d), Some(Some(29)));
+}
+
+#[test]
 fn cosine_similarity_u32_known_values() {
     let a = [1_u32, 0, 0];
     let b = [0_u32, 1, 0];

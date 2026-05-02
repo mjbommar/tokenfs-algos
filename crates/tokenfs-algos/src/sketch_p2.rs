@@ -26,6 +26,30 @@
 
 use crate::math;
 
+/// Failure modes for the fallible P² constructor.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum P2Error {
+    /// `p` was NaN or outside the open interval `(0, 1)`.
+    QuantileOutOfRange {
+        /// Caller-supplied target quantile.
+        value: f64,
+    },
+}
+
+impl core::fmt::Display for P2Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::QuantileOutOfRange { value } => write!(
+                f,
+                "P² target quantile {value} outside the open interval (0, 1)"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for P2Error {}
+
 /// Online P² quantile estimator for one fixed quantile `p ∈ (0, 1)`.
 #[derive(Clone, Debug)]
 pub struct Estimator {
@@ -51,7 +75,8 @@ impl Estimator {
     ///
     /// # Panics
     ///
-    /// Panics if `p` is not in `(0, 1)` or is NaN.
+    /// Panics if `p` is not in `(0, 1)` or is NaN. Use [`Self::try_new`]
+    /// in callers that take user-controlled `p`.
     #[must_use]
     pub fn new(p: f64) -> Self {
         assert!(
@@ -67,6 +92,15 @@ impl Estimator {
             // Per Jain-Chlamtac: marker desired-position increments.
             dn: [0.0, p / 2.0, p, (1.0 + p) / 2.0, 1.0],
         }
+    }
+
+    /// Fallible variant of [`Self::new`] returning [`P2Error`]
+    /// when `p` is outside `(0, 1)` or NaN, instead of panicking.
+    pub fn try_new(p: f64) -> Result<Self, P2Error> {
+        if !(p > 0.0 && p < 1.0) {
+            return Err(P2Error::QuantileOutOfRange { value: p });
+        }
+        Ok(Self::new(p))
     }
 
     /// Target quantile.
@@ -361,5 +395,31 @@ mod tests {
         assert!(result.is_err());
         let result = std::panic::catch_unwind(|| Estimator::new(f64::NAN));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn try_new_returns_error_for_invalid_p() {
+        // Fallible parallel of the panic test: out-of-range and NaN
+        // must surface as P2Error rather than panic.
+        for bad in [
+            0.0,
+            -0.5,
+            1.0,
+            1.5,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            let err = Estimator::try_new(bad).unwrap_err();
+            match err {
+                P2Error::QuantileOutOfRange { value } => {
+                    assert!(value.is_nan() || !(0.0..1.0).contains(&value) || value == 0.0);
+                }
+            }
+        }
+        // Sane inputs still construct.
+        assert!(Estimator::try_new(0.5).is_ok());
+        assert!(Estimator::try_new(0.95).is_ok());
+        assert!(Estimator::try_new(f64::EPSILON).is_ok());
     }
 }

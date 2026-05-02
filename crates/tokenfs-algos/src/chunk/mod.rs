@@ -65,6 +65,33 @@ impl Default for ChunkQuality {
     }
 }
 
+/// Failure modes for the fallible `ChunkConfig` constructors.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChunkConfigError {
+    /// `avg_size` exceeds `CHUNK_AVG_SIZE_CAP`. The infallible
+    /// constructors saturate; the `try_*` variants surface this.
+    AvgSizeOverflow {
+        /// Caller-supplied avg_size.
+        requested: usize,
+        /// Hard cap before saturation kicks in.
+        cap: usize,
+    },
+}
+
+impl core::fmt::Display for ChunkConfigError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::AvgSizeOverflow { requested, cap } => write!(
+                f,
+                "ChunkConfig avg_size {requested} exceeds the saturation cap {cap}"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for ChunkConfigError {}
+
 /// Configuration for Gear/FastCDC-style chunking.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ChunkConfig {
@@ -89,22 +116,66 @@ pub struct FastCdcConfig {
     pub normalization_level: u8,
 }
 
+/// Largest `avg_size` accepted before the constructor saturates rather
+/// than overflowing. Set to the largest power of two whose `× 4`
+/// expansion still lives within `usize`. `next_power_of_two()` panics
+/// in debug + wraps in release on inputs `> usize::MAX / 2`, and
+/// `avg_size * 4` wraps on inputs `> usize::MAX / 4`; saturating both
+/// keeps the public constructors panic-free for any user-controlled
+/// input. On 64-bit platforms this is `1 << 62` ≈ 4.6 EiB.
+pub const CHUNK_AVG_SIZE_CAP: usize = 1 << (usize::BITS as usize - 2);
+
+/// Saturating equivalent of `n.next_power_of_two()` — returns
+/// `1 << (usize::BITS - 1)` (the largest power of two representable
+/// in a `usize`) instead of panicking/wrapping when `n > 1 << (BITS - 1)`.
+const fn saturating_next_power_of_two(n: usize) -> usize {
+    let max_pot = 1_usize << (usize::BITS as usize - 1);
+    if n > max_pot {
+        max_pot
+    } else {
+        n.next_power_of_two()
+    }
+}
+
 impl ChunkConfig {
     /// Creates a conservative configuration from an average chunk size.
+    ///
+    /// Any user-controlled input is accepted: oversized values saturate
+    /// to `CHUNK_AVG_SIZE_CAP` before the next-power-of-two + `* 4`
+    /// arithmetic, so this constructor cannot panic or wrap. Pair with
+    /// [`Self::try_new`] in kernel-adjacent code that wants an explicit
+    /// overflow signal.
     #[must_use]
     pub fn new(avg_size: usize) -> Self {
-        let avg_size = avg_size.max(64).next_power_of_two();
+        let avg_size = saturating_next_power_of_two(avg_size.clamp(64, CHUNK_AVG_SIZE_CAP));
         Self {
             min_size: (avg_size / 4).max(16),
             avg_size,
-            max_size: (avg_size * 4).max(avg_size),
+            max_size: avg_size.saturating_mul(4).max(avg_size),
         }
     }
 
+    /// Fallible variant of [`Self::new`]: returns `Err` when
+    /// `avg_size > CHUNK_AVG_SIZE_CAP`. Use in kernel-adjacent
+    /// callers that need to reject hostile sizes explicitly.
+    pub fn try_new(avg_size: usize) -> Result<Self, ChunkConfigError> {
+        if avg_size > CHUNK_AVG_SIZE_CAP {
+            return Err(ChunkConfigError::AvgSizeOverflow {
+                requested: avg_size,
+                cap: CHUNK_AVG_SIZE_CAP,
+            });
+        }
+        Ok(Self::new(avg_size))
+    }
+
     /// Creates a configuration with explicit min/avg/max sizes.
+    ///
+    /// Saturating semantics match [`Self::new`]: oversized values
+    /// are clamped before any arithmetic. Pair with [`Self::try_with_sizes`]
+    /// to surface overflow as an error.
     #[must_use]
     pub fn with_sizes(min_size: usize, avg_size: usize, max_size: usize) -> Self {
-        let avg_size = avg_size.max(1).next_power_of_two();
+        let avg_size = saturating_next_power_of_two(avg_size.clamp(1, CHUNK_AVG_SIZE_CAP));
         let min_size = min_size.min(max_size).min(avg_size).max(1);
         let max_size = max_size.max(min_size).max(avg_size);
         Self {
@@ -112,6 +183,21 @@ impl ChunkConfig {
             avg_size,
             max_size,
         }
+    }
+
+    /// Fallible variant of [`Self::with_sizes`].
+    pub fn try_with_sizes(
+        min_size: usize,
+        avg_size: usize,
+        max_size: usize,
+    ) -> Result<Self, ChunkConfigError> {
+        if avg_size > CHUNK_AVG_SIZE_CAP {
+            return Err(ChunkConfigError::AvgSizeOverflow {
+                requested: avg_size,
+                cap: CHUNK_AVG_SIZE_CAP,
+            });
+        }
+        Ok(Self::with_sizes(min_size, avg_size, max_size))
     }
 
     /// Returns the boundary mask implied by the average chunk size.
@@ -529,11 +615,45 @@ fn mask_for_bits(bits: u32) -> u64 {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code — panic on Err is the desired failure mode.
 mod tests {
     use super::{
-        ChunkConfig, FastCdcConfig, chunks, fastcdc_chunks, fastcdc_find_boundary, find_boundary,
-        gear_hash, summarize_chunk_quality,
+        CHUNK_AVG_SIZE_CAP, ChunkConfig, ChunkConfigError, FastCdcConfig, chunks, fastcdc_chunks,
+        fastcdc_find_boundary, find_boundary, gear_hash, summarize_chunk_quality,
     };
+
+    #[test]
+    fn chunk_config_new_saturates_on_extreme_avg_size() {
+        // Pre-fix `avg_size.next_power_of_two()` panicked in debug
+        // and `avg_size * 4` wrapped on usize::MAX. Saturating
+        // semantics keep the constructor panic-free for any input.
+        let cfg = ChunkConfig::new(usize::MAX);
+        assert!(cfg.avg_size <= CHUNK_AVG_SIZE_CAP);
+        assert!(cfg.max_size >= cfg.avg_size);
+        assert!(cfg.min_size >= 16);
+    }
+
+    #[test]
+    fn chunk_config_with_sizes_saturates() {
+        let cfg = ChunkConfig::with_sizes(0, usize::MAX, usize::MAX);
+        assert!(cfg.avg_size <= CHUNK_AVG_SIZE_CAP);
+        assert!(cfg.max_size >= cfg.avg_size);
+    }
+
+    #[test]
+    fn chunk_config_try_new_rejects_overflow() {
+        let err = ChunkConfig::try_new(usize::MAX).unwrap_err();
+        assert!(matches!(err, ChunkConfigError::AvgSizeOverflow { .. }));
+        // Sane inputs still construct.
+        assert!(ChunkConfig::try_new(8 * 1024).is_ok());
+    }
+
+    #[test]
+    fn chunk_config_try_with_sizes_rejects_overflow() {
+        let err = ChunkConfig::try_with_sizes(0, usize::MAX, usize::MAX).unwrap_err();
+        assert!(matches!(err, ChunkConfigError::AvgSizeOverflow { .. }));
+        assert!(ChunkConfig::try_with_sizes(1024, 4096, 8192).is_ok());
+    }
 
     #[test]
     fn explicit_config_is_normalized() {

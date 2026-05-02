@@ -312,6 +312,9 @@ pub mod avx512 {
 /// Table size: 256 * 64 = **16 KiB** (fits L1 on every modern x86).
 /// Accumulator: 64 * 4 = 256 B (lives in registers).
 pub mod simhash {
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::boxed::Box;
+
     use super::TABLE_ROWS;
 
     /// Number of bits in the 64-bit SimHash signature.

@@ -219,14 +219,21 @@ pub mod kernels {
         ///
         /// # Safety
         ///
-        /// The caller must ensure the current CPU supports AVX2.
+        /// The caller must ensure the current CPU supports **all of**
+        /// AVX2, BMI2, and LZCNT. The function is annotated
+        /// `target_feature(enable = "avx2,bmi2,lzcnt")` and LLVM may
+        /// emit BMI2 (`bzhi`, `andn`) or LZCNT instructions inside
+        /// the body — calling it on a CPU that exposes AVX2 but not
+        /// BMI2/LZCNT is undefined behaviour. The safe public
+        /// dispatcher `runlength::transitions` checks all three via
+        /// `is_x86_feature_detected!` before calling here.
         ///
-        /// `bmi2` and `lzcnt` are added to the `target_feature` set so
-        /// the optimizer is free to lower `high_bits_mask` and the
-        /// per-iteration branch tests into BMI2/LZCNT forms (`bzhi`,
-        /// `andn`, `lzcnt`) when profitable. The runtime gate only
-        /// checks AVX2 because every x86 CPU shipped with AVX2
-        /// (Intel Haswell+, AMD Excavator+) also has BMI2 and LZCNT.
+        /// (Most x86 CPUs that ship AVX2 also ship BMI2 and LZCNT,
+        /// but the combination is not architecturally guaranteed:
+        /// KVM-without-CPUID-passthrough, very old Atom variants,
+        /// and some sandbox configurations expose AVX2 alone. See
+        /// commit history around #67 for the original UB
+        /// reproduction.)
         #[target_feature(enable = "avx2,bmi2,lzcnt")]
         #[must_use]
         pub unsafe fn transitions(bytes: &[u8]) -> u64 {

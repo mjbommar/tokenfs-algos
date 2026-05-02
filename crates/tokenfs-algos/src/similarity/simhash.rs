@@ -108,6 +108,9 @@ where
 
 #[cfg(any(feature = "std", feature = "alloc"))]
 mod table {
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::boxed::Box;
+
     use super::Signature64;
     use crate::similarity::kernels_gather;
 

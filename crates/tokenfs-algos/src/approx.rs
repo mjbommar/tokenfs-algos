@@ -11,6 +11,73 @@
 //!
 //! `CountMinSketch` already lives in [`crate::sketch`] and is not duplicated
 //! here.
+//!
+//! # Fallible constructors
+//!
+//! Each `new` / `with_target` constructor below panics on out-of-range
+//! parameters (zero bits, zero precision, etc.) — convenient for
+//! userland callers that pass compile-time constants. For
+//! kernel-adjacent or user-input-driven callers a `try_new` /
+//! `try_with_target` parallel returns [`ApproxError`] instead. See
+//! the per-method docs for the exact preconditions enforced.
+
+/// Failure modes for the fallible approx-data-structure constructors
+/// (`BloomFilter::try_new`, `BloomFilter::try_with_target`,
+/// `HyperLogLog::try_new`).
+#[cfg(feature = "std")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ApproxError {
+    /// A required positive-integer parameter was zero (BloomFilter
+    /// `bits` / `k`, HyperLogLog `precision` outside the valid band).
+    ZeroParameter {
+        /// Name of the offending parameter.
+        name: &'static str,
+    },
+    /// A floating-point ratio (e.g. Bloom filter target FPR) was
+    /// outside the open interval `(0, 1)`.
+    OutOfRangeFraction {
+        /// Name of the offending parameter.
+        name: &'static str,
+        /// Caller-supplied value.
+        value: f64,
+    },
+    /// HyperLogLog precision must be in `4..=16`; this captures
+    /// values outside that band.
+    PrecisionOutOfRange {
+        /// Caller-supplied precision.
+        requested: u32,
+        /// Smallest accepted precision.
+        min: u32,
+        /// Largest accepted precision.
+        max: u32,
+    },
+}
+
+#[cfg(feature = "std")]
+impl core::fmt::Display for ApproxError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::ZeroParameter { name } => {
+                write!(f, "approx parameter `{name}` must be > 0")
+            }
+            Self::OutOfRangeFraction { name, value } => write!(
+                f,
+                "approx parameter `{name}` = {value} must be in the open interval (0, 1)"
+            ),
+            Self::PrecisionOutOfRange {
+                requested,
+                min,
+                max,
+            } => write!(
+                f,
+                "HyperLogLog precision {requested} outside accepted band {min}..={max}"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for ApproxError {}
 
 // ============================================================================
 // SpaceSaving heavy hitters (fixed-size, no_std-clean)
@@ -203,6 +270,37 @@ mod bloom {
             Self::new(m, k)
         }
 
+        /// Fallible variant of [`Self::new`] returning [`super::ApproxError`]
+        /// on `bits == 0` or `k == 0` instead of panicking.
+        pub fn try_new(bits: usize, k: usize) -> Result<Self, super::ApproxError> {
+            if bits == 0 {
+                return Err(super::ApproxError::ZeroParameter { name: "bits" });
+            }
+            if k == 0 {
+                return Err(super::ApproxError::ZeroParameter { name: "k" });
+            }
+            Ok(Self::new(bits, k))
+        }
+
+        /// Fallible variant of [`Self::with_target`].
+        pub fn try_with_target(
+            expected_items: usize,
+            target_fpr: f64,
+        ) -> Result<Self, super::ApproxError> {
+            if expected_items == 0 {
+                return Err(super::ApproxError::ZeroParameter {
+                    name: "expected_items",
+                });
+            }
+            if !(target_fpr > 0.0 && target_fpr < 1.0) {
+                return Err(super::ApproxError::OutOfRangeFraction {
+                    name: "target_fpr",
+                    value: target_fpr,
+                });
+            }
+            Ok(Self::with_target(expected_items, target_fpr))
+        }
+
         /// Number of items inserted.
         #[must_use]
         pub fn inserted(&self) -> u64 {
@@ -331,6 +429,19 @@ mod hll {
                 registers: vec![0; m],
                 precision,
             }
+        }
+
+        /// Fallible variant of [`Self::new`] returning
+        /// [`super::ApproxError`] when `precision` is outside `4..=16`.
+        pub fn try_new(precision: u32) -> Result<Self, super::ApproxError> {
+            if !(4..=16).contains(&precision) {
+                return Err(super::ApproxError::PrecisionOutOfRange {
+                    requested: precision,
+                    min: 4,
+                    max: 16,
+                });
+            }
+            Ok(Self::new(precision))
         }
 
         /// Number of registers (`2^precision`).
@@ -627,5 +738,62 @@ mod tests {
         assert!(hll.estimate() > 100);
         hll.clear();
         assert_eq!(hll.estimate(), 0);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn bloom_try_new_rejects_zero_parameters() {
+        // Fallible parallel of the panic-on-zero contract.
+        let err = BloomFilter::try_new(0, 4).unwrap_err();
+        assert!(matches!(err, ApproxError::ZeroParameter { name: "bits" }));
+        let err = BloomFilter::try_new(64, 0).unwrap_err();
+        assert!(matches!(err, ApproxError::ZeroParameter { name: "k" }));
+        // Sane inputs construct.
+        assert!(BloomFilter::try_new(64, 4).is_ok());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn bloom_try_with_target_rejects_bad_inputs() {
+        let err = BloomFilter::try_with_target(0, 0.01).unwrap_err();
+        assert!(matches!(
+            err,
+            ApproxError::ZeroParameter {
+                name: "expected_items"
+            }
+        ));
+        for bad in [0.0, -0.1, 1.0, 2.0, f64::NAN] {
+            let err = BloomFilter::try_with_target(1000, bad).unwrap_err();
+            assert!(matches!(
+                err,
+                ApproxError::OutOfRangeFraction {
+                    name: "target_fpr",
+                    ..
+                }
+            ));
+        }
+        assert!(BloomFilter::try_with_target(1000, 0.01).is_ok());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn hll_try_new_rejects_precision_out_of_range() {
+        for bad in [0_u32, 3, 17, 32, 64] {
+            let err = HyperLogLog::try_new(bad).unwrap_err();
+            assert!(matches!(
+                err,
+                ApproxError::PrecisionOutOfRange {
+                    requested,
+                    min: 4,
+                    max: 16,
+                } if requested == bad
+            ));
+        }
+        for ok in [4_u32, 8, 12, 16] {
+            assert!(
+                HyperLogLog::try_new(ok).is_ok(),
+                "precision {ok} should be ok"
+            );
+        }
     }
 }

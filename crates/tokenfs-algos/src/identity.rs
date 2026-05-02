@@ -49,7 +49,7 @@
 #[cfg(all(feature = "alloc", not(feature = "std")))]
 use alloc::string::String;
 #[cfg(all(feature = "alloc", not(feature = "std")))]
-use alloc::vec::Vec;
+use alloc::{vec, vec::Vec};
 
 use core::fmt;
 

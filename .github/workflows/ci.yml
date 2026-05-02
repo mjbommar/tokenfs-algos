@@ -115,6 +115,15 @@ jobs:
       - name: Check (no default features)
         run: cargo check -p tokenfs-algos --no-default-features --lib
 
+      # Same shape with `alloc` enabled — verifies the no_std + alloc
+      # posture every storage-layer-adjacent caller will use. Test
+      # compile is intentionally NOT attempted here: test-only code
+      # (proptest, criterion, serde_json dev-deps; vec!/format! macros)
+      # requires `std` and would balloon the surface for no benefit.
+      # See `docs/NO_STD_POSTURE.md` for the documented matrix.
+      - name: Check (no default features + alloc)
+        run: cargo check -p tokenfs-algos --no-default-features --features alloc --lib
+
       - name: Test (with std + tunes-json)
         run: cargo test -p tokenfs-algos --features tunes-json
 
