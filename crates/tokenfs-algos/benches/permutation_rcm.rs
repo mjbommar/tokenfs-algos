@@ -221,9 +221,12 @@ fn deterministic_permutation(n: usize) -> Permutation {
     let perm: Vec<u32> = (0..n)
         .map(|i| ((i as u64 * stride) % n as u64) as u32)
         .collect();
-    // Bench-only: trust the construction; the inner test suite verifies
-    // it via `try_from_vec`.
-    Permutation::from_vec_unchecked(perm)
+    // SAFETY: `pick_coprime_stride(n)` returns `stride` coprime to `n`
+    // (with `gcd(stride, n) == 1`), so `i -> (i * stride) mod n` is a
+    // bijection on `0..n`. `n` is a usize from the bench harness and is
+    // far below `u32::MAX`. The inner test suite cross-checks this
+    // construction against `try_from_vec`.
+    unsafe { Permutation::from_vec_unchecked(perm) }
 }
 
 /// Returns an odd integer coprime to `n`. For `n >= 1`, 1 is always

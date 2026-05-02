@@ -49,7 +49,11 @@ fuzz_target!(|data: &[u8]| {
     // test that both constructors agree).
     let perm = Permutation::try_from_vec(perm_raw.clone())
         .expect("Fisher-Yates should produce a valid permutation");
-    let perm_unchecked = Permutation::from_vec_unchecked(perm_raw);
+    // SAFETY: `perm_raw` is the identity 0..n shuffled via Fisher-Yates
+    // (only `swap` operations on the identity), so it is a permutation
+    // of `0..n`. The `try_from_vec` call above also accepted the same
+    // bytes, providing a runtime cross-check.
+    let perm_unchecked = unsafe { Permutation::from_vec_unchecked(perm_raw) };
     assert_eq!(perm, perm_unchecked, "checked vs unchecked perm differ");
 
     // Build a Vec<u32> source from the remaining payload bytes; pad with
