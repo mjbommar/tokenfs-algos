@@ -19,6 +19,16 @@ calibration = ["std"]
 parallel = ["dep:rayon"]
 avx2 = []
 avx512 = ["nightly"]
+# AVX-512 sub-feature backends. All gate runtime detection (`is_x86_feature_
+# detected!`) on the corresponding feature; compile-time gating uses only the
+# umbrella `avx512` flag to keep the feature matrix small. The named features
+# below are kept as dependent aliases so callers can express intent — they
+# are no-ops at present beyond requiring `avx512`.
+avx512_vbmi = ["avx512"]
+avx512_vbmi2 = ["avx512"]
+avx512_bitalg = ["avx512"]
+avx512_gfni = ["avx512"]
+avx512_vpclmulqdq = ["avx512"]
 neon = []
 sve = ["nightly"]
 sve2 = ["nightly"]

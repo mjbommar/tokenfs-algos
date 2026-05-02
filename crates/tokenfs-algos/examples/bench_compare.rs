@@ -52,6 +52,7 @@ fn main() {
     bench_sketch_crc32_hash4();
     bench_similarity_dot_f32();
     bench_similarity_l2_squared_f32();
+    bench_histogram_bit_marginals();
 }
 
 // ---------- environment header ----------
@@ -298,6 +299,20 @@ fn bench_byteclass_validate_utf8() {
                 }),
             );
         }
+        #[cfg(all(feature = "avx512", any(target_arch = "x86", target_arch = "x86_64")))]
+        if byteclass::kernels::avx512_vbmi::is_available() {
+            emit(
+                "byteclass-validate-utf8",
+                "avx512-vbmi",
+                n,
+                measure(|| {
+                    // SAFETY: availability checked immediately above.
+                    black_box(unsafe {
+                        byteclass::kernels::avx512_vbmi::validate_utf8(black_box(&bytes))
+                    });
+                }),
+            );
+        }
         #[cfg(all(feature = "neon", target_arch = "aarch64"))]
         emit(
             "byteclass-validate-utf8",
@@ -452,6 +467,60 @@ fn bench_similarity_l2_squared_f32() {
         );
     }
 }
+
+#[cfg(all(feature = "avx512", any(target_arch = "x86", target_arch = "x86_64")))]
+fn bench_histogram_bit_marginals() {
+    for &n in PAYLOAD_SIZES_BYTES {
+        let bytes = make_random_bytes(n);
+        // Scalar reference path is always available regardless of arch.
+        emit(
+            "histogram-bit-marginals",
+            "scalar",
+            n,
+            measure(|| {
+                black_box(histogram::kernels::avx512_bitalg_bitsliced::block_scalar(
+                    black_box(&bytes),
+                ));
+            }),
+        );
+        if histogram::kernels::avx512_bitalg_bitsliced::is_available() {
+            emit(
+                "histogram-bit-marginals",
+                "avx512-bitalg",
+                n,
+                measure(|| {
+                    // SAFETY: availability checked immediately above.
+                    black_box(unsafe {
+                        histogram::kernels::avx512_bitalg_bitsliced::block_unchecked(black_box(
+                            &bytes,
+                        ))
+                    });
+                }),
+            );
+        }
+        if histogram::kernels::avx512_gfni_bitsliced::is_available() {
+            emit(
+                "histogram-bit-marginals",
+                "avx512-gfni",
+                n,
+                measure(|| {
+                    // SAFETY: availability checked immediately above.
+                    black_box(unsafe {
+                        histogram::kernels::avx512_gfni_bitsliced::block_unchecked(black_box(
+                            &bytes,
+                        ))
+                    });
+                }),
+            );
+        }
+    }
+}
+
+/// No-op stub when AVX-512 features are not enabled or the target
+/// architecture is not x86. Kept so the `main` call site does not need
+/// `cfg` gating around it.
+#[cfg(not(all(feature = "avx512", any(target_arch = "x86", target_arch = "x86_64"))))]
+fn bench_histogram_bit_marginals() {}
 
 // ---------- measurement core ----------
 

@@ -47,6 +47,46 @@ pub mod kernels {
     /// (1) issue 4 independent CRCs per iteration so the port stays
     /// saturated, and (2) keep 4 separate per-stream bin tables to
     /// eliminate the scatter aliasing — merge them at the end.
+    ///
+    /// ## VPCLMULQDQ exploration (issue #53) — negative result
+    ///
+    /// We considered two ways VPCLMULQDQ could accelerate this path:
+    ///
+    /// **(a) Replace `_mm_crc32_u32` with PCLMULQDQ-based CRC32C inside
+    /// the 4-stream pipeline.** Rejected. `_mm_crc32_u32` is the
+    /// dedicated CRC32C instruction (3-cycle latency, 1-cycle
+    /// throughput on Skylake / Zen 4) and produces a 32-bit hash from
+    /// a 32-bit input directly. PCLMULQDQ produces a 128-bit
+    /// polynomial product that needs Barrett reduction back to 32 bits
+    /// to match CRC32C — that's 3-4 ops per window vs the 1 op
+    /// `_mm_crc32_u32` already provides. The wider
+    /// `_mm512_clmulepi64_epi128` does 4 lanes of 64×64 → 128-bit poly
+    /// multiply in one op, but the per-lane reduction back to 32 bits
+    /// (Barrett or fold) adds cost that exceeds the 4-stream
+    /// `_mm_crc32_u32` baseline. Net: no speedup.
+    ///
+    /// **(b) Folly-style "fold by 4" CRC32C over 256-byte blocks.**
+    /// Rejected for THIS code path. The hash4_bins use case is
+    /// `for each 4-byte sliding window: bins[crc32c(0, window) %
+    /// BINS] += 1`. Each window's CRC is computed from `seed = 0`
+    /// independently, so there is no long CRC chain to fold across.
+    /// Folly's fold-by-4 technique applies when computing the CRC of
+    /// a contiguous N-byte buffer (file checksum, block integrity
+    /// hash); it does not apply to per-window hashing. If a future
+    /// caller needs single-shot CRC32C of a long buffer (kilobytes to
+    /// megabytes), VPCLMULQDQ + fold-by-4/16 is the correct approach
+    /// per Intel's "Fast CRC Computation Using PCLMULQDQ Instruction"
+    /// whitepaper — the implementation should live in a separate
+    /// `crc32c_long_buffer` primitive, not in the hash4_bins path.
+    ///
+    /// **Where VPCLMULQDQ might still help (not implemented):** if a
+    /// `tokenfs-algos` caller needs CRC32C as a per-extent file
+    /// checksum (one CRC per million bytes, not one per 4 bytes),
+    /// implementing Intel's fold-by-4 via `_mm512_clmulepi64_epi128`
+    /// would deliver ~2-3x over the scalar `_mm_crc32_u64`-chained
+    /// loop on long inputs. That kernel would belong as a peer of
+    /// [`crc32c_u32`], with a tag like `crc32c_long`. We declined to
+    /// add it speculatively without a concrete caller.
     #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
     pub mod sse42 {
         /// Returns true when the current CPU supports SSE4.2 CRC32C.

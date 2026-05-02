@@ -111,6 +111,10 @@ pub mod kernels {
                 any(target_arch = "x86", target_arch = "x86_64")
             ))]
             {
+                if super::avx512_vbmi::is_available() {
+                    // SAFETY: availability was checked immediately above.
+                    return unsafe { super::avx512_vbmi::validate_utf8(bytes) };
+                }
                 if super::avx512::is_available() {
                     // SAFETY: availability was checked immediately above.
                     return unsafe { super::avx512::validate_utf8(bytes) };
@@ -287,6 +291,50 @@ pub mod kernels {
             // SAFETY: `target_feature(enable = "avx2")` propagates the AVX2
             // requirement to the inner module-level entry point.
             unsafe { crate::byteclass::utf8_avx2::validate_utf8(bytes) }
+        }
+    }
+
+    /// AVX-512 VBMI UTF-8 validator. Same DFA as the AVX-512BW path but
+    /// fuses the two `prev1`-indexed lookups into a single 256-entry
+    /// `vpermi2b` byte-permute lookup. The byte-class `classify` kernel
+    /// has no VBMI variant — its hot path is already a `_mm512_movepi8_mask`
+    /// + `_mm512_cmpeq_epi8_mask` cascade that VBMI does not improve.
+    ///
+    /// Runtime gate: requires both AVX-512BW (for the kernel base) AND
+    /// AVX-512 VBMI (for the `vpermi2b` instruction).
+    #[cfg(all(feature = "avx512", any(target_arch = "x86", target_arch = "x86_64")))]
+    pub mod avx512_vbmi {
+        /// Returns true when AVX-512BW + AVX-512 VBMI are both available
+        /// at runtime.
+        #[cfg(feature = "std")]
+        #[must_use]
+        pub fn is_available() -> bool {
+            std::is_x86_feature_detected!("avx512bw") && std::is_x86_feature_detected!("avx512vbmi")
+        }
+
+        /// Returns true when AVX-512BW + AVX-512 VBMI are both available.
+        #[cfg(not(feature = "std"))]
+        #[must_use]
+        pub const fn is_available() -> bool {
+            false
+        }
+
+        /// Validates UTF-8 with the AVX-512 VBMI fused-table DFA.
+        ///
+        /// Returns the same triple as
+        /// [`super::scalar::validate_utf8`] / `core::str::from_utf8`.
+        ///
+        /// # Safety
+        ///
+        /// The caller must ensure both AVX-512BW and AVX-512 VBMI are
+        /// available on the current CPU.
+        #[target_feature(enable = "avx512bw,avx512vbmi")]
+        #[must_use]
+        pub unsafe fn validate_utf8(bytes: &[u8]) -> crate::byteclass::Utf8Validation {
+            // SAFETY: target_feature(enable = "avx512bw,avx512vbmi") on this
+            // function propagates both requirements to the inner module-level
+            // entry point.
+            unsafe { crate::byteclass::utf8_avx512::validate_utf8_vbmi(bytes) }
         }
     }
 
@@ -727,6 +775,92 @@ mod tests {
         // SAFETY: availability checked above.
         let actual = unsafe { kernels::avx512::validate_utf8(text.as_bytes()) };
         assert_eq!(actual, kernels::scalar::validate_utf8(text.as_bytes()));
+    }
+
+    #[cfg(all(
+        feature = "std",
+        feature = "avx512",
+        any(target_arch = "x86", target_arch = "x86_64")
+    ))]
+    #[test]
+    fn avx512_vbmi_validate_utf8_matches_scalar_when_available() {
+        if !kernels::avx512_vbmi::is_available() {
+            return;
+        }
+
+        for bytes in byteclass_cases() {
+            // SAFETY: availability was checked above.
+            let actual = unsafe { kernels::avx512_vbmi::validate_utf8(&bytes) };
+            assert_eq!(
+                actual,
+                kernels::scalar::validate_utf8(&bytes),
+                "AVX-512 VBMI validate_utf8 mismatch on {}-byte case",
+                bytes.len(),
+            );
+        }
+
+        // Long valid stream across many 64-byte blocks.
+        let mut text = String::new();
+        for _ in 0..512 {
+            text.push_str("hello \u{2603} world \u{1F600} ");
+        }
+        // SAFETY: availability checked above.
+        let actual = unsafe { kernels::avx512_vbmi::validate_utf8(text.as_bytes()) };
+        assert_eq!(actual, kernels::scalar::validate_utf8(text.as_bytes()));
+    }
+
+    /// Direct parity check between the AVX-512 VBMI variant and the
+    /// AVX-512BW variant on a fixed mixed-content payload. Required by
+    /// the task spec: "parity with scalar reference (or with the
+    /// existing AVX-512BW path for utf8) on a fixed mixed payload".
+    #[cfg(all(
+        feature = "std",
+        feature = "avx512",
+        any(target_arch = "x86", target_arch = "x86_64")
+    ))]
+    #[test]
+    fn avx512_vbmi_matches_avx512bw_on_mixed_payload() {
+        if !kernels::avx512_vbmi::is_available() || !kernels::avx512::is_available() {
+            return;
+        }
+
+        // Build a 1 MiB mixed payload covering ASCII, multi-byte UTF-8,
+        // and binary tails. Cycle through a heterogeneous filler to
+        // exercise the DFA's continuation-byte and high-leader paths
+        // across many 64-byte boundaries.
+        let mut payload = Vec::with_capacity(1 << 20);
+        let filler: &[u8] = b"hello world ";
+        let snowman = "\u{2603}".as_bytes();
+        let emoji = "\u{1F600}".as_bytes();
+        while payload.len() < (1 << 20) {
+            payload.extend_from_slice(filler);
+            payload.extend_from_slice(snowman);
+            payload.extend_from_slice(filler);
+            payload.extend_from_slice(emoji);
+        }
+        payload.truncate(1 << 20);
+
+        // SAFETY: availability checked above.
+        let bw = unsafe { kernels::avx512::validate_utf8(&payload) };
+        // SAFETY: availability checked above.
+        let vbmi = unsafe { kernels::avx512_vbmi::validate_utf8(&payload) };
+        assert_eq!(
+            bw, vbmi,
+            "VBMI vs AVX-512BW mismatch on 1 MiB mixed payload"
+        );
+
+        // Also verify on a payload with an injected error mid-stream.
+        let mut bad = payload.clone();
+        bad[768] = 0xFF;
+        // SAFETY: availability checked above.
+        let bw_bad = unsafe { kernels::avx512::validate_utf8(&bad) };
+        // SAFETY: availability checked above.
+        let vbmi_bad = unsafe { kernels::avx512_vbmi::validate_utf8(&bad) };
+        assert_eq!(
+            bw_bad, vbmi_bad,
+            "VBMI vs AVX-512BW mismatch on bad-byte payload"
+        );
+        assert!(!bw_bad.valid);
     }
 
     fn byteclass_cases() -> Vec<Vec<u8>> {

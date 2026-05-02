@@ -54,6 +54,13 @@ use core::arch::x86_64::{
     _mm512_test_epi8_mask, _mm512_xor_si512,
 };
 
+// VBMI imports: per-byte 128-entry permute (`vpermi2b`). Used by the
+// fused-table validator below.
+#[cfg(target_arch = "x86")]
+use core::arch::x86::{_mm512_mask_blend_epi8, _mm512_movepi8_mask, _mm512_permutex2var_epi8};
+#[cfg(target_arch = "x86_64")]
+use core::arch::x86_64::{_mm512_mask_blend_epi8, _mm512_movepi8_mask, _mm512_permutex2var_epi8};
+
 /// 64 bytes per iteration: one full AVX-512 register.
 const SIMD_CHUNK_SIZE: usize = 64;
 
@@ -540,6 +547,249 @@ pub(crate) unsafe fn validate_utf8(bytes: &[u8]) -> Utf8Validation {
     // Tail (< 64 bytes) — scalar handles it. Restart at a safe boundary
     // that includes any in-flight multibyte sequence from the previous
     // block, so error_len / valid_up_to match `from_utf8` exactly.
+    if processed < len {
+        let reentry = safe_reentry(bytes, processed);
+        return scalar_diagnose(bytes, reentry);
+    }
+
+    Utf8Validation {
+        valid: true,
+        valid_up_to: len,
+        error_len: 0,
+    }
+}
+
+// ===========================================================================
+// VBMI variant — fused 256-entry single-byte LUT for the two `prev1` lookups.
+// ===========================================================================
+//
+// The plain AVX-512BW path computes `byte_1_high & byte_1_low` as two
+// `_mm512_shuffle_epi8` calls (each a per-128-bit-lane 16-entry table) plus
+// the explicit `shr4` and `and 0x0F` index extractions. With AVX-512 VBMI
+// (`vpermi2b`), we can do a single 256-entry **byte** lookup keyed on the
+// raw `prev1` byte — the table T[i] is just `byte_1_high[i>>4] &
+// byte_1_low[i&0xF]` precomputed at module load.
+//
+// `vpermi2b` indexes 128 entries per call (low 6 bits = position, bit 6 =
+// source select). To cover 256 entries we use two `vpermi2b` calls with
+// disjoint source pairs (T0/T1 for prev1[7]==0, T2/T3 for prev1[7]==1) and
+// blend by the top bit of `prev1` via `_mm512_movepi8_mask`. Net: 2
+// `vpermi2b` + 1 mask blend, replacing 2 `shr4`-equivalents + 2
+// `shuffle_epi8` + 1 `and_si512`.
+//
+// On Zen 4 `vpermi2b` is 1 µop, 3-cycle latency, throughput 0.5/cycle (per
+// AMD SOG); the inner-loop op count drops by roughly 5→3 ops, with the
+// remaining 6-7 ops per byte unchanged. Whether this lifts the 1 MiB
+// throughput depends entirely on the AVX-512 downclock penalty: Zen 4
+// throttles less than client Intel, but at 64-byte/iter the kernel is
+// already memory-/L1-bandwidth-bound on warm caches, so wins here are
+// expected to be modest (single-digit percent).
+
+/// Fused 256-byte LUT for the `byte_1_high & byte_1_low` cross. Indexed
+/// directly by the raw `prev1` byte. T[i] = `byte_1_high[i>>4] &
+/// byte_1_low[i&0xF]`; same bit assignments as
+/// [`check_special_cases`].
+const FUSED_PREV1_TABLE: [u8; 256] = {
+    // byte_1_high (16 entries — same as the AVX2/AVX-512BW table)
+    const BYTE_1_HIGH: [u8; 16] = [
+        TOO_LONG,
+        TOO_LONG,
+        TOO_LONG,
+        TOO_LONG,
+        TOO_LONG,
+        TOO_LONG,
+        TOO_LONG,
+        TOO_LONG,
+        TWO_CONTS,
+        TWO_CONTS,
+        TWO_CONTS,
+        TWO_CONTS,
+        TOO_SHORT | OVERLONG_2,
+        TOO_SHORT,
+        TOO_SHORT | OVERLONG_3 | SURROGATE,
+        TOO_SHORT | TOO_LARGE | TOO_LARGE_1000 | OVERLONG_4,
+    ];
+    // byte_1_low (16 entries — same as the AVX2/AVX-512BW table)
+    const BYTE_1_LOW: [u8; 16] = [
+        CARRY | OVERLONG_3 | OVERLONG_2 | OVERLONG_4,
+        CARRY | OVERLONG_2,
+        CARRY,
+        CARRY,
+        CARRY | TOO_LARGE,
+        CARRY | TOO_LARGE | TOO_LARGE_1000,
+        CARRY | TOO_LARGE | TOO_LARGE_1000,
+        CARRY | TOO_LARGE | TOO_LARGE_1000,
+        CARRY | TOO_LARGE | TOO_LARGE_1000,
+        CARRY | TOO_LARGE | TOO_LARGE_1000,
+        CARRY | TOO_LARGE | TOO_LARGE_1000,
+        CARRY | TOO_LARGE | TOO_LARGE_1000,
+        CARRY | TOO_LARGE | TOO_LARGE_1000,
+        CARRY | TOO_LARGE | TOO_LARGE_1000 | SURROGATE,
+        CARRY | TOO_LARGE | TOO_LARGE_1000,
+        CARRY | TOO_LARGE | TOO_LARGE_1000,
+    ];
+    let mut out = [0_u8; 256];
+    let mut i = 0;
+    while i < 256 {
+        out[i] = BYTE_1_HIGH[i >> 4] & BYTE_1_LOW[i & 0xF];
+        i += 1;
+    }
+    out
+};
+
+/// Loads a 64-byte slice of [`FUSED_PREV1_TABLE`] into an AVX-512 register.
+///
+/// SAFETY: precondition — AVX-512BW available; `START + 64 <= 256`.
+#[target_feature(enable = "avx512bw")]
+#[inline]
+unsafe fn load_fused_chunk<const START: usize>() -> __m512i {
+    // SAFETY: caller ensures AVX-512BW; `FUSED_PREV1_TABLE.as_ptr().add(
+    // START)` points to 64 in-bounds bytes when `START + 64 <= 256`.
+    unsafe { _mm512_loadu_si512(FUSED_PREV1_TABLE.as_ptr().add(START).cast::<__m512i>()) }
+}
+
+/// VBMI variant of [`check_special_cases`]: fuses the two `prev1`-indexed
+/// lookups into one 256-entry byte LUT, evaluated with two `vpermi2b`
+/// calls + a `movepi8_mask` blend. The `byte_2_high` lookup remains as a
+/// 16-entry `pshufb` since it is indexed by the high nibble of `input`.
+///
+/// SAFETY: precondition — AVX-512BW and AVX-512 VBMI available.
+#[target_feature(enable = "avx512bw,avx512vbmi")]
+#[inline]
+unsafe fn check_special_cases_vbmi(input: __m512i, prev1: __m512i) -> __m512i {
+    // SAFETY: AVX-512BW + VBMI enabled by target_feature; helpers preserve them.
+    unsafe {
+        // Load the 4 64-byte chunks of the fused 256-entry table.
+        let t0 = load_fused_chunk::<0>();
+        let t1 = load_fused_chunk::<64>();
+        let t2 = load_fused_chunk::<128>();
+        let t3 = load_fused_chunk::<192>();
+
+        // Two `vpermi2b` calls: each indexes 128 entries (low 7 bits of
+        // prev1). The first reads from T0/T1 (covers indices 0..127); the
+        // second reads from T2/T3 (covers indices 128..255). Blend by the
+        // top bit of prev1.
+        let lo = _mm512_permutex2var_epi8(t0, prev1, t1);
+        let hi = _mm512_permutex2var_epi8(t2, prev1, t3);
+        let high_bit = _mm512_movepi8_mask(prev1);
+        let prev1_lookup = _mm512_mask_blend_epi8(high_bit, lo, hi);
+
+        // byte_2_high uses the 16-entry pshufb path (input high nibble).
+        let byte_2_high = lookup16(
+            shr4(input),
+            TOO_SHORT,
+            TOO_SHORT,
+            TOO_SHORT,
+            TOO_SHORT,
+            TOO_SHORT,
+            TOO_SHORT,
+            TOO_SHORT,
+            TOO_SHORT,
+            TOO_LONG | OVERLONG_2 | TWO_CONTS | OVERLONG_3 | TOO_LARGE_1000 | OVERLONG_4,
+            TOO_LONG | OVERLONG_2 | TWO_CONTS | OVERLONG_3 | TOO_LARGE,
+            TOO_LONG | OVERLONG_2 | TWO_CONTS | SURROGATE | TOO_LARGE,
+            TOO_LONG | OVERLONG_2 | TWO_CONTS | SURROGATE | TOO_LARGE,
+            TOO_SHORT,
+            TOO_SHORT,
+            TOO_SHORT,
+            TOO_SHORT,
+        );
+        _mm512_and_si512(prev1_lookup, byte_2_high)
+    }
+}
+
+/// VBMI variant of [`State::check_block`].
+///
+/// SAFETY: precondition — AVX-512BW and AVX-512 VBMI available.
+#[target_feature(enable = "avx512bw,avx512vbmi")]
+#[inline]
+unsafe fn check_block_vbmi(state: &mut State, input: __m512i) {
+    // SAFETY: AVX-512BW+VBMI enabled by target_feature; helpers preserve them.
+    unsafe {
+        let p1 = prev::<15>(input, state.prev);
+        let sc = check_special_cases_vbmi(input, p1);
+        let lengths = check_multibyte_lengths(input, state.prev, sc);
+        state.error = _mm512_or_si512(state.error, lengths);
+        state.incomplete = is_incomplete(input);
+        state.prev = input;
+    }
+}
+
+/// VBMI-accelerated UTF-8 validator. Returns the same triple
+/// [`validate_utf8`] does. The hot inner loop replaces the AVX-512BW
+/// path's 3-pshufb classification with a fused 256-entry `vpermi2b`
+/// lookup for the two `prev1` tables, leaving the `byte_2_high`
+/// 16-entry pshufb intact.
+///
+/// # Safety
+///
+/// The caller MUST verify both AVX-512BW and AVX-512 VBMI are available
+/// on the running CPU before invoking this function (e.g. via
+/// `std::is_x86_feature_detected!("avx512vbmi")` AND `"avx512bw"`).
+#[target_feature(enable = "avx512bw,avx512vbmi")]
+#[must_use]
+pub(crate) unsafe fn validate_utf8_vbmi(bytes: &[u8]) -> Utf8Validation {
+    let len = bytes.len();
+    if len < SIMD_CHUNK_SIZE {
+        return scalar_diagnose(bytes, 0);
+    }
+
+    let iter_lim = len - (len % SIMD_CHUNK_SIZE);
+    let ptr = bytes.as_ptr();
+
+    // SAFETY (entire block below): AVX-512BW + VBMI enabled by
+    // target_feature; the caller guarantees the CPU supports both. Pointer
+    // adds use `idx + 64 <= iter_lim <= len`. Inner intrinsics are gated
+    // by the same target_feature contract.
+    let processed = unsafe {
+        let mut state = State::new();
+        let mut idx: usize = 0;
+        let mut only_ascii = true;
+        let v_80 = splat(0x80);
+        'outer: loop {
+            if only_ascii {
+                while idx < iter_lim {
+                    let block = load64(ptr.add(idx));
+                    if _mm512_test_epi8_mask(block, v_80) != 0 {
+                        check_block_vbmi(&mut state, block);
+                        if state.has_error() {
+                            return scalar_diagnose(bytes, safe_reentry(bytes, idx));
+                        }
+                        only_ascii = false;
+                        idx += SIMD_CHUNK_SIZE;
+                        continue 'outer;
+                    }
+                    idx += SIMD_CHUNK_SIZE;
+                }
+            } else {
+                while idx < iter_lim {
+                    let block = load64(ptr.add(idx));
+                    if _mm512_test_epi8_mask(block, v_80) == 0 {
+                        state.check_incomplete_pending();
+                        if state.has_error() {
+                            return scalar_diagnose(bytes, safe_reentry(bytes, idx));
+                        }
+                        only_ascii = true;
+                        idx += SIMD_CHUNK_SIZE;
+                        continue 'outer;
+                    }
+                    check_block_vbmi(&mut state, block);
+                    if state.has_error() {
+                        return scalar_diagnose(bytes, safe_reentry(bytes, idx));
+                    }
+                    idx += SIMD_CHUNK_SIZE;
+                }
+            }
+            break;
+        }
+
+        state.check_incomplete_pending();
+        if state.has_error() {
+            return scalar_diagnose(bytes, safe_reentry(bytes, iter_lim));
+        }
+        idx
+    };
+
     if processed < len {
         let reentry = safe_reentry(bytes, processed);
         return scalar_diagnose(bytes, reentry);
