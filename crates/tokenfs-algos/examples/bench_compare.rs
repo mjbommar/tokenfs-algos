@@ -58,6 +58,7 @@ fn main() {
     bench_similarity_dot_f32();
     bench_similarity_l2_squared_f32();
     bench_search();
+    bench_fuzzy_digest();
 }
 
 // ---------- environment header ----------
@@ -705,6 +706,57 @@ fn throughput_gbps(payload_bytes: usize, median_ns: u64) -> f64 {
     }
     // bytes/ns == GB/s (1e9 bytes/sec divided by 1e9 ns/sec).
     payload_bytes as f64 / median_ns as f64
+}
+
+fn bench_fuzzy_digest() {
+    use tokenfs_algos::similarity::fuzzy::{ctph, tlsh_like};
+    for &n in PAYLOAD_SIZES_BYTES {
+        let bytes = make_text_bytes(n);
+        let bytes_b = make_random_bytes(n);
+
+        // CTPH digest build.
+        emit(
+            "fuzzy-ctph-digest",
+            "scalar",
+            n,
+            measure(|| {
+                black_box(ctph::Digest::from_bytes(black_box(&bytes)));
+            }),
+        );
+        // CTPH similarity (digest vs digest — measures comparison cost only).
+        let dig_a = ctph::Digest::from_bytes(&bytes);
+        let dig_b = ctph::Digest::from_bytes(&bytes_b);
+        emit(
+            "fuzzy-ctph-similarity",
+            "scalar",
+            n,
+            measure(|| {
+                black_box(ctph::similarity(black_box(&dig_a), black_box(&dig_b)));
+            }),
+        );
+        // TLSH-like digest build (requires ≥ 256 bytes for a stable
+        // digest; below that the upstream implementation refuses).
+        if n >= 256 {
+            emit(
+                "fuzzy-tlsh-digest",
+                "scalar",
+                n,
+                measure(|| {
+                    black_box(tlsh_like::digest(black_box(&bytes)));
+                }),
+            );
+            let t_a = tlsh_like::digest(&bytes);
+            let t_b = tlsh_like::digest(&bytes_b);
+            emit(
+                "fuzzy-tlsh-distance",
+                "scalar",
+                n,
+                measure(|| {
+                    black_box(tlsh_like::distance(black_box(&t_a), black_box(&t_b)));
+                }),
+            );
+        }
+    }
 }
 
 // ---------- payload generators ----------

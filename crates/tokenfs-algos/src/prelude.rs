@@ -23,7 +23,17 @@ pub use crate::histogram::{
     ByteHistogram, BytePairHistogram, BytePairScratch, HistogramBlockSignals, PlannedByteHistogram,
     block as histogram_block, block_with_profile as histogram_block_with_profile,
     explain_block as explain_histogram_block, plan_block as plan_histogram_block,
+    summary::{ByteValueMoments, byte_value_moments},
+    topk::MisraGries as ByteMisraGries,
 };
+pub use crate::search::bitap::{Bitap16, Bitap64};
+#[cfg(any(feature = "std", feature = "alloc"))]
+pub use crate::search::packed_dfa::PackedDfa;
+pub use crate::search::packed_pair::PackedPair;
+pub use crate::search::rabin_karp::RabinKarp;
+pub use crate::search::shift_or::ShiftOr;
+pub use crate::search::two_way::TwoWay;
 pub use crate::selector::{RepresentationHint, SelectorSignals};
+pub use crate::similarity::fuzzy::{ctph, tlsh_like};
 pub use crate::sketch::{CLog2Lut, CountMinSketch, HashBinSketch, MisraGries};
 pub use crate::structure::StructureSummary;
