@@ -156,7 +156,11 @@ impl<const W: u32> BitPacker<W> {
                 actual: out.len(),
             });
         }
-        kernels::auto::encode_u32_slice(W, values, out);
+        // SAFETY: width and output-length pre-validation above
+        // establishes the precondition for the unchecked kernel; the
+        // `_unchecked` dispatch keeps this fallible API panic-free
+        // even when `panicking-shape-apis` is disabled (audit-R7 #2).
+        unsafe { kernels::auto::encode_u32_slice_unchecked(W, values, out) };
         Ok(())
     }
 
@@ -202,7 +206,11 @@ impl<const W: u32> BitPacker<W> {
                 actual: out.len(),
             });
         }
-        kernels::auto::decode_u32_slice(W, input, n, out);
+        // SAFETY: width, input-length, and output-length pre-validation
+        // above establishes the precondition for the unchecked kernel;
+        // the `_unchecked` dispatch keeps this fallible API panic-free
+        // even when `panicking-shape-apis` is disabled (audit-R7 #2).
+        unsafe { kernels::auto::decode_u32_slice_unchecked(W, input, n, out) };
         Ok(())
     }
 }
@@ -293,7 +301,11 @@ impl DynamicBitPacker {
                 actual: out.len(),
             });
         }
-        kernels::auto::encode_u32_slice(self.width, values, out);
+        // SAFETY: width and output-length pre-validation above
+        // establishes the precondition for the unchecked kernel; the
+        // `_unchecked` dispatch keeps this fallible API panic-free
+        // even when `panicking-shape-apis` is disabled (audit-R7 #2).
+        unsafe { kernels::auto::encode_u32_slice_unchecked(self.width, values, out) };
         Ok(())
     }
 
@@ -340,7 +352,11 @@ impl DynamicBitPacker {
                 actual: out.len(),
             });
         }
-        kernels::auto::decode_u32_slice(self.width, input, n, out);
+        // SAFETY: width, input-length, and output-length pre-validation
+        // above establishes the precondition for the unchecked kernel;
+        // the `_unchecked` dispatch keeps this fallible API panic-free
+        // even when `panicking-shape-apis` is disabled (audit-R7 #2).
+        unsafe { kernels::auto::decode_u32_slice_unchecked(self.width, input, n, out) };
         Ok(())
     }
 }
@@ -351,6 +367,14 @@ pub mod kernels {
     pub mod auto {
         /// Packs `values` at width `w` into `out` using the best
         /// available kernel.
+        ///
+        /// Asserts caller-supplied buffer lengths before dispatching to
+        /// the `_unchecked` kernel.
+        ///
+        /// # Panics
+        ///
+        /// Panics if `w` is outside `1..=32` or `out.len() <
+        /// ceil(values.len()*w/8)`.
         pub fn encode_u32_slice(w: u32, values: &[u32], out: &mut [u8]) {
             // Encode is bandwidth-modest and the per-element work is
             // dominated by cross-byte stores; the scalar path already
@@ -358,8 +382,31 @@ pub mod kernels {
             super::scalar::encode_u32_slice(w, values, out);
         }
 
+        /// Runtime-dispatched encode kernel without bounds-checking
+        /// asserts.
+        ///
+        /// # Safety
+        ///
+        /// Caller must ensure `w` is in `1..=32` and
+        /// `out.len() >= ceil(values.len()*w/8)`. Used by
+        /// `try_encode_u32_slice` after pre-validation; eliminates the
+        /// `assert!` panic sites that would otherwise leak through the
+        /// fallible API surface (audit-R7 finding #2).
+        pub unsafe fn encode_u32_slice_unchecked(w: u32, values: &[u32], out: &mut [u8]) {
+            // SAFETY: caller upholds the buffer-length precondition.
+            unsafe { super::scalar::encode_u32_slice_unchecked(w, values, out) }
+        }
+
         /// Unpacks `n` values at width `w` from `input` into `out`
         /// using the best available kernel.
+        ///
+        /// Asserts caller-supplied buffer lengths before dispatching to
+        /// the `_unchecked` kernel.
+        ///
+        /// # Panics
+        ///
+        /// Panics if `w` is outside `1..=32`, `input.len() <
+        /// ceil(n*w/8)`, or `out.len() < n`.
         pub fn decode_u32_slice(w: u32, input: &[u8], n: usize, out: &mut [u32]) {
             #[cfg(all(
                 feature = "std",
@@ -384,6 +431,45 @@ pub mod kernels {
             }
 
             super::scalar::decode_u32_slice(w, input, n, out);
+        }
+
+        /// Runtime-dispatched decode kernel without bounds-checking
+        /// asserts.
+        ///
+        /// # Safety
+        ///
+        /// Caller must ensure `w` is in `1..=32`,
+        /// `input.len() >= ceil(n*w/8)`, and `out.len() >= n`. Used by
+        /// `try_decode_u32_slice` after pre-validation; eliminates the
+        /// `assert!` panic sites that would otherwise leak through the
+        /// fallible API surface (audit-R7 finding #2).
+        pub unsafe fn decode_u32_slice_unchecked(w: u32, input: &[u8], n: usize, out: &mut [u32]) {
+            #[cfg(all(
+                feature = "std",
+                feature = "avx2",
+                any(target_arch = "x86", target_arch = "x86_64")
+            ))]
+            {
+                if super::avx2::is_available() {
+                    // SAFETY: availability checked above; caller
+                    // upholds the buffer-length precondition.
+                    unsafe { super::avx2::decode_u32_slice_unchecked(w, input, n, out) };
+                    return;
+                }
+            }
+
+            #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+            {
+                if super::neon::is_available() {
+                    // SAFETY: NEON is mandatory on AArch64; caller
+                    // upholds the buffer-length precondition.
+                    unsafe { super::neon::decode_u32_slice_unchecked(w, input, n, out) };
+                    return;
+                }
+            }
+
+            // SAFETY: caller upholds the buffer-length precondition.
+            unsafe { super::scalar::decode_u32_slice_unchecked(w, input, n, out) }
         }
     }
 
@@ -412,6 +498,23 @@ pub mod kernels {
                 out.len(),
                 needed
             );
+            // SAFETY: asserts above establish the precondition.
+            unsafe { encode_u32_slice_unchecked(w, values, out) }
+        }
+
+        /// Scalar encoder body without bounds-checking asserts.
+        ///
+        /// # Safety
+        ///
+        /// Caller must ensure `w` is in `1..=32` and
+        /// `out.len() >= encoded_len_bytes(values.len(), w)`. Indexing
+        /// inside this routine is otherwise identical to
+        /// [`encode_u32_slice`] but does not include the leading
+        /// `assert!` guards, which keeps it panic-free for the
+        /// `try_encode_u32_slice` path even when
+        /// `panicking-shape-apis` is disabled (audit-R7 finding #2).
+        pub unsafe fn encode_u32_slice_unchecked(w: u32, values: &[u32], out: &mut [u8]) {
+            let needed = encoded_len_bytes(values.len(), w);
             // Zero exactly the needed prefix; the OR-into-existing-bytes
             // strategy below requires a clean slate.
             for byte in &mut out[..needed] {
@@ -493,6 +596,23 @@ pub mod kernels {
                 out.len(),
                 n
             );
+            // SAFETY: asserts above establish the precondition.
+            unsafe { decode_u32_slice_unchecked(w, input, n, out) }
+        }
+
+        /// Scalar decoder body without bounds-checking asserts.
+        ///
+        /// # Safety
+        ///
+        /// Caller must ensure `w` is in `1..=32`,
+        /// `input.len() >= encoded_len_bytes(n, w)`, and
+        /// `out.len() >= n`. Indexing inside this routine is otherwise
+        /// identical to [`decode_u32_slice`] but does not include the
+        /// leading `assert!` guards, which keeps it panic-free for the
+        /// `try_decode_u32_slice` path even when
+        /// `panicking-shape-apis` is disabled (audit-R7 finding #2).
+        pub unsafe fn decode_u32_slice_unchecked(w: u32, input: &[u8], n: usize, out: &mut [u32]) {
+            let needed = encoded_len_bytes(n, w);
 
             // Byte-aligned fast paths mirror the encode-side specialization.
             match w {
@@ -646,13 +766,31 @@ pub mod kernels {
                 out.len(),
                 n
             );
+            // SAFETY: AVX2 enabled on the enclosing fn; the asserts
+            // above establish the buffer-length precondition.
+            unsafe { decode_u32_slice_unchecked(w, input, n, out) }
+        }
 
+        /// Decodes `n` values of `w` bits each from `input` into `out`
+        /// without bounds-checking asserts.
+        ///
+        /// # Safety
+        ///
+        /// The caller must ensure the current CPU supports AVX2,
+        /// `w` is in `1..=32`, `input.len() >= encoded_len_bytes(n, w)`,
+        /// and `out.len() >= n`. Used by the `try_decode_u32_slice`
+        /// path after pre-validation; eliminates the `assert!` panic
+        /// sites that would otherwise leak through the fallible API
+        /// surface (audit-R7 finding #2).
+        #[target_feature(enable = "avx2")]
+        pub unsafe fn decode_u32_slice_unchecked(w: u32, input: &[u8], n: usize, out: &mut [u32]) {
             // Byte-aligned widths and the very small widths fall back
             // to scalar — the SIMD setup overhead exceeds the savings
             // on a memcpy-shaped workload.
             match w {
                 1 | 2 | 4 | 8 | 16 | 32 => {
-                    scalar::decode_u32_slice(w, input, n, out);
+                    // SAFETY: caller upholds the buffer-length precondition.
+                    unsafe { scalar::decode_u32_slice_unchecked(w, input, n, out) };
                     return;
                 }
                 _ => {}
@@ -666,7 +804,8 @@ pub mod kernels {
                 unsafe { decode_le24_avx2(w, input, n, out) };
             } else {
                 // 25..=31: 5-byte spans break the u32 lane load.
-                scalar::decode_u32_slice(w, input, n, out);
+                // SAFETY: caller upholds the buffer-length precondition.
+                unsafe { scalar::decode_u32_slice_unchecked(w, input, n, out) };
             }
         }
 
@@ -934,10 +1073,28 @@ pub mod kernels {
                 out.len(),
                 n
             );
+            // SAFETY: NEON enabled on the enclosing fn; the asserts
+            // above establish the buffer-length precondition.
+            unsafe { decode_u32_slice_unchecked(w, input, n, out) }
+        }
 
+        /// Decodes `n` values of `w` bits each from `input` into `out`
+        /// without bounds-checking asserts.
+        ///
+        /// # Safety
+        ///
+        /// The caller must ensure the current CPU supports NEON,
+        /// `w` is in `1..=32`, `input.len() >= encoded_len_bytes(n, w)`,
+        /// and `out.len() >= n`. Used by the `try_decode_u32_slice`
+        /// path after pre-validation; eliminates the `assert!` panic
+        /// sites that would otherwise leak through the fallible API
+        /// surface (audit-R7 finding #2).
+        #[target_feature(enable = "neon")]
+        pub unsafe fn decode_u32_slice_unchecked(w: u32, input: &[u8], n: usize, out: &mut [u32]) {
             match w {
                 1 | 2 | 4 | 8 | 16 | 32 => {
-                    scalar::decode_u32_slice(w, input, n, out);
+                    // SAFETY: caller upholds the buffer-length precondition.
+                    unsafe { scalar::decode_u32_slice_unchecked(w, input, n, out) };
                     return;
                 }
                 _ => {}
@@ -950,7 +1107,8 @@ pub mod kernels {
                 // SAFETY: target_feature on this fn forwards to the inner kernel.
                 unsafe { decode_le24_neon(w, input, n, out) };
             } else {
-                scalar::decode_u32_slice(w, input, n, out);
+                // SAFETY: caller upholds the buffer-length precondition.
+                unsafe { scalar::decode_u32_slice_unchecked(w, input, n, out) };
             }
         }
 
@@ -1493,6 +1651,120 @@ mod tests {
                 assert!(
                     padded[n..].iter().all(|&v| v == 0),
                     "tail clobbered w={w} n={n}"
+                );
+            }
+        }
+    }
+
+    /// Direct exercise of the `_unchecked` scalar kernels mirroring
+    /// the streamvbyte split (audit-R7 finding #2). The fallible
+    /// `try_*` API dispatches to these after pre-validation; this
+    /// test calls them directly so a regression that breaks the
+    /// `_unchecked` body cannot be masked by the asserting wrapper.
+    #[test]
+    fn scalar_unchecked_round_trip_every_width() {
+        for w in 1_u32..=32 {
+            for &n in &[0_usize, 1, 7, 8, 33, 1024] {
+                let values = deterministic_values(n, w, 0x5EED_u64 ^ ((w as u64) << 8) ^ n as u64);
+                let needed = encoded_len_bytes(n, w);
+                let mut encoded = vec![0_u8; needed];
+                // SAFETY: `encoded.len() == needed`.
+                unsafe { kernels::scalar::encode_u32_slice_unchecked(w, &values, &mut encoded) };
+                let mut decoded = vec![0_u32; n];
+                // SAFETY: `encoded.len() == needed` and `decoded.len() == n`.
+                unsafe {
+                    kernels::scalar::decode_u32_slice_unchecked(w, &encoded, n, &mut decoded)
+                };
+                assert_eq!(decoded, values, "scalar _unchecked round-trip w={w} n={n}");
+            }
+        }
+    }
+
+    /// Verifies the runtime-dispatched `_unchecked` siblings on
+    /// `kernels::auto`. Because the public `try_*` API funnels
+    /// through these, regressions inside the dispatch (wrong
+    /// availability check, broken NEON forwarder, missed
+    /// `target_feature`) would only surface here. Audit-R7 #2.
+    #[test]
+    fn auto_unchecked_round_trip_every_width() {
+        for w in 1_u32..=32 {
+            for &n in &[0_usize, 1, 7, 8, 33, 1024] {
+                let values = deterministic_values(n, w, 0xC0FF_u64 ^ ((w as u64) << 16) ^ n as u64);
+                let needed = encoded_len_bytes(n, w);
+                let mut encoded = vec![0_u8; needed];
+                // SAFETY: `encoded.len() == needed`, `w` is in 1..=32.
+                unsafe { kernels::auto::encode_u32_slice_unchecked(w, &values, &mut encoded) };
+                let mut decoded = vec![0_u32; n];
+                // SAFETY: `encoded.len() == needed`, `decoded.len() == n`,
+                // `w` is in 1..=32.
+                unsafe { kernels::auto::decode_u32_slice_unchecked(w, &encoded, n, &mut decoded) };
+                assert_eq!(decoded, values, "auto _unchecked round-trip w={w} n={n}");
+            }
+        }
+    }
+
+    /// Direct exercise of the AVX2 `_unchecked` kernel (audit-R7 #2).
+    /// The fallible `try_*` API funnels through `auto::*_unchecked`
+    /// which dispatches to this when AVX2 is detected; calling the
+    /// AVX2 kernel directly catches breakage that the dispatcher
+    /// would mask by silently falling back to scalar.
+    #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+    #[test]
+    fn avx2_decode_unchecked_matches_scalar_for_every_width() {
+        if !kernels::avx2::is_available() {
+            eprintln!("avx2 unavailable; skipping AVX2 _unchecked parity test");
+            return;
+        }
+        for w in 1_u32..=32 {
+            for &n in &[0_usize, 1, 7, 8, 33, 1024] {
+                let values = deterministic_values(n, w, 0x1FED_u64 ^ ((w as u64) << 4) ^ n as u64);
+                let needed = encoded_len_bytes(n, w);
+                let mut encoded = vec![0_u8; needed];
+                // SAFETY: `encoded.len() == needed`.
+                unsafe { kernels::scalar::encode_u32_slice_unchecked(w, &values, &mut encoded) };
+
+                let mut expected = vec![0_u32; n];
+                // SAFETY: same buffer-length precondition.
+                unsafe {
+                    kernels::scalar::decode_u32_slice_unchecked(w, &encoded, n, &mut expected)
+                };
+
+                let mut actual = vec![0_u32; n];
+                // SAFETY: `is_available()` returned true; buffers sized.
+                unsafe { kernels::avx2::decode_u32_slice_unchecked(w, &encoded, n, &mut actual) };
+                assert_eq!(
+                    actual, expected,
+                    "avx2 _unchecked decode diverged at w={w} n={n}"
+                );
+            }
+        }
+    }
+
+    /// Direct exercise of the NEON `_unchecked` kernel (audit-R7 #2).
+    /// Same rationale as the AVX2 variant.
+    #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+    #[test]
+    fn neon_decode_unchecked_matches_scalar_for_every_width() {
+        for w in 1_u32..=32 {
+            for &n in &[0_usize, 1, 7, 8, 33, 1024] {
+                let values = deterministic_values(n, w, 0x2FED_u64 ^ ((w as u64) << 4) ^ n as u64);
+                let needed = encoded_len_bytes(n, w);
+                let mut encoded = vec![0_u8; needed];
+                // SAFETY: `encoded.len() == needed`.
+                unsafe { kernels::scalar::encode_u32_slice_unchecked(w, &values, &mut encoded) };
+
+                let mut expected = vec![0_u32; n];
+                // SAFETY: same precondition.
+                unsafe {
+                    kernels::scalar::decode_u32_slice_unchecked(w, &encoded, n, &mut expected)
+                };
+
+                let mut actual = vec![0_u32; n];
+                // SAFETY: NEON is mandatory on AArch64.
+                unsafe { kernels::neon::decode_u32_slice_unchecked(w, &encoded, n, &mut actual) };
+                assert_eq!(
+                    actual, expected,
+                    "neon _unchecked decode diverged at w={w} n={n}"
                 );
             }
         }
