@@ -4,6 +4,71 @@
 //! `docs/v0.2_planning/03_EXECUTION_PLAN.md` § "Sprint 47-49 / 50-52"
 //! for the sprint-level milestones.
 //!
+//! ## What it is
+//!
+//! Rabbit Order is the graph-permutation algorithm published by
+//! [J. Arai, H. Shiokawa, T. Yamamuro, M. Onizuka, S. Iwamura,
+//! "Rabbit Order: Just-in-time Parallel Reordering for Fast Graph
+//! Analysis", *Proc. IEEE IPDPS 2016*, pp. 22-31][arai2016]. It
+//! computes a vertex permutation by repeatedly merging neighbouring
+//! vertices whose union maximises **modularity gain** (the same
+//! objective that drives Louvain community detection), then walks the
+//! resulting agglomerative dendrogram in DFS pre-order to emit the
+//! final ordering. The permutation places vertices that share a
+//! community contiguously, so subsequent locality-sensitive operations
+//! (BFS, PageRank, neighbour scans, sequential prefetch) hit the same
+//! cache line and the same translation-buffer entry.
+//!
+//! ## When to use it
+//!
+//! Use Rabbit Order when the input is a **sparse undirected graph**
+//! whose adjacency exhibits genuine community structure — clusters of
+//! vertices with many internal edges and few external ones — and the
+//! downstream workload is **locality-sensitive** (any of: BFS / DFS,
+//! PageRank, connected-components, neighbour aggregation in a GNN, or
+//! TokenFS extent-following on a deduped image where each cluster maps
+//! to a content-shared inode group). On benchmarks reported in the
+//! IPDPS 2016 paper, Rabbit Order yields the best known cache-miss
+//! reduction for this class of workload — typically 1.25-2.4× speedup
+//! over natural-order graphs across PageRank, BFS, and CC.
+//!
+//! Use [`super::rcm()`] (Reverse Cuthill-McKee) instead when the
+//! workload is **bandwidth-driven** (sparse linear solvers, banded
+//! matrices, classical sparse-matrix-vector products) or when build
+//! cost matters: RCM is roughly 100-500× faster to compute and is
+//! deterministic by construction. Use [`super::hilbert_2d`] /
+//! [`super::hilbert_nd`] when the input has a true low-dimensional
+//! point embedding (PCA-projected fingerprints, t-SNE/UMAP outputs)
+//! rather than graph adjacency. See `docs/PHASE_D_RABBIT_ORDER.md`
+//! for the side-by-side comparison.
+//!
+//! ## How it differs from RCM
+//!
+//! RCM and Rabbit Order optimise different objectives:
+//!
+//! * **RCM** minimises **bandwidth** — the maximum distance between
+//!   connected vertices in the new order — by BFS-and-reverse from a
+//!   pseudoperipheral start vertex. The result is a banded permutation
+//!   that is excellent for sparse-matrix solvers but only modestly
+//!   better than natural order for graph traversal workloads (because
+//!   bandwidth and cache locality are correlated but not identical).
+//! * **Rabbit Order** maximises **community modularity** — vertices
+//!   that share many edges land in adjacent slots regardless of their
+//!   global position in the BFS frontier. The result is a permutation
+//!   tuned for cache locality on graph-traversal workloads, at the
+//!   cost of a substantially heavier build phase.
+//!
+//! Concretely: RCM is `O(|V| + |E| log Δ)` with a small constant;
+//! Rabbit Order is `O(|E| log |V|)` with a large constant (heap
+//! maintenance plus sorted-list intersections per merge). On a
+//! 228 K-vertex graph with average degree 5, RCM completes in roughly
+//! 10 ms and Rabbit Order in 1-5 seconds. The build cost amortises
+//! over the workload's lifetime — TokenFS images are sealed once and
+//! read many times, so paying seconds at build time for percent-level
+//! cache improvements at every read is the right tradeoff.
+//!
+//! [arai2016]: https://doi.org/10.1109/IPDPS.2016.110
+//!
 //! ## Algorithm
 //!
 //! Bottom-up agglomerative community detection followed by dendrogram-DFS
@@ -111,15 +176,84 @@ struct Merge {
 /// agglomerative dendrogram produced by lowest-degree-first
 /// modularity-maximising merges.
 ///
+/// ## Inputs
+///
+/// `graph` is a [`CsrGraph`] borrowing two slices: `offsets` (length
+/// `n + 1`) and `neighbors` (length `offsets[n]`). The graph is treated
+/// as **undirected** — callers that have a directed adjacency must
+/// symmetrise it upstream. Self-loops, duplicate edges, and isolated
+/// vertices are all tolerated; see "Behaviour on degenerate inputs"
+/// below.
+///
+/// ## Output
+///
+/// A [`Permutation`] of length `n`. The constructor invariant is
+/// satisfied — every id `0..n` appears exactly once — so the result
+/// can be applied directly via [`Permutation::apply`] /
+/// [`Permutation::apply_into`].
+///
+/// ## Complexity
+///
+/// * Time: roughly `O(|E| log |V|)` for the heap-driven agglomeration
+///   plus the cost of intersecting sorted adjacency lists on each
+///   merge.
+/// * Space: `O(|V| + |E|)` for the working adjacency, the dendrogram,
+///   and the heap.
+///
+/// On a 228 K-vertex graph with average degree 5 (TokenFS-typical),
+/// expect roughly 1-5 seconds of wall-clock time.
+///
+/// ## When to use this vs `rabbit_order_par`
+///
+/// This is the **single-threaded** entry point. When the `parallel`
+/// Cargo feature is enabled and the graph has at least
+/// [`RABBIT_PARALLEL_EDGE_THRESHOLD`] directed edges, prefer
+/// [`rabbit_order_par`] — it parallelises the per-round merge-proposal
+/// phase across the global rayon thread pool while keeping the apply
+/// phase deterministic. Below the threshold, [`rabbit_order_par`]
+/// transparently delegates to this function (the rayon overhead
+/// outweighs any savings on small graphs).
+///
 /// ## Sequential baseline
 ///
-/// **This is the Sprint 47-49 single-pass sequential baseline.** Quality
+/// This is the Sprint 47-49 single-pass sequential baseline. Quality
 /// is meaningfully better than RCM on community-structured graphs but
-/// worse than the multi-level concurrent reference; see the module-level
-/// documentation for the full sprint plan. The function signature, type
-/// discipline, and determinism guarantees are stable across the
-/// follow-on SIMD and concurrent-merging sprints — only build cost will
-/// improve.
+/// worse than the multi-level concurrent reference; see the
+/// module-level documentation for the full sprint plan. The function
+/// signature, type discipline, and determinism guarantees are stable
+/// across the follow-on SIMD and concurrent-merging sprints — only
+/// build cost will improve.
+///
+/// ## Example
+///
+/// Two triangles connected by a bridge edge — Rabbit Order should
+/// place each triangle contiguously in the output:
+///
+/// ```
+/// use tokenfs_algos::permutation::{CsrGraph, rabbit_order};
+///
+/// // Vertices 0-1-2 form one triangle, 3-4-5 another, with a single
+/// // bridge edge 2-3 holding the two communities together.
+/// // CSR layout (undirected, both directions present):
+/// //   0 -> [1, 2]
+/// //   1 -> [0, 2]
+/// //   2 -> [0, 1, 3]
+/// //   3 -> [2, 4, 5]
+/// //   4 -> [3, 5]
+/// //   5 -> [3, 4]
+/// let offsets = [0_u32, 2, 4, 7, 10, 12, 14];
+/// let neighbors = [1_u32, 2, 0, 2, 0, 1, 3, 2, 4, 5, 3, 5, 3, 4];
+/// let graph = CsrGraph { n: 6, offsets: &offsets, neighbors: &neighbors };
+///
+/// let perm = rabbit_order(graph);
+/// assert_eq!(perm.len(), 6);
+/// // The result is a valid permutation: every id 0..n appears exactly once.
+/// let mut seen = [false; 6];
+/// for &new_id in perm.as_slice() {
+///     seen[new_id as usize] = true;
+/// }
+/// assert!(seen.iter().all(|b| *b));
+/// ```
 ///
 /// ## Behaviour on degenerate inputs
 ///
@@ -310,6 +444,44 @@ pub const RABBIT_PARALLEL_EDGE_THRESHOLD: usize = 200_000;
 /// vertex-id) order so the resulting [`Permutation`] is deterministic
 /// regardless of how many rayon threads execute the proposal phase.
 ///
+/// ## Inputs
+///
+/// `graph` is a [`CsrGraph`] borrowing two slices: `offsets` (length
+/// `n + 1`) and `neighbors` (length `offsets[n]`). The graph is treated
+/// as undirected; see [`rabbit_order`] for the full input contract
+/// (multi-edge folding, self-loop accounting, degenerate cases).
+///
+/// ## Output
+///
+/// A [`Permutation`] of length `n`, ready to be applied via
+/// [`Permutation::apply`] / [`Permutation::apply_into`]. Bit-exact
+/// across runs and thread counts (see "Determinism contract" below);
+/// **not** bit-exact with [`rabbit_order`] on graphs that admit
+/// multiple positive-modularity merges (see "Note: not bit-exact"
+/// below).
+///
+/// ## Complexity
+///
+/// * Time: same `O(|E| log |V|)` asymptotic as [`rabbit_order`]; the
+///   per-round proposal phase parallelises across rayon while the
+///   per-round apply phase runs sequentially. See "Performance
+///   posture" below for measured behaviour on sparse inputs.
+/// * Space: same `O(|V| + |E|)` working set as [`rabbit_order`], plus
+///   one `Vec<Option<u32>>` of length `|active|` per round for the
+///   parallel proposal output.
+///
+/// ## When to use this vs `rabbit_order`
+///
+/// Reach for this function when the input is **above** the
+/// [`RABBIT_PARALLEL_EDGE_THRESHOLD`] edge count (default ~200 K
+/// directed edges) and the calling pipeline is already rayon-driven.
+/// Below the threshold, this function delegates to [`rabbit_order`]
+/// transparently — see "Fallback for small graphs" below. Above the
+/// threshold, expect wall-clock parity with the sequential path on
+/// realistic sparse graphs (the apply phase is the bottleneck); the
+/// function exists to anchor a deterministic concurrent API surface
+/// rather than to deliver large speedups today.
+///
 /// ## Algorithm (Option A from `14_PERMUTATION.md` § 3)
 ///
 /// 1. Initialise per-community adjacency, weighted degrees, and self-
@@ -407,6 +579,26 @@ pub const RABBIT_PARALLEL_EDGE_THRESHOLD: usize = 200_000;
 /// Same as [`rabbit_order`]: empty / single-vertex / edgeless / self-
 /// looped / multigraph inputs all return a valid [`Permutation`]. See
 /// the [`rabbit_order`] documentation for the precise contract.
+///
+/// ## Example
+///
+/// The example mirrors [`rabbit_order`]'s — two triangles joined by a
+/// bridge edge. Below the small-graph threshold this call delegates
+/// to the sequential path, so the output is identical regardless of
+/// thread count. The only practical difference at this size is a few
+/// extra microseconds of bookkeeping; the example exercises the
+/// public API surface, not the parallel speedup.
+///
+/// ```no_run
+/// use tokenfs_algos::permutation::{CsrGraph, rabbit_order_par};
+///
+/// let offsets = [0_u32, 2, 4, 7, 10, 12, 14];
+/// let neighbors = [1_u32, 2, 0, 2, 0, 1, 3, 2, 4, 5, 3, 5, 3, 4];
+/// let graph = CsrGraph { n: 6, offsets: &offsets, neighbors: &neighbors };
+///
+/// let perm = rabbit_order_par(graph);
+/// assert_eq!(perm.len(), 6);
+/// ```
 ///
 /// # Panics
 ///

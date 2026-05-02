@@ -5,6 +5,29 @@
 //! type [`CsrGraph`], and the **build-time** ordering primitives that
 //! produce a [`Permutation`] from such inputs.
 //!
+//! ## Available orderings
+//!
+//! Four orderings are exposed; pick by input shape and quality / cost
+//! trade-off. See `docs/PHASE_D_RABBIT_ORDER.md` for the side-by-side
+//! comparison and `docs/v0.2_planning/14_PERMUTATION.md` for the full
+//! spec.
+//!
+//! | API | Input shape | Build cost | Quality | Use when |
+//! |---|---|---|---|---|
+//! | [`Permutation::identity`] | none (length only) | trivial | none | a permutation slot is required but no reordering is desired (placeholder, baseline, or fixture) |
+//! | [`rcm()`] | sparse undirected graph ([`CsrGraph`]) | very cheap (`O(\|V\| + \|E\| log Δ)`, ~10 ms / 228 K vertices) | bandwidth-minimising; modest cache-locality win | sparse-matrix solvers, bandwidth-driven workloads, or any "good enough" graph reorder where build time matters |
+//! | [`hilbert_2d`] / [`hilbert_nd`] | point cloud in 2D or N-D (`&[(f32,f32)]` / `&[Vec<f32>]`) | `O(n log n)` sort | preserves metric locality on the embedding | data has a true low-dimensional point embedding (PCA-projected fingerprints, t-SNE/UMAP outputs); spatial-locality scans |
+//! | [`rabbit_order()`] / [`rabbit_order_par()`] | sparse undirected graph ([`CsrGraph`]) | heavy (`O(\|E\| log \|V\|)`, 1-5 s / 228 K vertices) | best published cache-locality; community-aware | community-structured graphs feeding locality-sensitive workloads (BFS, PageRank, neighbour scans, TokenFS dedup-cluster reads) |
+//!
+//! [`hilbert_2d`] / [`hilbert_nd`] are gated on the `permutation_hilbert`
+//! Cargo feature; [`rabbit_order_par`] is gated on the `parallel` Cargo
+//! feature.
+//!
+//! Identity vs the others: pick [`Permutation::identity`] only when the
+//! permutation is a structural placeholder (the type's invariant is a
+//! valid bijection on `0..n`, so callers cannot pass a raw `Vec<u32>`).
+//! For real data, prefer one of the three reordering primitives.
+//!
 //! ## Sprint 11-13 / Sprint 47-49 / Sprint 53-55 status
 //!
 //! Phase B4 of `01_PHASES.md` lands [`rcm()`] (Reverse Cuthill-McKee).
