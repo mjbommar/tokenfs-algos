@@ -26,7 +26,15 @@
 //! `sve` / `sve2` cargo features are enabled and the target is aarch64.
 
 #![allow(missing_docs)]
-#![allow(clippy::unwrap_used)] // Test code — panic on None/Err is the desired failure mode.
+#![allow(clippy::unwrap_used)]
+// Test code — panic on None/Err is the desired failure mode.
+// The legacy `similarity::kernels::*` paths are deprecated re-exports of
+// `vector::kernels::*` (v0.2 module split); SVE remains in
+// `similarity::kernels::sve` for now, and the parity oracles below still
+// route through the deprecated `similarity::kernels::scalar::*` shim
+// rather than `vector::kernels::scalar::*` directly to keep this file's
+// import surface uniform with the SVE-specific code path.
+#![allow(deprecated)]
 #![cfg(all(feature = "sve2", target_arch = "aarch64"))]
 
 use proptest::prelude::*;

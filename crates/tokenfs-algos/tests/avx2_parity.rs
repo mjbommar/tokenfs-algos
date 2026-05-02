@@ -8,6 +8,7 @@
 //! feature so non-x86 builds compile cleanly.
 
 #![allow(missing_docs)]
+#![allow(deprecated)]
 #![allow(clippy::unwrap_used)] // Test code — panic on None is the desired failure mode.
 #![cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
 
@@ -18,7 +19,7 @@ use tokenfs_algos::{
     fingerprint::{self, BLOCK_SIZE},
     hash,
     histogram::{self, ByteHistogram},
-    runlength, similarity,
+    runlength, similarity, vector,
 };
 
 fn avx2_available() -> bool {
@@ -1177,5 +1178,191 @@ proptest! {
         };
         prop_assert_eq!(consumed, written);
         prop_assert_eq!(decoded, values);
+    }
+
+    // ---------- vector module: AVX2 hamming/jaccard parity ----------
+
+    #[test]
+    fn avx2_vector_hamming_u64_matches_scalar(
+        a in proptest::collection::vec(any::<u64>(), 0..512),
+        seed in any::<u64>(),
+    ) {
+        if !avx2_available() {
+            return Ok(());
+        }
+        let b: Vec<u64> = a.iter().enumerate()
+            .map(|(i, x)| x.wrapping_mul(seed.wrapping_add(i as u64 + 1)))
+            .collect();
+        let expected = vector::kernels::scalar::hamming_u64(&a, &b);
+        // SAFETY: avx2_available() returned true above.
+        let actual = unsafe { vector::kernels::avx2::hamming_u64(&a, &b) };
+        prop_assert_eq!(Some(actual), expected);
+        // Public dispatcher must agree.
+        prop_assert_eq!(vector::hamming_u64(&a, &b), expected);
+    }
+
+    #[test]
+    fn avx2_vector_jaccard_u64_matches_scalar(
+        a in proptest::collection::vec(any::<u64>(), 0..512),
+        seed in any::<u64>(),
+    ) {
+        if !avx2_available() {
+            return Ok(());
+        }
+        let b: Vec<u64> = a.iter().enumerate()
+            .map(|(i, x)| x ^ seed.rotate_left(i as u32))
+            .collect();
+        let expected = vector::kernels::scalar::jaccard_u64(&a, &b).unwrap();
+        // SAFETY: avx2_available() returned true above.
+        let actual = unsafe { vector::kernels::avx2::jaccard_u64(&a, &b) };
+        prop_assert!((expected - actual).abs() < 1e-12,
+            "jaccard_u64 diverged: scalar={expected} avx2={actual}");
+        // Public dispatcher.
+        let dispatched = vector::jaccard_u64(&a, &b).unwrap();
+        prop_assert!((expected - dispatched).abs() < 1e-12);
+    }
+
+    // ---------- vector module: AVX2 dot/L2/cosine f32 parity ----------
+
+    #[test]
+    fn avx2_vector_dot_l2_f32_match_scalar(
+        a in proptest::collection::vec(-256.0_f32..256.0, 0..1024),
+        seed in any::<u32>(),
+    ) {
+        if !avx2_available() {
+            return Ok(());
+        }
+        let b: Vec<f32> = a.iter().enumerate()
+            .map(|(i, x)| x + (seed.wrapping_mul(i as u32 + 1) as f32 * 1e-3))
+            .collect();
+        // Higham §3 / Wilkinson L1-norm bound, see explanation above.
+        let dot_s = vector::kernels::scalar::dot_f32(&a, &b).unwrap();
+        // SAFETY: avx2_available() returned true above.
+        let dot_v = unsafe { vector::kernels::avx2::dot_f32(&a, &b) };
+        let l1: f32 = a.iter().zip(b.iter()).map(|(&x, &y)| (x * y).abs()).sum();
+        let scale = l1.max(dot_s.abs()).max(dot_v.abs()).max(1.0);
+        prop_assert!((dot_s - dot_v).abs() / scale < 1e-3,
+            "vector::avx2::dot_f32 diverged: scalar={dot_s} avx2={dot_v} l1={l1}");
+
+        let l2_s = vector::kernels::scalar::l2_squared_f32(&a, &b).unwrap();
+        // SAFETY: avx2_available() returned true above.
+        let l2_v = unsafe { vector::kernels::avx2::l2_squared_f32(&a, &b) };
+        let scale = l2_s.abs().max(l2_v.abs()).max(1.0);
+        prop_assert!((l2_s - l2_v).abs() / scale < 5e-4,
+            "vector::avx2::l2_squared_f32 diverged: scalar={l2_s} avx2={l2_v}");
+    }
+
+    // ---------- vector module: AVX-512 f32 + hamming/jaccard parity ----------
+
+    #[cfg(feature = "avx512")]
+    #[test]
+    fn avx512_vector_dot_l2_f32_match_scalar(
+        a in proptest::collection::vec(-256.0_f32..256.0, 0..1024),
+        seed in any::<u32>(),
+    ) {
+        if !std::is_x86_feature_detected!("avx512f") {
+            return Ok(());
+        }
+        let b: Vec<f32> = a.iter().enumerate()
+            .map(|(i, x)| x + (seed.wrapping_mul(i as u32 + 1) as f32 * 1e-3))
+            .collect();
+        let dot_s = vector::kernels::scalar::dot_f32(&a, &b).unwrap();
+        // SAFETY: avx512f availability checked above.
+        let dot_v = unsafe { vector::kernels::avx512::dot_f32(&a, &b) };
+        let l1: f32 = a.iter().zip(b.iter()).map(|(&x, &y)| (x * y).abs()).sum();
+        let scale = l1.max(dot_s.abs()).max(dot_v.abs()).max(1.0);
+        prop_assert!((dot_s - dot_v).abs() / scale < 1e-3,
+            "vector::avx512::dot_f32 diverged: scalar={dot_s} avx512={dot_v} l1={l1}");
+
+        let l2_s = vector::kernels::scalar::l2_squared_f32(&a, &b).unwrap();
+        // SAFETY: avx512f availability checked above.
+        let l2_v = unsafe { vector::kernels::avx512::l2_squared_f32(&a, &b) };
+        let scale = l2_s.abs().max(l2_v.abs()).max(1.0);
+        prop_assert!((l2_s - l2_v).abs() / scale < 5e-4,
+            "vector::avx512::l2_squared_f32 diverged: scalar={l2_s} avx512={l2_v}");
+    }
+
+    #[cfg(feature = "avx512")]
+    #[test]
+    fn avx512_vector_hamming_jaccard_match_scalar(
+        a in proptest::collection::vec(any::<u64>(), 0..512),
+        seed in any::<u64>(),
+    ) {
+        if !std::is_x86_feature_detected!("avx512f")
+            || !std::is_x86_feature_detected!("avx512vpopcntdq")
+        {
+            return Ok(());
+        }
+        let b: Vec<u64> = a.iter().enumerate()
+            .map(|(i, x)| x.wrapping_mul(seed.wrapping_add(i as u64 + 1)))
+            .collect();
+        let h_s = vector::kernels::scalar::hamming_u64(&a, &b).unwrap();
+        // SAFETY: availability checked above.
+        let h_v = unsafe { vector::kernels::avx512::hamming_u64(&a, &b) };
+        prop_assert_eq!(h_s, h_v);
+        let j_s = vector::kernels::scalar::jaccard_u64(&a, &b).unwrap();
+        // SAFETY: availability checked above.
+        let j_v = unsafe { vector::kernels::avx512::jaccard_u64(&a, &b) };
+        prop_assert!((j_s - j_v).abs() < 1e-12);
+    }
+
+    // ---------- vector module: batched many-vs-one parity ----------
+
+    #[test]
+    fn avx2_vector_batched_dot_f32_one_to_many_matches_serial(
+        n_rows in 0_usize..16,
+        seed in any::<u32>(),
+    ) {
+        if !avx2_available() {
+            return Ok(());
+        }
+        let stride = 64_usize;
+        let mut state = seed.wrapping_add(1);
+        let mut next_f32 = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        let query: Vec<f32> = (0..stride).map(|_| next_f32()).collect();
+        let db: Vec<f32> = (0..n_rows * stride).map(|_| next_f32()).collect();
+        let mut out_batched = vec![0.0_f32; n_rows];
+        vector::dot_f32_one_to_many(&query, &db, stride, &mut out_batched);
+        for (i, slot) in out_batched.iter().enumerate() {
+            let row = &db[i * stride..(i + 1) * stride];
+            let serial = vector::dot_f32(&query, row).unwrap();
+            // The batched form re-resolves the dispatcher per row, so
+            // the result should be bit-exact with the serial single-pair
+            // call (same backend, same input).
+            prop_assert!((slot - serial).abs() < 1e-5,
+                "batched dot_f32 row {} diverged: got {} serial {}", i, slot, serial);
+        }
+    }
+
+    #[test]
+    fn avx2_vector_batched_hamming_u64_one_to_many_matches_serial(
+        n_rows in 0_usize..16,
+        seed in any::<u64>(),
+    ) {
+        if !avx2_available() {
+            return Ok(());
+        }
+        let stride = 8_usize;
+        let mut state = seed;
+        let mut next_u64 = || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        };
+        let query: Vec<u64> = (0..stride).map(|_| next_u64()).collect();
+        let db: Vec<u64> = (0..n_rows * stride).map(|_| next_u64()).collect();
+        let mut out_batched = vec![0_u32; n_rows];
+        vector::hamming_u64_one_to_many(&query, &db, stride, &mut out_batched);
+        for (i, slot) in out_batched.iter().enumerate() {
+            let row = &db[i * stride..(i + 1) * stride];
+            let serial = vector::hamming_u64(&query, row).unwrap();
+            prop_assert_eq!(*slot as u64, serial);
+        }
     }
 }
