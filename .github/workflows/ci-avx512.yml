@@ -82,15 +82,15 @@ jobs:
       - name: Test (with tunes-json feature)
         run: cargo test -p tokenfs-algos --features tunes-json
 
-      # Once #38 lands the AVX-512 kernels behind feature="avx512", these
-      # next two steps will exercise the new SIMD paths against scalar
-      # parity. Until then they're no-ops on the avx512 feature flag.
-      - name: Test (with avx512 feature, when available)
-        continue-on-error: true
+      # AVX-512 kernels (#38 byteclass, #47 VBMI utf8, #51 BITALG bit-
+      # marginals, #52 GFNI bit-marginals, #60 VBMI permute-LUT) all
+      # ship behind the `avx512` cargo feature; this step exercises
+      # them against the scalar reference. Hard-gated — AVX-512
+      # regressions block the workflow.
+      - name: Test (with avx512 feature)
         run: cargo test -p tokenfs-algos --features avx512
 
       - name: Bench AVX-512 paths (build-only smoke check)
-        continue-on-error: true
         run: cargo bench -p tokenfs-algos --features bench-internals,avx512 --no-run
 
       - name: Run dispatch_explain on this runner (logs detected backend)

@@ -250,10 +250,20 @@ pub struct BackendKernelSupport {
     pub runlength: KernelAvailability,
     /// Similarity f32 distance kernels (dot, L2², cosine).
     pub similarity: KernelAvailability,
-    /// SHA-256 hash implementation status. SHA-NI on x86 and FEAT_SHA2
-    /// on aarch64 are dispatched independently of the surrounding
-    /// SIMD backend; this field reports whether the SHA hardware path
-    /// is reachable on a CPU class that exposes this `Backend`.
+    /// SHA-256 hash implementation status for **this `Backend` alone**.
+    ///
+    /// Hardware SHA-256 lives in separate ISA extensions (SHA-NI on
+    /// x86, FEAT_SHA2 on aarch64) that are orthogonal to the SIMD
+    /// `Backend` enum. Notable — many AVX2-capable Intel CPUs
+    /// (Haswell through Rocket Lake) lack SHA-NI; FEAT_SHA2 is
+    /// optional on ARMv8-A. So every SIMD-`Backend` row reports
+    /// `ScalarFallback` here even though the runtime dispatch in
+    /// `crate::hash::sha256::sha256` does correctly pick the
+    /// hardware path when its own probe (`is_x86_feature_detected!
+    /// ("sha")` / `is_aarch64_feature_detected!("sha2")`) returns
+    /// true. To detect SHA hardware availability, query
+    /// `crate::hash::sha256::kernels::x86_shani::is_available` /
+    /// `kernels::aarch64_sha2::is_available` directly.
     pub hash_sha256: KernelAvailability,
 }
 
@@ -273,17 +283,18 @@ pub const fn backend_kernel_support(backend: Backend) -> BackendKernelSupport {
             // sketch CRC32C (kernels::sse42 — runs on every CPU that
             // has AVX2 in practice), runlength (kernels::avx2 with
             // BMI2/LZCNT gating), similarity dot/l2/cosine f32
-            // (kernels::avx2). hash_sha256 = Native because every CPU
-            // that exposes AVX2 is also a Goldmont+ / Zen+ class part
-            // that exposes SHA-NI, and the dispatch picks SHA-NI when
-            // is_x86_feature_detected!("sha") returns true.
+            // (kernels::avx2). hash_sha256 stays ScalarFallback —
+            // SHA-NI is OPTIONAL on x86 (Haswell..Rocket Lake have
+            // AVX2 but no SHA-NI); see the field doc.
             byte_histogram: KernelAvailability::Native,
             fingerprint: KernelAvailability::Native,
             byte_class: KernelAvailability::Native,
             sketch: KernelAvailability::Native,
             runlength: KernelAvailability::Native,
             similarity: KernelAvailability::Native,
-            hash_sha256: KernelAvailability::Native,
+            // SHA hardware (SHA-NI / FEAT_SHA2) is orthogonal to this
+            // SIMD backend; see the field's doc comment.
+            hash_sha256: KernelAvailability::ScalarFallback,
         },
         Backend::Neon => BackendKernelSupport {
             backend,
@@ -302,7 +313,9 @@ pub const fn backend_kernel_support(backend: Backend) -> BackendKernelSupport {
             sketch: KernelAvailability::Native,
             runlength: KernelAvailability::Native,
             similarity: KernelAvailability::Native,
-            hash_sha256: KernelAvailability::Native,
+            // SHA hardware (SHA-NI / FEAT_SHA2) is orthogonal to this
+            // SIMD backend; see the field's doc comment.
+            hash_sha256: KernelAvailability::ScalarFallback,
         },
         Backend::Avx512 => BackendKernelSupport {
             backend,
@@ -322,7 +335,9 @@ pub const fn backend_kernel_support(backend: Backend) -> BackendKernelSupport {
             sketch: KernelAvailability::Native,
             runlength: KernelAvailability::Native,
             similarity: KernelAvailability::Native,
-            hash_sha256: KernelAvailability::Native,
+            // SHA hardware (SHA-NI / FEAT_SHA2) is orthogonal to this
+            // SIMD backend; see the field's doc comment.
+            hash_sha256: KernelAvailability::ScalarFallback,
         },
         Backend::Sve | Backend::Sve2 => BackendKernelSupport {
             backend,
@@ -341,7 +356,9 @@ pub const fn backend_kernel_support(backend: Backend) -> BackendKernelSupport {
             sketch: KernelAvailability::Native,
             runlength: KernelAvailability::Native,
             similarity: KernelAvailability::Native,
-            hash_sha256: KernelAvailability::Native,
+            // SHA hardware (SHA-NI / FEAT_SHA2) is orthogonal to this
+            // SIMD backend; see the field's doc comment.
+            hash_sha256: KernelAvailability::ScalarFallback,
         },
         Backend::Scalar => BackendKernelSupport {
             backend,
@@ -351,6 +368,9 @@ pub const fn backend_kernel_support(backend: Backend) -> BackendKernelSupport {
             sketch: KernelAvailability::Native,
             runlength: KernelAvailability::Native,
             similarity: KernelAvailability::Native,
+            // The scalar SHA-256 reference implementation always works
+            // — it IS the FIPS 180-4 reference. Hardware extensions on
+            // SIMD backends are reported separately; see the field doc.
             hash_sha256: KernelAvailability::Native,
         },
         // Detection-only accelerators: no kernels are wired in yet, so
@@ -1680,38 +1700,46 @@ mod tests {
         assert_eq!(avx2.sketch, KernelAvailability::Native);
         assert_eq!(avx2.runlength, KernelAvailability::Native);
         assert_eq!(avx2.similarity, KernelAvailability::Native);
-        assert_eq!(avx2.hash_sha256, KernelAvailability::Native);
+        // SHA-NI is OPTIONAL on x86 — Haswell through Rocket Lake have
+        // AVX2 but no SHA-NI. The matrix reports ScalarFallback to
+        // avoid overclaim; the runtime sha256 dispatch still picks
+        // SHA-NI when is_x86_feature_detected!("sha") returns true.
+        assert_eq!(avx2.hash_sha256, KernelAvailability::ScalarFallback);
 
         // NEON ships native byte-class (kernels::neon), fingerprint
         // (#37), sketch CRC32C via __crc32cw (#45), runlength,
-        // similarity, and hash_sha256 (FEAT_SHA2 dispatched separately).
-        // Byte-histogram is the remaining gap on NEON.
+        // similarity. Byte-histogram is the remaining gap on NEON.
+        // hash_sha256 is ScalarFallback because FEAT_SHA2 is OPTIONAL
+        // on ARMv8-A (the runtime dispatcher still picks it when
+        // is_aarch64_feature_detected!("sha2") returns true).
         let neon = backend_kernel_support(Backend::Neon);
         assert_eq!(neon.byte_class, KernelAvailability::Native);
         assert_eq!(neon.fingerprint, KernelAvailability::Native);
         assert_eq!(neon.sketch, KernelAvailability::Native);
         assert_eq!(neon.runlength, KernelAvailability::Native);
         assert_eq!(neon.similarity, KernelAvailability::Native);
-        assert_eq!(neon.hash_sha256, KernelAvailability::Native);
+        assert_eq!(neon.hash_sha256, KernelAvailability::ScalarFallback);
         assert_eq!(neon.byte_histogram, KernelAvailability::ScalarFallback);
 
         // AVX-512 ships native byte-class (#38, #47, #60). The bit-marginal
         // BITALG/GFNI kernels (#51/#52) emit 8 marginals, NOT a 256-bin
         // histogram, so byte_histogram stays ScalarFallback. fingerprint
-        // is the remaining gap. sketch/runlength/similarity/sha256 are
-        // composed from AVX2/SSE4.2/SHA-NI which every AVX-512 host
-        // exposes — reported as Native.
+        // is the remaining gap. sketch/runlength/similarity/sha256
+        // composition: SHA-NI is OPTIONAL even on AVX-512 hosts (Skylake-X
+        // notably lacks it), so hash_sha256 stays ScalarFallback here too.
         let avx512 = backend_kernel_support(Backend::Avx512);
         assert_eq!(avx512.byte_class, KernelAvailability::Native);
         assert_eq!(avx512.byte_histogram, KernelAvailability::ScalarFallback);
         assert_eq!(avx512.fingerprint, KernelAvailability::ScalarFallback);
+        assert_eq!(avx512.hash_sha256, KernelAvailability::ScalarFallback);
 
         // SVE / SVE2 ship native byte-class classify + UTF-8 (#41),
         // runlength (#41 svcntp_b8), similarity (#41 svmla_f32_m). NEON-
-        // mandatory paths (fingerprint, sketch CRC32C, hash_sha256 via
-        // FEAT_SHA2) compose cleanly because every SVE host also exposes
-        // NEON. Byte-histogram is the remaining gap (svhistseg_u8 is
-        // future work).
+        // mandatory paths (fingerprint, sketch CRC32C via FEAT_CRC32 —
+        // mandatory on ARMv8.1+, which SVE always implies) compose cleanly.
+        // Byte-histogram is the remaining gap (svhistseg_u8 is future
+        // work). hash_sha256 stays ScalarFallback because FEAT_SHA2 is
+        // independent of SVE/NEON; runtime dispatcher handles it.
         for backend in [Backend::Sve, Backend::Sve2] {
             let support = backend_kernel_support(backend);
             assert_eq!(support.byte_class, KernelAvailability::Native);
@@ -1719,9 +1747,14 @@ mod tests {
             assert_eq!(support.sketch, KernelAvailability::Native);
             assert_eq!(support.runlength, KernelAvailability::Native);
             assert_eq!(support.similarity, KernelAvailability::Native);
-            assert_eq!(support.hash_sha256, KernelAvailability::Native);
+            assert_eq!(support.hash_sha256, KernelAvailability::ScalarFallback);
             assert_eq!(support.byte_histogram, KernelAvailability::ScalarFallback);
         }
+
+        // Scalar always reports Native for everything — it's the
+        // reference implementation set, including SHA-256.
+        let scalar = backend_kernel_support(Backend::Scalar);
+        assert_eq!(scalar.hash_sha256, KernelAvailability::Native);
     }
 
     #[cfg(all(feature = "std", target_os = "linux"))]

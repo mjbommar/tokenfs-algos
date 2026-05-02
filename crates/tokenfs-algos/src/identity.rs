@@ -40,7 +40,7 @@
 //! use tokenfs_algos::hash::sha256::sha256;
 //!
 //! let digest = sha256(b"");
-//! let mh = encode_multihash_vec(MultihashCode::Sha2_256, &digest);
+//! let mh = encode_multihash_vec(MultihashCode::Sha2_256, &digest).unwrap();
 //! let cid = build_cid_v1_string(Multicodec::Raw, &mh);
 //! assert_eq!(cid, "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku");
 //! # }
@@ -330,9 +330,14 @@ pub fn encode_multihash(
 /// Decodes a multihash. Returns `(code, digest)` where `digest` borrows from
 /// `bytes`.
 ///
-/// The decoder is strict: the declared digest length must equal the digest
-/// length expected by the multihash code, and there must be exactly that many
-/// bytes available after the header.
+/// The decoder is strict on three axes:
+///   1. The declared digest length must equal the digest length expected
+///      by the multihash code (e.g. 32 for SHA2-256).
+///   2. The bytes after the header must be EXACTLY `declared` long;
+///      trailing bytes are rejected. This matches the content-addressing
+///      contract — a multihash should be exactly its bytes.
+///   3. Truncated headers / digests yield `DecodeError::Truncated` or
+///      `DigestLengthMismatch` respectively.
 pub fn decode_multihash(bytes: &[u8]) -> Result<(MultihashCode, &[u8]), DecodeError> {
     if bytes.is_empty() {
         return Err(DecodeError::Truncated);
@@ -344,30 +349,49 @@ pub fn decode_multihash(bytes: &[u8]) -> Result<(MultihashCode, &[u8]), DecodeEr
     let (declared_len_u64, n2) = decode_varint_u64(rest)?;
     let declared = declared_len_u64 as usize;
     let digest = &rest[n2..];
-    if declared != code.digest_len() || declared > digest.len() {
+    // Strict: declared length must match the code's expected length AND
+    // the remaining buffer must be exactly that many bytes (no trailing
+    // junk). Pre-fix this used `declared > digest.len()` which silently
+    // accepted trailing bytes — see the regression test
+    // `decode_multihash_rejects_trailing_bytes`.
+    if declared != code.digest_len() || declared != digest.len() {
         return Err(DecodeError::DigestLengthMismatch {
             declared,
             available: digest.len(),
         });
     }
-    Ok((code, &digest[..declared]))
+    Ok((code, digest))
 }
 
 /// Allocates a `Vec<u8>` and writes the multihash into it.
+///
+/// Returns `Err(EncodeError::DigestLengthMismatch { .. })` when the
+/// digest length doesn't match the code's expected length. This is the
+/// only failure mode (the buffer is allocated to the exact size needed,
+/// so `BufferTooSmall` cannot occur here).
 #[cfg(any(feature = "std", feature = "alloc"))]
-#[must_use]
-pub fn encode_multihash_vec(code: MultihashCode, digest: &[u8]) -> Vec<u8> {
-    debug_assert_eq!(
-        digest.len(),
-        code.digest_len(),
-        "digest length must match multihash code"
-    );
+pub fn encode_multihash_vec(
+    code: MultihashCode,
+    digest: &[u8],
+) -> Result<Vec<u8>, EncodeError> {
+    if digest.len() != code.digest_len() {
+        return Err(EncodeError::DigestLengthMismatch {
+            code,
+            expected: code.digest_len(),
+            got: digest.len(),
+        });
+    }
     let needed = varint_u64_len(code.raw()) + varint_u64_len(digest.len() as u64) + digest.len();
     let mut out = vec![0u8; needed];
+    // SAFETY-shaped: the digest length was already verified equal to
+    // code.digest_len() above and `out` is sized to `needed`, so the
+    // inner encode_multihash cannot fail. The `expect` here only
+    // protects against an internal logic error (out length math drift)
+    // which would be a panic-worthy bug.
     let written =
         encode_multihash(code, digest, &mut out).expect("multihash encode into sized buffer");
     debug_assert_eq!(written, needed);
-    out
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -483,11 +507,16 @@ pub fn build_cid_v1_string(codec: Multicodec, multihash: &[u8]) -> String {
 // ---------------------------------------------------------------------------
 
 /// Computes the SHA-256 CIDv1 (raw codec, base32-lower text) of `bytes`.
+///
+/// Cannot fail in practice: the SHA-256 digest is always exactly 32
+/// bytes, which matches `MultihashCode::Sha2_256::digest_len()`. The
+/// `expect` here protects against an internal logic drift only.
 #[cfg(any(feature = "std", feature = "alloc"))]
 #[must_use]
 pub fn sha256_cid(bytes: &[u8]) -> String {
     let digest = crate::hash::sha256::sha256(bytes);
-    let mh = encode_multihash_vec(MultihashCode::Sha2_256, &digest);
+    let mh = encode_multihash_vec(MultihashCode::Sha2_256, &digest)
+        .expect("SHA-256 digest is always 32 bytes (matches Sha2_256 multihash length)");
     build_cid_v1_string(Multicodec::Raw, &mh)
 }
 
@@ -496,7 +525,8 @@ pub fn sha256_cid(bytes: &[u8]) -> String {
 #[must_use]
 pub fn blake3_cid(bytes: &[u8]) -> String {
     let digest = crate::hash::blake3::blake3(bytes);
-    let mh = encode_multihash_vec(MultihashCode::Blake3, &digest);
+    let mh = encode_multihash_vec(MultihashCode::Blake3, &digest)
+        .expect("BLAKE3 digest is always 32 bytes (matches Blake3 multihash length)");
     build_cid_v1_string(Multicodec::Raw, &mh)
 }
 
@@ -698,6 +728,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn encode_multihash_vec_returns_error_on_wrong_digest_len() {
+        // Public API regression: encode_multihash_vec must return
+        // Err on a wrong-length digest, not panic via .expect().
+        let too_short: Vec<u8> = vec![0u8; 16]; // SHA-256 wants 32
+        let err = encode_multihash_vec(MultihashCode::Sha2_256, &too_short).unwrap_err();
+        assert_eq!(
+            err,
+            EncodeError::DigestLengthMismatch {
+                code: MultihashCode::Sha2_256,
+                expected: 32,
+                got: 16,
+            }
+        );
+        let too_long: Vec<u8> = vec![0u8; 64];
+        let err2 = encode_multihash_vec(MultihashCode::Sha2_256, &too_long).unwrap_err();
+        assert_eq!(
+            err2,
+            EncodeError::DigestLengthMismatch {
+                code: MultihashCode::Sha2_256,
+                expected: 32,
+                got: 64,
+            }
+        );
+        // Right-sized digest still works.
+        let exact: Vec<u8> = vec![0u8; 32];
+        assert!(encode_multihash_vec(MultihashCode::Sha2_256, &exact).is_ok());
+    }
+
+    #[test]
+    fn multihash_decode_rejects_trailing_bytes() {
+        // Strict-decode regression: a well-formed sha2-256 multihash
+        // (code 0x12, length 0x20, 32 zero bytes) followed by trailing
+        // junk must NOT silently decode to the prefix. Pre-fix the
+        // decoder used `declared > digest.len()` and accepted this.
+        let mut bytes = [0u8; 2 + 32 + 5];
+        bytes[0] = 0x12;
+        bytes[1] = 0x20;
+        // last 5 bytes are non-zero junk
+        bytes[2 + 32..].copy_from_slice(b"junk!");
+        let err = decode_multihash(&bytes).unwrap_err();
+        assert_eq!(
+            err,
+            DecodeError::DigestLengthMismatch {
+                declared: 32,
+                available: 32 + 5,
+            }
+        );
+    }
+
     // ---- base32-lower (RFC 4648 §10 vectors, lower-cased) -------------
 
     fn b32(input: &[u8]) -> Vec<u8> {
@@ -742,7 +822,7 @@ mod tests {
     #[test]
     fn cid_v1_binary_layout_for_sha256_raw() {
         let digest = [0xaau8; 32];
-        let mh = encode_multihash_vec(MultihashCode::Sha2_256, &digest);
+        let mh = encode_multihash_vec(MultihashCode::Sha2_256, &digest).unwrap();
         let cid = build_cid_v1_vec(Multicodec::Raw, &mh);
         // 01 (cid version) | 55 (raw codec) | 12 (sha2-256) | 20 (32 bytes) | digest
         assert_eq!(cid[0], 0x01);
@@ -757,7 +837,7 @@ mod tests {
     fn cid_v1_binary_layout_for_dagjson_multibyte_codec() {
         // DagJson is 0x0129 → varint encodes as 0xa9 0x02.
         let digest = [0xbb_u8; 32];
-        let mh = encode_multihash_vec(MultihashCode::Sha2_256, &digest);
+        let mh = encode_multihash_vec(MultihashCode::Sha2_256, &digest).unwrap();
         let cid = build_cid_v1_vec(Multicodec::DagJson, &mh);
         assert_eq!(cid[0], 0x01);
         assert_eq!(cid[1], 0xa9);
@@ -771,7 +851,7 @@ mod tests {
     #[test]
     fn cid_v1_buffer_too_small() {
         let digest = [0u8; 32];
-        let mh = encode_multihash_vec(MultihashCode::Sha2_256, &digest);
+        let mh = encode_multihash_vec(MultihashCode::Sha2_256, &digest).unwrap();
         let mut out = [0u8; 8];
         let err = build_cid_v1(Multicodec::Raw, &mh, &mut out).unwrap_err();
         assert!(matches!(err, EncodeError::BufferTooSmall { .. }));

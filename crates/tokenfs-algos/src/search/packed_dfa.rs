@@ -110,6 +110,17 @@ pub struct PackedDfa {
     match_lists: Vec<Vec<u32>>,
     /// Per-pattern length, used to convert match-end-offset to start.
     pattern_lens: Vec<u32>,
+    /// Per-pattern original bytes, used by `find` / `find_iter` to
+    /// verify candidate matches against the haystack window. The DFA's
+    /// byte-class compression collapses bytes beyond
+    /// `MAX_PATTERN_CLASSES` distinct values into the wildcard class
+    /// (id 0), so the goto trie is an over-approximation: any
+    /// non-pattern byte that ends up sharing the wildcard class with
+    /// a real pattern byte can drive the DFA into a match state. The
+    /// post-verify step rejects those false positives. Cost: one
+    /// `Vec<u8>` allocation per pattern at construction; one slice
+    /// equality compare per *candidate* match at query time.
+    patterns: Vec<Vec<u8>>,
 }
 
 impl PackedDfa {
@@ -239,11 +250,16 @@ impl PackedDfa {
             transitions.extend_from_slice(row);
         }
 
+        // Store the original pattern bytes so find/find_iter can
+        // post-verify candidate matches against the haystack window.
+        let owned_patterns: Vec<Vec<u8>> = patterns.iter().map(|p| p.to_vec()).collect();
+
         Self {
             byte_class,
             transitions,
             match_lists,
             pattern_lens,
+            patterns: owned_patterns,
         }
     }
 
@@ -261,7 +277,10 @@ impl PackedDfa {
 
     /// Returns the first match in `haystack` as `(offset, pattern_index)`,
     /// or `None`. The returned offset is the *start* of the matched
-    /// pattern in the haystack.
+    /// pattern in the haystack. Each candidate match is verified
+    /// against the original pattern bytes before being yielded — see
+    /// `Self::patterns` for why this matters when the alphabet
+    /// exceeds `MAX_PATTERN_CLASSES`.
     #[must_use]
     pub fn find(&self, haystack: &[u8]) -> Option<(usize, usize)> {
         let n_classes = self.byte_class.n_classes();
@@ -269,10 +288,16 @@ impl PackedDfa {
         for (i, &b) in haystack.iter().enumerate() {
             let cls = self.byte_class.class_of(b) as usize;
             state = self.transitions[state as usize * n_classes + cls];
-            if let Some(&pat) = self.match_lists[state as usize].first() {
+            // Walk every candidate pattern in this state's match list:
+            // wildcard-class collapse can drive the DFA into a state
+            // whose first match is a false positive while a later one
+            // is a real hit.
+            for &pat in &self.match_lists[state as usize] {
                 let plen = self.pattern_lens[pat as usize] as usize;
                 let start = i + 1 - plen;
-                return Some((start, pat as usize));
+                if haystack[start..i + 1] == self.patterns[pat as usize][..] {
+                    return Some((start, pat as usize));
+                }
             }
         }
         None
@@ -312,16 +337,20 @@ impl<'h, 'm> Iterator for PackedDfaIter<'h, 'm> {
     fn next(&mut self) -> Option<(usize, usize)> {
         let n_classes = self.dfa.byte_class.n_classes();
 
-        // Drain remaining matches from the previous state if any.
+        // Drain remaining (verified) matches from the previous state.
         if self.pending_end_pos > 0 {
             let st = self.state as usize;
             let list = &self.dfa.match_lists[st];
-            if self.pending_idx < list.len() {
+            while self.pending_idx < list.len() {
                 let pat = list[self.pending_idx] as usize;
                 self.pending_idx += 1;
                 let plen = self.dfa.pattern_lens[pat] as usize;
                 let start = self.pending_end_pos - plen;
-                return Some((start, pat));
+                if self.haystack[start..self.pending_end_pos]
+                    == self.dfa.patterns[pat][..]
+                {
+                    return Some((start, pat));
+                }
             }
             self.pending_end_pos = 0;
             self.pending_idx = 0;
@@ -334,13 +363,18 @@ impl<'h, 'm> Iterator for PackedDfaIter<'h, 'm> {
             self.pos += 1;
             let st = self.state as usize;
             let list = &self.dfa.match_lists[st];
-            if !list.is_empty() {
-                let pat = list[0] as usize;
+            // Find the first VERIFIED pattern in this match list. Set
+            // pending_idx past it so a later .next() picks up where
+            // we left off.
+            for (idx, &pat_u32) in list.iter().enumerate() {
+                let pat = pat_u32 as usize;
                 let plen = self.dfa.pattern_lens[pat] as usize;
                 let start = self.pos - plen;
-                self.pending_end_pos = self.pos;
-                self.pending_idx = 1;
-                return Some((start, pat));
+                if self.haystack[start..self.pos] == self.dfa.patterns[pat][..] {
+                    self.pending_end_pos = self.pos;
+                    self.pending_idx = idx + 1;
+                    return Some((start, pat));
+                }
             }
         }
         None
@@ -421,6 +455,79 @@ mod tests {
         // Bytes outside the alphabet must not match.
         assert_eq!(dfa.find(b"X"), None);
         assert_eq!(dfa.find(b"!"), None);
+    }
+
+    #[test]
+    fn alphabet_overflow_does_not_yield_false_positives() {
+        // 33 distinct one-byte patterns: 'A'..='Z' (26) + '0'..='6' (7).
+        // The 33rd byte ('6') overflows MAX_PATTERN_CLASSES and shares
+        // the wildcard class (0) with every non-pattern byte. Before
+        // the post-verify fix `find` reported '6' as matching for any
+        // unrelated byte (e.g. '~', '7', '!') — see the issue write-up
+        // for the exact reproduction. After the fix every non-pattern
+        // byte must yield None.
+        let bytes: alloc::vec::Vec<u8> =
+            (b'A'..=b'Z').chain(b'0'..=b'6').collect();
+        assert_eq!(bytes.len(), 33);
+        let pats: alloc::vec::Vec<&[u8]> =
+            bytes.iter().map(core::slice::from_ref).collect();
+        let dfa = PackedDfa::new(&pats);
+        // Every real pattern still matches.
+        for (i, b) in bytes.iter().enumerate() {
+            let hay = [*b];
+            assert_eq!(dfa.find(&hay), Some((0, i)), "real pattern {b:?}");
+        }
+        // No non-pattern byte should match. The bytes below are all
+        // outside 'A'..='Z' and '0'..='6'.
+        for ch in b"~!@#$%^&*()7890[]{}abc xyz".iter() {
+            // Skip if the byte happens to be one of our patterns.
+            if bytes.contains(ch) {
+                continue;
+            }
+            let hay = [*ch];
+            assert_eq!(
+                dfa.find(&hay),
+                None,
+                "non-pattern byte {:?} (0x{:02x}) should not match",
+                *ch as char,
+                ch
+            );
+        }
+    }
+
+    #[test]
+    fn alphabet_overflow_find_iter_does_not_yield_false_positives() {
+        // Same setup as the find() regression test; ensure find_iter
+        // also post-verifies and rejects unrelated bytes.
+        let bytes: alloc::vec::Vec<u8> =
+            (b'A'..=b'Z').chain(b'0'..=b'6').collect();
+        let pats: alloc::vec::Vec<&[u8]> =
+            bytes.iter().map(core::slice::from_ref).collect();
+        let dfa = PackedDfa::new(&pats);
+        // Haystack is a string of bytes that are NOT in the pattern set;
+        // the pre-fix DFA would report a phantom (offset, 32) for each.
+        let hay = b"~~~7777!!!~~~";
+        let hits: alloc::vec::Vec<_> = dfa.find_iter(hay).collect();
+        assert!(
+            hits.is_empty(),
+            "find_iter must not yield false positives, got {hits:?}"
+        );
+    }
+
+    #[test]
+    fn alphabet_overflow_real_pattern_in_noise() {
+        // A real overflow pattern ('6') buried in non-pattern noise:
+        // verify the iterator yields only the real hit at the right
+        // offset, not phantom matches at the surrounding bytes.
+        let bytes: alloc::vec::Vec<u8> =
+            (b'A'..=b'Z').chain(b'0'..=b'6').collect();
+        let pats: alloc::vec::Vec<&[u8]> =
+            bytes.iter().map(core::slice::from_ref).collect();
+        let dfa = PackedDfa::new(&pats);
+        let hay = b"~~~6~~~";
+        let hits: alloc::vec::Vec<_> = dfa.find_iter(hay).collect();
+        // '6' is pattern index 32 (26 letters + 0..=5 = 32, then '6' = 33rd).
+        assert_eq!(hits, alloc::vec![(3, 32)]);
     }
 
     #[test]
