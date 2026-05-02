@@ -149,7 +149,12 @@ jobs:
           # Sanitize the matrix label into a filename-safe slug.
           slug=$(printf '%s' "${{ matrix.label }}" | tr ' /()' '-' | tr -s '-')
           out="perf-${slug}.tsv"
-          cargo run -p tokenfs-algos --example bench_compare --release > "$out"
+          # Enable nightly+sve+sve2 so the SVE2 bench arms compile in.
+          # The cfg gates inside the kernels also require target_arch=aarch64,
+          # so on x86 runners the features are effectively no-ops; on
+          # aarch64 they activate the runtime-detected SVE/SVE2 paths.
+          cargo run -p tokenfs-algos --example bench_compare --release \
+            --features nightly,sve,sve2 > "$out"
           echo "=== $out ==="
           cat "$out"
 
