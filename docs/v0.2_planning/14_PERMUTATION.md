@@ -86,14 +86,19 @@ For 228K vertices with average degree 5 (TokenFS-typical), this is ~10 ms.
 
 ### Existing Rust impls
 
-- **`sprs::linalg::ordering::reverse_cuthill_mckee`** — production-quality, pseudoperipheral start vertex, returns `Permutation` over a `CsMatViewI`. Use as oracle.
+- **`sprs::linalg::ordering::reverse_cuthill_mckee`** — production-quality, pseudoperipheral start vertex, returns `Permutation` over a `CsMatViewI`. **Use as parity oracle, do not depend on at runtime.**
+- **`rma`** crate — adjacency / CSR / CSC types, no ordering algos.
 
-### Why ship our own when `sprs` exists
+### Vendor decision
 
-Three reasons:
-1. We don't want to drag in `sprs`'s sparse-matrix data model just for one ordering function.
-2. We want the CSR input format to match our `CsrGraph` (which is the universal input shape across `permutation`, future `graph`, etc.).
-3. The argsort step in BFS frontier-by-degree benefits from `bits::popcount`-aware radix sort. Vendoring `sprs` doesn't expose that knob.
+**Ship our own RCM implementation against the `CsrGraph` input type.** Rationale:
+
+1. **No dependency drag**: `sprs` brings its full sparse-matrix data model; we just want one ordering function.
+2. **Input format alignment**: our `CsrGraph` is the universal input shape across `permutation`, future `graph` module, etc. Different sparse-matrix wrapper would force conversions.
+3. **SIMD opportunity**: BFS frontier sort by degree benefits from radix-sort + AVX-512 VPGATHERDD. Hidden inside `sprs`.
+4. **Determinism control**: tie-breaking on equal degree must be deterministic; we want that in our hands.
+
+**Use `sprs::reverse_cuthill_mckee` as a parity oracle in tests.** This is the same pattern as `roaring-rs` for `bitmap` and `sucds` for `bits::rank_select` — depend-on-for-tests-only, ship-our-own-for-runtime.
 
 ### SIMD opportunities
 
@@ -190,11 +195,22 @@ O(n log n) sort.
 
 ### Existing Rust impls
 
-- `hilbert` (Skilling N-D, has `Permutation` type). https://docs.rs/hilbert
-- `fast_hilbert` (LUT-based 2D). https://crates.io/crates/fast_hilbert
-- `hilbert_2d`, `hilbert_index`, `moore-hilbert` (FFI to Doug Moore).
+- **`hilbert`** (Skilling N-D, has `Permutation` type). https://docs.rs/hilbert
+- **`fast_hilbert`** (LUT-based 2D, very compact). https://crates.io/crates/fast_hilbert
+- **`hilbert_2d`**, **`hilbert_index`**, **`moore-hilbert`** (FFI to Doug Moore).
 
-**Tentative: depend on `fast_hilbert` for 2D and `hilbert` for N-D**, behind feature flags. Don't reimplement Skilling.
+### Vendor decision
+
+**Take `fast_hilbert` for 2D and `hilbert` for N-D as feature-gated dependencies.** Rationale:
+
+1. Skilling's algorithm is non-trivial bit-fiddling; high risk of subtle bugs in a reimplementation.
+2. The crates are well-tested, mature, MIT-licensed.
+3. SIMD opportunity is small (Hilbert key computation is per-point, integer ops; not bandwidth-bound).
+4. Our value-add is the Permutation type integration, not the Hilbert key computation.
+
+**Different from Stream-VByte / RCM / Roaring decisions** — those have meaningful SIMD opportunity inside the kernel that we want under our own dispatch. Hilbert keys don't, so vendoring is cleanest.
+
+Feature flag: `permutation_hilbert = ["dep:hilbert", "dep:fast_hilbert"]`. Optional so kernel-only consumers don't pull these in (they wouldn't anyway since `permutation` is build-time-only, but the flag keeps the dep tree clean for embedded / minimal consumers).
 
 ### SIMD
 
@@ -258,3 +274,20 @@ Per [`02b_DEPLOYMENT_MATRIX.md`](02b_DEPLOYMENT_MATRIX.md):
 - **cgo use:** the permutation arrays are typically large (millions of u32s); keep at batch granularity — Go calls `rcm(adjacency)` once per graph, not per-vertex.
 
 `Permutation::apply` is the only API in this module that's hot-path-capable; it's stateless and SIMD-friendly (sequential gather for sorted permutations, scatter for arbitrary).
+
+**Audit confirmation (per `02b_DEPLOYMENT_MATRIX.md`):**
+
+- The build-time-only constraint is **inherent to the algorithms**, not an API limitation. RCM is a BFS traversal over a graph that allocates a queue + visit-order Vec; Hilbert sorts a `Vec<(f32, f32)>` by Hilbert key; Rabbit Order builds a dendrogram. None of these can be made stack-only.
+- **`Permutation::apply` IS kernel-safe.** It's a `(perm: &[u32], src: &[T], dst: &mut [T]) → ()` operation, fully borrowed, allocation-free, and SIMD-friendly via gather. The build-time constraint is on **constructing** a Permutation, not on **applying** one.
+- For TokenFS specifically: the `tokenfs_writer` constructs the permutation at image-build time (userspace, ample memory) and writes the resulting `[u32; n]` array into the sealed image. The `tokenfs_reader` (FUSE or kernel) loads the permutation array from the mmap'd image and applies it via `Permutation::apply` on demand — kernel-safe.
+
+### Runtime-callable layout variants — open question
+
+Per critique #6: CDN edge caches and MinIO have an analogous "promote-from-cold-cache" pattern where a small batch of newly-popular objects could benefit from a *runtime* re-clustering of the cache directory. This is qualitatively different from TokenFS's "build-once" model — it's "build-many-times-per-day-incrementally."
+
+**Tentative position: not in scope for v0.2.** Reasons:
+1. Incremental clustering is a fundamentally different algorithm class (online k-means, streaming community detection) than RCM/Hilbert/Rabbit. Different module, different design.
+2. CDN edge / MinIO consumers haven't asked for this yet; deferral discipline applies.
+3. The `Permutation::apply` runtime API already covers "I have a precomputed permutation, apply it now" — which is the fast path even if recomputation happens on a slower cadence.
+
+If a CDN consumer materializes asking for online incremental clustering, that's its own module spec (probably `cluster::online`) in v0.3+. **Action**: add a sentence to `02b_DEPLOYMENT_MATRIX.md` noting that "build-time-only" applies to permutation *construction*; *application* is fully runtime-capable.

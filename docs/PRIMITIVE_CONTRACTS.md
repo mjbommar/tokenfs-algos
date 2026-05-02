@@ -1,10 +1,44 @@
 # Primitive Contracts
 
-Date: 2026-04-30.
+Date: 2026-04-30. Last revised: 2026-05-02.
 
 This crate is a low-level primitive library. Every hot primitive should be
-usable by TokenFS, FUSE, kernel-adjacent callers, Python bindings, benchmarks,
+usable by TokenFS, FUSE, kernel-adjacent callers, Postgres extensions,
+MinIO/Go consumers via cgo, CDN edge caches, Python bindings, benchmarks,
 and paper-calibration code without changing semantics across backends.
+
+## Queue-Pruning Gate
+
+Every candidate primitive (whether new or being lifted from deferred status)
+must justify itself by answering four questions before joining the
+implementation queue. If the answer is hypothetical for *every* environment
+in `docs/v0.2_planning/02b_DEPLOYMENT_MATRIX.md`, the primitive stays deferred.
+
+1. **What query/workload binds on this primitive being slow?** A specific,
+   documented consumer-side pattern — not a guess. If you can't name a
+   consumer that profiles bottlenecking on its absence, defer.
+2. **What's the cache-residency picture for the data this primitive operates
+   on?** Cache-tier conclusions vary across consumers (TokenFS metadata fits
+   in L3; Postgres indexes don't). L1-resident kernels can be branchy;
+   DRAM-resident kernels must be bandwidth-aware. Pick benches accordingly.
+3. **Which consumer environments can this primitive operate in?** Per the
+   deployment matrix: kernel-module use forbids rayon, blake3, large stack
+   scratch; cgo-bridged use mandates batch APIs. Some primitives are
+   kernel-safe (bits, most of bitmap, vector); others are inherently
+   userspace (permutation construction). Specify and verify.
+4. **What's the consumer surface — one consumer or many?** Single-consumer
+   primitives ride in their consumer's module. Multi-consumer primitives get
+   a dedicated module. If only one consumer is real and the rest are
+   speculative, push back on dedicated-module premise.
+
+This gate is the primary discipline that keeps the crate's surface area
+aligned with what consumers actually bind on, instead of growing
+speculatively. It applies to every new primitive proposal, every Tier-D-to-C
+promotion, and every "let's add this hash family / sort variant / regex
+engine" suggestion.
+
+The gate first appeared in `docs/v0.2_planning/README.md`'s framing principle.
+Promoted here so it survives the v0.2 milestone as the canonical contract.
 
 ## Hot-Path Contract
 

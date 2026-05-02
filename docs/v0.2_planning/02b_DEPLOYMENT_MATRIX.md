@@ -99,9 +99,10 @@ Re-examining the v0.2 module specs through this matrix:
 
 ### `permutation` (14_PERMUTATION.md)
 
-- **Kernel-safe**: ❌ N/A — this is a **build-time primitive**. Never runs in kernel. RCM and Rabbit Order operate on graph adjacency, not on byte slices in a hot path.
-- **Postgres / cgo / userspace**: ✅ all userspace-only consumers.
-- **Mark in spec**: "build-time only; not intended for hot-path use in any consumer."
+- **Permutation construction (RCM, Hilbert, Rabbit Order)**: ❌ build-time only. These algorithms allocate large work buffers (BFS queue, dendrogram) that can't be made stack-only. Never runs in kernel.
+- **`Permutation::apply` (using a precomputed permutation)**: ✅ kernel-safe. Stateless, borrowed slices, SIMD-friendly gather. This IS the runtime-hot-path API.
+- **Postgres / cgo / userspace**: ✅ for both construction and apply.
+- **Open question — online clustering for CDN/MinIO promotion patterns**: out of scope for v0.2. Different algorithm class (online k-means, streaming community detection). Would land as `cluster::online` in v0.3+ if a consumer asks.
 
 ### Deferred items (20_DEFERRED.md) — **revise needed**
 

@@ -2,6 +2,8 @@
 
 **Status:** working synthesis doc. 2026-05-01. Companion to `tokenfs-paper/docs/data-structures.md`. Maps the FS-level data structures TokenFS wants to ship to the `tokenfs-algos` primitives those structures need, identifies what already exists, and ranks the missing hardware-accelerated primitives by leverage.
 
+> **NOTE (2026-05-02):** the v0.2/v0.3 ship lists in §4 of this doc have been **superseded** by the corrected plan in [`docs/v0.2_planning/`](v0.2_planning/) after a multi-consumer (kernel module, FUSE, Postgres, MinIO, CDN edge, research) bottom-up reanalysis. The mapping in §3 below (FS data structures → tokenfs-algos primitives) is still useful as the TokenFS-paper-side input. For current primitive priorities, read [`v0.2_planning/00_BOTTOM_UP_ANALYSIS.md`](v0.2_planning/00_BOTTOM_UP_ANALYSIS.md) and [`v0.2_planning/01_PHASES.md`](v0.2_planning/01_PHASES.md) instead of §4 here.
+
 **Audience:** `tokenfs-algos` contributors deciding what to add next, and `tokenfs-paper` contributors needing to know which compute primitives they can rely on.
 
 ---

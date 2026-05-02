@@ -159,3 +159,17 @@ If non-TokenFS consumers materialize during the v0.2 implementation phase, the d
 5. **Levenshtein / Hamming** — Postgres `pg_trgm` consumer. Real if asked.
 
 The discipline still holds: don't build until a consumer documents a bottleneck. But the consumers in the matrix are **real and the asks are likely**, not hypothetical.
+
+## v0.2.x next-up candidates
+
+These three deferred items are explicitly tracked as **v0.2.x candidates** — not deferred to "indefinite future" but to "the patch release after v0.2 ships, contingent on documented consumer signal." Implementation effort estimates included so we can prioritize when the signal arrives.
+
+| Rank | Primitive | Module | Consumers waiting | Implementation cost | Trigger to ship |
+|---|---|---|---|---|---|
+| 1 | **Bloom SIMD insert + query** | extends `approx::BloomFilter` | Postgres `bloom` index, MinIO dedup, CDN edge | small (3-5 days) — extends existing scalar | first concrete consumer ask, OR documented v0.2 bench gap (e.g., MinIO-class workload bench shows Bloom probe time > 5%) |
+| 2 | **HyperLogLog SIMD merge** | extends `approx::HyperLogLog` | Postgres `approx_count_distinct`, OLAP DBs | small (2-4 days) | Postgres extension consumer signals interest, OR image-build profiling shows HLL merge bottlenecking |
+| 3 | **MinHash SIMD signature** | extends `similarity::minhash` | CDN edge dedup, MinIO bulk-similarity | medium (3-5 days) — adds AVX2/AVX-512/NEON kernels | CDN consumer signals interest, OR image-build-time MinHash sidecar generation profiles bottlenecking |
+
+These three are the "early returns on the deferral lottery" — small implementation cost, multiple known consumers waiting, clean SIMD wins. Track them as v0.2.x rather than amorphous "deferred" so the conversation about whether to ship them is concrete, not vague.
+
+**Action: revisit this list at the v0.2 ship gate.** If any of the three has a documented consumer ask by then, it ships in the v0.2.x patch series alongside whatever Phase A/B work is post-release polish.

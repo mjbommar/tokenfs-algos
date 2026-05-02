@@ -153,9 +153,21 @@ Lemire/Kurz Haswell numbers: decode 1.1-4.0 billion u32/s = ~4-16 GB/s of decode
 
 ### Existing Rust crates
 
-`stream-vbyte` v0.4.1 (Marshall Pierce, last release 2023-05): SSE4.1 encode + SSSE3 decode behind nightly `target_feature`; u32 only; scalar fallback on stable; **no AVX2, no NEON**. Stable but unmaintained.
+- **`stream-vbyte` v0.4.1** (Marshall Pierce, last release 2023-05): SSE4.1 encode + SSSE3 decode behind nightly `target_feature`; u32 only; scalar fallback on stable; **no AVX2, no NEON**. Stable but unmaintained.
+- **`streamvbyte64` v0.2.0** (mccullocht, 2023-07): adds u16/u64 width variants. Small user base.
+- **`bazhenov/svbyte`**, **`mpetri/streamvbyte`**: experiments / FFI to C; not active.
 
-**Open ground**: pure-Rust AVX2 + NEON Stream-VByte. We ship as part of `bits::streamvbyte` rather than vendoring `stream-vbyte`, because (a) we want our `dispatch::` infrastructure for runtime detection; (b) we want NEON parity; (c) we want our test/parity pattern integrated; (d) the upstream crate hasn't accepted contributions in 2 years.
+### Vendor decision
+
+**Ship our own pure-Rust SIMD implementation in `bits::streamvbyte`.** Rationale:
+
+1. **Dispatch coverage**: we want `dispatch::` runtime backend selection (SSSE3 / AVX2 / NEON / scalar). The existing crates pin to a single backend behind nightly `target_feature`.
+2. **NEON parity**: AArch64 deployment is a target (Apple Silicon, Graviton). No existing crate ships NEON.
+3. **Test integration**: the property/parity test pattern across the crate (per `PRIMITIVE_CONTRACTS.md`) needs to apply uniformly.
+4. **Maintenance**: the upstream Rust crates haven't accepted contributions in 2 years.
+5. **Surface compatibility**: the encoded format is interchangeable across implementations (Lemire's spec). Consumers using `stream-vbyte` for IO can read/write our format and vice versa — no lock-in either way.
+
+**Not** vendoring upstream code. The crates are MIT/Apache-licensed and we could vendor cleanly, but pure-Rust reimplementation against Lemire's paper + C reference is straightforward and lets us match our existing dispatch / test conventions exactly.
 
 ### Reference implementations
 
@@ -220,15 +232,53 @@ The 10x AVX-512 jump is *the* canonical AVX-512 win. This kernel alone justifies
 - Sizes 1 KB, 1 MB, 256 MB.
 - AVX-512 vs AVX2 vs scalar vs NEON.
 
-## § 5 Rank/select dictionary (Phase B)
+## § 5 Rank/select dictionary (Phase B — **largest single-piece work in v0.2**)
 
-### Algorithm
+**Honest budget: 1-2 weeks of focused implementation, not "a few days."** The naive scalar version is short, but a fast rank/select dictionary that's competitive with `sucds` / `sdsl-lite` requires real engineering: the multi-level superblock + block + per-block sample tables, careful tuning of block sizes against the target cache hierarchy, optional RRR (Raman/Raman/Rao) compression for sparse bitvectors, and Vigna's broadword tricks for the scalar inner kernels. This module gates the wavelet-tree and FM-index Tier-D items, so getting the foundation right matters.
+
+### Algorithm overview
 
 Given a `&[u64]` representing `n_bits` bits, build an index supporting:
-- `rank1(i)` = number of 1-bits in bits `[0, i)`. Common implementation: store popcount of every `block_size = 256` bits as `u32` superblock counts (1-2 bytes per 256 bits = ~0.4-0.8% overhead) plus a 9-bit `u16` "block popcount within superblock" every 64 bits.
-- `select1(k)` = position of the (k+1)-th 1-bit. Implement via binary search over superblock counts + AVX-512 `VPCMPGTQ`-driven scan within the small block. Vigna's broadword select-in-word is the scalar inner kernel.
+- `rank1(i)` = number of 1-bits in bits `[0, i)`. Constant-time per query.
+- `select1(k)` = position of the (k+1)-th 1-bit. Constant-time per query (with sampling tables).
 
-The space-time tradeoff is parameterized by block size. For TokenFS scales (millions of bits), 256-bit blocks give good cache behavior and ~0.6% overhead.
+Two levels of sampling:
+
+1. **Superblock counts** (`u32` per superblock of 4096 bits): cumulative popcount-up-to-here. ~0.1% overhead. Two cache-line bound for any rank query (the array entry + the bits themselves).
+2. **Block counts** (`u16` per block of 256 bits, relative to the containing superblock): partial popcount within the superblock. ~0.6% overhead.
+
+For rank: look up superblock count + block count + popcount the partial word. Three array accesses, one popcount, ~10-15 ns warm.
+
+For select: binary search through superblock counts (≤ log levels = ~20 cache misses for 1B-bit bitmaps), then within-block scan using **Vigna's broadword select** (Vigna 2008, *Broadword Implementation of Rank/Select Queries*) at the u64 level. Total ~30-50 ns per select.
+
+### Variants worth knowing
+
+- **Plain bitvector (this spec)**: ~0.7% space overhead, fast rank, fast select. The default.
+- **RRR (Raman/Raman/Rao 2007)**: compresses sparse bitvectors near information-theoretic minimum. Useful when bitvector is e.g. 1% dense or 99% dense. ~5-10x slower rank but huge space savings.
+- **SDArray (Okanohara/Sadakane 2007)**: stores positions of 1-bits as compressed integer sequence with select sampling. Fastest select, slowest rank.
+
+**v0.2 ships plain bitvector only.** RRR and SDArray are deferred to v0.3+ if a sparse-bitvector consumer asks (the `sucds` crate is the natural dependency in the meantime).
+
+### Reference implementations
+
+- **sdsl-lite** (C++): https://github.com/simongog/sdsl-lite — canonical academic reference. Multiple variants.
+- **sucds** (Rust): https://github.com/kampersanda/sucds — pure-Rust succinct DS crate. **Use as parity oracle.** v0.2 implements its own to capture SIMD acceleration opportunity (AVX-512 VPOPCNTQ for rank, parallel scan for select); v0.3 may depend on `sucds` for higher-level structures (wavelet tree, SDArray).
+
+### Vendor decision
+
+**Ship our own plain-bitvector implementation.** Rationale:
+- We want SIMD acceleration on the rank/select inner loops (`VPOPCNTQ` + parallel select scan).
+- We want `dispatch::` runtime backend selection.
+- We want kernel-safety (caller-provided output Vec for build).
+- `sucds` is mature but doesn't expose SIMD-accelerated kernels at the rank/select level.
+
+For v0.3 wavelet tree / FM-index work, **probably depend on `sucds`** rather than reimplementing the higher-level structures — those are ~10× our complexity budget and `sucds` is well-tested. The seam is: our `bits::rank_select` for the hot inner loop; `sucds` for the structure on top, if/when we ship one.
+
+### Space-time tradeoff
+
+Block sizes parameterize space vs query latency. For TokenFS scales (millions to tens of millions of bits per index, say 10-100 MB total), 256-bit blocks + 4096-bit superblocks give ~0.7% overhead and warm-cache rank latency ~15 ns. Larger superblocks reduce overhead but add cache pressure on the lookup; smaller blocks reduce within-block scan time but cost more space.
+
+For Postgres / MinIO scales (billions of bits), bumping superblock to 65536 bits keeps the count-array L2-resident and gives ~0.1% overhead, at the cost of an additional cache miss per rank.
 
 ### API
 

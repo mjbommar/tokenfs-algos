@@ -52,29 +52,42 @@
    examples: similarity scan (vector/distance + bits/bit_pack)
 ```
 
-## Phase A — roots (no inter-module deps)
+## Milestone breakdown
 
-These can ship in any order; nothing depends on anything else here. **All Phase A primitives are kernel-safe** in their `_st` (single-thread) variants; rayon-parallel variants are userspace-only. See each module's "Environment fitness" section.
+Phase A as a single milestone is too big to ship cleanly in solo development (5 sub-modules × parity tests + benches + 4 SIMD backends each ≈ 2-3 weeks of focused work). Split into two production milestones:
+
+### v0.1.x (stopgap — ships first, ~1 week solo)
+
+Two small, independent, high-impact primitives that unblock immediate work without waiting for the rest of Phase A:
+
+| # | Module / primitive | Why this slice first | Doc |
+|---|---|---|---|
+| **A1** | `bits::popcount` (scalar + AVX2 + AVX-512 VPOPCNTQ + NEON VCNT) | Foundation for B1 rank/select, B3 Roaring cardinality, vector hamming/jaccard. Smallest API; 1-2 days. | [`10_BITS.md`](10_BITS.md) § 4 |
+| **A3** | `hash::sha256_batch_st` (+ userspace `blake3_batch_*` if blake3 feature on) | Unblocks `tokenfs_writer` build-time Merkle work; 200K-extent Merkle leaf hashing. Real production win. 2-3 days. | [`12_HASH_BATCHED.md`](12_HASH_BATCHED.md) § 2 |
+
+**v0.1.x ship gate:** both primitives have scalar oracle + at least one SIMD backend with parity tests, dispatched via existing `dispatch::` infrastructure, with criterion benches showing measurable speedup over scalar. Ship as v0.1.x patch release.
+
+### v0.2 Phase A continuation (~2 weeks solo)
+
+The remaining Phase A primitives, dependency-independent of each other and of v0.1.x's A1/A3:
 
 | # | Module / primitive | Doc | Estimated complexity | Kernel-safe? |
 |---|---|---|---|---|
-| A1 | `bits::popcount` (scalar + AVX2 + AVX-512 VPOPCNTQ + NEON VCNT) | [`10_BITS.md`](10_BITS.md) § 4 | small (1-2 days) | ✅ |
 | A2 | `bits::bit_pack` (arbitrary widths 1-32) | [`10_BITS.md`](10_BITS.md) § 2 | medium (3-5 days) | ✅ |
-| A3 | `hash::sha256_batch_st` + (userspace) `hash::blake3_batch_*` | [`12_HASH_BATCHED.md`](12_HASH_BATCHED.md) § 2 | small (2-3 days) | ✅ SHA-256 only; blake3 is std-only |
 | A4 | `hash::set_membership_simd` | [`12_HASH_BATCHED.md`](12_HASH_BATCHED.md) § 3 | small (1-2 days) | ✅ |
 | A5 | `vector::distance` (5 metrics × scalar/AVX2/AVX-512/NEON) | [`13_VECTOR.md`](13_VECTOR.md) | medium (5-7 days) | ✅ |
 
-**Phase A ship gate:** all 5 primitives have scalar oracle + at least one SIMD backend with parity tests, dispatched via existing `dispatch::` infrastructure, with criterion benches showing measurable speedup over scalar on representative inputs.
+**v0.2 Phase A ship gate:** A2 + A4 + A5 each have scalar oracle + at least one SIMD backend with parity tests, dispatched via existing `dispatch::` infrastructure, with criterion benches showing measurable speedup over scalar on representative inputs.
 
 ## Phase B — high-leverage primitives that build on Phase A
 
-| # | Module / primitive | Depends on | Doc | Kernel-safe? |
-|---|---|---|---|---|
-| B1 | `bits::rank_select` | A1 popcount | [`10_BITS.md`](10_BITS.md) § 5 | ✅ (queries); ⚠️ build allocates |
-| B2 | `bits::streamvbyte` (encode + decode) | A2 bit_pack scaffolding | [`10_BITS.md`](10_BITS.md) § 3 | ✅ |
-| B3 | `bitmap::roaring` (intersection/union/difference/cardinality) | A1 popcount | [`11_BITMAP.md`](11_BITMAP.md) | ✅ (caller-provided output) |
-| B4 | `permutation::rcm` (Reverse Cuthill-McKee) | none (A1 popcount used by argsort optionally) | [`14_PERMUTATION.md`](14_PERMUTATION.md) § 2 | ❌ build-time only |
-| B5 | `permutation::hilbert` (2D/N-D Hilbert curve sort) | none | [`14_PERMUTATION.md`](14_PERMUTATION.md) § 4 | ❌ build-time only |
+| # | Module / primitive | Depends on | Doc | Estimated complexity | Kernel-safe? |
+|---|---|---|---|---|---|
+| B1 | `bits::rank_select` | A1 popcount | [`10_BITS.md`](10_BITS.md) § 5 | **large (1-2 weeks)** — superblock + block + sample tables; multiple variants (RRR / Vigna broadword) | ✅ (queries); ⚠️ build allocates |
+| B2 | `bits::streamvbyte` (encode + decode) | A2 bit_pack scaffolding | [`10_BITS.md`](10_BITS.md) § 3 | medium (4-6 days) | ✅ |
+| B3 | `bitmap::roaring` (intersection/union/difference/cardinality) | A1 popcount | [`11_BITMAP.md`](11_BITMAP.md) | large (1-2 weeks) — pair-dispatch table × backends | ✅ (caller-provided output) |
+| B4 | `permutation::rcm` (Reverse Cuthill-McKee) | none (A1 popcount used by argsort optionally) | [`14_PERMUTATION.md`](14_PERMUTATION.md) § 2 | small (3-4 days) | ❌ build-time only |
+| B5 | `permutation::hilbert` (2D/N-D Hilbert curve sort) | none | [`14_PERMUTATION.md`](14_PERMUTATION.md) § 4 | small (1-2 days) | ❌ build-time only |
 
 **Phase B ship gate:** parity tests against scalar reference (or against a known-good external impl: `roaring`-rs scalar for B3; `sprs::reverse_cuthill_mckee` for B4); criterion benches; for B3, head-to-head numbers against the `roaring` crate's scalar inner loops on intersection of two ~10K-cardinality posting lists.
 
@@ -115,10 +128,25 @@ See [`20_DEFERRED.md`](20_DEFERRED.md) for the full deferred list. Highlights:
 
 ## Per-phase contributor sketch
 
-If solo: A1 → A3 → A2 → A4 → A5 → B1 → B2 → B3 → B4 → B5 → C* → D1.
+If solo (revised given milestone split):
+- **v0.1.x ship**: A1 popcount → A3 batched hash. ~1 week. Two production wins.
+- **v0.2 ship**: A2 bit_pack → A4 set_membership → A5 vector distance → B2 streamvbyte → B3 Roaring → B4 RCM → B5 Hilbert → B1 rank_select. **B1 sits last because it's the longest single piece (1-2 weeks)** and unblocks Tier-D items that aren't on the v0.2 path anyway.
+- **Phase C**: composition demonstrators after relevant Bs.
+- **Phase D**: D1 Rabbit Order opportunistically.
 
 If two contributors:
-- Track 1: A1 → A2 → B1 → B2 → C1
-- Track 2: A3 → A4 → A5 → B3 → C3 (in parallel) → B4 → C2 → D1
+- Track 1: A1 popcount → A3 batched hash (v0.1.x) → A2 bit_pack → B2 streamvbyte → B1 rank_select → C1
+- Track 2: A4 → A5 → B3 → C3 (in parallel) → B4 → B5 → C2 → D1
 
-Both tracks meet at Phase C demonstrators.
+Both tracks meet at Phase C demonstrators. Track 2 gets the heavy B3 (Roaring) so Track 1 can focus on the bits-module sequence ending in rank_select.
+
+## Total time estimate (solo)
+
+Honest budget given complexity revisions per critique:
+- v0.1.x stopgap: ~1 week.
+- v0.2 Phase A continuation (A2+A4+A5): ~2 weeks.
+- v0.2 Phase B (B1-B5, with B1 and B3 being the long poles): ~5-6 weeks.
+- Phase C demonstrators: ~1 week.
+- **Total v0.1.x → v0.2 release: ~9-10 weeks solo.**
+
+This is honest scoping. With two contributors, halve. With opportunistic Phase D Rabbit Order, add 2-4 weeks.

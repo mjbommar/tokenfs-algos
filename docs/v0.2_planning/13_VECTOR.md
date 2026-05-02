@@ -188,9 +188,19 @@ Per [`02b_DEPLOYMENT_MATRIX.md`](02b_DEPLOYMENT_MATRIX.md):
 | `*_one_to_many` batched form | ✅ caller-provided output | ✅ | ✅ | ✅ ANN inner loop | ✅ | ✅ batch |
 
 **Notes:**
-- All kernels are stateless and operate on borrowed slices. No allocation. Kernel-safe across the board.
-- Single-pair operations on 1024-element vectors take ~3-10 µs depending on backend; well within FUSE per-request budget and below the cgo per-call overhead so calling per-pair from Go is *acceptable but wasteful*.
+- All kernels are **stateless** and operate on **borrowed slices**. No allocation in any single-pair API. Kernel-safe across the board.
+- The `*_one_to_many` batched form takes a caller-provided `out: &mut [f32]` (or u32/f64); no internal allocation. Kernel-safe.
+- Single-pair operations on 1024-element vectors take ~3-10 µs depending on backend; well within FUSE per-request budget. The cgo per-call overhead (~200 ns) is comparable to scalar single-pair latency on small vectors — **batched API is the right choice for Go consumers** but per-pair calls aren't catastrophic.
 - The `*_one_to_many` batched form is the canonical pgvector shape — query embedding × N database vectors. Hot for ANN, hot for "find similar object" in CDN/MinIO.
-- AVX-512 FMA gives ~30 GB/s on f32; the `kernel_fpu_begin` overhead is amortized over a 1024-element vector pair (~4 KB total bytes touched), so kernel SIMD use is net-positive.
+- AVX-512 FMA gives ~30 GB/s on f32; the `kernel_fpu_begin` overhead is amortized over a 1024-element vector pair (~4 KB total bytes touched), so kernel SIMD use is net-positive on vectors ≥ ~256 elements. For shorter vectors, the FPU bracket overhead dominates — kernel callers may prefer scalar.
 - For Postgres pgvector-extension consumers: this module is the natural inner-loop replacement. Could become an upstream contribution path or a documented dependency.
 - Reproducibility: the SIMD reduction tree (8-way pairwise for AVX2, 16-way for AVX-512, 4-way for NEON) is part of the public contract. Same input + same backend = bit-exact same output across versions, but cross-backend results differ within the documented `1e-3` Higham tolerance.
+
+**Audit confirmation (per `02b_DEPLOYMENT_MATRIX.md`):**
+
+- ❌ **None of the v0.2 vector APIs allocate or use rayon.** The single-pair APIs are `(a, b) → result`. The batched APIs take caller-provided output. No internal Vec, no rayon, no thread-locals.
+- ✅ **Every vector primitive has a kernel-safe path** — there is no separate "kernel-safe variant" needed because the default APIs ARE kernel-safe.
+- ✅ **No std-only dependencies.** No use of `Vec`, `String`, `format!` in any hot kernel. All `core::arch::*` intrinsics behind feature/target gates.
+- One nuance: the existing `cosine_similarity_f32` returns `Option<f64>` because of magnitude calc (sqrt). `core::f32::sqrt` requires the `libm` crate in no_std, which the existing `crate::math` wrapper provides. **Confirmed kernel-safe.**
+
+**Action:** none required. The 12_HASH_BATCHED revision (`_st`/`_par` split) was needed because of rayon and blake3-needs-std; the vector module has neither dependency, so its current spec is already kernel-correct.
