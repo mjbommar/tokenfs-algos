@@ -5,15 +5,19 @@
 //! type [`CsrGraph`], and the **build-time** ordering primitives that
 //! produce a [`Permutation`] from such inputs.
 //!
-//! ## Sprint 11-13 / Sprint 47-49 status
+//! ## Sprint 11-13 / Sprint 47-49 / Sprint 53-55 status
 //!
 //! Phase B4 of `01_PHASES.md` lands [`rcm()`] (Reverse Cuthill-McKee).
 //! Phase B5 lands `hilbert_2d` / `hilbert_nd` behind the
 //! `permutation_hilbert` Cargo feature (vendor wrappers around the
 //! `fast_hilbert` and `hilbert` crates per spec § 4). Sprint 47-49 of
 //! Phase D1 lands [`rabbit_order()`] as a single-pass sequential
-//! baseline; the SIMD modularity-gain inner loop (Sprint 50-52) and
-//! concurrent merging (Sprint 53-55) are follow-on sprints.
+//! baseline; Sprint 50-52 lifts the modularity-gain inner loop into a
+//! SIMD kernel module (see [`rabbit::kernels`]); Sprint 53-55 ships
+//! [`rabbit::rabbit_order_par`] (gated on the `parallel` Cargo
+//! feature), a round-based concurrent variant that parallelises the
+//! per-vertex merge-proposal phase across rayon while keeping the
+//! merge-application phase deterministic.
 //!
 //! ## Deployment posture
 //!
@@ -71,6 +75,8 @@ pub mod rcm;
 #[cfg(feature = "permutation_hilbert")]
 pub use hilbert::{hilbert_2d, hilbert_nd};
 pub use rabbit::rabbit_order;
+#[cfg(feature = "parallel")]
+pub use rabbit::rabbit_order_par;
 pub use rcm::rcm;
 
 /// A permutation array.

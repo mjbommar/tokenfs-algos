@@ -28,6 +28,8 @@ use std::hint::black_box;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use support::cache_tier_sizes;
 use tokenfs_algos::permutation::rabbit::kernels;
+#[cfg(feature = "parallel")]
+use tokenfs_algos::permutation::rabbit_order_par;
 use tokenfs_algos::permutation::{CsrGraph, Permutation, rabbit_order, rcm};
 
 /// Vertex counts swept by the build benchmark.
@@ -45,6 +47,17 @@ const VERTEX_COUNTS: &[u32] = &[10_000, 100_000, 1_000_000];
 /// sprints will close most of that gap and we'll add the 1 M tier back
 /// at that point.
 const RABBIT_VERTEX_COUNTS: &[u32] = &[10_000, 100_000];
+
+/// Rabbit Order parallel-vs-sequential vertex counts.
+///
+/// Includes the larger 1 M tier because the Sprint 53-55 round-based
+/// concurrent variant amortises agglomeration cost across rayon
+/// workers and the wall-time overhead is acceptable at that scale.
+/// 10 K is below [`tokenfs_algos::permutation::rabbit::RABBIT_PARALLEL_EDGE_THRESHOLD`]
+/// for typical degrees, so we report it primarily to confirm the
+/// fallback-to-sequential path is correctly engaged.
+#[cfg(feature = "parallel")]
+const RABBIT_PAR_VERTEX_COUNTS: &[u32] = &[10_000, 100_000, 1_000_000];
 
 /// Average undirected degree settings.
 ///
@@ -365,6 +378,74 @@ fn bench_modularity_gain_kernel(c: &mut Criterion) {
     group.finish();
 }
 
+/// Sprint 53-55: round-based parallel `rabbit_order_par` benchmark.
+///
+/// Compares the parallel variant against the sequential
+/// `rabbit_order` baseline at the
+/// [`RABBIT_PAR_VERTEX_COUNTS`] tiers. Each pair of rows shares a
+/// criterion benchmark group so the wall-clock ratio is visible
+/// directly in the report.
+///
+/// The parallel variant delegates to the sequential path on graphs
+/// below
+/// [`tokenfs_algos::permutation::rabbit::RABBIT_PARALLEL_EDGE_THRESHOLD`]
+/// directed edges (see its documentation), so the 10 K tier may
+/// produce identical numbers; that's the intended fallback semantics.
+#[cfg(feature = "parallel")]
+fn bench_rabbit_par_build(c: &mut Criterion) {
+    let mut group = c.benchmark_group("permutation_rabbit/par_build");
+    // The parallel variant is faster than the Sprint 47-49 sequential
+    // baseline at the 100 K / 1 M tiers but per-iteration cost is
+    // still in the seconds regime. Cap sample count + warmup so the
+    // bench wall time stays under criterion's expected default budget.
+    group.sample_size(10);
+    group.warm_up_time(core::time::Duration::from_millis(500));
+    for &n in RABBIT_PAR_VERTEX_COUNTS {
+        // Use only the lower average degree to cap the 1 M tier's
+        // memory + edge count to a CI-friendly working set.
+        let deg = 5_u32;
+        let (offsets, neighbors) =
+            linear_random_graph(n, deg, 0xF22_C0FFEE_u64 ^ u64::from(n) ^ u64::from(deg));
+        let graph_edges = neighbors.len() as u64;
+        group.throughput(Throughput::Elements(u64::from(n)));
+
+        let id_seq = format!("seq/n={n}/avg_deg={deg}/edges={graph_edges}");
+        group.bench_with_input(BenchmarkId::from_parameter(id_seq), &(), |b, _| {
+            b.iter(|| {
+                let g = CsrGraph {
+                    n,
+                    offsets: black_box(&offsets),
+                    neighbors: black_box(&neighbors),
+                };
+                rabbit_order(g)
+            });
+        });
+
+        let id_par = format!("par/n={n}/avg_deg={deg}/edges={graph_edges}");
+        group.bench_with_input(BenchmarkId::from_parameter(id_par), &(), |b, _| {
+            b.iter(|| {
+                let g = CsrGraph {
+                    n,
+                    offsets: black_box(&offsets),
+                    neighbors: black_box(&neighbors),
+                };
+                rabbit_order_par(g)
+            });
+        });
+    }
+    group.finish();
+}
+
+#[cfg(feature = "parallel")]
+criterion_group!(
+    benches,
+    bench_rcm_build,
+    bench_rabbit_build,
+    bench_apply_throughput,
+    bench_modularity_gain_kernel,
+    bench_rabbit_par_build
+);
+#[cfg(not(feature = "parallel"))]
 criterion_group!(
     benches,
     bench_rcm_build,
