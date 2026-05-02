@@ -2021,3 +2021,52 @@ pub(crate) fn cache_tier_sizes() -> &'static [(&'static str, usize)] {
         ("in-DRAM", 64 * 1024 * 1024), // 64 MB — exceeds L3, DRAM-bound
     ]
 }
+
+/// Reads the `TOKENFS_ALGOS_REAL_FILES` env var and returns the contents
+/// of every listed file as `(label, bytes)` pairs.
+///
+/// The env var is colon-separated (Unix path-list convention) and
+/// parsed via [`std::env::split_paths`]; on Windows callers can use
+/// the platform-native path separator. A file that fails to read is
+/// skipped with a warning on stderr; the function returns an empty
+/// `Vec` if the env var is unset or all paths are unreadable.
+///
+/// Each label is the file stem (sanitised to ASCII alphanumeric +
+/// dashes via [`sanitize_id_fragment`]) so it round-trips cleanly
+/// into Criterion benchmark IDs.
+///
+/// This is the v0.2-bench analogue of [`real_inputs_from_env`]; it
+/// returns raw byte slices so each consumer (rank/select bitvectors,
+/// posting-list u16 streams, StreamVByte u32 streams, similarity f32
+/// lanes) can synthesise its own input shape.
+#[allow(dead_code)]
+pub(crate) fn real_files_as_bytes() -> Vec<(String, Vec<u8>)> {
+    let Some(paths) = env::var_os("TOKENFS_ALGOS_REAL_FILES") else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for path in env::split_paths(&paths) {
+        if path.as_os_str().is_empty() {
+            continue;
+        }
+        match fs::read(&path) {
+            Ok(bytes) if !bytes.is_empty() => {
+                let label = path
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .map(sanitize_id_fragment)
+                    .filter(|stem| !stem.is_empty())
+                    .unwrap_or_else(|| format!("real-{}", out.len()));
+                out.push((label, bytes));
+            }
+            Ok(_) => {
+                eprintln!("skipping empty real-data file `{}`", path.display());
+            }
+            Err(error) => {
+                eprintln!("skipping real-data file `{}`: {error}", path.display());
+            }
+        }
+    }
+    out
+}
