@@ -39,6 +39,58 @@
 
 use core::marker::PhantomData;
 
+/// Failure modes for the fallible bit-pack APIs ([`BitPacker::try_encode_u32_slice`],
+/// [`BitPacker::try_decode_u32_slice`], [`DynamicBitPacker::try_encode_u32_slice`],
+/// and [`DynamicBitPacker::try_decode_u32_slice`]).
+///
+/// Returned instead of panicking when a caller-supplied buffer is too
+/// small or the configured width is out of the supported range.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BitPackError {
+    /// Decode input was shorter than `ceil(n * width / 8)` bytes.
+    InputTooShort {
+        /// Number of input bytes the operation needed.
+        needed: usize,
+        /// Length of the caller-supplied input buffer.
+        actual: usize,
+    },
+    /// Encode output (or decode output slot count) was too short for
+    /// the operation.
+    OutputTooShort {
+        /// Number of output bytes / slots the operation needed.
+        needed: usize,
+        /// Length of the caller-supplied output buffer.
+        actual: usize,
+    },
+    /// Width was outside the accepted `1..=32` range.
+    WidthOutOfRange {
+        /// Caller-supplied width.
+        width: u32,
+    },
+}
+
+impl core::fmt::Display for BitPackError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InputTooShort { needed, actual } => write!(
+                f,
+                "bit-pack input buffer too small: needed {needed}, got {actual}"
+            ),
+            Self::OutputTooShort { needed, actual } => write!(
+                f,
+                "bit-pack output buffer too small: needed {needed}, got {actual}"
+            ),
+            Self::WidthOutOfRange { width } => write!(
+                f,
+                "bit-pack width {width} outside the accepted range 1..=32"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for BitPackError {}
+
 /// Returns `ceil(n * w / 8)`, the number of bytes needed to pack `n`
 /// values of `w` bits each.
 ///
@@ -78,10 +130,29 @@ impl<const W: u32> BitPacker<W> {
     /// Panics if `out.len() < Self::encoded_len(values.len())` or if
     /// `W` is out of range `1..=32`. Values whose high bits exceed `W`
     /// are masked silently — callers that need range-checking should
-    /// validate upstream.
+    /// validate upstream. Use [`Self::try_encode_u32_slice`] for a
+    /// fallible variant that returns [`BitPackError`] instead.
     pub fn encode_u32_slice(values: &[u32], out: &mut [u8]) {
         assert!(W >= 1 && W <= 32, "BitPacker width must be 1..=32");
         kernels::auto::encode_u32_slice(W, values, out);
+    }
+
+    /// Fallible variant of [`Self::encode_u32_slice`] that returns
+    /// [`BitPackError`] when the output buffer is too small or the
+    /// const-generic width `W` is out of range, instead of panicking.
+    pub fn try_encode_u32_slice(values: &[u32], out: &mut [u8]) -> Result<(), BitPackError> {
+        if !(1..=32).contains(&W) {
+            return Err(BitPackError::WidthOutOfRange { width: W });
+        }
+        let needed = Self::encoded_len(values.len());
+        if out.len() < needed {
+            return Err(BitPackError::OutputTooShort {
+                needed,
+                actual: out.len(),
+            });
+        }
+        Self::encode_u32_slice(values, out);
+        Ok(())
     }
 
     /// Unpacks `n` integers of `W` bits each from `input` into `out`.
@@ -89,10 +160,40 @@ impl<const W: u32> BitPacker<W> {
     /// # Panics
     ///
     /// Panics if `input.len() < Self::encoded_len(n)`, `out.len() < n`,
-    /// or `W` is out of range `1..=32`.
+    /// or `W` is out of range `1..=32`. Use [`Self::try_decode_u32_slice`]
+    /// for a fallible variant that returns [`BitPackError`] instead.
     pub fn decode_u32_slice(input: &[u8], n: usize, out: &mut [u32]) {
         assert!(W >= 1 && W <= 32, "BitPacker width must be 1..=32");
         kernels::auto::decode_u32_slice(W, input, n, out);
+    }
+
+    /// Fallible variant of [`Self::decode_u32_slice`] that returns
+    /// [`BitPackError`] when the input buffer is too short, the output
+    /// buffer is too small, or the const-generic width `W` is out of
+    /// range, instead of panicking.
+    pub fn try_decode_u32_slice(
+        input: &[u8],
+        n: usize,
+        out: &mut [u32],
+    ) -> Result<(), BitPackError> {
+        if !(1..=32).contains(&W) {
+            return Err(BitPackError::WidthOutOfRange { width: W });
+        }
+        let needed = Self::encoded_len(n);
+        if input.len() < needed {
+            return Err(BitPackError::InputTooShort {
+                needed,
+                actual: input.len(),
+            });
+        }
+        if out.len() < n {
+            return Err(BitPackError::OutputTooShort {
+                needed: n,
+                actual: out.len(),
+            });
+        }
+        Self::decode_u32_slice(input, n, out);
+        Ok(())
     }
 }
 
@@ -151,9 +252,29 @@ impl DynamicBitPacker {
     /// # Panics
     ///
     /// Panics if `out.len() < self.encoded_len(values.len())`. Values
-    /// whose high bits exceed `self.width()` are masked silently.
+    /// whose high bits exceed `self.width()` are masked silently. Use
+    /// [`Self::try_encode_u32_slice`] for a fallible variant that
+    /// returns [`BitPackError`] instead.
     pub fn encode_u32_slice(&self, values: &[u32], out: &mut [u8]) {
         kernels::auto::encode_u32_slice(self.width, values, out);
+    }
+
+    /// Fallible variant of [`Self::encode_u32_slice`] that returns
+    /// [`BitPackError`] when the output buffer is too small or the
+    /// configured width is out of range, instead of panicking.
+    pub fn try_encode_u32_slice(&self, values: &[u32], out: &mut [u8]) -> Result<(), BitPackError> {
+        if !(1..=32).contains(&self.width) {
+            return Err(BitPackError::WidthOutOfRange { width: self.width });
+        }
+        let needed = self.encoded_len(values.len());
+        if out.len() < needed {
+            return Err(BitPackError::OutputTooShort {
+                needed,
+                actual: out.len(),
+            });
+        }
+        self.encode_u32_slice(values, out);
+        Ok(())
     }
 
     /// Unpacks `n` integers of `self.width()` bits each from `input`
@@ -162,8 +283,40 @@ impl DynamicBitPacker {
     /// # Panics
     ///
     /// Panics if `input.len() < self.encoded_len(n)` or `out.len() < n`.
+    /// Use [`Self::try_decode_u32_slice`] for a fallible variant that
+    /// returns [`BitPackError`] instead.
     pub fn decode_u32_slice(&self, input: &[u8], n: usize, out: &mut [u32]) {
         kernels::auto::decode_u32_slice(self.width, input, n, out);
+    }
+
+    /// Fallible variant of [`Self::decode_u32_slice`] that returns
+    /// [`BitPackError`] when the input buffer is too short, the output
+    /// buffer is too small, or the configured width is out of range,
+    /// instead of panicking.
+    pub fn try_decode_u32_slice(
+        &self,
+        input: &[u8],
+        n: usize,
+        out: &mut [u32],
+    ) -> Result<(), BitPackError> {
+        if !(1..=32).contains(&self.width) {
+            return Err(BitPackError::WidthOutOfRange { width: self.width });
+        }
+        let needed = self.encoded_len(n);
+        if input.len() < needed {
+            return Err(BitPackError::InputTooShort {
+                needed,
+                actual: input.len(),
+            });
+        }
+        if out.len() < n {
+            return Err(BitPackError::OutputTooShort {
+                needed: n,
+                actual: out.len(),
+            });
+        }
+        self.decode_u32_slice(input, n, out);
+        Ok(())
     }
 }
 
@@ -947,6 +1100,8 @@ pub mod kernels {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)] // Test code — panic on Err is the desired failure mode.
+
     use super::*;
 
     fn deterministic_values(n: usize, w: u32, seed: u64) -> Vec<u32> {
@@ -1115,6 +1270,156 @@ mod tests {
                 assert_eq!(actual, expected, "neon decode diverged at w={w} n={n}");
             }
         }
+    }
+
+    #[test]
+    fn try_encode_dynamic_returns_err_on_undersized_output() {
+        let packer = DynamicBitPacker::new(11);
+        let values = vec![1_u32; 8];
+        let needed = packer.encoded_len(8);
+        let mut out = vec![0_u8; needed - 1];
+        let err = packer.try_encode_u32_slice(&values, &mut out).unwrap_err();
+        assert_eq!(
+            err,
+            BitPackError::OutputTooShort {
+                needed,
+                actual: needed - 1
+            }
+        );
+    }
+
+    #[test]
+    fn try_decode_dynamic_returns_err_on_undersized_input() {
+        let packer = DynamicBitPacker::new(11);
+        let needed = packer.encoded_len(8);
+        let input = vec![0_u8; needed - 1];
+        let mut out = vec![0_u32; 8];
+        let err = packer
+            .try_decode_u32_slice(&input, 8, &mut out)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            BitPackError::InputTooShort {
+                needed,
+                actual: needed - 1
+            }
+        );
+    }
+
+    #[test]
+    fn try_decode_dynamic_returns_err_on_undersized_output() {
+        let packer = DynamicBitPacker::new(11);
+        let needed = packer.encoded_len(8);
+        let input = vec![0_u8; needed];
+        let mut out = vec![0_u32; 1];
+        let err = packer
+            .try_decode_u32_slice(&input, 8, &mut out)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            BitPackError::OutputTooShort {
+                needed: 8,
+                actual: 1
+            }
+        );
+    }
+
+    #[test]
+    fn try_dynamic_round_trip_matches_panicking_version() {
+        for w in 1_u32..=32 {
+            let packer = DynamicBitPacker::new(w);
+            let values = deterministic_values(33, w, 0xCAFEBABE_u64 ^ ((w as u64) << 8));
+            let mut try_encoded = vec![0_u8; packer.encoded_len(33)];
+            packer
+                .try_encode_u32_slice(&values, &mut try_encoded)
+                .unwrap();
+            let mut panic_encoded = vec![0_u8; packer.encoded_len(33)];
+            packer.encode_u32_slice(&values, &mut panic_encoded);
+            assert_eq!(try_encoded, panic_encoded, "encode w={w}");
+
+            let mut try_decoded = vec![0_u32; 33];
+            packer
+                .try_decode_u32_slice(&try_encoded, 33, &mut try_decoded)
+                .unwrap();
+            assert_eq!(try_decoded, values, "decode w={w}");
+        }
+    }
+
+    #[test]
+    fn try_const_packer_returns_err_on_undersized_output() {
+        const W: u32 = 11;
+        let needed = BitPacker::<W>::encoded_len(8);
+        let values = vec![1_u32; 8];
+        let mut out = vec![0_u8; needed - 1];
+        let err = BitPacker::<W>::try_encode_u32_slice(&values, &mut out).unwrap_err();
+        assert_eq!(
+            err,
+            BitPackError::OutputTooShort {
+                needed,
+                actual: needed - 1
+            }
+        );
+    }
+
+    #[test]
+    fn try_const_packer_returns_err_on_width_out_of_range() {
+        const W: u32 = 0;
+        let mut out = vec![0_u8; 4];
+        let err = BitPacker::<W>::try_encode_u32_slice(&[], &mut out).unwrap_err();
+        assert_eq!(err, BitPackError::WidthOutOfRange { width: 0 });
+        let err = BitPacker::<W>::try_decode_u32_slice(&out, 0, &mut [0_u32; 0]).unwrap_err();
+        assert_eq!(err, BitPackError::WidthOutOfRange { width: 0 });
+
+        const W2: u32 = 33;
+        let err = BitPacker::<W2>::try_encode_u32_slice(&[], &mut out).unwrap_err();
+        assert_eq!(err, BitPackError::WidthOutOfRange { width: 33 });
+    }
+
+    #[test]
+    fn try_const_packer_decode_returns_err_on_undersized_input() {
+        const W: u32 = 11;
+        let needed = BitPacker::<W>::encoded_len(8);
+        let input = vec![0_u8; needed - 1];
+        let mut out = vec![0_u32; 8];
+        let err = BitPacker::<W>::try_decode_u32_slice(&input, 8, &mut out).unwrap_err();
+        assert_eq!(
+            err,
+            BitPackError::InputTooShort {
+                needed,
+                actual: needed - 1
+            }
+        );
+    }
+
+    #[test]
+    fn try_const_packer_round_trip_matches_panicking_version() {
+        const W: u32 = 11;
+        let values = deterministic_values(33, W, 0xC0FFEE);
+        let mut try_encoded = vec![0_u8; BitPacker::<W>::encoded_len(33)];
+        BitPacker::<W>::try_encode_u32_slice(&values, &mut try_encoded).unwrap();
+        let mut decoded = vec![0_u32; 33];
+        BitPacker::<W>::try_decode_u32_slice(&try_encoded, 33, &mut decoded).unwrap();
+        assert_eq!(decoded, values);
+    }
+
+    #[test]
+    #[should_panic(expected = "encode output buffer too small")]
+    fn dynamic_encode_still_panics_on_undersized_output() {
+        let packer = DynamicBitPacker::new(11);
+        let values = vec![1_u32; 8];
+        let needed = packer.encoded_len(8);
+        let mut out = vec![0_u8; needed - 1];
+        packer.encode_u32_slice(&values, &mut out);
+    }
+
+    #[test]
+    #[should_panic(expected = "decode input buffer too small")]
+    fn dynamic_decode_still_panics_on_undersized_input() {
+        let packer = DynamicBitPacker::new(11);
+        let needed = packer.encoded_len(8);
+        let input = vec![0_u8; needed - 1];
+        let mut out = vec![0_u32; 8];
+        packer.decode_u32_slice(&input, 8, &mut out);
     }
 
     #[test]

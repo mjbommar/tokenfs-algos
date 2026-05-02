@@ -28,7 +28,10 @@ pub mod sha256;
 pub mod blake3;
 
 pub use batched::{BATCH_PARALLEL_THRESHOLD, sha256_batch_st};
-pub use set_membership::{contains_u32_batch_simd, contains_u32_simd};
+pub use set_membership::{
+    SetMembershipBatchError, contains_u32_batch_simd, contains_u32_simd,
+    try_contains_u32_batch_simd,
+};
 
 #[cfg(feature = "parallel")]
 pub use batched::sha256_batch_par;

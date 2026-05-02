@@ -61,6 +61,61 @@
 /// Number of `u32` values packed per control byte.
 const GROUP: usize = 4;
 
+/// Failure modes for the fallible Stream-VByte codec entry points
+/// ([`try_streamvbyte_encode_u32`] and [`try_streamvbyte_decode_u32`]).
+///
+/// Returned instead of panicking when a caller-supplied buffer is too
+/// small for the requested element count, or when the data stream runs
+/// out partway through a decode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamvbyteError {
+    /// `control` is too short for `n` integers
+    /// (`< streamvbyte_control_len(n)`).
+    ControlTooShort {
+        /// Number of control bytes required for the requested `n`.
+        needed: usize,
+        /// Length of the caller-supplied control buffer.
+        actual: usize,
+    },
+    /// `out` (or, for encode, `data_out`) is too short to hold the
+    /// requested output.
+    OutputTooShort {
+        /// Number of output slots / bytes the operation needed.
+        needed: usize,
+        /// Length of the caller-supplied output buffer.
+        actual: usize,
+    },
+    /// `data` runs out partway through decoding — the control byte
+    /// implied more bytes than were available in the data stream.
+    DataExhausted {
+        /// Byte position within `data` at which the underflow was
+        /// detected.
+        position: usize,
+    },
+}
+
+impl core::fmt::Display for StreamvbyteError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::ControlTooShort { needed, actual } => write!(
+                f,
+                "Stream-VByte control buffer too small: needed {needed}, got {actual}"
+            ),
+            Self::OutputTooShort { needed, actual } => write!(
+                f,
+                "Stream-VByte output buffer too small: needed {needed}, got {actual}"
+            ),
+            Self::DataExhausted { position } => write!(
+                f,
+                "Stream-VByte data stream exhausted at byte position {position}"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for StreamvbyteError {}
+
 /// Returns the number of control bytes needed to encode `n` `u32` values.
 ///
 /// One control byte covers up to four values, so this is `ceil(n / 4)`.
@@ -97,13 +152,43 @@ pub const fn streamvbyte_data_max_len(n: usize) -> usize {
 /// Panics if `control_out.len() < streamvbyte_control_len(values.len())`
 /// or `data_out.len() < streamvbyte_data_max_len(values.len())`. Use
 /// [`streamvbyte_data_max_len`] to size `data_out`; the actual byte count
-/// is the return value.
+/// is the return value. For a fallible variant that returns
+/// [`StreamvbyteError`] instead of panicking, use
+/// [`try_streamvbyte_encode_u32`].
 pub fn streamvbyte_encode_u32(
     values: &[u32],
     control_out: &mut [u8],
     data_out: &mut [u8],
 ) -> usize {
     kernels::auto::encode_u32(values, control_out, data_out)
+}
+
+/// Fallible variant of [`streamvbyte_encode_u32`] that returns
+/// [`StreamvbyteError`] when the caller-supplied buffers are too small,
+/// instead of panicking.
+///
+/// Returns the number of data bytes written on success.
+pub fn try_streamvbyte_encode_u32(
+    values: &[u32],
+    control_out: &mut [u8],
+    data_out: &mut [u8],
+) -> Result<usize, StreamvbyteError> {
+    let n = values.len();
+    let ctrl_needed = streamvbyte_control_len(n);
+    if control_out.len() < ctrl_needed {
+        return Err(StreamvbyteError::ControlTooShort {
+            needed: ctrl_needed,
+            actual: control_out.len(),
+        });
+    }
+    let data_needed = streamvbyte_data_max_len(n);
+    if data_out.len() < data_needed {
+        return Err(StreamvbyteError::OutputTooShort {
+            needed: data_needed,
+            actual: data_out.len(),
+        });
+    }
+    Ok(streamvbyte_encode_u32(values, control_out, data_out))
 }
 
 /// Decodes `n` `u32` values from separate control + data byte streams.
@@ -116,9 +201,68 @@ pub fn streamvbyte_encode_u32(
 ///
 /// Panics if `control.len() < streamvbyte_control_len(n)` or `out.len() < n`.
 /// `data` must be long enough to hold the bytes implied by the control
-/// stream — when in doubt, size it via [`streamvbyte_data_max_len`].
+/// stream — when in doubt, size it via [`streamvbyte_data_max_len`]. For a
+/// fallible variant that returns [`StreamvbyteError`] instead of
+/// panicking, use [`try_streamvbyte_decode_u32`].
 pub fn streamvbyte_decode_u32(control: &[u8], data: &[u8], n: usize, out: &mut [u32]) -> usize {
     kernels::auto::decode_u32(control, data, n, out)
+}
+
+/// Fallible variant of [`streamvbyte_decode_u32`] that returns
+/// [`StreamvbyteError`] when the caller-supplied buffers are too small or
+/// when the data stream runs out partway through, instead of panicking.
+///
+/// Returns the number of data bytes consumed on success.
+pub fn try_streamvbyte_decode_u32(
+    control: &[u8],
+    data: &[u8],
+    n: usize,
+    out: &mut [u32],
+) -> Result<usize, StreamvbyteError> {
+    let ctrl_needed = streamvbyte_control_len(n);
+    if control.len() < ctrl_needed {
+        return Err(StreamvbyteError::ControlTooShort {
+            needed: ctrl_needed,
+            actual: control.len(),
+        });
+    }
+    if out.len() < n {
+        return Err(StreamvbyteError::OutputTooShort {
+            needed: n,
+            actual: out.len(),
+        });
+    }
+    // Walk the control stream to verify the implied data length fits
+    // before invoking the panicking kernel. This matches the kernel's
+    // own data-byte accounting (full groups + padded tail).
+    let full_groups = n / GROUP;
+    let mut implied_data: usize = 0;
+    for g in 0..full_groups {
+        let c = control[g];
+        for k in 0..GROUP {
+            let code = (c >> (2 * k)) & 0b11;
+            implied_data += (code as usize) + 1;
+            if implied_data > data.len() {
+                return Err(StreamvbyteError::DataExhausted {
+                    position: data.len(),
+                });
+            }
+        }
+    }
+    let tail = n - full_groups * GROUP;
+    if tail > 0 {
+        let c = control[full_groups];
+        for k in 0..GROUP {
+            let code = (c >> (2 * k)) & 0b11;
+            implied_data += (code as usize) + 1;
+            if implied_data > data.len() {
+                return Err(StreamvbyteError::DataExhausted {
+                    position: data.len(),
+                });
+            }
+        }
+    }
+    Ok(streamvbyte_decode_u32(control, data, n, out))
 }
 
 /// Pinned Stream-VByte kernels.
@@ -760,6 +904,8 @@ pub mod kernels {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)] // Test code — panic on Err is the desired failure mode.
+
     use super::*;
 
     fn deterministic_values(n: usize, seed: u64, max_bytes: u32) -> Vec<u32> {
@@ -1105,5 +1251,127 @@ mod tests {
             assert_eq!(consumed, written, "dispatched offset diverged at n={n}");
             assert_eq!(actual, expected, "dispatched decode diverged at n={n}");
         }
+    }
+
+    #[test]
+    fn try_encode_returns_err_on_undersized_control() {
+        let values = vec![1_u32, 2, 3, 4, 5];
+        let mut ctrl = vec![0_u8; 0]; // need 2 bytes for n=5.
+        let mut data = vec![0_u8; streamvbyte_data_max_len(values.len())];
+        let err = try_streamvbyte_encode_u32(&values, &mut ctrl, &mut data).unwrap_err();
+        assert_eq!(
+            err,
+            StreamvbyteError::ControlTooShort {
+                needed: 2,
+                actual: 0
+            }
+        );
+    }
+
+    #[test]
+    fn try_encode_returns_err_on_undersized_data() {
+        let values = vec![0xff_ff_ff_ff_u32; 4]; // 4-byte code each.
+        let mut ctrl = vec![0_u8; streamvbyte_control_len(values.len())];
+        let mut data = vec![0_u8; 1];
+        let err = try_streamvbyte_encode_u32(&values, &mut ctrl, &mut data).unwrap_err();
+        // Worst case is 4 bytes per value -> 16 bytes; max_len for n=4
+        // is 16.
+        assert_eq!(
+            err,
+            StreamvbyteError::OutputTooShort {
+                needed: streamvbyte_data_max_len(4),
+                actual: 1
+            }
+        );
+    }
+
+    #[test]
+    fn try_encode_returns_ok_with_byte_count_on_valid_inputs() {
+        let values = vec![0_u32, 1, 2, 3];
+        let mut ctrl = vec![0_u8; streamvbyte_control_len(values.len())];
+        let mut data = vec![0_u8; streamvbyte_data_max_len(values.len())];
+        let written = try_streamvbyte_encode_u32(&values, &mut ctrl, &mut data).unwrap();
+        // Bytes themselves are 1 each → total 4.
+        assert_eq!(written, 4);
+        assert_eq!(ctrl[0], 0x00);
+        assert_eq!(&data[..4], &[0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn try_decode_returns_err_on_undersized_control() {
+        let mut out = vec![0_u32; 5];
+        let ctrl = vec![0_u8; 1]; // need 2 for n=5.
+        let data = vec![0_u8; 32];
+        let err = try_streamvbyte_decode_u32(&ctrl, &data, 5, &mut out).unwrap_err();
+        assert_eq!(
+            err,
+            StreamvbyteError::ControlTooShort {
+                needed: 2,
+                actual: 1
+            }
+        );
+    }
+
+    #[test]
+    fn try_decode_returns_err_on_undersized_output() {
+        let ctrl = vec![0_u8; 2];
+        let data = vec![0_u8; 16];
+        let mut out = vec![0_u32; 1];
+        let err = try_streamvbyte_decode_u32(&ctrl, &data, 5, &mut out).unwrap_err();
+        assert_eq!(
+            err,
+            StreamvbyteError::OutputTooShort {
+                needed: 5,
+                actual: 1
+            }
+        );
+    }
+
+    #[test]
+    fn try_decode_returns_err_when_data_is_exhausted() {
+        // Encode 4 four-byte values -> 1 control byte (0xff) + 16 data
+        // bytes; truncate the data to 8 bytes so the decode would read
+        // past the end.
+        let values = vec![0xff_ff_ff_ff_u32; 4];
+        let mut ctrl = vec![0_u8; streamvbyte_control_len(values.len())];
+        let mut data = vec![0_u8; streamvbyte_data_max_len(values.len())];
+        streamvbyte_encode_u32(&values, &mut ctrl, &mut data);
+        let truncated = &data[..8];
+        let mut out = vec![0_u32; 4];
+        let err = try_streamvbyte_decode_u32(&ctrl, truncated, 4, &mut out).unwrap_err();
+        assert!(matches!(err, StreamvbyteError::DataExhausted { .. }));
+    }
+
+    #[test]
+    fn try_decode_returns_ok_and_matches_scalar_on_valid_inputs() {
+        for n in [0_usize, 1, 3, 4, 5, 100, 1024] {
+            let values = deterministic_values(n, 0xC0DE ^ (n as u64), 4);
+            let mut ctrl = vec![0_u8; streamvbyte_control_len(n)];
+            let mut data = vec![0_u8; streamvbyte_data_max_len(n)];
+            let written = streamvbyte_encode_u32(&values, &mut ctrl, &mut data);
+            let mut out = vec![0_u32; n];
+            let consumed =
+                try_streamvbyte_decode_u32(&ctrl, &data[..written], n, &mut out).unwrap();
+            assert_eq!(consumed, written);
+            assert_eq!(out, values);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "control_out too small")]
+    fn encode_still_panics_on_undersized_control() {
+        let values = vec![1_u32, 2, 3, 4, 5];
+        let mut ctrl = vec![0_u8; 0];
+        let mut data = vec![0_u8; streamvbyte_data_max_len(values.len())];
+        streamvbyte_encode_u32(&values, &mut ctrl, &mut data);
+    }
+
+    #[test]
+    #[should_panic(expected = "decode output buffer too small")]
+    fn decode_still_panics_on_undersized_output() {
+        let ctrl = vec![0_u8; 2];
+        let data = vec![0_u8; 16];
+        let mut out = vec![0_u32; 1];
+        streamvbyte_decode_u32(&ctrl, &data, 5, &mut out);
     }
 }

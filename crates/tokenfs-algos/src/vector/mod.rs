@@ -48,8 +48,10 @@ pub mod distance;
 pub mod kernels;
 
 pub use batch::{
-    cosine_similarity_f32_one_to_many, dot_f32_one_to_many, hamming_u64_one_to_many,
-    jaccard_u64_one_to_many, l2_squared_f32_one_to_many,
+    BatchShapeError, cosine_similarity_f32_one_to_many, dot_f32_one_to_many,
+    hamming_u64_one_to_many, jaccard_u64_one_to_many, l2_squared_f32_one_to_many,
+    try_cosine_similarity_f32_one_to_many, try_dot_f32_one_to_many, try_hamming_u64_one_to_many,
+    try_jaccard_u64_one_to_many, try_l2_squared_f32_one_to_many,
 };
 pub use distance::{
     cosine_similarity_f32, cosine_similarity_u32, dot_f32, dot_u32, hamming_u64, jaccard_u64,

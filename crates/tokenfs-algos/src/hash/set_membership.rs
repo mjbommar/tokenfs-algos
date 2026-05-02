@@ -22,6 +22,39 @@
 //! All backends are bit-exact with the scalar reference. The function is
 //! pure with respect to its inputs and never allocates.
 
+/// Failure modes for the fallible batched set-membership API
+/// ([`try_contains_u32_batch_simd`]).
+///
+/// Returned instead of panicking when the caller-supplied buffer
+/// lengths are inconsistent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SetMembershipBatchError {
+    /// `needles.len() != out.len()`.
+    LengthMismatch {
+        /// Caller-supplied `needles.len()`.
+        needles_len: usize,
+        /// Caller-supplied `out.len()`.
+        out_len: usize,
+    },
+}
+
+impl core::fmt::Display for SetMembershipBatchError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::LengthMismatch {
+                needles_len,
+                out_len,
+            } => write!(
+                f,
+                "set_membership batch length mismatch: needles.len()={needles_len} but out.len()={out_len}"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for SetMembershipBatchError {}
+
 /// Returns true if any element of `haystack` equals `needle`.
 ///
 /// Optimized for short haystacks (≤ 256 elements). For longer haystacks,
@@ -42,7 +75,9 @@ pub fn contains_u32_simd(haystack: &[u32], needle: u32) -> bool {
 ///
 /// # Panics
 ///
-/// Panics if `needles.len() != out.len()`.
+/// Panics if `needles.len() != out.len()`. Use
+/// [`try_contains_u32_batch_simd`] for a fallible variant that returns
+/// [`SetMembershipBatchError`] instead.
 pub fn contains_u32_batch_simd(haystack: &[u32], needles: &[u32], out: &mut [bool]) {
     assert_eq!(
         needles.len(),
@@ -52,6 +87,24 @@ pub fn contains_u32_batch_simd(haystack: &[u32], needles: &[u32], out: &mut [boo
         out.len(),
     );
     kernels::auto::contains_u32_batch(haystack, needles, out);
+}
+
+/// Fallible variant of [`contains_u32_batch_simd`] that returns
+/// [`SetMembershipBatchError::LengthMismatch`] when `needles.len() !=
+/// out.len()`, instead of panicking.
+pub fn try_contains_u32_batch_simd(
+    haystack: &[u32],
+    needles: &[u32],
+    out: &mut [bool],
+) -> Result<(), SetMembershipBatchError> {
+    if needles.len() != out.len() {
+        return Err(SetMembershipBatchError::LengthMismatch {
+            needles_len: needles.len(),
+            out_len: out.len(),
+        });
+    }
+    contains_u32_batch_simd(haystack, needles, out);
+    Ok(())
 }
 
 /// Pinned set-membership kernels.
@@ -597,12 +650,17 @@ pub mod kernels {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)] // Test code — panic on Err is the desired failure mode.
+
     extern crate alloc;
 
     use alloc::vec;
     use alloc::vec::Vec;
 
-    use super::{contains_u32_batch_simd, contains_u32_simd, kernels};
+    use super::{
+        SetMembershipBatchError, contains_u32_batch_simd, contains_u32_simd, kernels,
+        try_contains_u32_batch_simd,
+    };
 
     fn deterministic_haystack(n: usize, seed: u64) -> Vec<u32> {
         let mut state = seed;
@@ -751,6 +809,43 @@ mod tests {
         let needles = [1_u32, 2, 3, 4];
         let mut out = vec![false; 3];
         contains_u32_batch_simd(&haystack, &needles, &mut out);
+    }
+
+    #[test]
+    fn try_batched_returns_err_on_length_mismatch() {
+        let haystack = [1_u32, 2, 3];
+        let needles = [1_u32, 2, 3, 4];
+        let mut out = vec![false; 3];
+        let err = try_contains_u32_batch_simd(&haystack, &needles, &mut out).unwrap_err();
+        assert_eq!(
+            err,
+            SetMembershipBatchError::LengthMismatch {
+                needles_len: 4,
+                out_len: 3
+            }
+        );
+    }
+
+    #[test]
+    fn try_batched_returns_ok_and_matches_panic_version() {
+        let haystack: Vec<u32> = (0_u32..200).collect();
+        let needles: Vec<u32> = (0_u32..64).map(|i| i.wrapping_mul(7)).collect();
+        let mut try_out = vec![false; needles.len()];
+        try_contains_u32_batch_simd(&haystack, &needles, &mut try_out).unwrap();
+        let mut panic_out = vec![false; needles.len()];
+        contains_u32_batch_simd(&haystack, &needles, &mut panic_out);
+        assert_eq!(try_out, panic_out);
+        for (i, needle) in needles.iter().enumerate() {
+            assert_eq!(try_out[i], haystack.contains(needle));
+        }
+    }
+
+    #[test]
+    fn try_batched_empty_inputs_no_op() {
+        let haystack: [u32; 4] = [1, 2, 3, 4];
+        let needles: [u32; 0] = [];
+        let mut out: [bool; 0] = [];
+        try_contains_u32_batch_simd(&haystack, &needles, &mut out).unwrap();
     }
 
     #[test]
