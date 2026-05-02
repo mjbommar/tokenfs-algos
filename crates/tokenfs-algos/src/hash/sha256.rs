@@ -659,24 +659,21 @@ pub mod kernels {
         ///
         /// **Currently force-disabled pending real-hardware CI
         /// verification.** A previous incarnation of
-        /// `compress_block_sha2` was bit-divergent from the scalar
-        /// reference on real ARM silicon (Linux Cobalt-100 / Apple M1
-        /// / Windows Cobalt-100 — see CI run 25241406257) even though
-        /// QEMU user-mode emulation passed parity. The block
-        /// compressor below has been rewritten as a literal port of
-        /// the canonical noloader / SHA-Intrinsics reference, which
-        /// is also the pattern used by OpenSSL `sha256-armv8.pl`,
-        /// mbedTLS, and Apple's CommonCrypto. The new code passes
-        /// parity under QEMU; flip this gate to
-        /// `std::arch::is_aarch64_feature_detected!("sha2")` and push
-        /// to a real-hardware runner to confirm before re-enabling
-        /// for production users.
+        /// Returns true when AArch64 FEAT_SHA2 is available at runtime.
+        ///
+        /// `compress_block_sha2` is a literal port of the canonical
+        /// noloader / SHA-Intrinsics reference (also the pattern used
+        /// by OpenSSL `sha256-armv8.pl`, mbedTLS, and Apple's
+        /// CommonCrypto). The previous hand-rolled macro version was
+        /// bit-divergent from scalar on real ARM silicon (Linux
+        /// Cobalt-100 / Apple M1 / Windows Cobalt-100, run
+        /// 25241406257); QEMU user-mode emulation mirrored the bug,
+        /// masking it locally. Re-enabled in 240aab1 / canonical-port
+        /// merge after CI verification on real hardware.
         #[cfg(feature = "std")]
         #[must_use]
         pub fn is_available() -> bool {
-            // FIXME(re-enable after real-aarch64 CI parity check):
-            //   replace with `std::arch::is_aarch64_feature_detected!("sha2")`.
-            false && std::arch::is_aarch64_feature_detected!("sha2")
+            std::arch::is_aarch64_feature_detected!("sha2")
         }
 
         #[cfg(not(feature = "std"))]
