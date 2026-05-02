@@ -964,31 +964,17 @@ fn detect_logical_cpus() -> Option<usize> {
 /// neither x86 nor aarch64).
 #[must_use]
 pub fn detect_accelerators() -> AcceleratorProfile {
-    cfg_if::cfg_if! {
-        if #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))] {
-            // Intel AMX features. The `is_x86_feature_detected!` macro
-            // accepts these as of Rust 1.61+; on hosts that don't ship
-            // the feature, the macro is stable and returns false.
-            AcceleratorProfile {
-                amx_tile: std::is_x86_feature_detected!("amx-tile"),
-                amx_int8: std::is_x86_feature_detected!("amx-int8"),
-                amx_bf16: std::is_x86_feature_detected!("amx-bf16"),
-                sme: false,
-                sme2: false,
-            }
-        } else if #[cfg(all(feature = "std", target_arch = "aarch64"))] {
-            // ARMv9.2+ SME / ARMv9.3+ SME2.
-            AcceleratorProfile {
-                amx_tile: false,
-                amx_int8: false,
-                amx_bf16: false,
-                sme: std::arch::is_aarch64_feature_detected!("sme"),
-                sme2: std::arch::is_aarch64_feature_detected!("sme2"),
-            }
-        } else {
-            AcceleratorProfile::none()
-        }
-    }
+    // Detection stubs only. AMX (`is_x86_feature_detected!("amx-*")`)
+    // and SME (`is_aarch64_feature_detected!("sme"|"sme2")`) macro
+    // arms are gated behind unstable `stdarch_*_feature_detection`
+    // nightly features that are still in flux. The CI nightly
+    // (2026-04-30+) no longer recognises the `feature` attribute
+    // for them. Until those macros stabilise, `detect_accelerators`
+    // returns the all-false profile on every host. Re-enabling is a
+    // single-callsite swap once the toolchain ships them stable; the
+    // surrounding `Backend::Amx`/`Sme`/`Sme2` enum + `KernelSupport`
+    // wiring stay live so the swap doesn't ripple.
+    AcceleratorProfile::none()
 }
 
 fn detect_cache_profile() -> CacheProfile {
