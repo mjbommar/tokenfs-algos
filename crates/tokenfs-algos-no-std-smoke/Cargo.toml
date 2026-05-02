@@ -1,0 +1,11 @@
+[package]
+name = "tokenfs-algos-no-std-smoke"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+test = false           # this crate exists to verify no_std lib build, not to run tests
+
+[dependencies]
+tokenfs-algos = { path = "../tokenfs-algos", default-features = false, features = ["alloc"] }

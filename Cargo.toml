@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/tokenfs-algos",
+    "crates/tokenfs-algos-no-std-smoke",
     "tools/xtask",
 ]
 resolver = "3"

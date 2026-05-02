@@ -448,8 +448,10 @@ const BASE32_LOWER_ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 /// (no padding).
 #[must_use]
 pub const fn base32_lower_len(input_bytes: usize) -> usize {
-    // ceil(input_bytes * 8 / 5)
-    (input_bytes * 8).div_ceil(5)
+    // ceil(input_bytes * 8 / 5). saturating_mul keeps the function panic-free
+    // and wrap-free on usize::MAX-class inputs (the realistic cap is much
+    // smaller, but kernel-adjacent sizing should be defensive).
+    input_bytes.saturating_mul(8).div_ceil(5)
 }
 
 /// Encodes `bytes` as RFC 4648 §6 base32 with the lower-case alphabet and no
@@ -938,5 +940,33 @@ mod tests {
         assert!(s.contains("too small"));
         let s = format!("{}", DecodeError::UnknownMultihashCode(0x99));
         assert!(s.contains("99"));
+    }
+
+    // ---- base32_lower_len overflow safety ------------------------------
+
+    #[test]
+    fn base32_lower_len_zero_is_zero() {
+        // Trivial canonical case.
+        assert_eq!(base32_lower_len(0), 0);
+    }
+
+    #[test]
+    fn base32_lower_len_one_byte_is_two_chars() {
+        // 1 byte = 8 bits = ceil(8 / 5) = 2 base32 chars.
+        assert_eq!(base32_lower_len(1), 2);
+    }
+
+    #[test]
+    fn base32_lower_len_saturates_on_huge_input() {
+        // saturating_mul keeps this function panic-free in debug and
+        // wrap-free in release. The pre-fix expression `input_bytes * 8`
+        // panicked in debug and silently wrapped in release on inputs
+        // larger than usize::MAX / 8. Any input above usize::MAX / 8
+        // saturates the multiplication to usize::MAX, so the function
+        // returns ceil(usize::MAX / 5).
+        let huge = usize::MAX / 4;
+        let got = base32_lower_len(huge);
+        let expected = usize::MAX.div_ceil(5);
+        assert_eq!(got, expected);
     }
 }

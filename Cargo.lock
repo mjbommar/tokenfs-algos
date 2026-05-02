@@ -1228,6 +1228,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokenfs-algos-no-std-smoke"
+version = "0.1.0"
+dependencies = [
+ "tokenfs-algos",
+]
+
+[[package]]
 name = "unarray"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -31,6 +31,88 @@
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec::Vec};
 
+use core::fmt;
+
+/// Reasons a container's data violated a structural invariant.
+///
+/// Returned by the validating `try_from_vec` constructors on
+/// [`ArrayContainer`] and [`RunContainer`]. Each variant carries the
+/// offending index so that callers (or property-test shrinkers) can
+/// pinpoint the failure without re-walking the input.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContainerInvariantError {
+    /// `ArrayContainer`: data is not strictly ascending sorted.
+    ArrayUnsorted {
+        /// Index of the first element that broke the ordering, i.e. the
+        /// element where `data[i - 1] >= data[i]`.
+        offending_index: usize,
+    },
+    /// `ArrayContainer`: data exceeds the 4096 array→bitmap promotion
+    /// threshold. Caller should promote to [`BitmapContainer`].
+    ArrayOverThreshold {
+        /// Length of the supplied array.
+        len: usize,
+        /// Threshold the array exceeded ([`ARRAY_MAX_CARDINALITY`]).
+        threshold: usize,
+    },
+    /// `RunContainer`: runs are not sorted by `start`.
+    RunsUnsorted {
+        /// Index of the first run that broke the ordering, i.e. the run
+        /// whose `start` is `<= runs[i - 1].start`.
+        offending_index: usize,
+    },
+    /// `RunContainer`: two adjacent runs overlap or are not coalesced
+    /// (i.e. `runs[i - 1]` ends at or after `runs[i].start - 1`).
+    RunsNotCoalesced {
+        /// Index of the run that should have merged into its predecessor.
+        offending_index: usize,
+    },
+    /// `RunContainer`: a run's `start + length_minus_one + 1` exceeds the
+    /// 16-bit value space (65 536).
+    RunOverflowsValueSpace {
+        /// Index of the offending run.
+        offending_index: usize,
+        /// Run start.
+        start: u16,
+        /// Run length minus one (CRoaring on-disk convention).
+        length_minus_one: u16,
+    },
+}
+
+impl fmt::Display for ContainerInvariantError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ArrayUnsorted { offending_index } => write!(
+                f,
+                "ArrayContainer: data not strictly ascending at index {offending_index}"
+            ),
+            Self::ArrayOverThreshold { len, threshold } => write!(
+                f,
+                "ArrayContainer: length {len} exceeds promotion threshold {threshold}"
+            ),
+            Self::RunsUnsorted { offending_index } => write!(
+                f,
+                "RunContainer: runs not sorted by start at index {offending_index}"
+            ),
+            Self::RunsNotCoalesced { offending_index } => write!(
+                f,
+                "RunContainer: runs at index {offending_index} overlap or are adjacent (must be coalesced)"
+            ),
+            Self::RunOverflowsValueSpace {
+                offending_index,
+                start,
+                length_minus_one,
+            } => write!(
+                f,
+                "RunContainer: run at index {offending_index} (start={start}, length_minus_one={length_minus_one}) overflows the 16-bit value space"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for ContainerInvariantError {}
+
 /// Number of `u64` words in a [`BitmapContainer`].
 pub const BITMAP_WORDS: usize = 1024;
 
@@ -216,6 +298,13 @@ impl Iterator for BitmapIter<'_> {
 ///   intermediate over-cap arrays before promoting to a
 ///   [`BitmapContainer`]; the per-op dispatch wrappers in
 ///   [`crate::bitmap::union`] and friends apply the promotion rule.
+///
+/// The `data` field is `pub` so SIMD kernels can construct directly when
+/// the invariants are upheld by construction (e.g. merge-emitting paths
+/// that produce sorted output by design). For untrusted input, prefer
+/// [`ArrayContainer::try_from_vec`], which validates both the ordering
+/// invariant and the 4096-element promotion threshold up-front and
+/// returns a [`ContainerInvariantError`] on violation.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ArrayContainer {
     /// Sorted `u16` values.
@@ -241,6 +330,43 @@ impl ArrayContainer {
             "ArrayContainer::from_sorted: input is not strictly ascending"
         );
         Self { data }
+    }
+
+    /// Validating constructor — recommended path for untrusted input.
+    ///
+    /// Walks `data` once, verifying:
+    ///
+    /// 1. each adjacent pair satisfies `data[i - 1] < data[i]`
+    ///    (strictly ascending), and
+    /// 2. the length does not exceed [`ARRAY_MAX_CARDINALITY`] (4096).
+    ///
+    /// Returns [`ContainerInvariantError::ArrayUnsorted`] or
+    /// [`ContainerInvariantError::ArrayOverThreshold`] on violation; the
+    /// returned error carries the offending index / length so callers
+    /// can recover or report.
+    ///
+    /// # Errors
+    ///
+    /// * [`ContainerInvariantError::ArrayUnsorted`] if `data[i - 1] >= data[i]`.
+    /// * [`ContainerInvariantError::ArrayOverThreshold`] if
+    ///   `data.len() > ARRAY_MAX_CARDINALITY`.
+    pub fn try_from_vec(data: Vec<u16>) -> Result<Self, ContainerInvariantError> {
+        if data.len() > ARRAY_MAX_CARDINALITY {
+            return Err(ContainerInvariantError::ArrayOverThreshold {
+                len: data.len(),
+                threshold: ARRAY_MAX_CARDINALITY,
+            });
+        }
+        // Strictly ascending check. We walk indices 1..len so the
+        // reported offending_index points at the right-hand element of
+        // the violating pair; that matches the convention used by the
+        // run-validator below.
+        for i in 1..data.len() {
+            if data[i - 1] >= data[i] {
+                return Err(ContainerInvariantError::ArrayUnsorted { offending_index: i });
+            }
+        }
+        Ok(Self { data })
     }
 
     /// Returns the cardinality (`data.len()`).
@@ -294,6 +420,13 @@ pub enum Container {
 ///   coalesced so no two runs are adjacent or overlapping).
 /// * `runs[i].0 + runs[i].1 + 1 <= 65536`, i.e. each run fits inside the
 ///   16-bit value space.
+///
+/// The `runs` field is `pub` so SIMD kernels can construct directly when
+/// the invariants are upheld by construction (e.g. run-merging paths
+/// that emit coalesced output by design). For untrusted input, prefer
+/// [`RunContainer::try_from_vec`], which validates ordering, coalescing,
+/// and value-space invariants up-front and returns a
+/// [`ContainerInvariantError`] on violation.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RunContainer {
     /// Sorted, coalesced `(start, length_minus_one)` pairs.
@@ -315,6 +448,55 @@ impl RunContainer {
     pub fn from_runs(runs: Vec<(u16, u16)>) -> Self {
         debug_assert!(Self::runs_are_valid(&runs));
         Self { runs }
+    }
+
+    /// Validating constructor — recommended path for untrusted input.
+    ///
+    /// Walks `runs` once, verifying for each entry `(start, length_minus_one)`:
+    ///
+    /// 1. `start + length_minus_one + 1 <= 65 536` (fits in 16-bit value
+    ///    space).
+    /// 2. For all `i > 0`, `runs[i].0 > runs[i - 1].0` (sorted by start).
+    /// 3. For all `i > 0`, `runs[i].0 > runs[i - 1].0 + runs[i - 1].1 + 1`
+    ///    (no overlap and no adjacency — i.e. the run list is coalesced).
+    ///
+    /// Order of checks is `RunOverflowsValueSpace` (per-run, before any
+    /// adjacency math is meaningful) → `RunsUnsorted` →
+    /// `RunsNotCoalesced`. Errors carry the offending index so callers
+    /// can pinpoint the failure.
+    ///
+    /// # Errors
+    ///
+    /// * [`ContainerInvariantError::RunOverflowsValueSpace`] if
+    ///   `start + length_minus_one + 1 > 65 536`.
+    /// * [`ContainerInvariantError::RunsUnsorted`] if `runs[i].0 <= runs[i - 1].0`.
+    /// * [`ContainerInvariantError::RunsNotCoalesced`] if `runs[i].0` falls
+    ///   inside or immediately after the predecessor's run.
+    pub fn try_from_vec(runs: Vec<(u16, u16)>) -> Result<Self, ContainerInvariantError> {
+        for i in 0..runs.len() {
+            let (start, len_m1) = runs[i];
+            // Per-run value-space check first: u32 widening avoids overflow
+            // on the `+1` and matches the runs_are_valid math exactly.
+            let end = u32::from(start) + u32::from(len_m1);
+            if end > u32::from(u16::MAX) {
+                return Err(ContainerInvariantError::RunOverflowsValueSpace {
+                    offending_index: i,
+                    start,
+                    length_minus_one: len_m1,
+                });
+            }
+            if i > 0 {
+                let (prev_start, prev_len_m1) = runs[i - 1];
+                if start <= prev_start {
+                    return Err(ContainerInvariantError::RunsUnsorted { offending_index: i });
+                }
+                let prev_end = u32::from(prev_start) + u32::from(prev_len_m1);
+                if u32::from(start) <= prev_end + 1 {
+                    return Err(ContainerInvariantError::RunsNotCoalesced { offending_index: i });
+                }
+            }
+        }
+        Ok(Self { runs })
     }
 
     /// Returns the cardinality (sum of `length_minus_one + 1` over all runs).
@@ -374,6 +556,8 @@ impl RunContainer {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)] // Test code — panic on Err is the desired failure mode.
+
     use super::*;
 
     #[test]
@@ -468,5 +652,160 @@ mod tests {
         assert!(RunContainer::runs_are_valid(&[(65530, 5)]));
         // (65530, 6) would extend to 65536 which is out of u16 — invalid.
         assert!(!RunContainer::runs_are_valid(&[(65530, 6)]));
+    }
+
+    // ---- try_from_vec validating constructors --------------------------
+
+    #[test]
+    fn array_try_from_vec_happy_path() {
+        let ac = ArrayContainer::try_from_vec(vec![1, 3, 5, 65535]).unwrap();
+        assert_eq!(ac.cardinality(), 4);
+        assert!(ac.contains(3));
+        assert!(ac.contains(65535));
+        assert!(!ac.contains(2));
+    }
+
+    #[test]
+    fn array_try_from_vec_empty_is_ok() {
+        let ac = ArrayContainer::try_from_vec(Vec::new()).unwrap();
+        assert!(ac.is_empty());
+    }
+
+    #[test]
+    fn array_try_from_vec_rejects_unsorted() {
+        // 7 < 5 violates strictly ascending at index 2.
+        let err = ArrayContainer::try_from_vec(vec![1, 5, 3, 9]).unwrap_err();
+        assert_eq!(
+            err,
+            ContainerInvariantError::ArrayUnsorted { offending_index: 2 }
+        );
+    }
+
+    #[test]
+    fn array_try_from_vec_rejects_duplicate() {
+        // Duplicate at index 1: 5 is not strictly greater than 5.
+        let err = ArrayContainer::try_from_vec(vec![5, 5]).unwrap_err();
+        assert_eq!(
+            err,
+            ContainerInvariantError::ArrayUnsorted { offending_index: 1 }
+        );
+    }
+
+    #[test]
+    fn array_try_from_vec_rejects_over_threshold() {
+        // 4097 elements exceeds the 4096 promotion threshold; values can
+        // be sorted yet still fail the cap.
+        let too_big: Vec<u16> = (0..ARRAY_MAX_CARDINALITY as u32 + 1)
+            .map(|v| v as u16)
+            .collect();
+        let len = too_big.len();
+        let err = ArrayContainer::try_from_vec(too_big).unwrap_err();
+        assert_eq!(
+            err,
+            ContainerInvariantError::ArrayOverThreshold {
+                len,
+                threshold: ARRAY_MAX_CARDINALITY,
+            }
+        );
+    }
+
+    #[test]
+    fn array_try_from_vec_at_threshold_is_ok() {
+        // Exactly 4096 elements (the cap) is allowed.
+        let exact: Vec<u16> = (0..ARRAY_MAX_CARDINALITY as u32)
+            .map(|v| v as u16)
+            .collect();
+        assert!(ArrayContainer::try_from_vec(exact).is_ok());
+    }
+
+    #[test]
+    fn run_try_from_vec_happy_path() {
+        let rc = RunContainer::try_from_vec(vec![(0, 9), (100, 0), (1000, 99)]).unwrap();
+        assert_eq!(rc.cardinality(), 10 + 1 + 100);
+        assert!(rc.contains(0));
+        assert!(rc.contains(1099));
+        assert!(!rc.contains(1100));
+    }
+
+    #[test]
+    fn run_try_from_vec_empty_is_ok() {
+        let rc = RunContainer::try_from_vec(Vec::new()).unwrap();
+        assert!(rc.is_empty());
+    }
+
+    #[test]
+    fn run_try_from_vec_rejects_overflow() {
+        // (65530, 6) extends to 65536 which is one past u16::MAX.
+        let err = RunContainer::try_from_vec(vec![(65530, 6)]).unwrap_err();
+        assert_eq!(
+            err,
+            ContainerInvariantError::RunOverflowsValueSpace {
+                offending_index: 0,
+                start: 65530,
+                length_minus_one: 6,
+            }
+        );
+    }
+
+    #[test]
+    fn run_try_from_vec_rejects_unsorted() {
+        // (200, 0) followed by (100, 0): start went backwards.
+        let err = RunContainer::try_from_vec(vec![(200, 0), (100, 0)]).unwrap_err();
+        assert_eq!(
+            err,
+            ContainerInvariantError::RunsUnsorted { offending_index: 1 }
+        );
+    }
+
+    #[test]
+    fn run_try_from_vec_rejects_duplicate_start() {
+        // Two runs with the same start — fails the sorted check (not
+        // strictly ascending by start).
+        let err = RunContainer::try_from_vec(vec![(100, 0), (100, 0)]).unwrap_err();
+        assert_eq!(
+            err,
+            ContainerInvariantError::RunsUnsorted { offending_index: 1 }
+        );
+    }
+
+    #[test]
+    fn run_try_from_vec_rejects_overlap() {
+        // (0, 9) covers 0..=9; (5, 0) starts inside the previous run.
+        let err = RunContainer::try_from_vec(vec![(0, 9), (5, 0)]).unwrap_err();
+        assert_eq!(
+            err,
+            ContainerInvariantError::RunsNotCoalesced { offending_index: 1 }
+        );
+    }
+
+    #[test]
+    fn run_try_from_vec_rejects_adjacency() {
+        // (0, 4) covers 0..=4; (5, 0) is immediately adjacent — should
+        // have been coalesced into (0, 5).
+        let err = RunContainer::try_from_vec(vec![(0, 4), (5, 0)]).unwrap_err();
+        assert_eq!(
+            err,
+            ContainerInvariantError::RunsNotCoalesced { offending_index: 1 }
+        );
+    }
+
+    #[test]
+    fn run_try_from_vec_at_max_value_is_ok() {
+        // (65530, 5) covers exactly 65530..=65535 — fits at the limit.
+        assert!(RunContainer::try_from_vec(vec![(65530, 5)]).is_ok());
+    }
+
+    #[test]
+    fn container_invariant_error_display_smoke() {
+        // Smoke-coverage of the Display impl so the message format
+        // doesn't drift silently.
+        #[cfg(all(feature = "alloc", not(feature = "std")))]
+        use alloc::format;
+        let s = format!(
+            "{}",
+            ContainerInvariantError::ArrayUnsorted { offending_index: 7 }
+        );
+        assert!(s.contains("not strictly ascending"));
+        assert!(s.contains("7"));
     }
 }
