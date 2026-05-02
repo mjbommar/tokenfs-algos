@@ -284,9 +284,15 @@ pub const fn backend_kernel_support(backend: Backend) -> BackendKernelSupport {
         },
         Backend::Sve | Backend::Sve2 => BackendKernelSupport {
             backend,
+            // SVE2-native kernels live in `byteclass::kernels::sve2`,
+            // `runlength::kernels::sve2`, and the f32 distance fns in
+            // `similarity::kernels::sve`. Histogram, fingerprint, and
+            // sketch families still fall back to scalar — those are
+            // candidates for future SVE2 work (`svhistseg_u8` for the
+            // byte histogram in particular looks promising).
             byte_histogram: KernelAvailability::ScalarFallback,
             fingerprint: KernelAvailability::ScalarFallback,
-            byte_class: KernelAvailability::ScalarFallback,
+            byte_class: KernelAvailability::Native,
             sketch: KernelAvailability::ScalarFallback,
         },
         Backend::Scalar => BackendKernelSupport {
@@ -1629,6 +1635,15 @@ mod tests {
             let support = backend_kernel_support(backend);
             assert_eq!(support.byte_histogram, KernelAvailability::ScalarFallback);
             assert_eq!(support.fingerprint, KernelAvailability::ScalarFallback);
+        }
+
+        // SVE / SVE2 ship a native byte-class classifier
+        // (`byteclass::kernels::sve2::classify`); the histogram/fingerprint/
+        // sketch families remain scalar fallback today.
+        for backend in [Backend::Sve, Backend::Sve2] {
+            let support = backend_kernel_support(backend);
+            assert_eq!(support.byte_class, KernelAvailability::Native);
+            assert_eq!(support.sketch, KernelAvailability::ScalarFallback);
         }
     }
 
