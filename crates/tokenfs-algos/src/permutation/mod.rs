@@ -5,22 +5,22 @@
 //! type [`CsrGraph`], and the **build-time** ordering primitives that
 //! produce a [`Permutation`] from such inputs.
 //!
-//! ## Sprint 11-13 status
+//! ## Sprint 11-13 / Sprint 47-49 status
 //!
 //! Phase B4 of `01_PHASES.md` lands [`rcm()`] (Reverse Cuthill-McKee).
 //! Phase B5 lands `hilbert_2d` / `hilbert_nd` behind the
 //! `permutation_hilbert` Cargo feature (vendor wrappers around the
-//! `fast_hilbert` and `hilbert` crates per spec § 4). One follow-on
-//! remains spec'd:
-//!
-//! * `rabbit_order` — community-detection-driven (Phase D1).
+//! `fast_hilbert` and `hilbert` crates per spec § 4). Sprint 47-49 of
+//! Phase D1 lands [`rabbit_order()`] as a single-pass sequential
+//! baseline; the SIMD modularity-gain inner loop (Sprint 50-52) and
+//! concurrent merging (Sprint 53-55) are follow-on sprints.
 //!
 //! ## Deployment posture
 //!
 //! Per `docs/v0.2_planning/02b_DEPLOYMENT_MATRIX.md`:
 //!
 //! * **Permutation construction** ([`rcm()`], `hilbert_2d` /
-//!   `hilbert_nd`, future `rabbit_order`): build-time only. These
+//!   `hilbert_nd`, [`rabbit_order()`]): build-time only. These
 //!   algorithms allocate large work buffers (BFS queue, key-array
 //!   sort, dendrogram) that cannot be made stack-only. Never runs in
 //!   kernel.
@@ -65,10 +65,12 @@ use alloc::vec::Vec;
 
 #[cfg(feature = "permutation_hilbert")]
 pub mod hilbert;
+pub mod rabbit;
 pub mod rcm;
 
 #[cfg(feature = "permutation_hilbert")]
 pub use hilbert::{hilbert_2d, hilbert_nd};
+pub use rabbit::rabbit_order;
 pub use rcm::rcm;
 
 /// A permutation array.
