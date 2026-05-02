@@ -12,6 +12,7 @@ This folder is a planning workbench, not a contract. Each doc is intended to be 
 | [`01_PHASES.md`](01_PHASES.md) | Phase A → D ship order, dependency graph between modules, gating criteria. |
 | [`02_CACHE_RESIDENCY.md`](02_CACHE_RESIDENCY.md) | Per-table cache-tier analysis across consumer scales (TokenFS image, Postgres column, CDN edge). |
 | [`02b_DEPLOYMENT_MATRIX.md`](02b_DEPLOYMENT_MATRIX.md) | Consumer environment × constraint matrix (kernel module, FUSE, Postgres, cgo, CDN edge, forensics, Python). |
+| [`03_EXECUTION_PLAN.md`](03_EXECUTION_PLAN.md) | Concrete sprint-level plan. v0.1.x → v0.2 → v0.2.x → Phase D. Per-sprint tasks, ship gates, risk register, ~16 weeks solo total. |
 | [`10_BITS.md`](10_BITS.md) | New `bits` module: bit-pack/unpack at arbitrary widths, Stream-VByte codec, bit-rank/select dictionary. |
 | [`11_BITMAP.md`](11_BITMAP.md) | New `bitmap` module: Roaring-style SIMD container kernels. |
 | [`12_HASH_BATCHED.md`](12_HASH_BATCHED.md) | Additions to `hash`: batched BLAKE3 + SHA-256 wrappers, hash-set membership SIMD. |
