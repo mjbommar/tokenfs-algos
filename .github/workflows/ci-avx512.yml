@@ -99,13 +99,11 @@ jobs:
       # --- per-runner micro-benchmarks (scalar vs SIMD, including AVX-512
       #     when the planner picks it). Output is a TSV picked up by the
       #     `perf-report` job in ci.yml via cross-workflow artifact pull. ---
-      # bench_compare currently exercises scalar / SSE4.2 / AVX2 backends.
-      # When #38 lands the AVX-512 backends, switch this invocation to
-      # `--features avx512` and the AVX-512 numbers will join the
-      # per-primitive comparison automatically (the column already exists).
-      # For now this gives a useful Zen 4 AVX2 datapoint on a *physical*
-      # box (vs Zen 3 EPYC virtualized GitHub-hosted runners).
-      - name: Run bench_compare (Zen 4 host)
+      # `--features avx512` enables the AVX-512BW byteclass + UTF-8
+      # backends added in #38 so the s7 column shows AVX-512 numbers
+      # alongside AVX2/SSE4.2/NEON. Bench_compare's runtime dispatch
+      # picks AVX-512 when the host advertises avx512bw.
+      - name: Run bench_compare (Zen 4 host, AVX-512 enabled)
         env:
           RUNNER_LABEL: avx512-${{ runner.name }}
         shell: bash
@@ -113,7 +111,7 @@ jobs:
           set -euo pipefail
           slug=$(printf '%s' "${RUNNER_LABEL}" | tr ' /()' '-' | tr -s '-')
           out="perf-${slug}.tsv"
-          cargo run -p tokenfs-algos --example bench_compare --release > "$out"
+          cargo run -p tokenfs-algos --example bench_compare --release --features avx512 > "$out"
           echo "=== $out ==="
           cat "$out"
 
