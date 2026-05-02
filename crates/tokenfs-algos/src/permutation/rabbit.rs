@@ -27,17 +27,22 @@
 //! 5. DFS the dendrogram in pre-order; the leaf-visit sequence is the
 //!    new ordering.
 //!
-//! ## Sequential baseline + SIMD modularity-gain inner loop
+//! ## Sequential baseline + SIMD modularity-gain inner loop + parallel agglomeration
 //!
 //! The Sprint 47-49 sequential baseline is the agglomeration loop in
 //! [`rabbit_order`]. Sprint 50-52 lifts the per-pair modularity-gain
 //! kernel into the [`kernels`] module with scalar / AVX2 / AVX-512 /
-//! NEON variants. The reference C++ implementation
-//! (`araij/rabbit_order`) further parallelises step 3 via per-thread
-//! merge buffers and a concurrent hash map; that lives in Sprint 53-55
-//! (see `03_EXECUTION_PLAN.md` Phase D1). This file remains
-//! single-threaded, single-pass (no recursive multi-level), and uses
-//! sorted `Vec`-backed adjacency rather than a concurrent hash map.
+//! NEON variants. Sprint 53-55 adds [`rabbit_order_par`] (gated on the
+//! `parallel` Cargo feature): a round-based concurrent variant where
+//! each round's per-vertex proposal phase runs across the global rayon
+//! thread pool while the merge-application phase remains sequential in
+//! canonical (ascending absorbed-vertex-id) order so the resulting
+//! permutation is bit-exact across thread counts. See
+//! [`rabbit_order_par`]'s rustdoc for the full determinism contract.
+//! The implementation continues to use sorted `Vec`-backed adjacency
+//! rather than a concurrent hash map — `rayon::par_iter` provides
+//! enough parallelism for the proposal phase without the per-bucket
+//! atomics overhead.
 //!
 //! ## Determinism
 //!
@@ -283,6 +288,367 @@ pub fn rabbit_order(graph: CsrGraph<'_>) -> Permutation {
     }
 
     dfs_visit_order(n, &merges)
+}
+
+/// Edge-count threshold below which [`rabbit_order_par`] falls back to
+/// the sequential [`rabbit_order`] path.
+///
+/// Concurrent agglomeration introduces per-round bookkeeping (snapshot
+/// the active set, gather proposals, apply sequentially). On graphs with
+/// fewer than ~200 K directed edges the rayon thread-pool wake-up cost
+/// and the per-round overhead overwhelm the savings, so we delegate to
+/// the heap-based sequential implementation.
+#[cfg(feature = "parallel")]
+pub const RABBIT_PARALLEL_EDGE_THRESHOLD: usize = 200_000;
+
+/// Round-based concurrent Rabbit Order — Sprint 53-55 of `03_EXECUTION_PLAN.md`.
+///
+/// Computes the same kind of agglomerative-modularity-driven permutation
+/// as [`rabbit_order`] but parallelises the per-round merge-proposal
+/// phase across the global rayon thread pool. The merge-application
+/// phase remains sequential and uses a canonical (ascending absorbed-
+/// vertex-id) order so the resulting [`Permutation`] is deterministic
+/// regardless of how many rayon threads execute the proposal phase.
+///
+/// ## Algorithm (Option A from `14_PERMUTATION.md` § 3)
+///
+/// 1. Initialise per-community adjacency, weighted degrees, and self-
+///    loop accounting from the CSR — identical to the sequential path.
+/// 2. **Round loop**: while at least one positive-`dQ` proposal exists,
+///    repeat:
+///    - **Snapshot phase** (sequential): collect every still-alive
+///      vertex into a vector sorted by ascending `(weighted_degree,
+///      vertex_id)`. This is the canonical "low-degree-first" iteration
+///      order shared with [`rabbit_order`].
+///    - **Proposal phase** (parallel): partition the snapshot across
+///      rayon worker threads via `par_iter`. Each worker iterates its
+///      chunk and calls the per-vertex `best_merge_target` helper
+///      (read-only against the shared adjacency / degree state) using
+///      thread-local scratch buffers. Output: per-vertex `Option<u32>`
+///      proposing a merge target, or `None` when no neighbour yields
+///      `dQ > 0`.
+///    - **Apply phase** (sequential, canonical order): iterate the
+///      proposals in ascending absorbed-vertex-id order. For each
+///      `(u -> v)` proposal:
+///      - Skip when `u` was already absorbed earlier in this round
+///        (another vertex picked `u` as its merge target).
+///      - Skip when `v` was already absorbed earlier in this round
+///        (the target evaporated before its turn came up).
+///      - Otherwise: record the merge in the dendrogram, fold `u`'s
+///        adjacency into `v`'s via the same `absorb_into` helper the
+///        sequential path uses, and mark `u` as dead.
+///    - When the round produced no merges, break out.
+/// 3. Reconstruct the permutation via the dendrogram-DFS pre-order
+///    walk.
+///
+/// ## Determinism contract
+///
+/// **Same input + same thread count → same output.** Each rayon worker
+/// reads from the shared snapshot (immutable during the proposal phase)
+/// so the per-vertex proposals are pure functions of `(adj,
+/// weighted_degree, self_degree, m)` at round start. Workers do not
+/// mutate any shared state during the proposal phase.
+///
+/// **Same input + different thread counts → same output.** The proposal
+/// phase's per-vertex output does not depend on chunk boundaries (each
+/// vertex's merge-target computation is hermetic). The apply phase
+/// orders proposals by ascending absorbed-vertex-id before consuming
+/// them, so the merge sequence — and therefore the dendrogram — is
+/// invariant under any reordering the parallel proposal phase might
+/// have produced.
+///
+/// **Bit-exact across runs.** Integer arithmetic throughout; no
+/// floating-point reduction order to track. The scalar/SIMD kernel
+/// dispatch in [`kernels::auto`] is itself bit-exact (see the kernel
+/// module documentation) so the choice of backend per-thread does not
+/// perturb proposals.
+///
+/// **Note: not bit-exact with [`rabbit_order`].** The sequential path
+/// uses a heap that re-evaluates each vertex against the *current*
+/// (post-merge) state, while the round-based parallel path locks the
+/// per-round proposals against the *snapshot* taken at round start.
+/// Both produce valid Rabbit Order permutations and both group
+/// communities contiguously, but the merge sequences differ on graphs
+/// with >2 vertices that admit multiple positive-`dQ` merges. On
+/// trivial inputs (empty graph, n=1, fully disconnected, edgeless) both
+/// produce identical output because no merges happen.
+///
+/// ## Fallback for small graphs
+///
+/// When the input has fewer than [`RABBIT_PARALLEL_EDGE_THRESHOLD`]
+/// directed edges, this function delegates to [`rabbit_order`] —
+/// rayon's per-task overhead exceeds the agglomeration cost on small
+/// graphs. The threshold is documented as a public constant so
+/// callers can pre-classify their inputs.
+///
+/// ## Performance posture
+///
+/// The Sprint 53-55 spec (`docs/v0.2_planning/03_EXECUTION_PLAN.md`)
+/// flags up front that the round-based concurrent variant's wall-clock
+/// gain over the heap-based sequential path is bounded by the
+/// **sequential apply phase**: each round, the merge-application step
+/// runs serially in canonical order to preserve determinism. On
+/// realistic sparse graphs that means the speedup is dominated by the
+/// proposal-phase fraction of the per-round work, which is small
+/// relative to the per-merge `absorb_into` + `relink_neighbour`
+/// bookkeeping. As a result, the parallel variant typically runs at
+/// **wall-clock parity or modestly slower** than the sequential
+/// baseline on TokenFS-typical sparse inputs at 100 K - 1 M vertices.
+///
+/// The function exists primarily to provide a **deterministic API
+/// surface** for callers who want to participate in a rayon-driven
+/// pipeline without forcing a sequential `rabbit_order` call inside
+/// it, and to anchor future work that swaps the apply-phase strategy
+/// (colouring-based conflict-free batching, hand-rolled lock-free
+/// adjacency, etc.) without churning the public API.
+///
+/// ## Behaviour on degenerate inputs
+///
+/// Same as [`rabbit_order`]: empty / single-vertex / edgeless / self-
+/// looped / multigraph inputs all return a valid [`Permutation`]. See
+/// the [`rabbit_order`] documentation for the precise contract.
+///
+/// # Panics
+///
+/// Same panic conditions as [`rabbit_order`].
+#[cfg(feature = "parallel")]
+#[must_use]
+pub fn rabbit_order_par(graph: CsrGraph<'_>) -> Permutation {
+    let n = graph.n as usize;
+    assert_eq!(
+        graph.offsets.len(),
+        n + 1,
+        "rabbit_order_par: offsets.len() ({}) != n + 1 ({})",
+        graph.offsets.len(),
+        n + 1
+    );
+    if n == 0 {
+        return Permutation::identity(0);
+    }
+    // Defer the rest of the validation + small-graph fallback to the
+    // sequential path. The sequential routine performs the same bounds
+    // checks and is bit-for-bit deterministic; we want the small-graph
+    // codepath to share both behaviours so the public API is uniform.
+    if graph.neighbors.len() < RABBIT_PARALLEL_EDGE_THRESHOLD {
+        return rabbit_order(graph);
+    }
+
+    // -- input validation (mirrors `rabbit_order`) --
+    for w in graph.offsets.windows(2) {
+        assert!(
+            w[0] <= w[1],
+            "rabbit_order_par: offsets non-monotone: offsets contains {} followed by {}",
+            w[0],
+            w[1]
+        );
+    }
+    assert_eq!(
+        graph.offsets[n] as usize,
+        graph.neighbors.len(),
+        "rabbit_order_par: offsets[n] ({}) != neighbors.len() ({})",
+        graph.offsets[n],
+        graph.neighbors.len()
+    );
+
+    // -- Build the per-community adjacency in parallel. Each vertex's
+    // consolidation is independent (input is the immutable raw CSR
+    // slice; output is a per-vertex AdjList plus a self-loop counter).
+    // We collect into temporary Vecs first, then drain into the
+    // primary `adj` vector and `self_loop` counter array. --
+    use rayon::prelude::*;
+
+    let consolidated: Vec<(AdjList, u64)> = (0..n)
+        .into_par_iter()
+        .map(|v| {
+            let raw = graph.neighbors_of(v as u32);
+            for &u in raw {
+                assert!(
+                    (u as usize) < n,
+                    "rabbit_order_par: neighbour {u} of vertex {v} out of range [0, {n})"
+                );
+            }
+            consolidate_neighbours_pure(v as u32, raw)
+        })
+        .collect();
+    let mut adj: Vec<AdjList> = Vec::with_capacity(n);
+    let mut self_loop: Vec<u64> = Vec::with_capacity(n);
+    for (a, sl) in consolidated {
+        adj.push(a);
+        self_loop.push(sl);
+    }
+
+    let mut weighted_degree: Vec<u64> = (0..n)
+        .map(|v| adj[v].iter().map(|(_, w)| *w).sum::<u64>() + self_loop[v])
+        .collect();
+    let total_edge_weight: u64 = {
+        let off_diag: u64 = (0..n).map(|v| weighted_degree[v] - self_loop[v]).sum();
+        off_diag / 2 + self_loop.iter().sum::<u64>()
+    };
+
+    if total_edge_weight == 0 {
+        return Permutation::identity(n);
+    }
+
+    let mut alive: Vec<bool> = vec![true; n];
+    let mut merges: Vec<Merge> = Vec::with_capacity(n);
+
+    // Active vertex list, maintained incrementally across rounds.
+    // Initialised with every vertex that has at least one neighbour;
+    // vertices are dropped from this list when they are absorbed by
+    // the apply phase. Re-sorting the survivors at the start of each
+    // round is O(|active| log |active|) — much cheaper than an
+    // O(n)-per-round full-scan once the agglomeration has reduced
+    // the active set to a fraction of `n`.
+    let mut active: Vec<u32> = Vec::with_capacity(n);
+    for (v, list) in adj.iter().enumerate() {
+        if !list.is_empty() {
+            // SAFETY: v < n <= u32::MAX as usize (vertex IDs are u32).
+            #[allow(clippy::cast_possible_truncation)]
+            active.push(v as u32);
+        }
+    }
+
+    loop {
+        // -- Snapshot phase: drop absorbed vertices from the active
+        // list (incremental maintenance), then re-sort the survivors
+        // by canonical (weighted_degree asc, vertex_id asc) order.
+        // The sort fixes the per-round proposal-phase iteration
+        // order to be the same on every thread count, which is the
+        // determinism contract's anchor point. --
+        active.retain(|&u| alive[u as usize] && !adj[u as usize].is_empty());
+        if active.is_empty() {
+            break;
+        }
+        active.sort_unstable_by_key(|&u| (weighted_degree[u as usize], u));
+
+        // -- Proposal phase (parallel, read-only against `adj` /
+        // `weighted_degree`). Each worker thread takes a contiguous
+        // chunk of the canonical-ordered active set and reuses a pair
+        // of scratch buffers across every vertex in the chunk. Using
+        // `par_chunks` (rather than per-vertex `par_iter`) amortises
+        // rayon's per-task dispatch overhead — for typical TokenFS
+        // sparse graphs each `best_merge_target` call evaluates only
+        // a handful of neighbours, so per-task overhead would dominate
+        // a per-vertex parallel iteration. --
+        let chunk_size = active
+            .len()
+            .div_ceil(rayon::current_num_threads().max(1) * 4)
+            .max(1);
+        let proposals: Vec<Option<u32>> = active
+            .par_chunks(chunk_size)
+            .flat_map_iter(|chunk| {
+                // Per-thread scratch buffers reused across the chunk.
+                let mut scratch_weights: Vec<u64> = Vec::with_capacity(64);
+                let mut scratch_degrees: Vec<u64> = Vec::with_capacity(64);
+                let mut out: Vec<Option<u32>> = Vec::with_capacity(chunk.len());
+                for &u in chunk {
+                    out.push(best_merge_target(
+                        u,
+                        &adj[u as usize],
+                        &weighted_degree,
+                        total_edge_weight,
+                        &mut scratch_weights,
+                        &mut scratch_degrees,
+                    ));
+                }
+                out
+            })
+            .collect();
+
+        // -- Build the canonical apply-phase ordering. Each entry is
+        // `(absorbed_id, target_id)`; sorted by absorbed_id ascending
+        // so the apply phase is deterministic across thread counts. --
+        let mut applies: Vec<(u32, u32)> = active
+            .iter()
+            .zip(proposals)
+            .filter_map(|(&u, opt)| opt.map(|v| (u, v)))
+            .collect();
+        if applies.is_empty() {
+            // No positive-dQ merge proposed anywhere; agglomeration is
+            // complete (or the remaining alive vertices are mutually
+            // disconnected).
+            break;
+        }
+        applies.sort_unstable_by_key(|&(u, _)| u);
+
+        // -- Sequential apply phase. Skip proposals whose endpoints
+        // were already absorbed by an earlier (lower-absorbed-id)
+        // apply in this round. The "earlier" criterion is the
+        // canonical sort order — invariant across threads. --
+        let mut applied_in_round = false;
+        for (u, v) in applies {
+            if !alive[u as usize] {
+                // `u` was already absorbed earlier this round.
+                continue;
+            }
+            if !alive[v as usize] {
+                // `v` was absorbed earlier this round; the proposal
+                // referenced a target that no longer exists.
+                continue;
+            }
+            if u == v {
+                // Defensive: `best_merge_target` already excludes
+                // self-loops, but apply-phase invariants demand
+                // u != v.
+                continue;
+            }
+            merges.push(Merge {
+                absorbed: u,
+                into: v,
+            });
+            absorb_into(
+                u as usize,
+                v as usize,
+                &mut adj,
+                &mut weighted_degree,
+                &mut self_loop,
+            );
+            alive[u as usize] = false;
+            applied_in_round = true;
+        }
+
+        if !applied_in_round {
+            // Every proposal was a conflict; no merge happened. This
+            // should not be reachable with the canonical ordering
+            // (the lowest-id alive vertex always wins), but guard
+            // against infinite loops defensively.
+            break;
+        }
+    }
+
+    dfs_visit_order(n, &merges)
+}
+
+/// Pure variant of [`consolidate_neighbours`] that returns the per-
+/// vertex `(AdjList, self_loop_count)` instead of mutating a shared
+/// slice. Used by [`rabbit_order_par`]'s parallel CSR ingestion phase.
+#[cfg(feature = "parallel")]
+fn consolidate_neighbours_pure(v: u32, raw: &[u32]) -> (AdjList, u64) {
+    if raw.is_empty() {
+        return (AdjList::new(), 0);
+    }
+    let mut tmp: Vec<u32> = raw.to_vec();
+    tmp.sort_unstable();
+
+    let mut out: AdjList = AdjList::with_capacity(tmp.len());
+    let mut self_loop: u64 = 0;
+    let mut i = 0;
+    while i < tmp.len() {
+        let n = tmp[i];
+        let mut j = i + 1;
+        let mut count = 1_u64;
+        while j < tmp.len() && tmp[j] == n {
+            count += 1;
+            j += 1;
+        }
+        if n == v {
+            self_loop += count;
+        } else {
+            out.push((n, count));
+        }
+        i = j;
+    }
+    (out, self_loop)
 }
 
 /// Folds duplicate neighbour entries from the raw CSR into a sorted
@@ -2092,6 +2458,344 @@ mod tests {
                 m_doubled,
             );
             assert_eq!(scalar_out, auto_out);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Sprint 53-55: round-based concurrent merging tests.
+    //
+    // The parallel variant produces an identical permutation to the
+    // sequential one ONLY on degenerate inputs that admit no merges
+    // (empty, n=1, n=2, fully disconnected, edgeless). On non-trivial
+    // inputs both produce valid Rabbit Order permutations but the
+    // merge sequences differ — the heap-based sequential path
+    // re-evaluates each vertex against the current state, while the
+    // round-based parallel path locks per-round proposals against the
+    // round-start snapshot. The tests below cover both regimes.
+
+    #[cfg(feature = "parallel")]
+    mod parallel_tests {
+        //! Sprint 53-55 deterministic round-based parallel rabbit-order tests.
+        //!
+        //! Covers:
+        //!   * Trivial-input parity vs the sequential path.
+        //!   * Run-to-run determinism (same thread count, three runs).
+        //!   * Cross-thread-count determinism (1, 2, 4, 8 threads via
+        //!     `rayon::ThreadPoolBuilder::install`).
+        //!   * Permutation validity property on randomised inputs.
+        //!   * Quality property: K-clique-with-bridges → cliques
+        //!     contiguous in output.
+        use super::*;
+
+        /// Constructs a graph with directed-edge count above
+        /// [`RABBIT_PARALLEL_EDGE_THRESHOLD`] so the parallel path
+        /// actually executes. Used by the determinism tests below.
+        ///
+        /// Returns `(n, offsets, neighbors)`. The graph is a chain of
+        /// 4-cliques connected by single bridge edges, expanded to
+        /// reach the edge threshold.
+        ///
+        /// `num_cliques` controls how far above the threshold we go;
+        /// callers that just need to exercise the parallel path use
+        /// the minimum, while quality tests use a larger size.
+        fn clique_chain(num_cliques: u32) -> (u32, Vec<u32>, Vec<u32>) {
+            // Each 4-clique has 6 undirected edges = 12 directed.
+            // Each bridge contributes 2 directed edges. To exceed
+            // RABBIT_PARALLEL_EDGE_THRESHOLD (= 200_000), we need
+            // roughly 200_000 / 12 ~= 17_000 cliques.
+            let n: u32 = num_cliques * 4;
+            let mut edges: Vec<(u32, u32)> =
+                Vec::with_capacity((num_cliques as usize) * 6 + (num_cliques as usize - 1));
+            for k in 0..num_cliques {
+                let base = k * 4;
+                for i in 0..4_u32 {
+                    for j in (i + 1)..4_u32 {
+                        edges.push((base + i, base + j));
+                    }
+                }
+                if k + 1 < num_cliques {
+                    // Bridge: last vertex of clique k -> first vertex of clique k+1.
+                    edges.push((base + 3, (k + 1) * 4));
+                }
+            }
+            let (offsets, neighbors) = csr_from_edges(n, &edges);
+            (n, offsets, neighbors)
+        }
+
+        /// Convenience wrapper: minimum-sized chain that still trips
+        /// the parallel threshold. Used by the determinism tests
+        /// where speed of test wall time matters.
+        fn min_above_threshold_chain() -> (u32, Vec<u32>, Vec<u32>) {
+            // 17_000 cliques give 17_000 * 12 + 16_999 * 2 = 237_998
+            // directed edges, comfortably above the 200_000 threshold.
+            clique_chain(17_000)
+        }
+
+        /// Convenience wrapper: large chain for the quality property
+        /// test, where seeing many cliques matters more than wall
+        /// time.
+        fn large_clique_chain() -> (u32, Vec<u32>, Vec<u32>) {
+            clique_chain(18_000)
+        }
+
+        #[test]
+        fn par_matches_sequential_on_empty_graph() {
+            let offsets = [0_u32];
+            let neighbors: [u32; 0] = [];
+            let g = CsrGraph {
+                n: 0,
+                offsets: &offsets,
+                neighbors: &neighbors,
+            };
+            assert_eq!(rabbit_order_par(g), rabbit_order(g));
+        }
+
+        #[test]
+        fn par_matches_sequential_on_single_vertex() {
+            let offsets = [0_u32, 0];
+            let neighbors: [u32; 0] = [];
+            let g = CsrGraph {
+                n: 1,
+                offsets: &offsets,
+                neighbors: &neighbors,
+            };
+            assert_eq!(rabbit_order_par(g), rabbit_order(g));
+        }
+
+        #[test]
+        fn par_matches_sequential_on_two_connected_vertices() {
+            let offsets = [0_u32, 1, 2];
+            let neighbors = [1_u32, 0];
+            let g = CsrGraph {
+                n: 2,
+                offsets: &offsets,
+                neighbors: &neighbors,
+            };
+            assert_eq!(rabbit_order_par(g), rabbit_order(g));
+        }
+
+        #[test]
+        fn par_matches_sequential_on_fully_disconnected() {
+            let offsets = vec![0_u32; 6];
+            let neighbors: Vec<u32> = Vec::new();
+            let g = CsrGraph {
+                n: 5,
+                offsets: &offsets,
+                neighbors: &neighbors,
+            };
+            assert_eq!(rabbit_order_par(g), rabbit_order(g));
+        }
+
+        #[test]
+        fn par_matches_sequential_on_edgeless_graph() {
+            // n=10 vertices, no edges. `total_edge_weight == 0`
+            // triggers the identity-permutation early return on both
+            // paths.
+            let offsets = vec![0_u32; 11];
+            let neighbors: Vec<u32> = Vec::new();
+            let g = CsrGraph {
+                n: 10,
+                offsets: &offsets,
+                neighbors: &neighbors,
+            };
+            assert_eq!(rabbit_order_par(g), rabbit_order(g));
+        }
+
+        #[test]
+        fn par_is_deterministic_across_runs() {
+            // Use a graph above the parallel threshold so the
+            // multi-round agglomeration code path actually runs.
+            let (n, offsets, neighbors) = min_above_threshold_chain();
+            let g = CsrGraph {
+                n,
+                offsets: &offsets,
+                neighbors: &neighbors,
+            };
+            let p1 = rabbit_order_par(g);
+            let p2 = rabbit_order_par(g);
+            let p3 = rabbit_order_par(g);
+            assert_eq!(p1, p2, "rabbit_order_par must be deterministic across runs");
+            assert_eq!(p2, p3, "rabbit_order_par must be deterministic across runs");
+        }
+
+        #[test]
+        fn par_is_deterministic_across_thread_counts() {
+            // Build the input once. Use the minimum-above-threshold
+            // chain to keep the four-pool test wall time bounded
+            // while still actually exercising the parallel path.
+            let (n, offsets, neighbors) = min_above_threshold_chain();
+            let g = CsrGraph {
+                n,
+                offsets: &offsets,
+                neighbors: &neighbors,
+            };
+
+            // Run under each of {1, 2, 4, 8} threads and assert the
+            // resulting permutations are identical.
+            let mut perms: Vec<Permutation> = Vec::with_capacity(4);
+            for &tc in &[1_usize, 2, 4, 8] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(tc)
+                    .build()
+                    .expect("ThreadPoolBuilder must succeed");
+                let p = pool.install(|| rabbit_order_par(g));
+                perms.push(p);
+            }
+            for w in perms.windows(2) {
+                assert_eq!(
+                    w[0], w[1],
+                    "rabbit_order_par must be deterministic across thread counts"
+                );
+            }
+        }
+
+        #[test]
+        fn par_returns_valid_permutation_on_random_graphs() {
+            // Generate several random graphs above the parallel
+            // threshold; assert each output is a valid permutation.
+            for &(n, deg, seed) in &[
+                (50_000_u32, 5_u32, 0xC0FFEE_u64),
+                (50_000, 8, 0xDEAD_BEEF),
+                (100_000, 3, 0x5151_5EED),
+            ] {
+                let (offsets, neighbors) = erdos_renyi_csr(n, deg, seed);
+                if neighbors.len() < RABBIT_PARALLEL_EDGE_THRESHOLD {
+                    // Below threshold falls back to sequential; that's
+                    // already covered by the sequential tests.
+                    continue;
+                }
+                let g = CsrGraph {
+                    n,
+                    offsets: &offsets,
+                    neighbors: &neighbors,
+                };
+                let perm = rabbit_order_par(g);
+                assert_valid_permutation(&perm, n as usize);
+            }
+        }
+
+        #[test]
+        fn par_returns_valid_permutation_below_threshold() {
+            // Small inputs that fall back to the sequential path must
+            // still produce valid permutations through the public API.
+            for &n in &[5_u32, 16, 32, 64] {
+                let edges: Vec<(u32, u32)> = (0..(n - 1)).map(|i| (i, i + 1)).collect();
+                let (offsets, neighbors) = csr_from_edges(n, &edges);
+                let g = CsrGraph {
+                    n,
+                    offsets: &offsets,
+                    neighbors: &neighbors,
+                };
+                let perm = rabbit_order_par(g);
+                assert_valid_permutation(&perm, n as usize);
+                // Below threshold, the parallel path delegates to the
+                // sequential path so they are bit-exact.
+                assert_eq!(perm, rabbit_order(g));
+            }
+        }
+
+        #[test]
+        fn par_groups_clique_members_contiguously() {
+            // Quality property: same K-clique-with-bridges check the
+            // sequential path runs (tolerated within a small slack).
+            let cliques: [[u32; 4]; 4] =
+                [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11], [12, 13, 14, 15]];
+            let n = 16_u32;
+            let mut edges: Vec<(u32, u32)> = Vec::new();
+            for clique in &cliques {
+                for i in 0..clique.len() {
+                    for j in (i + 1)..clique.len() {
+                        edges.push((clique[i], clique[j]));
+                    }
+                }
+            }
+            edges.push((3, 4));
+            edges.push((7, 8));
+            edges.push((11, 12));
+            let (offsets, neighbors) = csr_from_edges(n, &edges);
+            let g = CsrGraph {
+                n,
+                offsets: &offsets,
+                neighbors: &neighbors,
+            };
+            // Below threshold; the par variant delegates to sequential
+            // for n=16. Validate the contract regardless: the parallel
+            // path must satisfy the same quality property.
+            let perm = rabbit_order_par(g);
+            assert_valid_permutation(&perm, n as usize);
+
+            let p = perm.as_slice();
+            for clique in &cliques {
+                let mut min_pos = u32::MAX;
+                let mut max_pos = 0_u32;
+                for &v in clique {
+                    let pos = p[v as usize];
+                    if pos < min_pos {
+                        min_pos = pos;
+                    }
+                    if pos > max_pos {
+                        max_pos = pos;
+                    }
+                }
+                let span = max_pos - min_pos;
+                assert!(
+                    span <= 4,
+                    "clique {clique:?} span {span} exceeds tolerance (positions: {:?})",
+                    clique.iter().map(|&v| p[v as usize]).collect::<Vec<_>>()
+                );
+            }
+        }
+
+        #[test]
+        fn par_groups_clique_chain_above_threshold() {
+            // Quality property on the above-threshold graph: every
+            // 4-clique must have its 4 vertices in some contiguous (or
+            // very nearly contiguous) block of the output, allowing
+            // for the bridge-vertex absorption near boundaries.
+            let (n, offsets, neighbors) = large_clique_chain();
+            let g = CsrGraph {
+                n,
+                offsets: &offsets,
+                neighbors: &neighbors,
+            };
+            let perm = rabbit_order_par(g);
+            assert_valid_permutation(&perm, n as usize);
+            let p = perm.as_slice();
+            // Inspect every 50th clique to keep the assertion runtime
+            // bounded while still covering a representative slice.
+            let num_cliques = n / 4;
+            let mut tight = 0_u32;
+            let mut slack = 0_u32;
+            for k in (0..num_cliques).step_by(50) {
+                let base = k * 4;
+                let mut min_pos = u32::MAX;
+                let mut max_pos = 0_u32;
+                for offset in 0..4 {
+                    let pos = p[(base + offset) as usize];
+                    if pos < min_pos {
+                        min_pos = pos;
+                    }
+                    if pos > max_pos {
+                        max_pos = pos;
+                    }
+                }
+                let span = max_pos - min_pos;
+                if span <= 3 {
+                    tight += 1;
+                } else if span <= 6 {
+                    slack += 1;
+                }
+            }
+            // Expect overwhelmingly tight clique groupings; allow a
+            // small minority of slack outliers near community
+            // boundaries where the bridge vertex can be absorbed
+            // either way.
+            assert!(tight + slack > 0, "no cliques inspected; sampling broke?");
+            let total = tight + slack;
+            assert!(
+                tight * 5 >= total * 4,
+                "expected >=80% tight cliques, got tight={tight} slack={slack} total_inspected={total}"
+            );
         }
     }
 }
