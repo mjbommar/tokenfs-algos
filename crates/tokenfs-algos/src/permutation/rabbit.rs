@@ -530,7 +530,13 @@ fn dfs_visit_order(n: usize, merges: &[Merge]) -> Permutation {
         next_position as usize, n,
         "dfs_visit_order: missed a vertex"
     );
-    Permutation::from_vec_unchecked(perm)
+    // SAFETY: every vertex in `0..n` is either an unabsorbed root or the
+    // descendant of one. The DFS pre-order walk visits each vertex
+    // exactly once and assigns it a strictly increasing `next_position`
+    // in `0..n`. The debug assertion above checks the cardinality. Hence
+    // `perm` is a bijection on `0..n` with `n <= u32::MAX as usize`
+    // (vertex IDs are u32 by construction).
+    unsafe { Permutation::from_vec_unchecked(perm) }
 }
 
 #[cfg(test)]

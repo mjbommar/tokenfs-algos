@@ -127,7 +127,12 @@ pub fn hilbert_2d(points: &[(f32, f32)]) -> Permutation {
         // `rank < n <= u32::MAX as usize` so the cast is safe.
         perm[original_idx as usize] = rank as u32;
     }
-    Permutation::from_vec_unchecked(perm)
+    // SAFETY: `keyed` was built by mapping each input index `0..n` to
+    // exactly one entry, then sorted; the loop assigns each `original_idx`
+    // (covering `0..n` exactly once) the unique `rank` in `0..n`. Hence
+    // `perm` is a bijection on `0..n`, and `n <= u32::MAX as usize` is
+    // enforced by the asserts above.
+    unsafe { Permutation::from_vec_unchecked(perm) }
 }
 
 /// Computes a Hilbert curve ordering for N-dimensional points.
@@ -217,7 +222,12 @@ pub fn hilbert_nd(points: &[Vec<f32>], dim: usize) -> Permutation {
     for (rank, (_, original_idx)) in keyed.iter().enumerate() {
         perm[*original_idx as usize] = rank as u32;
     }
-    Permutation::from_vec_unchecked(perm)
+    // SAFETY: `keyed` was built by mapping each input index `0..n` to
+    // exactly one entry, then sorted; the loop assigns each `original_idx`
+    // (covering `0..n` exactly once) the unique `rank` in `0..n`. Hence
+    // `perm` is a bijection on `0..n`, and `n <= u32::MAX as usize` is
+    // enforced by the assert in the build loop above.
+    unsafe { Permutation::from_vec_unchecked(perm) }
 }
 
 /// Returns the `(min, max)` of a finite-valued axis iterator.

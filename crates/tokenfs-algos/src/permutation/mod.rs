@@ -111,14 +111,25 @@ impl Permutation {
         Self(perm)
     }
 
-    /// Constructs a [`Permutation`] from a raw `Vec<u32>` without checks.
+    /// Constructs a [`Permutation`] from a raw `Vec<u32>` WITHOUT
+    /// validating that it contains every index `0..n` exactly once.
     ///
-    /// The caller asserts that `perm` is a valid permutation: every
-    /// integer in `0..perm.len()` appears exactly once and `perm.len()
-    /// <= u32::MAX as usize`. Use [`Permutation::try_from_vec`] for the
-    /// checked constructor.
+    /// # Safety
+    ///
+    /// The caller must ensure `perm` is a valid permutation:
+    /// * `perm.len()` is the size of the underlying set and
+    ///   `perm.len() <= u32::MAX as usize`.
+    /// * Every index in `0..perm.len()` appears exactly once in `perm`.
+    ///
+    /// Constructing a [`Permutation`] that violates these invariants
+    /// does not trigger undefined behaviour directly (later operations
+    /// bounds-check) but causes panics, infinite loops in
+    /// [`Permutation::inverse`], or silently wrong results in
+    /// [`Permutation::apply`]. For untrusted input, prefer
+    /// [`Permutation::try_from_vec`], which validates the invariant in
+    /// O(n) time.
     #[must_use]
-    pub fn from_vec_unchecked(perm: Vec<u32>) -> Self {
+    pub unsafe fn from_vec_unchecked(perm: Vec<u32>) -> Self {
         Self(perm)
     }
 
@@ -156,9 +167,9 @@ impl Permutation {
         for (old_id, &new_id) in self.0.iter().enumerate() {
             // The constructor invariants guarantee `new_id < n`; the
             // unchecked indexing is correct under those invariants but
-            // we use the checked form so accidental construction via
-            // `from_vec_unchecked` with bad data still produces a
-            // panic instead of UB.
+            // we use the checked form so callers who broke the safety
+            // contract of `from_vec_unchecked` still get a panic
+            // instead of out-of-bounds writes.
             inv[new_id as usize] = old_id as u32;
         }
         Self(inv)
@@ -358,6 +369,35 @@ mod tests {
     fn try_from_vec_accepts_identity_and_reverse() {
         assert!(Permutation::try_from_vec(vec![0, 1, 2, 3]).is_some());
         assert!(Permutation::try_from_vec(vec![3, 2, 1, 0]).is_some());
+    }
+
+    #[test]
+    fn try_from_vec_rejects_length_mismatch() {
+        // Index `n` (out of range for length `n`) — covers the "length
+        // mismatch" branch where every entry is in-range for some larger
+        // domain but exceeds `perm.len() - 1` for this particular vector.
+        assert!(Permutation::try_from_vec(vec![1, 2, 3]).is_none());
+        // Mixed: in-range and out-of-range together.
+        assert!(Permutation::try_from_vec(vec![0, 1, 4]).is_none());
+    }
+
+    #[test]
+    fn try_from_vec_accepts_empty() {
+        // Empty Vec is the unique 0-length permutation (vacuous bijection).
+        let perm = Permutation::try_from_vec(Vec::<u32>::new()).expect("empty perm valid");
+        assert_eq!(perm.len(), 0);
+        assert!(perm.is_empty());
+    }
+
+    #[test]
+    fn from_vec_unchecked_round_trips_valid_input() {
+        // SAFETY: `[2, 0, 3, 1]` is a permutation of `0..4`.
+        let perm = unsafe { Permutation::from_vec_unchecked(vec![2_u32, 0, 3, 1]) };
+        assert_eq!(perm.as_slice(), &[2, 0, 3, 1]);
+        // The same bytes pass `try_from_vec`, demonstrating the two
+        // constructors agree on valid input.
+        let checked = Permutation::try_from_vec(vec![2_u32, 0, 3, 1]).expect("valid");
+        assert_eq!(perm, checked);
     }
 
     #[test]

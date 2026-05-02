@@ -117,7 +117,12 @@ pub fn rcm(graph: CsrGraph<'_>) -> Permutation {
 
     debug_assert_eq!(order.len(), n, "rcm: visit order length mismatch");
     order.reverse();
-    Permutation::from_vec_unchecked(order)
+    // SAFETY: `bfs_record_order` records every vertex exactly once via the
+    // `visited` mask, and the outer loop drains every connected component
+    // until `order.len() == n`. Reversing preserves the bijection. Hence
+    // `order` is a permutation of `0..n` with `n <= u32::MAX as usize`
+    // (CSR vertex IDs are u32 by construction).
+    unsafe { Permutation::from_vec_unchecked(order) }
 }
 
 /// Finds the lowest-degree unvisited vertex (tie-break: lowest ID).
