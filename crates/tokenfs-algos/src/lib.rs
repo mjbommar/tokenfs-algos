@@ -5,6 +5,20 @@
 //! structured so SIMD backends can be added without changing callers.
 
 #![cfg_attr(not(feature = "std"), no_std)]
+// AArch64 SVE / SVE2 intrinsics (`core::arch::aarch64::sv*`) are gated
+// behind the `stdarch_aarch64_sve` unstable feature today (rust-lang
+// tracking issue #145052). Opting in is required for any code that
+// touches the SVE/SVE2 module under our `sve` / `sve2` cargo features.
+// The umbrella `nightly` feature plus the architecture-specific cargo
+// flag keeps the attribute scoped to builds that actually want SVE.
+#![cfg_attr(
+    all(
+        feature = "nightly",
+        any(feature = "sve", feature = "sve2"),
+        target_arch = "aarch64"
+    ),
+    feature(stdarch_aarch64_sve)
+)]
 
 #[cfg(all(feature = "alloc", not(feature = "std")))]
 extern crate alloc;

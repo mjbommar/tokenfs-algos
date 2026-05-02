@@ -268,6 +268,18 @@ fn bench_byteclass_classify() {
                 black_box(unsafe { byteclass::kernels::neon::classify(black_box(&bytes)) });
             }),
         );
+        #[cfg(all(feature = "sve2", target_arch = "aarch64"))]
+        if byteclass::kernels::sve2::is_available() {
+            emit(
+                "byteclass-classify",
+                "sve2",
+                n,
+                measure(|| {
+                    // SAFETY: availability checked immediately above.
+                    black_box(unsafe { byteclass::kernels::sve2::classify(black_box(&bytes)) });
+                }),
+            );
+        }
     }
 }
 
@@ -430,6 +442,20 @@ fn bench_byteclass_validate_utf8() {
                 black_box(unsafe { byteclass::kernels::neon::validate_utf8(black_box(&bytes)) });
             }),
         );
+        #[cfg(all(feature = "sve2", target_arch = "aarch64"))]
+        if byteclass::kernels::sve2::is_available() {
+            emit(
+                "byteclass-validate-utf8",
+                "sve2",
+                n,
+                measure(|| {
+                    // SAFETY: availability checked immediately above.
+                    black_box(unsafe {
+                        byteclass::kernels::sve2::validate_utf8(black_box(&bytes))
+                    });
+                }),
+            );
+        }
     }
 }
 
@@ -466,6 +492,18 @@ fn bench_runlength_transitions() {
                 black_box(unsafe { runlength::kernels::neon::transitions(black_box(&bytes)) });
             }),
         );
+        #[cfg(all(feature = "sve2", target_arch = "aarch64"))]
+        if runlength::kernels::sve2::is_available() {
+            emit(
+                "runlength-transitions",
+                "sve2",
+                n,
+                measure(|| {
+                    // SAFETY: availability checked immediately above.
+                    black_box(unsafe { runlength::kernels::sve2::transitions(black_box(&bytes)) });
+                }),
+            );
+        }
     }
 }
 
@@ -542,6 +580,28 @@ fn bench_similarity_dot_f32() {
                 black_box(similarity::distance::dot_f32(black_box(&a), black_box(&b)));
             }),
         );
+        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+        emit(
+            "similarity-dot-f32",
+            "neon",
+            payload_bytes,
+            measure(|| {
+                // SAFETY: NEON is mandatory in the AArch64 ABI.
+                black_box(unsafe { sim_kernels::neon::dot_f32(black_box(&a), black_box(&b)) });
+            }),
+        );
+        #[cfg(all(feature = "sve", target_arch = "aarch64"))]
+        if sim_kernels::sve::is_available() {
+            emit(
+                "similarity-dot-f32",
+                "sve",
+                payload_bytes,
+                measure(|| {
+                    // SAFETY: availability checked immediately above.
+                    black_box(unsafe { sim_kernels::sve::dot_f32(black_box(&a), black_box(&b)) });
+                }),
+            );
+        }
     }
 }
 
@@ -678,6 +738,32 @@ fn bench_similarity_l2_squared_f32() {
                 ));
             }),
         );
+        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+        emit(
+            "similarity-l2-squared-f32",
+            "neon",
+            payload_bytes,
+            measure(|| {
+                // SAFETY: NEON is mandatory in the AArch64 ABI.
+                black_box(unsafe {
+                    sim_kernels::neon::l2_squared_f32(black_box(&a), black_box(&b))
+                });
+            }),
+        );
+        #[cfg(all(feature = "sve", target_arch = "aarch64"))]
+        if sim_kernels::sve::is_available() {
+            emit(
+                "similarity-l2-squared-f32",
+                "sve",
+                payload_bytes,
+                measure(|| {
+                    // SAFETY: availability checked immediately above.
+                    black_box(unsafe {
+                        sim_kernels::sve::l2_squared_f32(black_box(&a), black_box(&b))
+                    });
+                }),
+            );
+        }
     }
 }
 
