@@ -14,7 +14,9 @@
 
 #![allow(missing_docs)]
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use tokenfs_algos::similarity::{distance, kernels::scalar};
 
 const SIZES: [usize; 4] = [256, 1024, 4096, 16_384];

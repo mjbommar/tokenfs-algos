@@ -3,12 +3,13 @@
 use std::{
     env,
     fs::File,
+    hint::black_box,
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::OnceLock,
 };
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use tokenfs_algos::{
     byteclass, chunk, distribution, divergence, entropy, fingerprint, format, hash,
     histogram::{self, ByteHistogram},

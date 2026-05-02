@@ -3,8 +3,9 @@
 mod support;
 
 use std::env;
+use std::hint::black_box;
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use support::{
     AccessPattern, WorkloadInput, context_inputs_from_env, real_inputs_from_env, synthetic_inputs,
     workload_matrix_inputs_from_env, write_workload_manifest,

@@ -553,10 +553,12 @@ proptest! {
         // f32 reduction-order tolerance: scalar = left-to-right accumulator,
         // SIMD = pairwise tree (8 lanes for AVX2). Over 1024 floats with
         // input magnitude up to 1000 and cancellation possible, partial sums
-        // can be 10x the final sum, so relative error of ~1e-2 is the
-        // realistic floor. L2_squared has no cancellation (all squared
-        // terms are non-negative) so it stays within 5e-4.
-        prop_assert!((dot_s - dot_v).abs() / scale < 1e-2,
+        // can be 10x the final sum. Empirically (proptest case discovered on
+        // windows-aarch64 NEON) adversarial seeds reach ~2% relative error;
+        // 3% gives a safety margin without admitting genuine kernel bugs (a
+        // real divergence would be >>10%). L2_squared has no cancellation
+        // (all squared terms are non-negative) so it stays within 5e-4.
+        prop_assert!((dot_s - dot_v).abs() / scale < 3e-2,
             "dot_f32 diverged: scalar={dot_s} avx2={dot_v}");
 
         let l2_s = similarity::kernels::scalar::l2_squared_f32(&a, &b).unwrap();

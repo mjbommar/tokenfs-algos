@@ -5,7 +5,9 @@
 
 #![allow(missing_docs)]
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{Criterion, criterion_group, criterion_main};
 use tokenfs_algos::dispatch::{
     ApiContext, Backend, CacheState, ContentKind, EntropyClass, EntropyScale, ProcessorProfile,
     ReadPattern, SourceHint, WorkloadShape, plan_histogram,

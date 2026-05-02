@@ -364,9 +364,11 @@ proptest! {
         let scale = dot_s.abs().max(dot_v.abs()).max(1.0);
         // f32 reduction-order tolerance: see avx2_parity.rs for the full
         // explanation. dot_f32 over 1024 elements with cancellation can
-        // drift by ~1% (partial sums are O(10x) the final sum); L2_squared
-        // sums squared terms only so cancellation can't blow it up.
-        prop_assert!((dot_s - dot_v).abs() / scale < 1e-2,
+        // drift up to ~2% on adversarial seeds (windows-aarch64 NEON tree
+        // shape, observed flake at 1.86% on PR #2 CI); 3% gives a safety
+        // margin without admitting genuine kernel bugs. L2_squared sums
+        // squared terms only so cancellation can't blow it up.
+        prop_assert!((dot_s - dot_v).abs() / scale < 3e-2,
             "dot_f32 diverged: scalar={dot_s} neon={dot_v}");
 
         let l2_s = similarity::kernels::scalar::l2_squared_f32(&a, &b).unwrap();
