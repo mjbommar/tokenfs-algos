@@ -400,6 +400,241 @@ pub mod kernels {
         }
     }
 
+    /// Permutation-LUT byte classifier built on AVX-512 VBMI.
+    ///
+    /// Replaces the per-class `cmpeq + popcount` chain in
+    /// [`super::avx512::classify`] with a single 256-entry table lookup
+    /// per byte, then a small per-class popcount loop. The lookup is
+    /// driven by `_mm512_permutex2var_epi8` (`vpermi2b`), which selects
+    /// 64 bytes from the 128-byte concatenation of two source registers.
+    /// Two such lookups blended by the high bit of each input byte cover
+    /// the full 256-byte table.
+    ///
+    /// # Hardware requirements
+    ///
+    /// AVX-512 VBMI ships on Intel Ice Lake (2019) and newer client/server
+    /// parts (Tiger Lake, Sapphire Rapids, Granite Rapids). It is **not**
+    /// part of the AVX-512BW base. Notable absences:
+    ///
+    /// * AMD Zen 4 (e.g. EPYC 9004 / Ryzen 7000) implements AVX-512F/BW/VL
+    ///   and even VBMI2 + BITALG, but does **not** expose the original
+    ///   `vpermi2b` (`AVX512VBMI`) bit. Code paths that gate on `avx512vbmi`
+    ///   will fall back on those CPUs.
+    /// * Intel Alder Lake / Raptor Lake disabled AVX-512 in production
+    ///   microcode; this kernel never runs there.
+    ///
+    /// At time of writing only Intel Ice Lake-and-later runners can
+    /// execute this path; everywhere else the dispatch falls back to
+    /// [`super::avx512`] or below.
+    ///
+    /// # Why use it
+    ///
+    /// This kernel is a **generalization** of
+    /// [`super::avx512::classify`]: instead of hard-coding 4 named byte
+    /// classes (printable / control / whitespace / high-bit), it accepts
+    /// any `[u8; 256]` table mapping byte values to class indices in
+    /// `0..16`. That makes it suitable for ad-hoc classifiers (URL-safe
+    /// bytes, hex digits, base64 alphabets, JSON structural characters,
+    /// etc.) without writing bespoke kernels for each.
+    #[cfg(all(feature = "avx512", any(target_arch = "x86", target_arch = "x86_64")))]
+    pub mod avx512_vbmi {
+        use crate::byteclass::ByteClassCounts;
+
+        #[cfg(target_arch = "x86")]
+        use core::arch::x86::{
+            __m512i, _mm512_cmpeq_epi8_mask, _mm512_loadu_si512, _mm512_mask_blend_epi8,
+            _mm512_movepi8_mask, _mm512_permutex2var_epi8, _mm512_set1_epi8,
+        };
+        #[cfg(target_arch = "x86_64")]
+        use core::arch::x86_64::{
+            __m512i, _mm512_cmpeq_epi8_mask, _mm512_loadu_si512, _mm512_mask_blend_epi8,
+            _mm512_movepi8_mask, _mm512_permutex2var_epi8, _mm512_set1_epi8,
+        };
+
+        const LANES: usize = 64;
+
+        /// Maximum number of distinct class IDs supported by the LUT
+        /// kernels. Class IDs in tables passed to [`classify_with_lut`]
+        /// must be in `0..MAX_CLASSES`.
+        pub const MAX_CLASSES: usize = 16;
+
+        /// Returns true when AVX-512 VBMI is available at runtime.
+        ///
+        /// VBMI is **not** implied by AVX-512BW. AMD Zen 4 has BW but not
+        /// VBMI; Intel Ice Lake and later do.
+        #[cfg(feature = "std")]
+        #[must_use]
+        pub fn is_available() -> bool {
+            // VBMI is the precondition for `_mm512_permutex2var_epi8`
+            // (`vpermi2b`); BW is required for the per-class compare-mask
+            // intrinsics; the F base is implied by both.
+            std::is_x86_feature_detected!("avx512vbmi") && std::is_x86_feature_detected!("avx512bw")
+        }
+
+        /// Returns true when AVX-512 VBMI is available at runtime.
+        #[cfg(not(feature = "std"))]
+        #[must_use]
+        pub const fn is_available() -> bool {
+            false
+        }
+
+        /// Loads a contiguous 64-byte slice into an `__m512i`.
+        ///
+        /// # Safety
+        ///
+        /// Requires AVX-512 VBMI (and implicitly BW + F). `src` must be
+        /// readable for at least 64 bytes.
+        #[target_feature(enable = "avx512vbmi,avx512bw")]
+        #[inline]
+        unsafe fn load_table_chunk(src: &[u8; 64]) -> __m512i {
+            // SAFETY: `src` is a 64-byte array, which is the exact input
+            // width of `_mm512_loadu_si512`.
+            unsafe { _mm512_loadu_si512(src.as_ptr().cast::<__m512i>()) }
+        }
+
+        /// Counts coarse byte classes against an arbitrary `[u8; 256]`
+        /// class-index table.
+        ///
+        /// `class_table[b]` is the class index assigned to byte value `b`.
+        /// Indices must be in `0..MAX_CLASSES`. The returned array is
+        /// indexed by class: `counts[c]` is the number of input bytes that
+        /// mapped to class `c`. Entries beyond the maximum class index
+        /// used by the table remain zero.
+        ///
+        /// # Algorithm
+        ///
+        /// 1. The 256-byte `class_table` is split into four 64-byte halves.
+        ///    The first two form the "low" pair (covering byte values
+        ///    `0x00..0x7F`); the last two form the "high" pair (covering
+        ///    `0x80..0xFF`).
+        /// 2. For each 64-byte input chunk:
+        ///    * `lo = vpermi2b(chunk, low_pair)` — looks up `chunk[i]` for
+        ///      bytes in `0x00..0x7F`. `vpermi2b` ignores the high bit of
+        ///      its index, so this also produces a (wrong) value for bytes
+        ///      `0x80..0xFF`.
+        ///    * `hi = vpermi2b(chunk, high_pair)` — same shape, with the
+        ///      high half of the table.
+        ///    * `mask = movepi8_mask(chunk)` — high-bit-of-each-lane.
+        ///    * `classes = mask_blend(mask, lo, hi)` — picks `hi` where
+        ///      the input byte's high bit is set, `lo` otherwise.
+        /// 3. For each class `c` in `0..MAX_CLASSES`:
+        ///    `counts[c] += popcnt(cmpeq_mask(classes, splat(c)))`.
+        ///
+        /// The trailing tail (`bytes.len() % 64`) is handled by a scalar
+        /// loop against the same table.
+        ///
+        /// # Safety
+        ///
+        /// The caller must ensure the current CPU supports AVX-512 VBMI
+        /// (see [`is_available`]). Entries of `class_table` that are
+        /// `>= MAX_CLASSES` are silently discarded (the per-class
+        /// `cmpeq` loop only matches indices `0..MAX_CLASSES`); the
+        /// returned counts therefore may not sum to `bytes.len()` if
+        /// out-of-range entries were used.
+        #[target_feature(enable = "avx512vbmi,avx512bw")]
+        #[must_use]
+        #[allow(clippy::cast_possible_wrap)]
+        pub unsafe fn classify_with_lut(
+            bytes: &[u8],
+            class_table: &[u8; 256],
+        ) -> [u64; MAX_CLASSES] {
+            let mut counts = [0_u64; MAX_CLASSES];
+
+            // Pre-load the four 64-byte table halves once. The four
+            // sub-slices each have length exactly 64; the `try_into`
+            // calls into `&[u8; 64]` cannot fail. We use
+            // `unwrap_unchecked` to avoid a panic branch that the
+            // compiler might otherwise leave around the inlined loads.
+            //
+            // SAFETY: each of `[0..64]`, `[64..128]`, `[128..192]`,
+            // `[192..256]` slices a length-256 array at length-64
+            // strides, so the conversion to `&[u8; 64]` always
+            // succeeds. `load_table_chunk` requires `avx512vbmi+bw`,
+            // which is asserted by this function's `target_feature`.
+            let t0_arr: &[u8; 64] = unsafe { (&class_table[0..64]).try_into().unwrap_unchecked() };
+            let t1_arr: &[u8; 64] =
+                unsafe { (&class_table[64..128]).try_into().unwrap_unchecked() };
+            let t2_arr: &[u8; 64] =
+                unsafe { (&class_table[128..192]).try_into().unwrap_unchecked() };
+            let t3_arr: &[u8; 64] =
+                unsafe { (&class_table[192..256]).try_into().unwrap_unchecked() };
+            // SAFETY: target_feature(enable = "avx512vbmi,avx512bw")
+            // propagates to the helper.
+            let (t0, t1, t2, t3) = unsafe {
+                (
+                    load_table_chunk(t0_arr),
+                    load_table_chunk(t1_arr),
+                    load_table_chunk(t2_arr),
+                    load_table_chunk(t3_arr),
+                )
+            };
+
+            // Splat constants for each candidate class index.
+            // `_mm512_set1_epi8` is a safe-to-call `pub fn` when the
+            // enclosing function has `target_feature(enable = "avx512bw")`,
+            // which `target_feature(enable = "avx512vbmi,avx512bw")` does.
+            let class_splats: [__m512i; MAX_CLASSES] =
+                core::array::from_fn(|i| _mm512_set1_epi8(i as i8));
+
+            let mut index = 0;
+            while index + LANES <= bytes.len() {
+                // SAFETY: `index + 64 <= bytes.len()`; the unaligned 64-byte
+                // load reads from `bytes` which the bounds check above
+                // proves is in range.
+                let chunk =
+                    unsafe { _mm512_loadu_si512(bytes.as_ptr().add(index).cast::<__m512i>()) };
+
+                // Two LUT halves; blend by high-bit of each input byte.
+                // All four intrinsics are safe to call under
+                // `target_feature(avx512vbmi,avx512bw)`.
+                let lo = _mm512_permutex2var_epi8(t0, chunk, t1);
+                let hi = _mm512_permutex2var_epi8(t2, chunk, t3);
+                let high_bit_mask = _mm512_movepi8_mask(chunk);
+                let classes = _mm512_mask_blend_epi8(high_bit_mask, lo, hi);
+
+                // Per-class popcount via cmpeq-mask.
+                for (c, splat_c) in class_splats.iter().enumerate() {
+                    let class_mask = _mm512_cmpeq_epi8_mask(classes, *splat_c);
+                    counts[c] += u64::from(class_mask.count_ones());
+                }
+
+                index += LANES;
+            }
+
+            // Scalar tail.
+            for &byte in &bytes[index..] {
+                let c = class_table[byte as usize] as usize;
+                if c < MAX_CLASSES {
+                    counts[c] += 1;
+                }
+            }
+
+            counts
+        }
+
+        /// Convenience wrapper that translates the LUT result back into
+        /// the legacy [`ByteClassCounts`] shape, given a `class_table`
+        /// built by [`super::super::printable_control_whitespace_high_bit_table`].
+        ///
+        /// # Safety
+        ///
+        /// Same precondition as [`classify_with_lut`].
+        #[target_feature(enable = "avx512vbmi,avx512bw")]
+        #[must_use]
+        pub unsafe fn classify(bytes: &[u8]) -> ByteClassCounts {
+            let table = super::super::printable_control_whitespace_high_bit_table();
+            // SAFETY: target_feature(enable = "avx512vbmi,avx512bw") is set.
+            let counts = unsafe { classify_with_lut(bytes, &table) };
+            ByteClassCounts {
+                printable_ascii: counts[super::super::CLASS_PRINTABLE as usize],
+                whitespace: counts[super::super::CLASS_WHITESPACE as usize],
+                control: counts[super::super::CLASS_CONTROL as usize],
+                high_bit: counts[super::super::CLASS_HIGH_BIT as usize],
+                other: 0,
+            }
+        }
+    }
+
     /// AArch64 NEON byte-class classifier.
     ///
     /// Mirrors the AVX2 byte-class path. NEON has no movemask, so per-class
@@ -567,6 +802,94 @@ pub mod kernels {
     }
 }
 
+/// Class index used by [`printable_control_whitespace_high_bit_table`]
+/// for printable ASCII (`0x20..=0x7e`, excluding the space character).
+pub const CLASS_PRINTABLE: u8 = 0;
+/// Class index used by [`printable_control_whitespace_high_bit_table`]
+/// for ASCII whitespace (`\t`, `\n`, `\r`, ` `).
+pub const CLASS_WHITESPACE: u8 = 1;
+/// Class index used by [`printable_control_whitespace_high_bit_table`]
+/// for ASCII control bytes excluding whitespace
+/// (`0x00..=0x1f` minus whitespace, plus `0x7f`).
+pub const CLASS_CONTROL: u8 = 2;
+/// Class index used by [`printable_control_whitespace_high_bit_table`]
+/// for high-bit bytes (`0x80..=0xff`).
+pub const CLASS_HIGH_BIT: u8 = 3;
+
+/// Builds a 256-byte class-index table from a closure mapping each byte
+/// value to a class index.
+///
+/// Class indices must be in `0..16` (see
+/// [`kernels::avx512_vbmi::MAX_CLASSES`]) for the LUT-based classifier
+/// to produce well-defined per-class counts. The scalar reference path
+/// in [`classify_with_table`] handles arbitrary `u8` indices safely; it
+/// just rejects entries `>= 16`.
+#[must_use]
+pub fn class_table_from_fn<F: Fn(u8) -> u8>(f: F) -> [u8; 256] {
+    let mut out = [0_u8; 256];
+    let mut b: u32 = 0;
+    while b < 256 {
+        out[b as usize] = f(b as u8);
+        b += 1;
+    }
+    out
+}
+
+/// Returns the canonical 4-class table used by
+/// [`kernels::auto::classify`]: printable / whitespace / control /
+/// high-bit. Matches the indices declared by [`CLASS_PRINTABLE`],
+/// [`CLASS_WHITESPACE`], [`CLASS_CONTROL`], and [`CLASS_HIGH_BIT`].
+///
+/// Useful as a sanity-check input for [`classify_with_table`].
+#[must_use]
+pub fn printable_control_whitespace_high_bit_table() -> [u8; 256] {
+    class_table_from_fn(|b| match b {
+        b'\t' | b'\n' | b'\r' | b' ' => CLASS_WHITESPACE,
+        0x20..=0x7e => CLASS_PRINTABLE,
+        0x00..=0x1f | 0x7f => CLASS_CONTROL,
+        0x80..=0xff => CLASS_HIGH_BIT,
+    })
+}
+
+/// Counts bytes per class against an arbitrary `[u8; 256]` class-index
+/// table.
+///
+/// Uses [`kernels::avx512_vbmi::classify_with_lut`] when AVX-512 VBMI is
+/// available at runtime; otherwise falls back to a portable scalar loop.
+/// Class indices in the table must be in `0..16`; entries `>= 16` are
+/// counted into nothing (silently dropped).
+///
+/// The returned array is indexed by class: `counts[c]` is the number of
+/// input bytes that mapped to class `c`.
+#[must_use]
+pub fn classify_with_table(bytes: &[u8], class_table: &[u8; 256]) -> [u64; 16] {
+    #[cfg(all(
+        feature = "std",
+        feature = "avx512",
+        any(target_arch = "x86", target_arch = "x86_64")
+    ))]
+    {
+        if kernels::avx512_vbmi::is_available() {
+            // SAFETY: availability was checked immediately above.
+            return unsafe { kernels::avx512_vbmi::classify_with_lut(bytes, class_table) };
+        }
+    }
+
+    classify_with_table_scalar(bytes, class_table)
+}
+
+/// Portable scalar reference for [`classify_with_table`].
+fn classify_with_table_scalar(bytes: &[u8], class_table: &[u8; 256]) -> [u64; 16] {
+    let mut counts = [0_u64; 16];
+    for &byte in bytes {
+        let c = class_table[byte as usize] as usize;
+        if c < counts.len() {
+            counts[c] += 1;
+        }
+    }
+    counts
+}
+
 /// Counts coarse byte classes using the public runtime-dispatched path.
 #[must_use]
 pub fn classify(bytes: &[u8]) -> ByteClassCounts {
@@ -591,7 +914,11 @@ pub fn is_ascii_dominant(bytes: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify, is_ascii_dominant, kernels, validate_utf8};
+    use super::{
+        CLASS_CONTROL, CLASS_HIGH_BIT, CLASS_PRINTABLE, CLASS_WHITESPACE, class_table_from_fn,
+        classify, classify_with_table, classify_with_table_scalar, is_ascii_dominant, kernels,
+        printable_control_whitespace_high_bit_table, validate_utf8,
+    };
 
     #[test]
     fn classifies_ascii_text() {
@@ -727,6 +1054,217 @@ mod tests {
         // SAFETY: availability checked above.
         let actual = unsafe { kernels::avx512::validate_utf8(text.as_bytes()) };
         assert_eq!(actual, kernels::scalar::validate_utf8(text.as_bytes()));
+    }
+
+    #[test]
+    fn class_table_from_fn_round_trip() {
+        let table = printable_control_whitespace_high_bit_table();
+        for b in 0_u32..256 {
+            let expected = match b as u8 {
+                b'\t' | b'\n' | b'\r' | b' ' => CLASS_WHITESPACE,
+                0x20..=0x7e => CLASS_PRINTABLE,
+                0x00..=0x1f | 0x7f => CLASS_CONTROL,
+                0x80..=0xff => CLASS_HIGH_BIT,
+            };
+            assert_eq!(table[b as usize], expected, "table mismatch at byte {b}");
+        }
+    }
+
+    #[test]
+    fn classify_with_table_default_matches_named_classify() {
+        let table = printable_control_whitespace_high_bit_table();
+        for bytes in byteclass_cases() {
+            let lut_counts = classify_with_table(&bytes, &table);
+            let named = classify(&bytes);
+            assert_eq!(
+                lut_counts[CLASS_PRINTABLE as usize],
+                named.printable_ascii,
+                "printable mismatch on {}-byte case",
+                bytes.len()
+            );
+            assert_eq!(
+                lut_counts[CLASS_WHITESPACE as usize],
+                named.whitespace,
+                "whitespace mismatch on {}-byte case",
+                bytes.len()
+            );
+            assert_eq!(
+                lut_counts[CLASS_CONTROL as usize],
+                named.control,
+                "control mismatch on {}-byte case",
+                bytes.len()
+            );
+            assert_eq!(
+                lut_counts[CLASS_HIGH_BIT as usize],
+                named.high_bit,
+                "high-bit mismatch on {}-byte case",
+                bytes.len()
+            );
+        }
+    }
+
+    #[test]
+    fn classify_with_table_alpha_digit_other() {
+        // 4-class table: 0=upper, 1=lower, 2=digit, 3=other.
+        let table = class_table_from_fn(|b| match b {
+            b'A'..=b'Z' => 0,
+            b'a'..=b'z' => 1,
+            b'0'..=b'9' => 2,
+            _ => 3,
+        });
+
+        let payload = b"Hello, World 12345! Foo Bar 678";
+        let counts = classify_with_table(payload, &table);
+
+        // "H", "W", "F", "B" -> 4 uppercase
+        // "ello", "orld", "oo", "ar" -> 4+4+2+2 = 12 lowercase
+        // "12345", "678" -> 8 digits
+        // remainder = total - (upper + lower + digit)
+        let upper = counts[0];
+        let lower = counts[1];
+        let digit = counts[2];
+        let other = counts[3];
+
+        assert_eq!(upper, 4, "uppercase count");
+        assert_eq!(lower, 12, "lowercase count");
+        assert_eq!(digit, 8, "digit count");
+        assert_eq!(
+            upper + lower + digit + other,
+            payload.len() as u64,
+            "total covers payload"
+        );
+    }
+
+    #[test]
+    fn classify_with_table_scalar_fallback_matches_self() {
+        // Drives the scalar fallback path explicitly to confirm it agrees
+        // with itself across edge cases (length 0, 1, 63, 64, 65, ...).
+        let table = printable_control_whitespace_high_bit_table();
+        for bytes in byteclass_cases() {
+            assert_eq!(
+                classify_with_table_scalar(&bytes, &table),
+                {
+                    let mut expected = [0_u64; 16];
+                    for &b in &bytes {
+                        let c = table[b as usize] as usize;
+                        if c < expected.len() {
+                            expected[c] += 1;
+                        }
+                    }
+                    expected
+                },
+                "scalar fallback self-consistency on {}-byte case",
+                bytes.len()
+            );
+        }
+    }
+
+    #[cfg(all(
+        feature = "std",
+        feature = "avx512",
+        any(target_arch = "x86", target_arch = "x86_64")
+    ))]
+    #[test]
+    fn avx512_vbmi_classify_with_lut_matches_scalar_when_available() {
+        if !kernels::avx512_vbmi::is_available() {
+            return;
+        }
+
+        let table = printable_control_whitespace_high_bit_table();
+        let base = byteclass_cases()
+            .into_iter()
+            .flatten()
+            .cycle()
+            .take(16 * 1024 + 127)
+            .collect::<Vec<_>>();
+        for start in 0..64 {
+            for len in [
+                0_usize, 1, 2, 7, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 4096, 8191,
+            ] {
+                let end = (start + len).min(base.len());
+                let bytes = &base[start..end];
+                // SAFETY: availability was checked above.
+                let actual = unsafe { kernels::avx512_vbmi::classify_with_lut(bytes, &table) };
+                let expected = classify_with_table_scalar(bytes, &table);
+                assert_eq!(
+                    actual,
+                    expected,
+                    "VBMI LUT mismatch at start {start}, len {}",
+                    bytes.len()
+                );
+            }
+        }
+    }
+
+    #[cfg(all(
+        feature = "std",
+        feature = "avx512",
+        any(target_arch = "x86", target_arch = "x86_64")
+    ))]
+    #[test]
+    fn avx512_vbmi_classify_named_matches_scalar_when_available() {
+        if !kernels::avx512_vbmi::is_available() {
+            return;
+        }
+
+        for bytes in byteclass_cases() {
+            // SAFETY: availability was checked above.
+            let actual = unsafe { kernels::avx512_vbmi::classify(&bytes) };
+            let expected = kernels::scalar::classify(&bytes);
+            assert_eq!(
+                actual.printable_ascii,
+                expected.printable_ascii,
+                "VBMI named printable mismatch ({}-byte)",
+                bytes.len()
+            );
+            assert_eq!(
+                actual.whitespace,
+                expected.whitespace,
+                "VBMI named whitespace mismatch ({}-byte)",
+                bytes.len()
+            );
+            assert_eq!(
+                actual.control,
+                expected.control,
+                "VBMI named control mismatch ({}-byte)",
+                bytes.len()
+            );
+            assert_eq!(
+                actual.high_bit,
+                expected.high_bit,
+                "VBMI named high-bit mismatch ({}-byte)",
+                bytes.len()
+            );
+        }
+    }
+
+    #[cfg(all(
+        feature = "std",
+        feature = "avx512",
+        any(target_arch = "x86", target_arch = "x86_64")
+    ))]
+    #[test]
+    fn avx512_vbmi_lut_alpha_digit_table_when_available() {
+        if !kernels::avx512_vbmi::is_available() {
+            return;
+        }
+
+        let table = class_table_from_fn(|b| match b {
+            b'A'..=b'Z' => 0,
+            b'a'..=b'z' => 1,
+            b'0'..=b'9' => 2,
+            _ => 3,
+        });
+        // Build a chunk longer than one 64-byte stride so the SIMD loop
+        // body runs at least once and the scalar tail is exercised.
+        let mut text = Vec::with_capacity(200);
+        text.extend_from_slice(b"Hello, World 12345! Foo Bar 678 ");
+        text.extend_from_slice(b"qwertyuiopASDFGHJKL12345!@#$%^&*()_+");
+        text.extend_from_slice(b"ZZZZZZZZZ aaaaa  9090909090 ABCDEFG ");
+        // SAFETY: availability checked above.
+        let actual = unsafe { kernels::avx512_vbmi::classify_with_lut(&text, &table) };
+        let expected = classify_with_table_scalar(&text, &table);
+        assert_eq!(actual, expected);
     }
 
     fn byteclass_cases() -> Vec<Vec<u8>> {

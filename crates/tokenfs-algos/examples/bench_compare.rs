@@ -47,6 +47,7 @@ fn main() {
     bench_byte_value_moments();
     bench_fingerprint_block();
     bench_byteclass_classify();
+    bench_byteclass_classify_lut();
     bench_byteclass_validate_utf8();
     bench_runlength_transitions();
     bench_sketch_crc32_hash4();
@@ -256,6 +257,102 @@ fn bench_byteclass_classify() {
                 black_box(unsafe { byteclass::kernels::neon::classify(black_box(&bytes)) });
             }),
         );
+    }
+}
+
+fn bench_byteclass_classify_lut() {
+    // 4-class table: same partition as the named `ByteClassCounts`
+    // (printable / whitespace / control / high-bit), so this row is
+    // directly comparable to `byteclass-classify` above.
+    let table_4 = byteclass::printable_control_whitespace_high_bit_table();
+    // 16-class table: ASCII letters split by case, digits, and 13 fine
+    // partitions over the rest of the byte range, exercising every
+    // class slot in the kernel's fixed `MAX_CLASSES`-wide popcount loop.
+    let table_16 = byteclass::class_table_from_fn(|b| match b {
+        b'A'..=b'Z' => 0,
+        b'a'..=b'z' => 1,
+        b'0'..=b'9' => 2,
+        b' ' | b'\t' => 3,
+        b'\n' | b'\r' => 4,
+        b'.' | b',' | b';' | b':' | b'?' | b'!' => 5,
+        b'(' | b')' | b'[' | b']' | b'{' | b'}' => 6,
+        b'<' | b'>' | b'/' | b'\\' | b'|' => 7,
+        b'+' | b'-' | b'*' | b'%' | b'^' | b'&' => 8,
+        b'\'' | b'"' | b'`' => 9,
+        b'_' | b'$' | b'#' | b'@' => 10,
+        b'~' | b'=' => 11,
+        0x00..=0x1f | 0x7f => 12,
+        0x80..=0xbf => 13,
+        0xc0..=0xdf => 14,
+        0xe0..=0xff => 15,
+    });
+
+    for &n in PAYLOAD_SIZES_BYTES {
+        let bytes = make_text_bytes(n);
+
+        emit(
+            "byteclass-classify-lut-c4",
+            "scalar",
+            n,
+            measure(|| {
+                black_box(byteclass::classify_with_table(black_box(&bytes), &table_4));
+            }),
+        );
+        emit(
+            "byteclass-classify-lut-c16",
+            "scalar",
+            n,
+            measure(|| {
+                black_box(byteclass::classify_with_table(black_box(&bytes), &table_16));
+            }),
+        );
+
+        // Existing AVX-512BW kernel for direct comparison against the new
+        // permute kernel on the 4-class table.
+        #[cfg(all(feature = "avx512", any(target_arch = "x86", target_arch = "x86_64")))]
+        if byteclass::kernels::avx512::is_available() {
+            emit(
+                "byteclass-classify-lut-c4",
+                "avx512bw-cmp-popcnt",
+                n,
+                measure(|| {
+                    // SAFETY: availability checked immediately above.
+                    black_box(unsafe { byteclass::kernels::avx512::classify(black_box(&bytes)) });
+                }),
+            );
+        }
+
+        #[cfg(all(feature = "avx512", any(target_arch = "x86", target_arch = "x86_64")))]
+        if byteclass::kernels::avx512_vbmi::is_available() {
+            emit(
+                "byteclass-classify-lut-c4",
+                "avx512vbmi-permute",
+                n,
+                measure(|| {
+                    // SAFETY: availability checked immediately above.
+                    black_box(unsafe {
+                        byteclass::kernels::avx512_vbmi::classify_with_lut(
+                            black_box(&bytes),
+                            &table_4,
+                        )
+                    });
+                }),
+            );
+            emit(
+                "byteclass-classify-lut-c16",
+                "avx512vbmi-permute",
+                n,
+                measure(|| {
+                    // SAFETY: availability checked immediately above.
+                    black_box(unsafe {
+                        byteclass::kernels::avx512_vbmi::classify_with_lut(
+                            black_box(&bytes),
+                            &table_16,
+                        )
+                    });
+                }),
+            );
+        }
     }
 }
 
