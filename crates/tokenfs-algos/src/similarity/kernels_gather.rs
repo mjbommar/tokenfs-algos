@@ -94,15 +94,15 @@ pub mod avx2 {
 
     #[cfg(target_arch = "x86")]
     use core::arch::x86::{
-        __m128i, __m256i, _mm256_blendv_epi8, _mm256_cmpgt_epi64, _mm256_i32gather_epi64,
-        _mm256_loadu_si256, _mm256_set1_epi64x, _mm256_setr_epi32, _mm256_storeu_si256,
-        _mm256_xor_si256,
+        __m128i, __m256i, _mm256_blendv_epi8, _mm256_castsi256_si128, _mm256_cmpgt_epi64,
+        _mm256_i32gather_epi64, _mm256_loadu_si256, _mm256_set1_epi64x, _mm256_setr_epi32,
+        _mm256_storeu_si256, _mm256_xor_si256,
     };
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::{
-        __m128i, __m256i, _mm256_blendv_epi8, _mm256_cmpgt_epi64, _mm256_i32gather_epi64,
-        _mm256_loadu_si256, _mm256_set1_epi64x, _mm256_setr_epi32, _mm256_storeu_si256,
-        _mm256_xor_si256,
+        __m128i, __m256i, _mm256_blendv_epi8, _mm256_castsi256_si128, _mm256_cmpgt_epi64,
+        _mm256_i32gather_epi64, _mm256_loadu_si256, _mm256_set1_epi64x, _mm256_setr_epi32,
+        _mm256_storeu_si256, _mm256_xor_si256,
     };
 
     /// Returns true when AVX2 is available. The gather + unsigned-min
@@ -180,11 +180,11 @@ pub mod avx2 {
             // We only need the low 4 i32 lanes of the __m256i for
             // `_mm256_i32gather_epi64`; encode (0,1,2,3).
             let v: __m256i = _mm256_setr_epi32(0, 1, 2, 3, 0, 0, 0, 0);
-            core::arch::x86_64::_mm256_castsi256_si128(v)
+            _mm256_castsi256_si128(v)
         };
         let idx_hi: __m128i = {
             let v: __m256i = _mm256_setr_epi32(4, 5, 6, 7, 0, 0, 0, 0);
-            core::arch::x86_64::_mm256_castsi256_si128(v)
+            _mm256_castsi256_si128(v)
         };
 
         let row_stride_bytes = core::mem::size_of::<[u64; 8]>();

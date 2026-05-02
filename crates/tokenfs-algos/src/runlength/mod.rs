@@ -174,11 +174,22 @@ pub mod kernels {
         /// fit in L1.
         const UNROLL_LANES: usize = LANES * 2;
 
-        /// Returns true when AVX2 is available at runtime.
+        /// Returns true when AVX2 + BMI2 + LZCNT are all available at
+        /// runtime.
+        ///
+        /// The transitions kernel is annotated with
+        /// `target_feature(enable = "avx2,bmi2,lzcnt")` so LLVM can emit
+        /// BMI2 / LZCNT instructions inside the function body. Calling
+        /// it on a CPU that exposes AVX2 but not BMI2 (KVM without
+        /// CPUID passthrough, very old Atom cores, some sandbox
+        /// configurations) is undefined behaviour. All three checks
+        /// here keep the dispatch sound.
         #[cfg(feature = "std")]
         #[must_use]
         pub fn is_available() -> bool {
             std::is_x86_feature_detected!("avx2")
+                && std::is_x86_feature_detected!("bmi2")
+                && std::is_x86_feature_detected!("lzcnt")
         }
 
         /// Returns true when AVX2 is available at runtime.

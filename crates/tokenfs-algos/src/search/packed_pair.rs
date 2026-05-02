@@ -29,7 +29,9 @@
 //! - Space: four bytes (`byte0`, `byte1`, two `usize`s) plus the needle
 //!   reference. No per-byte tables.
 
-#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(all(feature = "std", target_arch = "x86"))]
+use core::arch::x86;
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
 use core::arch::x86_64 as x86;
 
 /// Packed-pair substring matcher.

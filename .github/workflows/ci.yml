@@ -124,6 +124,16 @@ jobs:
       - name: Test (bench-internals feature)
         run: cargo test -p tokenfs-algos --features bench-internals
 
+      # SVE2 backends only compile under target_arch = "aarch64" + the
+      # `sve` / `sve2` cargo features. The Linux Cobalt-100 runner has
+      # SVE2 hardware (svebitperm + sveaes + svesha3 + svesm4 + svebf16
+      # + svei8mm); without this step the SVE parity tests never fire
+      # against real silicon. macOS M1 has no SVE so the cfg gate skips
+      # the kernels entirely (the test suite is a no-op there).
+      - name: Test (SVE/SVE2 features on aarch64)
+        if: matrix.arch == 'aarch64'
+        run: cargo test -p tokenfs-algos --features nightly,sve,sve2
+
       - name: Build benchmarks (no-run, smoke-check)
         run: |
           cargo bench -p tokenfs-algos --features bench-internals --bench primitives --no-run

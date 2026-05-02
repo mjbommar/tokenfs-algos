@@ -242,10 +242,19 @@ pub struct BackendKernelSupport {
     pub byte_histogram: KernelAvailability,
     /// F22/content fingerprint implementation status.
     pub fingerprint: KernelAvailability,
-    /// Byte-class implementation status.
+    /// Byte-class (classify + UTF-8 validation) implementation status.
     pub byte_class: KernelAvailability,
-    /// Sketch/hash-bin implementation status.
+    /// Sketch / hash-bin (CRC32C-driven) implementation status.
     pub sketch: KernelAvailability,
+    /// Run-length transition counter implementation status.
+    pub runlength: KernelAvailability,
+    /// Similarity f32 distance kernels (dot, L2², cosine).
+    pub similarity: KernelAvailability,
+    /// SHA-256 hash implementation status. SHA-NI on x86 and FEAT_SHA2
+    /// on aarch64 are dispatched independently of the surrounding
+    /// SIMD backend; this field reports whether the SHA hardware path
+    /// is reachable on a CPU class that exposes this `Backend`.
+    pub hash_sha256: KernelAvailability,
 }
 
 /// Returns current primitive implementation coverage for `backend`.
@@ -258,42 +267,81 @@ pub const fn backend_kernel_support(backend: Backend) -> BackendKernelSupport {
     match backend {
         Backend::Avx2 => BackendKernelSupport {
             backend,
+            // Native: histogram (avx2_stripe4_u32, avx2_palette_u32,
+            // avx2_rle_stripe4_u32), fingerprint (kernels::avx2),
+            // byteclass classify + utf8 (kernels::avx2 + utf8_avx2),
+            // sketch CRC32C (kernels::sse42 — runs on every CPU that
+            // has AVX2 in practice), runlength (kernels::avx2 with
+            // BMI2/LZCNT gating), similarity dot/l2/cosine f32
+            // (kernels::avx2). hash_sha256 = Native because every CPU
+            // that exposes AVX2 is also a Goldmont+ / Zen+ class part
+            // that exposes SHA-NI, and the dispatch picks SHA-NI when
+            // is_x86_feature_detected!("sha") returns true.
             byte_histogram: KernelAvailability::Native,
             fingerprint: KernelAvailability::Native,
             byte_class: KernelAvailability::Native,
             sketch: KernelAvailability::Native,
+            runlength: KernelAvailability::Native,
+            similarity: KernelAvailability::Native,
+            hash_sha256: KernelAvailability::Native,
         },
         Backend::Neon => BackendKernelSupport {
             backend,
-            // Histogram, fingerprint, sketch don't have NEON kernels yet —
-            // see byteclass::kernels::neon for the first NEON path.
+            // Native: fingerprint (#37 — fingerprint::neon::block),
+            // byteclass classify + utf8 (kernels::neon + utf8_neon),
+            // sketch CRC32C (#45 — kernels::neon, hardware __crc32cw),
+            // runlength (kernels::neon), similarity f32 distance
+            // (kernels::neon), hash_sha256 (FEAT_SHA2 on aarch64,
+            // dispatched separately by sha256::aarch64_sha2). Histogram
+            // doesn't have a NEON kernel yet — `svhistseg_u8` would be
+            // the natural SVE2 candidate; standalone NEON byte-histogram
+            // is still future work.
             byte_histogram: KernelAvailability::ScalarFallback,
-            fingerprint: KernelAvailability::ScalarFallback,
+            fingerprint: KernelAvailability::Native,
             byte_class: KernelAvailability::Native,
-            sketch: KernelAvailability::ScalarFallback,
+            sketch: KernelAvailability::Native,
+            runlength: KernelAvailability::Native,
+            similarity: KernelAvailability::Native,
+            hash_sha256: KernelAvailability::Native,
         },
         Backend::Avx512 => BackendKernelSupport {
             backend,
-            // Byte-class kernels exist behind the `avx512` cargo feature
-            // (see byteclass::kernels::avx512); the rest still fall back
-            // to scalar until parity-tested kernels land.
+            // Native: byteclass classify + utf8 (kernels::avx512 +
+            // utf8_avx512 from #38; VBMI variant added in #47/#60),
+            // sketch CRC32C (SSE4.2 path — every AVX-512 CPU has it),
+            // runlength (AVX-512BW could replace AVX2 here but the
+            // existing AVX2+BMI2 path already wins; reported as Native
+            // because the AVX2 kernel runs unchanged on AVX-512 hosts),
+            // similarity (AVX2 kernel, same logic), hash_sha256 (SHA-NI).
+            // BITALG/GFNI bit-marginals (#51/#52) emit 8 marginals, NOT
+            // a 256-bin histogram, so byte_histogram stays ScalarFallback.
+            // Native AVX-512 fingerprint is future work.
             byte_histogram: KernelAvailability::ScalarFallback,
             fingerprint: KernelAvailability::ScalarFallback,
             byte_class: KernelAvailability::Native,
-            sketch: KernelAvailability::ScalarFallback,
+            sketch: KernelAvailability::Native,
+            runlength: KernelAvailability::Native,
+            similarity: KernelAvailability::Native,
+            hash_sha256: KernelAvailability::Native,
         },
         Backend::Sve | Backend::Sve2 => BackendKernelSupport {
             backend,
-            // SVE2-native kernels live in `byteclass::kernels::sve2`,
-            // `runlength::kernels::sve2`, and the f32 distance fns in
-            // `similarity::kernels::sve`. Histogram, fingerprint, and
-            // sketch families still fall back to scalar — those are
-            // candidates for future SVE2 work (`svhistseg_u8` for the
-            // byte histogram in particular looks promising).
+            // Native (SVE2): byteclass classify + utf8 (#41 —
+            // kernels::sve2), runlength (#41 — kernels::sve2 with
+            // svcntp_b8 popcount-of-mask). Native (SVE base ISA):
+            // similarity dot/l2/cosine f32 (#41 — kernels::sve, runs on
+            // both SVE and SVE2 hardware). NEON-mandatory paths
+            // (fingerprint + sketch CRC32C) compose cleanly because
+            // every SVE-capable AArch64 CPU also exposes NEON; reported
+            // as Native via NEON delegation. Histogram is the same gap
+            // as Backend::Neon.
             byte_histogram: KernelAvailability::ScalarFallback,
-            fingerprint: KernelAvailability::ScalarFallback,
+            fingerprint: KernelAvailability::Native,
             byte_class: KernelAvailability::Native,
-            sketch: KernelAvailability::ScalarFallback,
+            sketch: KernelAvailability::Native,
+            runlength: KernelAvailability::Native,
+            similarity: KernelAvailability::Native,
+            hash_sha256: KernelAvailability::Native,
         },
         Backend::Scalar => BackendKernelSupport {
             backend,
@@ -301,6 +349,9 @@ pub const fn backend_kernel_support(backend: Backend) -> BackendKernelSupport {
             fingerprint: KernelAvailability::Native,
             byte_class: KernelAvailability::Native,
             sketch: KernelAvailability::Native,
+            runlength: KernelAvailability::Native,
+            similarity: KernelAvailability::Native,
+            hash_sha256: KernelAvailability::Native,
         },
         // Detection-only accelerators: no kernels are wired in yet, so
         // every primitive falls back to scalar code today.
@@ -310,6 +361,9 @@ pub const fn backend_kernel_support(backend: Backend) -> BackendKernelSupport {
             fingerprint: KernelAvailability::ScalarFallback,
             byte_class: KernelAvailability::ScalarFallback,
             sketch: KernelAvailability::ScalarFallback,
+            runlength: KernelAvailability::ScalarFallback,
+            similarity: KernelAvailability::ScalarFallback,
+            hash_sha256: KernelAvailability::ScalarFallback,
         },
     }
 }
@@ -1618,32 +1672,55 @@ mod tests {
 
     #[test]
     fn backend_support_is_honest_about_future_backends() {
+        // AVX2 has full coverage across every primitive family today.
         let avx2 = backend_kernel_support(Backend::Avx2);
         assert_eq!(avx2.byte_histogram, KernelAvailability::Native);
         assert_eq!(avx2.fingerprint, KernelAvailability::Native);
+        assert_eq!(avx2.byte_class, KernelAvailability::Native);
+        assert_eq!(avx2.sketch, KernelAvailability::Native);
+        assert_eq!(avx2.runlength, KernelAvailability::Native);
+        assert_eq!(avx2.similarity, KernelAvailability::Native);
+        assert_eq!(avx2.hash_sha256, KernelAvailability::Native);
 
-        // NEON has a real byte-class kernel (see byteclass::kernels::neon).
-        // Other primitive families on NEON remain scalar fallback until
-        // parity-tested kernels exist.
+        // NEON ships native byte-class (kernels::neon), fingerprint
+        // (#37), sketch CRC32C via __crc32cw (#45), runlength,
+        // similarity, and hash_sha256 (FEAT_SHA2 dispatched separately).
+        // Byte-histogram is the remaining gap on NEON.
         let neon = backend_kernel_support(Backend::Neon);
         assert_eq!(neon.byte_class, KernelAvailability::Native);
+        assert_eq!(neon.fingerprint, KernelAvailability::Native);
+        assert_eq!(neon.sketch, KernelAvailability::Native);
+        assert_eq!(neon.runlength, KernelAvailability::Native);
+        assert_eq!(neon.similarity, KernelAvailability::Native);
+        assert_eq!(neon.hash_sha256, KernelAvailability::Native);
         assert_eq!(neon.byte_histogram, KernelAvailability::ScalarFallback);
-        assert_eq!(neon.fingerprint, KernelAvailability::ScalarFallback);
-        assert_eq!(neon.sketch, KernelAvailability::ScalarFallback);
 
-        for backend in [Backend::Avx512, Backend::Sve, Backend::Sve2] {
-            let support = backend_kernel_support(backend);
-            assert_eq!(support.byte_histogram, KernelAvailability::ScalarFallback);
-            assert_eq!(support.fingerprint, KernelAvailability::ScalarFallback);
-        }
+        // AVX-512 ships native byte-class (#38, #47, #60). The bit-marginal
+        // BITALG/GFNI kernels (#51/#52) emit 8 marginals, NOT a 256-bin
+        // histogram, so byte_histogram stays ScalarFallback. fingerprint
+        // is the remaining gap. sketch/runlength/similarity/sha256 are
+        // composed from AVX2/SSE4.2/SHA-NI which every AVX-512 host
+        // exposes — reported as Native.
+        let avx512 = backend_kernel_support(Backend::Avx512);
+        assert_eq!(avx512.byte_class, KernelAvailability::Native);
+        assert_eq!(avx512.byte_histogram, KernelAvailability::ScalarFallback);
+        assert_eq!(avx512.fingerprint, KernelAvailability::ScalarFallback);
 
-        // SVE / SVE2 ship a native byte-class classifier
-        // (`byteclass::kernels::sve2::classify`); the histogram/fingerprint/
-        // sketch families remain scalar fallback today.
+        // SVE / SVE2 ship native byte-class classify + UTF-8 (#41),
+        // runlength (#41 svcntp_b8), similarity (#41 svmla_f32_m). NEON-
+        // mandatory paths (fingerprint, sketch CRC32C, hash_sha256 via
+        // FEAT_SHA2) compose cleanly because every SVE host also exposes
+        // NEON. Byte-histogram is the remaining gap (svhistseg_u8 is
+        // future work).
         for backend in [Backend::Sve, Backend::Sve2] {
             let support = backend_kernel_support(backend);
             assert_eq!(support.byte_class, KernelAvailability::Native);
-            assert_eq!(support.sketch, KernelAvailability::ScalarFallback);
+            assert_eq!(support.fingerprint, KernelAvailability::Native);
+            assert_eq!(support.sketch, KernelAvailability::Native);
+            assert_eq!(support.runlength, KernelAvailability::Native);
+            assert_eq!(support.similarity, KernelAvailability::Native);
+            assert_eq!(support.hash_sha256, KernelAvailability::Native);
+            assert_eq!(support.byte_histogram, KernelAvailability::ScalarFallback);
         }
     }
 

@@ -894,7 +894,7 @@ pub mod neon {
 ///
 /// # Why SVE here
 ///
-/// SVE's predicated FMA (`svmla_f32_x`) plus the active-lane predicate
+/// SVE's predicated FMA (`svmla_f32_m`) plus the active-lane predicate
 /// (`svwhilelt_b32`) is the textbook win over fixed-128-bit NEON for
 /// floating-point reductions: one vector-length-agnostic loop
 /// processes the whole input, the tail iteration zeros inactive lanes
@@ -908,7 +908,7 @@ pub mod neon {
 /// that is the VLA promise.
 ///
 /// Note: this module compiles under the `sve` cargo feature, not
-/// `sve2`. The intrinsics used here (`svmla_f32_x`, `svwhilelt_b32`,
+/// `sve2`. The intrinsics used here (`svmla_f32_m`, `svwhilelt_b32`,
 /// `svaddv_f32`) all live in the SVE base ISA. SVE2 is a strict
 /// superset; everything compiled here also runs on SVE2 hardware.
 ///
@@ -922,7 +922,7 @@ pub mod neon {
 #[cfg(all(feature = "sve", target_arch = "aarch64"))]
 pub mod sve {
     use core::arch::aarch64::{
-        svaddv_f32, svcntw, svdup_n_f32, svld1_f32, svmla_f32_x, svptest_any, svptrue_b32,
+        svaddv_f32, svcntw, svdup_n_f32, svld1_f32, svmla_f32_m, svptest_any, svptrue_b32,
         svsub_f32_x, svwhilelt_b32_u64,
     };
 
@@ -966,14 +966,16 @@ pub mod sve {
             // does not fault past valid memory.
             let va = unsafe { svld1_f32(pg, pa.add(i as usize)) };
             let vb = unsafe { svld1_f32(pg, pb.add(i as usize)) };
-            // svmla_f32_x: acc = acc + va * vb under predicate `pg`.
-            // Inactive lanes leave `acc` unchanged (the "_x" suffix
-            // means "don't care" for inactive lanes, but the LLVM
-            // lowering preserves them in practice — the contributions
-            // to the running sum are zero either way because `va * vb`
-            // for an inactive lane is multiplied by the implicit-zero
-            // load result).
-            acc = svmla_f32_x(pg, acc, va, vb);
+            // svmla_f32_m: acc = acc + va * vb under predicate `pg`,
+            // with inactive lanes preserved from `acc`. The merge
+            // ("_m") variant is required here — the don't-care ("_x")
+            // variant leaves inactive lanes implementation-defined,
+            // and the subsequent svaddv_f32 sums every lane, so any
+            // garbage in inactive lanes would poison the reduction on
+            // tail iterations. Real ARM cores are allowed to leave
+            // inactive lanes as previous register state; QEMU happens
+            // to zero them, masking the bug locally.
+            acc = svmla_f32_m(pg, acc, va, vb);
             i += step;
         }
 
@@ -1006,7 +1008,11 @@ pub mod sve {
             let va = unsafe { svld1_f32(pg, pa.add(i as usize)) };
             let vb = unsafe { svld1_f32(pg, pb.add(i as usize)) };
             let d = svsub_f32_x(pg, va, vb);
-            acc = svmla_f32_x(pg, acc, d, d);
+            // svmla_f32_m: see dot_f32 — _m preserves `acc` in inactive
+            // lanes so the trailing svaddv_f32 reduction stays correct.
+            // Garbage in inactive lanes of `d` is harmless because the
+            // _m variant ignores the new computation entirely there.
+            acc = svmla_f32_m(pg, acc, d, d);
             i += step;
         }
 
