@@ -18,6 +18,10 @@ pub use crate::fingerprint::{
     FingerprintKernelInfo, block as fingerprint_block, extent as fingerprint_extent,
     kernel_catalog as fingerprint_kernel_catalog,
 };
+#[cfg(any(feature = "std", feature = "alloc"))]
+pub use crate::format::{
+    Detection as FormatDetection, Format, Sniffer as FormatSniffer, detect as detect_format,
+};
 #[cfg(feature = "blake3")]
 pub use crate::hash::blake3::{
     BLOCK_BYTES as BLAKE3_BLOCK_BYTES, DIGEST_BYTES as BLAKE3_DIGEST_BYTES, Hasher as Blake3Hasher,

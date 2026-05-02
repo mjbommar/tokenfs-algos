@@ -10,7 +10,7 @@ use std::{
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use tokenfs_algos::{
-    byteclass, chunk, distribution, divergence, entropy, fingerprint, hash,
+    byteclass, chunk, distribution, divergence, entropy, fingerprint, format, hash,
     histogram::{self, ByteHistogram},
     runlength, selector, sketch, structure,
 };
@@ -1075,5 +1075,78 @@ fn read_center_slice(path: &Path, size: usize) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-criterion_group!(benches, bench_primitive_matrix);
+/// Benchmarks the `format` sniffer on three storage-relevant payload
+/// sizes (1 KiB / 64 KiB / 1 MiB) for two call shapes:
+///
+/// - `format-detect-stateless` invokes [`format::detect`] per
+///   iteration, so each call rebuilds the magic-byte DFA from
+///   scratch. This is the worst case — useful only as the apples-
+///   to-apples baseline for the cached path.
+/// - `format-sniffer-cached` calls [`format::Sniffer::detect`] on a
+///   `Sniffer` that was constructed once outside the timing loop.
+///   This is the recommended call shape for storage layers.
+///
+/// The synthetic payloads exercise three branches of the detector:
+/// a gzip header (Layer 1, magic-byte hit), JSON text (Layer 2,
+/// text-shape heuristic), and pseudo-random bytes (Layer 3,
+/// entropy fallback).
+fn bench_format_detect(c: &mut Criterion) {
+    let sizes = [1024_usize, 64 * 1024, 1024 * 1024];
+    let mut payloads = Vec::new();
+    for size in sizes {
+        // Gzip-prefixed payload: magic at offset 0, padded with zeros.
+        let mut gzip = vec![0_u8; size];
+        gzip[0] = 0x1f;
+        gzip[1] = 0x8b;
+        payloads.push(("gzip", size, gzip));
+
+        // JSON text: a repeating object literal padded to size.
+        const JSON_FILLER: &[u8] = b"{\"key\":\"value\",\"n\":42,\"a\":[1,2,3]} ";
+        let mut json = Vec::with_capacity(size);
+        while json.len() + JSON_FILLER.len() < size {
+            json.extend_from_slice(JSON_FILLER);
+        }
+        json.resize(size, b' ');
+        payloads.push(("json", size, json));
+
+        // Pseudo-random bytes — drives the entropy fallback.
+        payloads.push((
+            "prng",
+            size,
+            deterministic_prng(size, 0xF0E1_D2C3 ^ size as u64),
+        ));
+    }
+
+    let mut group = c.benchmark_group("format_detect");
+
+    // Build the sniffer once outside the timing loop so its DFA cost
+    // is fully amortised across all `cached` measurements.
+    let sniffer = format::Sniffer::new();
+
+    for (case, size, bytes) in &payloads {
+        group.throughput(Throughput::Bytes(*size as u64));
+
+        let stateless_id = format!("format-detect-stateless/case={case}/bytes={size}");
+        group.bench_with_input(
+            BenchmarkId::from_parameter(stateless_id),
+            bytes.as_slice(),
+            |b, input| {
+                b.iter(|| black_box(format::detect(black_box(input))));
+            },
+        );
+
+        let cached_id = format!("format-sniffer-cached/case={case}/bytes={size}");
+        group.bench_with_input(
+            BenchmarkId::from_parameter(cached_id),
+            bytes.as_slice(),
+            |b, input| {
+                b.iter(|| black_box(sniffer.detect(black_box(input))));
+            },
+        );
+    }
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_primitive_matrix, bench_format_detect);
 criterion_main!(benches);
