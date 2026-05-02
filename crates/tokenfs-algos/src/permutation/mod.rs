@@ -7,20 +7,23 @@
 //!
 //! ## Sprint 11-13 status
 //!
-//! Phase B4 of `01_PHASES.md` lands [`rcm()`] (Reverse Cuthill-McKee). Two
-//! follow-ons are spec'd:
+//! Phase B4 of `01_PHASES.md` lands [`rcm()`] (Reverse Cuthill-McKee).
+//! Phase B5 lands `hilbert_2d` / `hilbert_nd` behind the
+//! `permutation_hilbert` Cargo feature (vendor wrappers around the
+//! `fast_hilbert` and `hilbert` crates per spec § 4). One follow-on
+//! remains spec'd:
 //!
-//! * `hilbert_2d` / `hilbert_nd` — Hilbert curve ordering (Phase B5).
 //! * `rabbit_order` — community-detection-driven (Phase D1).
 //!
 //! ## Deployment posture
 //!
 //! Per `docs/v0.2_planning/02b_DEPLOYMENT_MATRIX.md`:
 //!
-//! * **Permutation construction** ([`rcm()`], future `hilbert_*`,
-//!   `rabbit_order`): build-time only. These algorithms allocate large
-//!   work buffers (BFS queue, dendrogram) that cannot be made
-//!   stack-only. Never runs in kernel.
+//! * **Permutation construction** ([`rcm()`], `hilbert_2d` /
+//!   `hilbert_nd`, future `rabbit_order`): build-time only. These
+//!   algorithms allocate large work buffers (BFS queue, key-array
+//!   sort, dendrogram) that cannot be made stack-only. Never runs in
+//!   kernel.
 //! * **[`Permutation::apply`] / [`Permutation::apply_into`]**:
 //!   kernel-safe. Stateless borrowed slices, allocation-free for the
 //!   `_into` form, SIMD-friendly via gather.
@@ -60,8 +63,12 @@ use alloc::vec;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+#[cfg(feature = "permutation_hilbert")]
+pub mod hilbert;
 pub mod rcm;
 
+#[cfg(feature = "permutation_hilbert")]
+pub use hilbert::{hilbert_2d, hilbert_nd};
 pub use rcm::rcm;
 
 /// A permutation array.
