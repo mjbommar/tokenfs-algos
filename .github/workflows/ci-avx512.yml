@@ -116,7 +116,7 @@ jobs:
           cat "$out"
 
       - name: Upload perf TSV artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: perf-avx512-${{ runner.name }}
           path: perf-avx512-*.tsv
