@@ -879,7 +879,7 @@ pub fn plan_histogram_traced_tuned(
     for (index, rule) in RULES.iter().enumerate() {
         let matched = (rule.predicate)(profile, workload, &signals);
         trace.push(RuleDecision {
-            index: index as u16,
+            index: index as u32,
             name: rule.name,
             matched,
         });

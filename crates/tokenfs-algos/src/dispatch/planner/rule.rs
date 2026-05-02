@@ -48,7 +48,12 @@ pub struct Rule {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct RuleDecision {
     /// Index of the rule in `RULES`.
-    pub index: u16,
+    ///
+    /// Widened from `u16` to `u32` to match the natural `usize`
+    /// enumerate index without truncation risk; the populate site
+    /// always fits in `u32` for any feasible rule count
+    /// (audit-R7 finding #4).
+    pub index: u32,
     /// Stable rule name.
     pub name: &'static str,
     /// True iff the rule's predicate matched.
