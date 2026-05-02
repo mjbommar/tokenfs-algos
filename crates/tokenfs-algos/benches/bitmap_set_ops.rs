@@ -13,9 +13,20 @@
 //!
 //! Run all: `cargo bench --bench bitmap_set_ops`
 //! Filter:  `cargo bench --bench bitmap_set_ops -- bitmap_x_bitmap`
+//!
+//! Real-data path: set `TOKENFS_ALGOS_REAL_FILES=<path1>:<path2>` to
+//! synthesise additional posting lists from each file. Two-byte windows
+//! become candidate doc-ids: their low 12 bits, sorted and deduplicated,
+//! drive the array-container kernels; their low 16 bits set bits in a
+//! 65 536-bit Roaring bitmap container. Each listed file produces an
+//! extra bench row labelled `real/<file-stem>`.
 
 #![allow(missing_docs)]
+// `support` is shared with the larger workload-matrix benches; only
+// `real_files_as_bytes` is consumed here.
 #![allow(dead_code)]
+
+mod support;
 
 use std::hint::black_box;
 
@@ -65,6 +76,78 @@ fn deterministic_sorted_u16(n: usize, seed: u64) -> Vec<u16> {
         out.push(last as u16);
     }
     out
+}
+
+/// Real-data input shape: paired posting-list halves derived from the
+/// first / second half of a file. Each 2-byte window contributes a
+/// candidate doc-id; we keep the low 12 bits (sorted + deduplicated) for
+/// array-container benches and the low 16 bits as set bits for bitmap-
+/// container benches. Splitting on file halves keeps `a` and `b`
+/// distinct enough to exercise non-trivial set-algebra paths.
+struct RealPostingInput {
+    label: String,
+    array_a: Vec<u16>,
+    array_b: Vec<u16>,
+    bitmap_a: [u64; BITMAP_WORDS],
+    bitmap_b: [u64; BITMAP_WORDS],
+}
+
+fn real_data_inputs() -> Vec<RealPostingInput> {
+    support::real_files_as_bytes()
+        .into_iter()
+        .filter_map(|(label, bytes)| {
+            // Need at least four bytes to form one window per half.
+            if bytes.len() < 4 {
+                return None;
+            }
+            let mid = bytes.len() / 2;
+            let (head, tail) = bytes.split_at(mid);
+
+            let array_a = sorted_unique_low12(head);
+            let array_b = sorted_unique_low12(tail);
+            if array_a.is_empty() || array_b.is_empty() {
+                return None;
+            }
+            let bitmap_a = bitmap_from_u16_windows(head);
+            let bitmap_b = bitmap_from_u16_windows(tail);
+
+            Some(RealPostingInput {
+                label,
+                array_a,
+                array_b,
+                bitmap_a,
+                bitmap_b,
+            })
+        })
+        .collect()
+}
+
+/// Build a sorted, deduplicated `Vec<u16>` from the low 12 bits of every
+/// 2-byte LE window in `bytes`. Caps at 4096 entries to keep the result
+/// inside an array container (the 4096-element promotion threshold).
+fn sorted_unique_low12(bytes: &[u8]) -> Vec<u16> {
+    let mut seen = [false; 4096];
+    for chunk in bytes.chunks_exact(2) {
+        let value = u16::from_le_bytes([chunk[0], chunk[1]]) & 0x0FFF;
+        seen[value as usize] = true;
+    }
+    seen.iter()
+        .enumerate()
+        .filter_map(|(idx, &set)| if set { Some(idx as u16) } else { None })
+        .collect()
+}
+
+/// Build a `[u64; BITMAP_WORDS]` (a 65 536-bit Roaring bitmap container)
+/// where each 2-byte LE window's low 16 bits sets the corresponding bit.
+fn bitmap_from_u16_windows(bytes: &[u8]) -> [u64; BITMAP_WORDS] {
+    let mut bm = [0_u64; BITMAP_WORDS];
+    for chunk in bytes.chunks_exact(2) {
+        let value = u16::from_le_bytes([chunk[0], chunk[1]]) as usize;
+        let word = value / 64;
+        let bit = value % 64;
+        bm[word] |= 1_u64 << bit;
+    }
+    bm
 }
 
 fn bench_bitmap_x_bitmap(c: &mut Criterion) {
@@ -255,6 +338,97 @@ fn bench_bitmap_x_bitmap(c: &mut Criterion) {
         });
     }
 
+    for input in &real_data_inputs() {
+        let label_prefix = format!("real/{}", input.label);
+        let a = input.bitmap_a;
+        let b = input.bitmap_b;
+        group.bench_function(format!("scalar/and_into/{label_prefix}"), |bench| {
+            bench.iter(|| {
+                bitmap::kernels::bitmap_x_bitmap_scalar::and_into(
+                    black_box(&a),
+                    black_box(&b),
+                    &mut out,
+                )
+            });
+        });
+        group.bench_function(format!("scalar/and_cardinality/{label_prefix}"), |bench| {
+            bench.iter(|| {
+                bitmap::kernels::bitmap_x_bitmap_scalar::and_cardinality(
+                    black_box(&a),
+                    black_box(&b),
+                )
+            });
+        });
+        group.bench_function(format!("scalar/or_into/{label_prefix}"), |bench| {
+            bench.iter(|| {
+                bitmap::kernels::bitmap_x_bitmap_scalar::or_into(
+                    black_box(&a),
+                    black_box(&b),
+                    &mut out,
+                )
+            });
+        });
+
+        #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+        if bitmap::kernels::bitmap_x_bitmap_avx2::is_available() {
+            group.bench_function(format!("avx2/and_into/{label_prefix}"), |bench| {
+                bench.iter(|| {
+                    // SAFETY: availability checked above.
+                    unsafe {
+                        bitmap::kernels::bitmap_x_bitmap_avx2::and_into(
+                            black_box(&a),
+                            black_box(&b),
+                            &mut out,
+                        )
+                    }
+                });
+            });
+            group.bench_function(format!("avx2/and_cardinality/{label_prefix}"), |bench| {
+                bench.iter(|| {
+                    // SAFETY: availability checked above.
+                    unsafe {
+                        bitmap::kernels::bitmap_x_bitmap_avx2::and_cardinality(
+                            black_box(&a),
+                            black_box(&b),
+                        )
+                    }
+                });
+            });
+        }
+
+        #[cfg(all(feature = "avx512", any(target_arch = "x86", target_arch = "x86_64")))]
+        if bitmap::kernels::bitmap_x_bitmap_avx512::is_available() {
+            group.bench_function(format!("avx512/and_into/{label_prefix}"), |bench| {
+                bench.iter(|| {
+                    // SAFETY: availability checked above.
+                    unsafe {
+                        bitmap::kernels::bitmap_x_bitmap_avx512::and_into(
+                            black_box(&a),
+                            black_box(&b),
+                            &mut out,
+                        )
+                    }
+                });
+            });
+        }
+
+        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+        {
+            group.bench_function(format!("neon/and_into/{label_prefix}"), |bench| {
+                bench.iter(|| {
+                    // SAFETY: NEON is mandatory on AArch64.
+                    unsafe {
+                        bitmap::kernels::bitmap_x_bitmap_neon::and_into(
+                            black_box(&a),
+                            black_box(&b),
+                            &mut out,
+                        )
+                    }
+                });
+            });
+        }
+    }
+
     group.finish();
 }
 
@@ -335,6 +509,61 @@ fn bench_array_x_array(c: &mut Criterion) {
         }
     }
 
+    for input in &real_data_inputs() {
+        let label = format!("real/{}", input.label);
+        let a = input.array_a.clone();
+        let b = input.array_b.clone();
+        group.throughput(Throughput::Elements((a.len() + b.len()) as u64));
+
+        group.bench_with_input(
+            BenchmarkId::new("scalar/intersect", &label),
+            &(),
+            |bench, _| {
+                let mut out = Vec::with_capacity(a.len().min(b.len()));
+                bench.iter(|| {
+                    bitmap::kernels::array_x_array_scalar::intersect(
+                        black_box(&a),
+                        black_box(&b),
+                        &mut out,
+                    );
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("scalar/intersect_cardinality", &label),
+            &(),
+            |bench, _| {
+                bench.iter(|| {
+                    bitmap::kernels::array_x_array_scalar::intersect_cardinality(
+                        black_box(&a),
+                        black_box(&b),
+                    )
+                });
+            },
+        );
+
+        #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+        if bitmap::kernels::array_x_array_sse42::is_available() {
+            group.bench_with_input(
+                BenchmarkId::new("sse42/intersect", &label),
+                &(),
+                |bench, _| {
+                    let mut out = Vec::with_capacity(a.len().min(b.len()));
+                    bench.iter(|| {
+                        // SAFETY: availability checked above.
+                        unsafe {
+                            bitmap::kernels::array_x_array_sse42::intersect(
+                                black_box(&a),
+                                black_box(&b),
+                                &mut out,
+                            );
+                        }
+                    });
+                },
+            );
+        }
+    }
+
     group.finish();
 }
 
@@ -379,6 +608,61 @@ fn bench_array_x_bitmap(c: &mut Criterion) {
         if bitmap::kernels::array_x_bitmap_avx2::is_available() {
             group.bench_with_input(
                 BenchmarkId::new("avx2/intersect", label),
+                &(),
+                |bench, _| {
+                    let mut out = Vec::with_capacity(array.len());
+                    bench.iter(|| {
+                        // SAFETY: availability checked above.
+                        unsafe {
+                            bitmap::kernels::array_x_bitmap_avx2::intersect_array_bitmap(
+                                black_box(&array),
+                                black_box(&bm),
+                                &mut out,
+                            );
+                        }
+                    });
+                },
+            );
+        }
+    }
+
+    for input in &real_data_inputs() {
+        let label = format!("real/{}", input.label);
+        let array = input.array_a.clone();
+        let bm = input.bitmap_b;
+        group.throughput(Throughput::Elements(array.len() as u64));
+
+        group.bench_with_input(
+            BenchmarkId::new("scalar/intersect", &label),
+            &(),
+            |bench, _| {
+                let mut out = Vec::with_capacity(array.len());
+                bench.iter(|| {
+                    bitmap::kernels::array_x_bitmap_scalar::intersect_array_bitmap(
+                        black_box(&array),
+                        black_box(&bm),
+                        &mut out,
+                    );
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("scalar/intersect_cardinality", &label),
+            &(),
+            |bench, _| {
+                bench.iter(|| {
+                    bitmap::kernels::array_x_bitmap_scalar::intersect_cardinality_array_bitmap(
+                        black_box(&array),
+                        black_box(&bm),
+                    )
+                });
+            },
+        );
+
+        #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+        if bitmap::kernels::array_x_bitmap_avx2::is_available() {
+            group.bench_with_input(
+                BenchmarkId::new("avx2/intersect", &label),
                 &(),
                 |bench, _| {
                     let mut out = Vec::with_capacity(array.len());

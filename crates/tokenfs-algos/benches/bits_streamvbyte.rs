@@ -7,10 +7,16 @@
 //!
 //! Run all: `cargo bench -p tokenfs-algos --bench bits_streamvbyte`
 //! Filter:  `cargo bench -p tokenfs-algos --bench bits_streamvbyte -- decode/avx2`
+//!
+//! Real-data path: set `TOKENFS_ALGOS_REAL_FILES=<path1>:<path2>` to
+//! synthesise additional `Vec<u32>` streams from each file (4-byte LE
+//! windows masked to 24 bits, matching the synthetic posting-list-delta
+//! distribution). Each listed file produces an extra row in every
+//! sub-bench, labelled `real/<file-stem>/n=<element-count>`.
 
 #![allow(missing_docs)]
-// `support` is shared with the larger workload-matrix benches; this bench
-// declares it for path consistency but doesn't consume any helpers.
+// `support` is shared with the larger workload-matrix benches; only
+// `real_files_as_bytes` is consumed here.
 #![allow(dead_code)]
 
 mod support;
@@ -47,10 +53,54 @@ fn deterministic_values(n: usize) -> Vec<u32> {
         .collect()
 }
 
+/// Real-data input shape: a `Vec<u32>` materialised from 4-byte LE
+/// windows of the file, masked to the low 24 bits (matching the
+/// posting-list-delta-style distribution used by the synthetic path so
+/// the same shuffle-table and dispatcher costs are exercised).
+struct RealU32Input {
+    label: String,
+    values: Vec<u32>,
+}
+
+fn real_data_inputs() -> Vec<RealU32Input> {
+    support::real_files_as_bytes()
+        .into_iter()
+        .filter_map(|(label, bytes)| {
+            if bytes.len() < 4 {
+                return None;
+            }
+            let values: Vec<u32> = bytes
+                .chunks_exact(4)
+                .map(|chunk| {
+                    u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) & 0x00ff_ffff
+                })
+                .collect();
+            if values.is_empty() {
+                return None;
+            }
+            Some(RealU32Input { label, values })
+        })
+        .collect()
+}
+
 fn bench_decode(c: &mut Criterion) {
     let mut group = c.benchmark_group("bits_streamvbyte/decode");
-    for &(n, label) in SIZES {
-        let values = deterministic_values(n);
+    let real_inputs = real_data_inputs();
+    let synthetic_iter = SIZES
+        .iter()
+        .map(|&(n, label)| (label.to_string(), deterministic_values(n)));
+    let real_iter = real_inputs.iter().map(|input| {
+        (
+            format!("real/{}/n={}", input.label, input.values.len()),
+            input.values.clone(),
+        )
+    });
+
+    for (label, values) in synthetic_iter.chain(real_iter) {
+        let n = values.len();
+        if n == 0 {
+            continue;
+        }
         let mut ctrl = vec![0_u8; bits::streamvbyte_control_len(n)];
         let mut data = vec![0_u8; bits::streamvbyte_data_max_len(n)];
         let written = bits::streamvbyte_encode_u32(&values, &mut ctrl, &mut data);
@@ -147,8 +197,22 @@ fn bench_decode(c: &mut Criterion) {
 
 fn bench_encode(c: &mut Criterion) {
     let mut group = c.benchmark_group("bits_streamvbyte/encode");
-    for &(n, label) in SIZES {
-        let values = deterministic_values(n);
+    let real_inputs = real_data_inputs();
+    let synthetic_iter = SIZES
+        .iter()
+        .map(|&(n, label)| (label.to_string(), deterministic_values(n)));
+    let real_iter = real_inputs.iter().map(|input| {
+        (
+            format!("real/{}/n={}", input.label, input.values.len()),
+            input.values.clone(),
+        )
+    });
+
+    for (label, values) in synthetic_iter.chain(real_iter) {
+        let n = values.len();
+        if n == 0 {
+            continue;
+        }
         let mut ctrl = vec![0_u8; bits::streamvbyte_control_len(n)];
         let mut data = vec![0_u8; bits::streamvbyte_data_max_len(n)];
         group.throughput(Throughput::Bytes((n * 4) as u64));
