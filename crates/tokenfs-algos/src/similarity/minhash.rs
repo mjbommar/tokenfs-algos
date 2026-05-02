@@ -215,7 +215,7 @@ pub fn classic_from_bytes_table_8(
 ///
 /// Two streams that consume the same bytes (in any order — the hash family
 /// is order-independent) produce identical signatures regardless of chunk
-/// boundaries. This is verified by [`tests::stream_chunking_invariant`].
+/// boundaries. This is verified by `tests::stream_chunking_invariant`.
 ///
 /// ## Example
 ///

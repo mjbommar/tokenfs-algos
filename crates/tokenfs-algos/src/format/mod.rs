@@ -13,7 +13,7 @@
 //!
 //! Detection is layered, cheapest-first:
 //!
-//! 1. **Magic-byte DFA.** All magic-byte rules feed a [`crate::search::PackedDfa`]
+//! 1. **Magic-byte DFA.** All magic-byte rules feed a `crate::search::PackedDfa`
 //!    that scans the input once. A match becomes a [`Detection`] with
 //!    confidence 100. Rules with non-zero anchor offsets (notably
 //!    `tar`'s `ustar` magic at offset 257) are post-filtered against
@@ -39,7 +39,7 @@
 //! # Allocation requirement
 //!
 //! Both [`Sniffer`] and the stateless [`detect`] function require the
-//! `alloc` (or `std`) feature because [`crate::search::PackedDfa`]
+//! `alloc` (or `std`) feature because `crate::search::PackedDfa`
 //! itself stores its state table in a `Vec<u32>`.
 //!
 //! # Performance
