@@ -58,6 +58,42 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+/// Failure modes for the fallible rank/select dictionary constructor
+/// ([`RankSelectDict::try_build`]).
+///
+/// Returned instead of panicking when the borrowed bit slice is too
+/// short to hold the requested logical bit count.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RankSelectError {
+    /// `bits.len() * 64 < n_bits` — the borrowed slice cannot hold the
+    /// requested number of logical bits.
+    BitsTooShort {
+        /// `bits.len()` (count of `u64` words in the borrowed slice).
+        bits_len_words: usize,
+        /// Caller-supplied logical bit count.
+        requested_n_bits: usize,
+    },
+}
+
+impl core::fmt::Display for RankSelectError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::BitsTooShort {
+                bits_len_words,
+                requested_n_bits,
+            } => write!(
+                f,
+                "RankSelectDict bits slice too short: {bits_len_words} words \
+                 (= {} bits) cannot hold {requested_n_bits} requested bits",
+                bits_len_words.saturating_mul(64)
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for RankSelectError {}
+
 /// Bits per **block**. Each block carries a `u16` relative count.
 ///
 /// 256 bits = 4 `u64` words. Per-block scan cost is bounded by 4 words.
@@ -112,14 +148,24 @@ impl<'a> RankSelectDict<'a> {
     /// # Panics
     ///
     /// Panics if `bits` is too short to hold `n_bits` bits, i.e. if
-    /// `bits.len() * 64 < n_bits`.
+    /// `bits.len() * 64 < n_bits`. Use [`Self::try_build`] for a
+    /// fallible variant that returns [`RankSelectError`] instead.
     #[must_use]
     pub fn build(bits: &'a [u64], n_bits: usize) -> Self {
-        assert!(
-            bits.len().saturating_mul(64) >= n_bits,
-            "RankSelectDict::build: bits.len() = {} cannot hold {n_bits} bits",
-            bits.len()
-        );
+        Self::try_build(bits, n_bits)
+            .expect("RankSelectDict::build: bits slice too short for n_bits")
+    }
+
+    /// Fallible variant of [`Self::build`] that returns
+    /// [`RankSelectError::BitsTooShort`] when the borrowed slice cannot
+    /// hold the requested number of logical bits, instead of panicking.
+    pub fn try_build(bits: &'a [u64], n_bits: usize) -> Result<Self, RankSelectError> {
+        if bits.len().saturating_mul(64) < n_bits {
+            return Err(RankSelectError::BitsTooShort {
+                bits_len_words: bits.len(),
+                requested_n_bits: n_bits,
+            });
+        }
 
         let n_blocks = n_bits.div_ceil(BLOCK_BITS);
         let n_superblocks = n_bits.div_ceil(SUPERBLOCK_BITS);
@@ -166,13 +212,13 @@ impl<'a> RankSelectDict<'a> {
         // Total popcount under `n_bits` bits as a usize for ergonomic use.
         let total_ones = cumulative as usize;
 
-        Self {
+        Ok(Self {
             bits,
             n_bits,
             superblock_counts,
             block_counts,
             total_ones,
-        }
+        })
     }
 
     /// Returns the bit length the dictionary was built over.
@@ -653,6 +699,8 @@ pub mod kernels {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)] // Test code — panic on Err is the desired failure mode.
+
     use super::*;
     use alloc::vec;
 
@@ -1242,6 +1290,35 @@ mod tests {
                 k += step;
             }
         }
+    }
+
+    #[test]
+    fn try_build_returns_err_on_too_short_bits() {
+        let bits = [0_u64, 0_u64]; // 128 bits total.
+        let err = RankSelectDict::try_build(&bits, 200).unwrap_err();
+        assert_eq!(
+            err,
+            RankSelectError::BitsTooShort {
+                bits_len_words: 2,
+                requested_n_bits: 200
+            }
+        );
+    }
+
+    #[test]
+    fn try_build_returns_ok_on_valid_inputs() {
+        let bits = vec![0xAAAA_AAAA_AAAA_AAAA_u64; 4]; // 256 bits.
+        let dict = RankSelectDict::try_build(&bits, 256).unwrap();
+        assert_eq!(dict.len_bits(), 256);
+        // Alternating pattern: half the bits are set.
+        assert_eq!(dict.count_ones(), 128);
+    }
+
+    #[test]
+    #[should_panic(expected = "RankSelectDict::build: bits slice too short")]
+    fn build_still_panics_on_too_short_bits() {
+        let bits = [0_u64];
+        let _ = RankSelectDict::build(&bits, 200);
     }
 
     /// Parity vs sucds across deterministic random bitvectors. Brute
