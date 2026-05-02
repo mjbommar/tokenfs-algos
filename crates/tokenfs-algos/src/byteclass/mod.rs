@@ -403,7 +403,7 @@ pub mod kernels {
     /// Permutation-LUT byte classifier built on AVX-512 VBMI.
     ///
     /// Replaces the per-class `cmpeq + popcount` chain in
-    /// [`super::avx512::classify`] with a single 256-entry table lookup
+    /// `super::avx512::classify` with a single 256-entry table lookup
     /// per byte, then a small per-class popcount loop. The lookup is
     /// driven by `_mm512_permutex2var_epi8` (`vpermi2b`), which selects
     /// 64 bytes from the 128-byte concatenation of two source registers.
@@ -425,12 +425,12 @@ pub mod kernels {
     ///
     /// At time of writing only Intel Ice Lake-and-later runners can
     /// execute this path; everywhere else the dispatch falls back to
-    /// [`super::avx512`] or below.
+    /// `super::avx512` or below.
     ///
     /// # Why use it
     ///
     /// This kernel is a **generalization** of
-    /// [`super::avx512::classify`]: instead of hard-coding 4 named byte
+    /// `super::avx512::classify`: instead of hard-coding 4 named byte
     /// classes (printable / control / whitespace / high-bit), it accepts
     /// any `[u8; 256]` table mapping byte values to class indices in
     /// `0..16`. That makes it suitable for ad-hoc classifiers (URL-safe

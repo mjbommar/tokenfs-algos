@@ -85,7 +85,7 @@ pub mod kernels {
     /// implementing Intel's fold-by-4 via `_mm512_clmulepi64_epi128`
     /// would deliver ~2-3x over the scalar `_mm_crc32_u64`-chained
     /// loop on long inputs. That kernel would belong as a peer of
-    /// [`crc32c_u32`], with a tag like `crc32c_long`. We declined to
+    /// `crc32c_u32`, with a tag like `crc32c_long`. We declined to
     /// add it speculatively without a concrete caller.
     #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
     pub mod sse42 {

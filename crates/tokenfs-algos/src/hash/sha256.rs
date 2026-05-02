@@ -4,7 +4,7 @@
 //! The public [`sha256`] function picks the fastest available backend at
 //! runtime. Pinned reference paths live under [`kernels::scalar`] for
 //! reproducibility; pinned hardware paths live under [`kernels::x86_shani`]
-//! and [`kernels::aarch64_sha2`] respectively.
+//! and `kernels::aarch64_sha2` respectively.
 //!
 //! All backends produce bit-exact identical output. This is enforced by
 //! parity tests in this module and a long-input stress vector.

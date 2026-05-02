@@ -56,7 +56,7 @@ const MAX_PATTERN_CLASSES: usize = 32;
 ///
 /// Class assignment:
 /// - Class 0 = wildcard ("byte not in any pattern", or overflow when we
-///   exceed [`MAX_PATTERN_CLASSES`]).
+///   exceed `MAX_PATTERN_CLASSES`).
 /// - Classes `1..=n_pattern_classes` = distinct pattern bytes in order
 ///   of first appearance.
 #[derive(Clone, Debug)]
@@ -68,7 +68,7 @@ pub struct ByteClass {
 impl ByteClass {
     /// Builds a byte-class table from the union of all bytes in
     /// `patterns`. Distinct pattern bytes are assigned individual class
-    /// ids up to [`MAX_PATTERN_CLASSES`]; remaining bytes share the
+    /// ids up to `MAX_PATTERN_CLASSES`; remaining bytes share the
     /// wildcard class (id 0).
     fn from_patterns(patterns: &[&[u8]]) -> Self {
         let mut map = [0_u8; 256];
