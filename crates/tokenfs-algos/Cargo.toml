@@ -81,11 +81,11 @@ name = "bits_popcount"
 harness = false
 
 [[bench]]
-name = "hash_set_membership"
+name = "bits_streamvbyte"
 harness = false
 
 [[bench]]
-name = "permutation_rcm"
+name = "hash_set_membership"
 harness = false
 
 [lints]

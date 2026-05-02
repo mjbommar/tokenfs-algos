@@ -517,6 +517,139 @@ fn avx2_bits_bit_pack_decode_matches_scalar_on_every_width() {
     }
 }
 
+/// Deterministic `u32` corpus clamped to `max_bytes` significant bytes
+/// so the encoded width spans every Stream-VByte length code.
+fn deterministic_streamvbyte_values(n: usize, seed: u64, max_bytes: u32) -> Vec<u32> {
+    let mask: u32 = match max_bytes {
+        1 => 0x0000_00ff,
+        2 => 0x0000_ffff,
+        3 => 0x00ff_ffff,
+        _ => u32::MAX,
+    };
+    let mut state = seed;
+    (0..n)
+        .map(|_| {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            (state.wrapping_mul(0x2545_f491_4f6c_dd1d) as u32) & mask
+        })
+        .collect()
+}
+
+#[test]
+fn ssse3_bits_streamvbyte_decode_matches_scalar_on_size_grid() {
+    if !std::is_x86_feature_detected!("ssse3") {
+        eprintln!("ssse3 unavailable on this host; skipping bits::streamvbyte SSSE3 parity test");
+        return;
+    }
+    // Cover every (full-groups, tail-shape) interaction plus large sizes
+    // that exercise the SIMD-then-scalar tail boundary.
+    for n in [
+        0_usize, 1, 2, 3, 4, 5, 7, 8, 16, 31, 32, 33, 64, 99, 100, 256, 1023, 1024, 1025, 4096,
+    ] {
+        for max in [1_u32, 2, 3, 4] {
+            let values = deterministic_streamvbyte_values(
+                n,
+                0xF22_C0FFEE_u64 ^ ((max as u64) << 8) ^ n as u64,
+                max,
+            );
+            let mut ctrl = vec![0_u8; bits::streamvbyte_control_len(n)];
+            let mut data = vec![0_u8; bits::streamvbyte_data_max_len(n)];
+            let written = bits::streamvbyte_encode_u32(&values, &mut ctrl, &mut data);
+
+            let mut expected = vec![0_u32; n];
+            bits::streamvbyte::kernels::scalar::decode_u32(
+                &ctrl,
+                &data[..written],
+                n,
+                &mut expected,
+            );
+
+            let mut actual = vec![0_u32; n];
+            // SAFETY: ssse3 availability checked above.
+            let consumed = unsafe {
+                bits::streamvbyte::kernels::ssse3::decode_u32(
+                    &ctrl,
+                    &data[..written],
+                    n,
+                    &mut actual,
+                )
+            };
+            assert_eq!(
+                actual, expected,
+                "ssse3 bits::streamvbyte diverged at n={n} max_bytes={max}"
+            );
+            assert_eq!(
+                consumed, written,
+                "ssse3 offset diverged at n={n} max_bytes={max}"
+            );
+        }
+    }
+}
+
+#[test]
+fn avx2_bits_streamvbyte_decode_matches_scalar_on_size_grid() {
+    if !avx2_available() {
+        eprintln!("avx2 unavailable on this host; skipping bits::streamvbyte AVX2 parity test");
+        return;
+    }
+    // Same grid as the SSSE3 path; AVX2 dual-pumps two control bytes per
+    // iteration so we add sizes that hit the odd-residual full group.
+    for n in [
+        0_usize, 1, 2, 3, 4, 5, 7, 8, 9, 12, 16, 17, 31, 32, 33, 64, 100, 256, 257, 1023, 1024,
+        1025, 4096,
+    ] {
+        for max in [1_u32, 2, 3, 4] {
+            let values = deterministic_streamvbyte_values(
+                n,
+                0xC0FFEE_u64 ^ ((max as u64) << 16) ^ n as u64,
+                max,
+            );
+            let mut ctrl = vec![0_u8; bits::streamvbyte_control_len(n)];
+            let mut data = vec![0_u8; bits::streamvbyte_data_max_len(n)];
+            let written = bits::streamvbyte_encode_u32(&values, &mut ctrl, &mut data);
+
+            let mut expected = vec![0_u32; n];
+            bits::streamvbyte::kernels::scalar::decode_u32(
+                &ctrl,
+                &data[..written],
+                n,
+                &mut expected,
+            );
+
+            let mut actual = vec![0_u32; n];
+            // SAFETY: avx2 availability checked above.
+            let consumed = unsafe {
+                bits::streamvbyte::kernels::avx2::decode_u32(
+                    &ctrl,
+                    &data[..written],
+                    n,
+                    &mut actual,
+                )
+            };
+            assert_eq!(
+                actual, expected,
+                "avx2 bits::streamvbyte diverged at n={n} max_bytes={max}"
+            );
+            assert_eq!(
+                consumed, written,
+                "avx2 offset diverged at n={n} max_bytes={max}"
+            );
+
+            // Auto-dispatched API must agree.
+            let mut dispatched = vec![0_u32; n];
+            let dispatched_consumed =
+                bits::streamvbyte_decode_u32(&ctrl, &data[..written], n, &mut dispatched);
+            assert_eq!(
+                dispatched, expected,
+                "dispatched bits::streamvbyte diverged at n={n} max_bytes={max}"
+            );
+            assert_eq!(dispatched_consumed, written);
+        }
+    }
+}
+
 fn deterministic_u32_haystack(n: usize, seed: u64) -> Vec<u32> {
     let mut state = seed;
     (0..n)
@@ -1006,5 +1139,43 @@ proptest! {
             hash::set_membership::kernels::sse41::contains_u32(&haystack, needle)
         };
         prop_assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn avx2_bits_streamvbyte_round_trip_random(
+        values in proptest::collection::vec(any::<u32>(), 0..2048),
+    ) {
+        if !avx2_available() {
+            return Ok(());
+        }
+        let n = values.len();
+        let mut ctrl = vec![0_u8; bits::streamvbyte_control_len(n)];
+        let mut data = vec![0_u8; bits::streamvbyte_data_max_len(n)];
+        let written = bits::streamvbyte_encode_u32(&values, &mut ctrl, &mut data);
+        let mut decoded = vec![0_u32; n];
+        let consumed = unsafe {
+            bits::streamvbyte::kernels::avx2::decode_u32(&ctrl, &data[..written], n, &mut decoded)
+        };
+        prop_assert_eq!(consumed, written);
+        prop_assert_eq!(decoded, values);
+    }
+
+    #[test]
+    fn ssse3_bits_streamvbyte_round_trip_random(
+        values in proptest::collection::vec(any::<u32>(), 0..2048),
+    ) {
+        if !std::is_x86_feature_detected!("ssse3") {
+            return Ok(());
+        }
+        let n = values.len();
+        let mut ctrl = vec![0_u8; bits::streamvbyte_control_len(n)];
+        let mut data = vec![0_u8; bits::streamvbyte_data_max_len(n)];
+        let written = bits::streamvbyte_encode_u32(&values, &mut ctrl, &mut data);
+        let mut decoded = vec![0_u32; n];
+        let consumed = unsafe {
+            bits::streamvbyte::kernels::ssse3::decode_u32(&ctrl, &data[..written], n, &mut decoded)
+        };
+        prop_assert_eq!(consumed, written);
+        prop_assert_eq!(decoded, values);
     }
 }
