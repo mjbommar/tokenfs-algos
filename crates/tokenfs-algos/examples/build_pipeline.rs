@@ -261,9 +261,9 @@ impl OwnedCsr {
 /// 1. Group extents by `(bin -> Vec<extent_id>)`.
 /// 2. Within each bin, link consecutive extents in ID order — bin `b`
 ///    holding `[e0, e1, e2]` contributes undirected edges `(e0, e1)`
-///    and `(e1, e2)`. This keeps the edge count `O(SHINGLES_PER_EXTENT
-///    * NUM_EXTENTS)` instead of the `O(M^2)` that a fully-pairwise
-///    binning would produce.
+///    and `(e1, e2)`. This keeps the edge count
+///    `O(SHINGLES_PER_EXTENT * NUM_EXTENTS)` instead of the `O(M^2)`
+///    that a fully-pairwise binning would produce.
 /// 3. Symmetrise into a CSR adjacency. Duplicate edges are tolerated;
 ///    `rcm()` treats them as degree weight (see `rcm` rustdoc).
 ///
@@ -423,7 +423,10 @@ fn main() {
         fmt_bytes(NUM_EXTENTS * PAYLOAD_BYTES),
         PAYLOAD_BYTES
     );
-    println!("families      : {NUM_FAMILIES} (~{} extents/family)", NUM_EXTENTS / NUM_FAMILIES);
+    println!(
+        "families      : {NUM_FAMILIES} (~{} extents/family)",
+        NUM_EXTENTS / NUM_FAMILIES
+    );
     println!("rng seed      : 0x{RNG_SEED:016X}");
     #[cfg(feature = "parallel")]
     println!("hash backend  : sha256_batch_par (rayon fan-out)");
@@ -450,9 +453,8 @@ fn main() {
     let mut digests = vec![[0_u8; 32]; NUM_EXTENTS];
     hash_merkle_leaves(&extents, &mut digests);
     let dt_hash = t1.elapsed();
-    let hash_throughput_mibs = (NUM_EXTENTS * PAYLOAD_BYTES) as f64
-        / (1024.0 * 1024.0)
-        / dt_hash.as_secs_f64().max(1e-9);
+    let hash_throughput_mibs =
+        (NUM_EXTENTS * PAYLOAD_BYTES) as f64 / (1024.0 * 1024.0) / dt_hash.as_secs_f64().max(1e-9);
     println!(
         "[stage 1] SHA-256 batch ({NUM_EXTENTS} x {PAYLOAD_BYTES}B Merkle leaves)  : {:>8.2} ms ({:.1} MiB/s)",
         dt_hash.as_secs_f64() * 1000.0,
@@ -541,7 +543,10 @@ fn main() {
     );
     if bw_after > 0 && bw_before > 0 {
         if bw_after <= bw_before {
-            println!("bandwidth reduction        : {:.3}x", 1.0 / bw_ratio.max(1e-9));
+            println!(
+                "bandwidth reduction        : {:.3}x",
+                1.0 / bw_ratio.max(1e-9)
+            );
         } else {
             println!("bandwidth ratio (after/before): {bw_ratio:.3}");
         }
@@ -552,29 +557,13 @@ fn main() {
     // -------------------------------------------------------------------------
     println!();
     println!("--- metadata layout sample ---");
-    println!(
-        "first 6 extents in input order  : {:?}",
-        &metadata_in[..6]
-    );
-    println!(
-        "first 6 extents in RCM order    : {:?}",
-        &metadata_out[..6]
-    );
-    println!(
-        "note: synthetic input is family-major, so input bandwidth is already"
-    );
-    println!(
-        "      near-optimal for this similarity graph. The RCM permutation is"
-    );
-    println!(
-        "      a valid relabelling but doesn't reduce bandwidth on this fixture;"
-    );
-    println!(
-        "      a real tokenfs_writer ingest order is roughly random and would"
-    );
-    println!(
-        "      see the typical RCM 1.5-3x bandwidth reduction."
-    );
+    println!("first 6 extents in input order  : {:?}", &metadata_in[..6]);
+    println!("first 6 extents in RCM order    : {:?}", &metadata_out[..6]);
+    println!("note: synthetic input is family-major, so input bandwidth is already");
+    println!("      near-optimal for this similarity graph. The RCM permutation is");
+    println!("      a valid relabelling but doesn't reduce bandwidth on this fixture;");
+    println!("      a real tokenfs_writer ingest order is roughly random and would");
+    println!("      see the typical RCM 1.5-3x bandwidth reduction.");
 
     // -------------------------------------------------------------------------
     // Memory accounting

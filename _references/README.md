@@ -17,6 +17,7 @@ license and provenance review.
 | `safe_arch` | Safer Rust wrappers around architecture intrinsics. | Keep target-feature availability visible at the API boundary. |
 | `criterion.rs` | Benchmark harness and stored statistical outputs. | Mine `target/criterion` JSON, but keep our own workload/hardware history. |
 | `maturin` | PyO3 packaging and build frontend. | Keep Python binding as a later workspace member wrapping stable Rust APIs. |
+| `usearch` | Unum's single-header HNSW + clustering engine. mmap-able indexes from disk without loading into RAM. | Reference architecture for FS-resident similarity search: HNSW that lives on disk, mmap'd into the reader, no warm-up. Multi-language bindings, SIMD-optimized, used by ClickHouse and DuckDB. Same author lineage as StringZilla / NumKong. |
 
 Local paper code that still needs migration lives outside this directory:
 
