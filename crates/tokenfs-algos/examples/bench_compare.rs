@@ -25,6 +25,8 @@ use std::env;
 use std::hint::black_box;
 use std::time::Instant;
 
+use tokenfs_algos::histogram::summary::byte_value_moments;
+use tokenfs_algos::histogram::topk::MisraGries;
 use tokenfs_algos::{
     byteclass, fingerprint, histogram, runlength,
     similarity::{self, kernels as sim_kernels},
@@ -40,6 +42,9 @@ fn main() {
     print_header();
 
     bench_histogram_block();
+    bench_histogram_block_rle();
+    bench_topk_misra_gries();
+    bench_byte_value_moments();
     bench_fingerprint_block();
     bench_byteclass_classify();
     bench_byteclass_validate_utf8();
@@ -111,6 +116,61 @@ fn bench_histogram_block() {
                 black_box(histogram::kernels::avx2_palette_u32::block(black_box(
                     &bytes,
                 )));
+            }),
+        );
+    }
+}
+
+fn bench_histogram_block_rle() {
+    for &n in PAYLOAD_SIZES_BYTES {
+        let bytes = make_random_bytes(n);
+        emit(
+            "histogram-block-rle",
+            "scalar-stripe4-u32",
+            n,
+            measure(|| {
+                black_box(histogram::kernels::stripe4_u32::block(black_box(&bytes)));
+            }),
+        );
+        #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+        emit(
+            "histogram-block-rle",
+            "avx2-rle-stripe4-u32",
+            n,
+            measure(|| {
+                black_box(histogram::kernels::avx2_rle_stripe4_u32::block(black_box(
+                    &bytes,
+                )));
+            }),
+        );
+    }
+}
+
+fn bench_topk_misra_gries() {
+    for &n in PAYLOAD_SIZES_BYTES {
+        let bytes = make_random_bytes(n);
+        emit(
+            "topk-misra-gries-k16",
+            "scalar",
+            n,
+            measure(|| {
+                let mut sk = MisraGries::<16>::new();
+                sk.update_slice(black_box(&bytes));
+                black_box(&sk);
+            }),
+        );
+    }
+}
+
+fn bench_byte_value_moments() {
+    for &n in PAYLOAD_SIZES_BYTES {
+        let bytes = make_random_bytes(n);
+        emit(
+            "byte-value-moments",
+            "scalar",
+            n,
+            measure(|| {
+                black_box(byte_value_moments(black_box(&bytes)));
             }),
         );
     }
