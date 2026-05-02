@@ -24,6 +24,8 @@
 extern crate alloc;
 
 pub mod approx;
+#[cfg(any(feature = "std", feature = "alloc"))]
+pub mod bitmap;
 pub mod bits;
 pub mod byteclass;
 pub mod chunk;
