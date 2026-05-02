@@ -36,6 +36,7 @@ pub mod fingerprint;
 pub mod format;
 pub mod hash;
 pub mod histogram;
+pub mod identity;
 pub mod paper;
 pub mod prelude;
 pub mod runlength;

@@ -36,6 +36,17 @@ pub use crate::histogram::{
     summary::{ByteValueMoments, byte_value_moments},
     topk::MisraGries as ByteMisraGries,
 };
+#[cfg(all(feature = "blake3", any(feature = "std", feature = "alloc")))]
+pub use crate::identity::blake3_cid;
+pub use crate::identity::{
+    MAX_VARINT_LEN, MULTIBASE_BASE32_LOWER_PREFIX, Multicodec, MultihashCode, base32_lower_len,
+    build_cid_v1, decode_multihash, decode_varint_u64, encode_base32_lower, encode_multihash,
+    encode_varint_u64, varint_u64_len,
+};
+#[cfg(any(feature = "std", feature = "alloc"))]
+pub use crate::identity::{
+    build_cid_v1_string, build_cid_v1_vec, encode_multihash_vec, sha256_cid,
+};
 pub use crate::search::bitap::{Bitap16, Bitap64};
 #[cfg(any(feature = "std", feature = "alloc"))]
 pub use crate::search::packed_dfa::PackedDfa;
