@@ -57,7 +57,22 @@ pub mod stripe4_u32 {
     }
 
     /// Adds bytes into an existing histogram with this pinned kernel.
+    ///
+    /// We issue a single T1 (L2-keep) prefetch on the next 4 stripes
+    /// (== 64 bytes ahead, exactly one cache line on Intel/Arm) before
+    /// entering the hot loop. The hot loop itself is left untouched
+    /// because the L1 streaming prefetcher saturates the byte-counter
+    /// pipeline; injecting a per-iteration prefetch hurts measured
+    /// throughput. The single hint gives the L2 a head start when
+    /// `bytes` was just streamed in from a higher cache level.
     pub fn add_block(bytes: &[u8], histogram: &mut ByteHistogram) {
+        const PREFETCH_AHEAD_BYTES: usize = 64;
+        if bytes.len() > PREFETCH_AHEAD_BYTES {
+            // SAFETY: bound checked above; prefetch never dereferences.
+            unsafe {
+                crate::primitives::prefetch::prefetch_t1(bytes.as_ptr().add(PREFETCH_AHEAD_BYTES));
+            }
+        }
         histogram_scalar::add_block_striped_u32::<4>(bytes, histogram.counts_mut_for_primitives());
         histogram.add_to_total_for_primitives(bytes.len() as u64);
     }

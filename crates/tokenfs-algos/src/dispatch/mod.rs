@@ -24,6 +24,21 @@ pub enum Backend {
     Neon = 5,
     /// Portable scalar backend.
     Scalar = 6,
+    /// Intel AMX (Advanced Matrix Extensions) backend (Sapphire Rapids+).
+    ///
+    /// Detection-only: no kernels are wired to this backend yet. The
+    /// variant exists so [`ProcessorProfile`] can advertise AMX
+    /// availability and so future tile-based primitives have a stable
+    /// label in dispatch traces.
+    Amx = 7,
+    /// Arm SME (Scalable Matrix Extension) backend (ARMv9.2+).
+    ///
+    /// Detection-only: see [`Backend::Amx`].
+    Sme = 8,
+    /// Arm SME2 backend (ARMv9.3+).
+    ///
+    /// Detection-only: see [`Backend::Amx`].
+    Sme2 = 9,
 }
 
 /// Basic cache facts used by planner heuristics.
@@ -52,6 +67,52 @@ impl CacheProfile {
     }
 }
 
+/// Matrix/tile accelerator availability for the current process.
+///
+/// This is purely detection metadata; the crate does not yet ship
+/// AMX/SME kernels. The fields exist so the planner and
+/// `dispatch_explain` example can surface what each runner advertises,
+/// and so future tile-based primitives can gate on real CPU support.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Default)]
+pub struct AcceleratorProfile {
+    /// Intel AMX tile-config support (`amx-tile`).
+    pub amx_tile: bool,
+    /// Intel AMX INT8 tile mul (`amx-int8`).
+    pub amx_int8: bool,
+    /// Intel AMX BF16 tile mul (`amx-bf16`).
+    pub amx_bf16: bool,
+    /// Arm SME (Scalable Matrix Extension) base feature.
+    pub sme: bool,
+    /// Arm SME2.
+    pub sme2: bool,
+}
+
+impl AcceleratorProfile {
+    /// Returns the all-false accelerator profile.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            amx_tile: false,
+            amx_int8: false,
+            amx_bf16: false,
+            sme: false,
+            sme2: false,
+        }
+    }
+
+    /// Returns true if any AMX feature is detected.
+    #[must_use]
+    pub const fn has_any_amx(self) -> bool {
+        self.amx_tile || self.amx_int8 || self.amx_bf16
+    }
+
+    /// Returns true if SME or SME2 is detected.
+    #[must_use]
+    pub const fn has_any_sme(self) -> bool {
+        self.sme || self.sme2
+    }
+}
+
 /// Processor facts used by runtime planning.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct ProcessorProfile {
@@ -61,6 +122,8 @@ pub struct ProcessorProfile {
     pub cache: CacheProfile,
     /// Logical CPU count when available.
     pub logical_cpus: Option<usize>,
+    /// AMX/SME accelerator availability (detection-only).
+    pub accelerators: AcceleratorProfile,
 }
 
 impl ProcessorProfile {
@@ -71,6 +134,7 @@ impl ProcessorProfile {
             backend: Backend::Scalar,
             cache: CacheProfile::unknown(),
             logical_cpus: None,
+            accelerators: AcceleratorProfile::none(),
         }
     }
 
@@ -81,6 +145,7 @@ impl ProcessorProfile {
             backend: detected_backend(),
             cache: detected_cache_profile(),
             logical_cpus: detect_logical_cpus(),
+            accelerators: detect_accelerators(),
         }
     }
 }
@@ -230,6 +295,15 @@ pub const fn backend_kernel_support(backend: Backend) -> BackendKernelSupport {
             fingerprint: KernelAvailability::Native,
             byte_class: KernelAvailability::Native,
             sketch: KernelAvailability::Native,
+        },
+        // Detection-only accelerators: no kernels are wired in yet, so
+        // every primitive falls back to scalar code today.
+        Backend::Amx | Backend::Sme | Backend::Sme2 => BackendKernelSupport {
+            backend,
+            byte_histogram: KernelAvailability::ScalarFallback,
+            fingerprint: KernelAvailability::ScalarFallback,
+            byte_class: KernelAvailability::ScalarFallback,
+            sketch: KernelAvailability::ScalarFallback,
         },
     }
 }
@@ -852,6 +926,9 @@ fn decode_backend(value: u8) -> Option<Backend> {
         value if value == Backend::Sve as u8 => Some(Backend::Sve),
         value if value == Backend::Neon as u8 => Some(Backend::Neon),
         value if value == Backend::Scalar as u8 => Some(Backend::Scalar),
+        value if value == Backend::Amx as u8 => Some(Backend::Amx),
+        value if value == Backend::Sme as u8 => Some(Backend::Sme),
+        value if value == Backend::Sme2 as u8 => Some(Backend::Sme2),
         _ => None,
     }
 }
@@ -876,6 +953,40 @@ fn detect_logical_cpus() -> Option<usize> {
                 .map(core::num::NonZeroUsize::get)
         } else {
             None
+        }
+    }
+}
+
+/// Detects matrix/tile accelerator availability for the current process.
+///
+/// Returns the all-false profile when the platform doesn't expose the
+/// relevant feature flags (e.g. `std` is off, or the target arch is
+/// neither x86 nor aarch64).
+#[must_use]
+pub fn detect_accelerators() -> AcceleratorProfile {
+    cfg_if::cfg_if! {
+        if #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))] {
+            // Intel AMX features. The `is_x86_feature_detected!` macro
+            // accepts these as of Rust 1.61+; on hosts that don't ship
+            // the feature, the macro is stable and returns false.
+            AcceleratorProfile {
+                amx_tile: std::is_x86_feature_detected!("amx-tile"),
+                amx_int8: std::is_x86_feature_detected!("amx-int8"),
+                amx_bf16: std::is_x86_feature_detected!("amx-bf16"),
+                sme: false,
+                sme2: false,
+            }
+        } else if #[cfg(all(feature = "std", target_arch = "aarch64"))] {
+            // ARMv9.2+ SME / ARMv9.3+ SME2.
+            AcceleratorProfile {
+                amx_tile: false,
+                amx_int8: false,
+                amx_bf16: false,
+                sme: std::arch::is_aarch64_feature_detected!("sme"),
+                sme2: std::arch::is_aarch64_feature_detected!("sme2"),
+            }
+        } else {
+            AcceleratorProfile::none()
         }
     }
 }
@@ -1030,11 +1141,46 @@ fn detect_aarch64_backend() -> Backend {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApiContext, Backend, CacheState, ContentKind, EntropyClass, EntropyScale,
-        HistogramStrategy, KernelAvailability, PlannerConfidenceSource, ProcessorProfile,
-        ReadPattern, SourceHint, WorkloadShape, backend_kernel_support, histogram_kernel_catalog,
-        plan_histogram,
+        AcceleratorProfile, ApiContext, Backend, CacheState, ContentKind, EntropyClass,
+        EntropyScale, HistogramStrategy, KernelAvailability, PlannerConfidenceSource,
+        ProcessorProfile, ReadPattern, SourceHint, WorkloadShape, backend_kernel_support,
+        detect_accelerators, histogram_kernel_catalog, plan_histogram,
     };
+
+    #[test]
+    fn portable_profile_advertises_no_accelerators() {
+        let profile = ProcessorProfile::portable();
+        assert_eq!(profile.accelerators, AcceleratorProfile::none());
+        assert!(!profile.accelerators.has_any_amx());
+        assert!(!profile.accelerators.has_any_sme());
+    }
+
+    #[test]
+    fn detect_accelerators_returns_a_concrete_profile() {
+        // We can't assert the bits — they depend on the host CPU — but
+        // we can at least guarantee the call returns and that, when an
+        // AMX bit is reported, the umbrella `has_any_amx` agrees.
+        let profile = detect_accelerators();
+        if profile.amx_tile || profile.amx_int8 || profile.amx_bf16 {
+            assert!(profile.has_any_amx());
+        }
+        if profile.sme || profile.sme2 {
+            assert!(profile.has_any_sme());
+        }
+    }
+
+    #[test]
+    fn backend_support_is_honest_about_amx_and_sme() {
+        for backend in [Backend::Amx, Backend::Sme, Backend::Sme2] {
+            let support = backend_kernel_support(backend);
+            // No real kernels are wired in yet; every primitive must
+            // honestly report scalar fallback for the new backends.
+            assert_eq!(support.byte_histogram, KernelAvailability::ScalarFallback);
+            assert_eq!(support.fingerprint, KernelAvailability::ScalarFallback);
+            assert_eq!(support.byte_class, KernelAvailability::ScalarFallback);
+            assert_eq!(support.sketch, KernelAvailability::ScalarFallback);
+        }
+    }
 
     #[test]
     fn planner_avoids_adaptive_sampling_for_tiny_random_reads() {

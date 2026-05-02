@@ -25,6 +25,7 @@ use std::env;
 use std::hint::black_box;
 use std::time::Instant;
 
+use tokenfs_algos::hash::sha256;
 use tokenfs_algos::histogram::summary::byte_value_moments;
 use tokenfs_algos::histogram::topk::MisraGries;
 use tokenfs_algos::{
@@ -62,6 +63,7 @@ fn main() {
     bench_histogram_bit_marginals();
     bench_minhash_update();
     bench_simhash_update();
+    bench_hash_sha256();
 }
 
 // ---------- environment header ----------
@@ -781,6 +783,51 @@ fn bench_search() {
                 n,
                 measure(|| {
                     black_box(dfa.find(black_box(&haystack)));
+                }),
+            );
+        }
+    }
+}
+fn bench_hash_sha256() {
+    for &n in PAYLOAD_SIZES_BYTES {
+        let bytes = make_random_bytes(n);
+        emit(
+            "hash-sha256",
+            "scalar",
+            n,
+            measure(|| {
+                black_box(sha256::kernels::scalar::sha256(black_box(&bytes)));
+            }),
+        );
+        emit(
+            "hash-sha256",
+            "auto",
+            n,
+            measure(|| {
+                black_box(sha256::sha256(black_box(&bytes)));
+            }),
+        );
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if sha256::kernels::x86_shani::is_available() {
+            emit(
+                "hash-sha256",
+                "x86-shani",
+                n,
+                measure(|| {
+                    // SAFETY: availability checked above.
+                    black_box(unsafe { sha256::kernels::x86_shani::sha256(black_box(&bytes)) });
+                }),
+            );
+        }
+        #[cfg(target_arch = "aarch64")]
+        if sha256::kernels::aarch64_sha2::is_available() {
+            emit(
+                "hash-sha256",
+                "aarch64-sha2",
+                n,
+                measure(|| {
+                    // SAFETY: availability checked above.
+                    black_box(unsafe { sha256::kernels::aarch64_sha2::sha256(black_box(&bytes)) });
                 }),
             );
         }

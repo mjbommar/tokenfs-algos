@@ -1,7 +1,14 @@
-//! Small non-cryptographic hash primitives.
+//! Small non-cryptographic hash primitives, plus a SHA-256 module with
+//! hardware-accelerated backends.
 //!
-//! These are for sketching, bucketing, and deterministic benchmarking. They are
-//! not integrity or security hashes.
+//! The mixers in [`kernels::scalar`] (FNV-1a 64, SplitMix-style mix64) are
+//! for sketching, bucketing, and deterministic benchmarking. They are *not*
+//! integrity or security hashes.
+//!
+//! For cryptographic SHA-256 — with x86 SHA-NI and AArch64 FEAT_SHA2
+//! backends behind a runtime feature gate — see the [`sha256`] submodule.
+
+pub mod sha256;
 
 /// Pinned hash kernels.
 pub mod kernels {
