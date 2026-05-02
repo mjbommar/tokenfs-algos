@@ -11,6 +11,9 @@ use core::arch::x86_64::{
 };
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const RLE_LANES: usize = 32;
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const LANES: usize = 32;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const MAX_PALETTE: usize = 16;
@@ -166,4 +169,74 @@ fn add_palette_sample(
     }
 
     Some(())
+}
+
+/// AVX2 byte-histogram with a constant-chunk RLE fast path bolted onto a
+/// scalar four-stripe core.
+///
+/// For each 32-byte chunk we compare the chunk against
+/// `_mm256_set1_epi8(chunk[0])`. If every lane matches, the chunk is a
+/// 32-byte run of one value and we increment that bin by 32 in a single
+/// counter update. Otherwise the chunk falls through to the four-stripe
+/// scalar path. On real-world inputs (text, code, executables) constant
+/// chunks are common (zero-fill, space-fill, padding) and the fast path
+/// converts 32 increments into 1. On uniform random inputs no chunk is
+/// constant and the kernel degenerates to the four-stripe path; the
+/// constant-chunk probe is one AVX2 broadcast + cmpeq + movemask + branch
+/// per 32 bytes, which costs at most a few percent of the stripe core.
+///
+/// # Safety
+///
+/// The caller must ensure the current CPU supports AVX2.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn add_block_rle_stripe4_u32(bytes: &[u8], counts: &mut [u64; 256]) {
+    if bytes.is_empty() {
+        return;
+    }
+
+    let mut h0 = [0_u32; 256];
+    let mut h1 = [0_u32; 256];
+    let mut h2 = [0_u32; 256];
+    let mut h3 = [0_u32; 256];
+
+    let mut index = 0_usize;
+    let mut runs = [0_u64; 256];
+
+    while index + RLE_LANES <= bytes.len() {
+        // SAFETY: index + RLE_LANES <= bytes.len() by the loop guard.
+        let chunk = unsafe { _mm256_loadu_si256(bytes.as_ptr().add(index).cast::<__m256i>()) };
+        // SAFETY: index < bytes.len() because RLE_LANES > 0.
+        let head = unsafe { *bytes.as_ptr().add(index) };
+        let needle = _mm256_set1_epi8(head as i8);
+        let mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, needle)) as u32;
+
+        if mask == u32::MAX {
+            // Constant chunk: bin += 32 in one go.
+            runs[head as usize] += RLE_LANES as u64;
+        } else {
+            // Heterogeneous chunk: scalar four-stripe over the chunk's
+            // 32 bytes. 32 is divisible by 4 so there is no inner tail.
+            let chunk_bytes = &bytes[index..index + RLE_LANES];
+            for group in 0..(RLE_LANES / 4) {
+                let base = group * 4;
+                h0[chunk_bytes[base] as usize] += 1;
+                h1[chunk_bytes[base + 1] as usize] += 1;
+                h2[chunk_bytes[base + 2] as usize] += 1;
+                h3[chunk_bytes[base + 3] as usize] += 1;
+            }
+        }
+        index += RLE_LANES;
+    }
+
+    // Scalar tail (< 32 bytes). Use stripe-0 for simplicity; spreading
+    // across the four stripes here would not move the needle.
+    for &byte in &bytes[index..] {
+        h0[byte as usize] += 1;
+    }
+
+    // Reduce stripes + RLE accumulator into the public table.
+    for slot in 0..256 {
+        counts[slot] += u64::from(h0[slot] + h1[slot] + h2[slot] + h3[slot]) + runs[slot];
+    }
 }

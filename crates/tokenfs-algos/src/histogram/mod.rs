@@ -4,6 +4,8 @@ pub mod byte;
 pub mod kernels;
 pub mod ngram;
 pub mod pair;
+pub mod summary;
+pub mod topk;
 
 #[cfg(feature = "bench-internals")]
 pub mod bench_internals;
