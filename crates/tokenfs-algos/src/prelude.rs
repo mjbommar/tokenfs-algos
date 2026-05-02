@@ -18,6 +18,11 @@ pub use crate::fingerprint::{
     FingerprintKernelInfo, block as fingerprint_block, extent as fingerprint_extent,
     kernel_catalog as fingerprint_kernel_catalog,
 };
+#[cfg(feature = "blake3")]
+pub use crate::hash::blake3::{
+    BLOCK_BYTES as BLAKE3_BLOCK_BYTES, DIGEST_BYTES as BLAKE3_DIGEST_BYTES, Hasher as Blake3Hasher,
+    blake3, blake3_derive_key, blake3_keyed, blake3_xof,
+};
 pub use crate::hash::{fnv1a64, mix64};
 pub use crate::histogram::{
     ByteHistogram, BytePairHistogram, BytePairScratch, HistogramBlockSignals, PlannedByteHistogram,

@@ -7,8 +7,14 @@
 //!
 //! For cryptographic SHA-256 — with x86 SHA-NI and AArch64 FEAT_SHA2
 //! backends behind a runtime feature gate — see the [`sha256`] submodule.
+//! For BLAKE3 (parallel content-addressable hash with variable-length
+//! output) gated behind the `blake3` cargo feature, see the [`blake3`]
+//! submodule.
 
 pub mod sha256;
+
+#[cfg(feature = "blake3")]
+pub mod blake3;
 
 /// Pinned hash kernels.
 pub mod kernels {

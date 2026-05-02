@@ -25,6 +25,8 @@ use std::env;
 use std::hint::black_box;
 use std::time::Instant;
 
+#[cfg(feature = "blake3")]
+use tokenfs_algos::hash::blake3 as b3;
 use tokenfs_algos::hash::sha256;
 use tokenfs_algos::histogram::summary::byte_value_moments;
 use tokenfs_algos::histogram::topk::MisraGries;
@@ -64,6 +66,7 @@ fn main() {
     bench_minhash_update();
     bench_simhash_update();
     bench_hash_sha256();
+    bench_hash_blake3();
 }
 
 // ---------- environment header ----------
@@ -918,6 +921,52 @@ fn bench_hash_sha256() {
             );
         }
     }
+}
+
+#[cfg(feature = "blake3")]
+fn bench_hash_blake3() {
+    // Streaming chunk size paired with the upstream `Hasher`. 4 KiB is
+    // a typical filesystem block size; comparing against the one-shot
+    // path tells us the overhead of the chunked feed.
+    const STREAM_CHUNK: usize = 4 * 1024;
+
+    for &n in PAYLOAD_SIZES_BYTES {
+        let bytes = make_random_bytes(n);
+
+        // Wrapper one-shot vs SHA-256 (already emitted by `bench_hash_sha256`).
+        emit(
+            "hash-blake3",
+            "wrapper",
+            n,
+            measure(|| {
+                black_box(b3::blake3(black_box(&bytes)));
+            }),
+        );
+
+        // Streaming `Hasher` fed in 4 KiB chunks. Output is bit-exact
+        // with the one-shot row above; the timing difference is purely
+        // the chunked-feed overhead.
+        if n >= STREAM_CHUNK {
+            emit(
+                "hash-blake3-stream4k",
+                "wrapper",
+                n,
+                measure(|| {
+                    let mut h = b3::Hasher::new();
+                    for window in black_box(&bytes).chunks(STREAM_CHUNK) {
+                        h.update(window);
+                    }
+                    black_box(h.finalize());
+                }),
+            );
+        }
+    }
+}
+
+#[cfg(not(feature = "blake3"))]
+fn bench_hash_blake3() {
+    // No-op stub when the `blake3` feature is not enabled. The rest of
+    // the benchmark suite still runs.
 }
 
 // ---------- measurement core ----------
