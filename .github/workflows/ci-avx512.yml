@@ -95,3 +95,32 @@ jobs:
 
       - name: Run dispatch_explain on this runner (logs detected backend)
         run: cargo run -p tokenfs-algos --example dispatch_explain --release
+
+      # --- per-runner micro-benchmarks (scalar vs SIMD, including AVX-512
+      #     when the planner picks it). Output is a TSV picked up by the
+      #     `perf-report` job in ci.yml via cross-workflow artifact pull. ---
+      # bench_compare currently exercises scalar / SSE4.2 / AVX2 backends.
+      # When #38 lands the AVX-512 backends, switch this invocation to
+      # `--features avx512` and the AVX-512 numbers will join the
+      # per-primitive comparison automatically (the column already exists).
+      # For now this gives a useful Zen 4 AVX2 datapoint on a *physical*
+      # box (vs Zen 3 EPYC virtualized GitHub-hosted runners).
+      - name: Run bench_compare (Zen 4 host)
+        env:
+          RUNNER_LABEL: avx512-${{ runner.name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          slug=$(printf '%s' "${RUNNER_LABEL}" | tr ' /()' '-' | tr -s '-')
+          out="perf-${slug}.tsv"
+          cargo run -p tokenfs-algos --example bench_compare --release > "$out"
+          echo "=== $out ==="
+          cat "$out"
+
+      - name: Upload perf TSV artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-avx512-${{ runner.name }}
+          path: perf-avx512-*.tsv
+          if-no-files-found: error
+          retention-days: 30

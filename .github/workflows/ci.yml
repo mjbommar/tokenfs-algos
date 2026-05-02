@@ -177,12 +177,55 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download all perf artifacts
+      - name: Download all perf artifacts (this workflow run)
         uses: actions/download-artifact@v4
         with:
           pattern: perf-*
           merge-multiple: true
           path: perf-data
+
+      # The AVX-512 numbers come from a separate workflow (`CI (AVX-512
+      # self-hosted)`), so they aren't in this run's artifacts. Find the
+      # AVX-512 run for the same SHA, wait briefly for it to complete,
+      # then download its perf TSV(s) into the same `perf-data` dir.
+      # Best-effort: if the AVX-512 workflow isn't running (e.g. self-
+      # hosted runner offline) the aggregator continues without it.
+      - name: Pull AVX-512 perf artifact (cross-workflow, best effort)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Up to 5 minutes of polling; AVX-512 workflow normally finishes
+          # in <60s on the self-hosted Zen 4 runner (s7).
+          for attempt in $(seq 1 30); do
+            avx_run=$(gh run list \
+              --branch main \
+              --workflow 'CI (AVX-512 self-hosted)' \
+              --limit 10 \
+              --json databaseId,headSha,status \
+              --jq ".[] | select(.headSha==\"${{ github.sha }}\") | .databaseId" \
+              | head -1 || true)
+            if [ -z "$avx_run" ]; then
+              echo "no AVX-512 run for SHA ${{ github.sha }} yet (attempt $attempt)"
+              sleep 10
+              continue
+            fi
+            status=$(gh run view "$avx_run" --json status --jq '.status' 2>/dev/null || echo unknown)
+            if [ "$status" = "completed" ]; then
+              echo "AVX-512 run $avx_run completed; downloading perf artifact"
+              # gh run download nests each artifact under its own directory;
+              # flatten into perf-data so the aggregator's `perf-*.tsv`
+              # glob picks the AVX-512 TSV up alongside the matrix runners.
+              rm -rf /tmp/avx-perf && mkdir -p /tmp/avx-perf
+              gh run download "$avx_run" --pattern 'perf-avx512-*' --dir /tmp/avx-perf 2>&1 || \
+                echo "no perf-avx512 artifact in run $avx_run (likely older commit)"
+              find /tmp/avx-perf -name 'perf-*.tsv' -exec cp {} perf-data/ \; || true
+              break
+            fi
+            echo "AVX-512 run $avx_run status=$status (attempt $attempt); waiting..."
+            sleep 10
+          done
 
       - name: List downloaded files
         run: ls -la perf-data || true
