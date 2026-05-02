@@ -29,6 +29,10 @@ use tokenfs_algos::histogram::summary::byte_value_moments;
 use tokenfs_algos::histogram::topk::MisraGries;
 use tokenfs_algos::{
     byteclass, fingerprint, histogram, runlength,
+    search::{
+        bitap::Bitap16, bitap::Bitap64, packed_dfa::PackedDfa, packed_pair::PackedPair,
+        rabin_karp::RabinKarp, shift_or::ShiftOr, two_way::TwoWay,
+    },
     similarity::{self, kernels as sim_kernels},
     sketch,
 };
@@ -52,6 +56,7 @@ fn main() {
     bench_sketch_crc32_hash4();
     bench_similarity_dot_f32();
     bench_similarity_l2_squared_f32();
+    bench_search();
 }
 
 // ---------- environment header ----------
@@ -450,6 +455,114 @@ fn bench_similarity_l2_squared_f32() {
                 ));
             }),
         );
+    }
+}
+
+fn bench_search() {
+    // Three needle lengths: 4 / 16 / 64 bytes. The needle is taken from
+    // a deterministic offset inside each haystack so every algorithm
+    // observes the same hit position.
+    const NEEDLE_LENS: &[usize] = &[4_usize, 16, 64];
+    const HIT_OFFSET_FRAC: usize = 4; // hit at 1/4 into the haystack
+
+    for &n in PAYLOAD_SIZES_BYTES {
+        let haystack = make_random_bytes(n);
+        for &nlen in NEEDLE_LENS {
+            if haystack.len() < nlen {
+                continue;
+            }
+            // Carve a deterministic needle out of the haystack so each
+            // algorithm finds it at the same position.
+            let hit_at = (haystack.len() / HIT_OFFSET_FRAC).min(haystack.len() - nlen);
+            let needle: Vec<u8> = haystack[hit_at..hit_at + nlen].to_vec();
+            let primitive = match nlen {
+                4 => "search-needle4",
+                16 => "search-needle16",
+                64 => "search-needle64",
+                _ => "search-needle",
+            };
+
+            // Two-Way (general).
+            let tw = TwoWay::new(&needle);
+            emit(
+                primitive,
+                "two_way",
+                n,
+                measure(|| {
+                    black_box(tw.find(black_box(&haystack)));
+                }),
+            );
+
+            // Rabin-Karp (rolling hash).
+            let rk = RabinKarp::new(&needle);
+            emit(
+                primitive,
+                "rabin_karp",
+                n,
+                measure(|| {
+                    black_box(rk.find(black_box(&haystack)));
+                }),
+            );
+
+            // Bitap16 (only for ≤16 byte needles).
+            if let Some(bp) = Bitap16::new(&needle) {
+                emit(
+                    primitive,
+                    "bitap16",
+                    n,
+                    measure(|| {
+                        black_box(bp.find(black_box(&haystack)));
+                    }),
+                );
+            }
+
+            // Bitap64 (≤64 byte needles).
+            if let Some(bp) = Bitap64::new(&needle) {
+                emit(
+                    primitive,
+                    "bitap64",
+                    n,
+                    measure(|| {
+                        black_box(bp.find(black_box(&haystack)));
+                    }),
+                );
+            }
+
+            // Shift-Or (≤64 byte needles).
+            if let Some(so) = ShiftOr::new(&needle) {
+                emit(
+                    primitive,
+                    "shift_or",
+                    n,
+                    measure(|| {
+                        black_box(so.find(black_box(&haystack)));
+                    }),
+                );
+            }
+
+            // PackedPair (needle ≥ 2 bytes).
+            if let Some(pp) = PackedPair::new(&needle) {
+                emit(
+                    primitive,
+                    "packed_pair",
+                    n,
+                    measure(|| {
+                        black_box(pp.find(black_box(&haystack)));
+                    }),
+                );
+            }
+
+            // PackedDfa (single-pattern, single match).
+            let dfa = PackedDfa::new(&[needle.as_slice()]);
+            emit(
+                primitive,
+                "packed_dfa",
+                n,
+                measure(|| {
+                    black_box(dfa.find(black_box(&haystack)));
+                }),
+            );
+        }
     }
 }
 
