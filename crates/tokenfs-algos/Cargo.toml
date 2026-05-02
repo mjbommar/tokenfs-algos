@@ -118,5 +118,9 @@ harness = false
 name = "bitmap_set_ops"
 harness = false
 
+[[bench]]
+name = "permutation_rcm"
+harness = false
+
 [lints]
 workspace = true

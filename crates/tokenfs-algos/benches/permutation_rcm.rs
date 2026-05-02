@@ -1,14 +1,19 @@
-//! `bench-permutation-rcm`: RCM build cost + Permutation::apply throughput.
+//! `bench-permutation-rcm`: RCM build cost, Rabbit Order build cost,
+//! and `Permutation::apply` throughput.
 //!
 //! Build cost is reported on synthetic Erdős-Rényi graphs at three
-//! vertex counts (10K, 100K, 1M) and two average-degree settings (5
-//! and 20). The applied permutation throughput is reported across the
-//! canonical L1 / L2 / L3 / DRAM cache tiers from
-//! [`support::cache_tier_sizes`].
+//! vertex counts (10K, 100K, 1M for RCM; 10K and 100K for Rabbit Order
+//! since the sequential dendrogram baseline is ~100-500x slower than
+//! RCM and 1M vertices would dominate bench wall time) and two
+//! average-degree settings (5 and 20). The applied permutation
+//! throughput is reported across the canonical L1 / L2 / L3 / DRAM
+//! cache tiers from [`support::cache_tier_sizes`].
 //!
 //! Run all: `cargo bench -p tokenfs-algos --bench permutation_rcm`
 //! Quick:   `cargo bench -p tokenfs-algos --bench permutation_rcm -- --quick`
 //! Filter:  `cargo bench -p tokenfs-algos --bench permutation_rcm -- in-L1`
+//! RCM:     `cargo bench -p tokenfs-algos --bench permutation_rcm -- rcm`
+//! Rabbit:  `cargo bench -p tokenfs-algos --bench permutation_rcm -- rabbit`
 
 #![allow(missing_docs)]
 // `support` is shared with the larger workload-matrix benches; only the
@@ -22,7 +27,7 @@ use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use support::cache_tier_sizes;
-use tokenfs_algos::permutation::{CsrGraph, Permutation, rcm};
+use tokenfs_algos::permutation::{CsrGraph, Permutation, rabbit_order, rcm};
 
 /// Vertex counts swept by the build benchmark.
 ///
@@ -30,6 +35,15 @@ use tokenfs_algos::permutation::{CsrGraph, Permutation, rcm};
 /// CSR neighbours buffer of ~80 MB; the bench runs in milliseconds
 /// per iteration but keep an eye on the working set when expanding.
 const VERTEX_COUNTS: &[u32] = &[10_000, 100_000, 1_000_000];
+
+/// Rabbit Order vertex counts. Smaller than [`VERTEX_COUNTS`] because
+/// the Sprint 47-49 sequential dendrogram baseline is ~100-500x heavier
+/// per vertex than RCM; including 1 M would inflate criterion's wall
+/// time per run beyond the typical PR-CI budget. The SIMD inner loop
+/// (Sprint 50-52) and concurrent merging (Sprint 53-55) follow-on
+/// sprints will close most of that gap and we'll add the 1 M tier back
+/// at that point.
+const RABBIT_VERTEX_COUNTS: &[u32] = &[10_000, 100_000];
 
 /// Average undirected degree settings.
 ///
@@ -145,6 +159,39 @@ fn bench_rcm_build(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_rabbit_build(c: &mut Criterion) {
+    let mut group = c.benchmark_group("permutation_rabbit/build");
+    // The sequential baseline is heavy enough that larger n per
+    // criterion sample inflates run time noticeably; cap the sample
+    // count and warmup to keep total bench wall time tractable while
+    // still producing statistically meaningful numbers.
+    group.sample_size(10);
+    group.warm_up_time(core::time::Duration::from_millis(500));
+    for &n in RABBIT_VERTEX_COUNTS {
+        for &deg in AVERAGE_DEGREES {
+            let (offsets, neighbors) =
+                linear_random_graph(n, deg, 0xF22_C0FFEE_u64 ^ u64::from(n) ^ u64::from(deg));
+            let graph_edges = neighbors.len() as u64;
+            // Throughput in vertices/sec is the natural axis to
+            // compare against `bench_rcm_build`.
+            group.throughput(Throughput::Elements(u64::from(n)));
+
+            let id = format!("rabbit/n={n}/avg_deg={deg}/edges={graph_edges}");
+            group.bench_with_input(BenchmarkId::from_parameter(id), &(), |b, _| {
+                b.iter(|| {
+                    let g = CsrGraph {
+                        n,
+                        offsets: black_box(&offsets),
+                        neighbors: black_box(&neighbors),
+                    };
+                    rabbit_order(g)
+                });
+            });
+        }
+    }
+    group.finish();
+}
+
 fn deterministic_u32_payload(byte_size: usize, seed: u64) -> Vec<u32> {
     let n = byte_size / core::mem::size_of::<u32>();
     let mut state = seed;
@@ -239,5 +286,10 @@ fn bench_apply_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_rcm_build, bench_apply_throughput);
+criterion_group!(
+    benches,
+    bench_rcm_build,
+    bench_rabbit_build,
+    bench_apply_throughput
+);
 criterion_main!(benches);
