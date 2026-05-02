@@ -128,10 +128,13 @@ jobs:
       # `sve` / `sve2` cargo features. The Linux Cobalt-100 runner has
       # SVE2 hardware (svebitperm + sveaes + svesha3 + svesm4 + svebf16
       # + svei8mm); without this step the SVE parity tests never fire
-      # against real silicon. macOS M1 has no SVE so the cfg gate skips
-      # the kernels entirely (the test suite is a no-op there).
-      - name: Test (SVE/SVE2 features on aarch64)
-        if: matrix.arch == 'aarch64'
+      # against real silicon. Restricted to linux-aarch64 because the
+      # macOS GitHub-hosted runner is Apple M1 (NO SVE), and Windows
+      # aarch64 (Cobalt-100) has SVE2 but the runner image's cargo
+      # toolchain doesn't reliably ship the SVE intrinsic crate path
+      # — re-enable for windows-aarch64 once verified.
+      - name: Test (SVE/SVE2 features on linux-aarch64)
+        if: matrix.label == 'linux-aarch64 (NEON)'
         run: cargo test -p tokenfs-algos --features nightly,sve,sve2
 
       - name: Build benchmarks (no-run, smoke-check)
