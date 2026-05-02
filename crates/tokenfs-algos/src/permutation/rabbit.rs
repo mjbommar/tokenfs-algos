@@ -999,16 +999,23 @@ pub mod kernels {
     //!
     //! ## i64 fast path eligibility
     //!
-    //! When `m_doubled < 2^32` AND `self_degree < 2^32` AND every entry
-    //! of `neighbor_weights` and `neighbor_degrees` is `< 2^32`, both
-    //! products `2 * m * w` and `deg(u) * deg(v)` fit in `u64`, their
-    //! difference fits in `i65`, and the SIMD backends use 32-bit-input
-    //! widening multiplies (`_mm256_mul_epu32`, `_mm512_mul_epu32`,
-    //! `vmull_u32`) to evaluate the score in `i64` lanes. For inputs
-    //! larger than the bound, every backend transparently delegates to
-    //! [`scalar::modularity_gains_neighbor_batch`] for the i128
-    //! arithmetic (the SIMD lanes do not have a portable widening
-    //! multiply that produces 128-bit results).
+    //! Eligibility is `m_doubled < 2^31` AND `self_degree < 2^31` AND
+    //! every entry of `neighbor_weights` and `neighbor_degrees` is
+    //! `< 2^31` (audit-R7 #6: code-doc reconciliation; the literal
+    //! `BOUND` constant on each backend is `1_u64 << 31`, not `1u64 << 32`,
+    //! to keep the i64 product symmetric around zero — see the per-
+    //! backend `BOUND` doc-comment for the sign-overflow rationale).
+    //! Under that bound both products `2 * m * w` and `deg(u) * deg(v)`
+    //! fit in `u64`, their difference fits in `i64` (the per-pair score
+    //! sits in `i63` after the `m_doubled` factor, so even the
+    //! community-wide sum stays in `i64` for the realistic batch sizes
+    //! the agglomeration loop emits), and the SIMD backends use
+    //! 32-bit-input widening multiplies (`_mm256_mul_epu32`,
+    //! `_mm512_mul_epu32`, `vmull_u32`) to evaluate the score in `i64`
+    //! lanes. For inputs larger than the bound, every backend
+    //! transparently delegates to [`scalar::modularity_gains_neighbor_batch`]
+    //! for the i128 arithmetic (the SIMD lanes do not have a portable
+    //! widening multiply that produces 128-bit results).
     //!
     //! For TokenFS-typical workloads (200 K vertices, average degree
     //! 5-20, weights bounded by a small constant) the fast path covers
@@ -2301,10 +2308,12 @@ mod tests {
     // Sprint 50-52: SIMD modularity-gain inner loop parity tests.
     //
     // Every SIMD backend must produce bit-exact results vs the scalar
-    // reference for both the i64-fast-path regime (every input < 2^32)
-    // and the i128-fallback regime (any input >= 2^32). The
-    // `rabbit_order` permutation must remain unchanged whether the
-    // SIMD path or the scalar path was selected at runtime.
+    // reference for both the i64-fast-path regime (every input < 2^31
+    // — see `kernels::scalar::fast_path_eligible` for the bound and
+    // its sign-overflow rationale) and the i128-fallback regime (any
+    // input >= 2^31). The `rabbit_order` permutation must remain
+    // unchanged whether the SIMD path or the scalar path was selected
+    // at runtime.
 
     use super::kernels;
 
