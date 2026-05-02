@@ -201,16 +201,16 @@ O(n log n) sort.
 
 ### Vendor decision
 
-**Take `fast_hilbert` for 2D and `hilbert` for N-D as feature-gated dependencies.** Rationale:
+**Take `fast_hilbert` for 2D as a dep; ship our own Skilling N-D implementation (~200 lines) to avoid the upstream `hilbert` 0.1 crate's vulnerable transitive deps.** See R5 #158.
 
-1. Skilling's algorithm is non-trivial bit-fiddling; high risk of subtle bugs in a reimplementation.
-2. The crates are well-tested, mature, MIT-licensed.
-3. SIMD opportunity is small (Hilbert key computation is per-point, integer ops; not bandwidth-bound).
-4. Our value-add is the Permutation type integration, not the Hilbert key computation.
+Rationale (updated post audit-R5):
 
-**Different from Stream-VByte / RCM / Roaring decisions** — those have meaningful SIMD opportunity inside the kernel that we want under our own dispatch. Hilbert keys don't, so vendoring is cleanest.
+1. **2D path:** [`fast_hilbert`](https://crates.io/crates/fast_hilbert) is LUT-based, MIT-licensed, `no_std`-compatible, and pulls only `cfg-if`. Keep it.
+2. **N-D path:** the natural choice would have been the [`hilbert`](https://crates.io/crates/hilbert) 0.1 crate (also a Skilling implementation), but it transitively pulls `criterion 0.3` → `atty 0.2` (RUSTSEC-2021-0145) and `spectral 0.6` → `num 0.1` → `rustc-serialize 0.3` (RUSTSEC-2022-0004). The R4 audit added `deny.toml` ignore entries; R5 #158 promoted the fix from "ignore the warning" to "drop the dependency."
+3. The Skilling 2004 algorithm is ~80 lines of bit-twiddling plus a big-endian interleave step. The in-tree implementation in `crates/tokenfs-algos/src/permutation/hilbert.rs` (`skilling_hilbert_key` + `interleave_be`) is matched bit-for-bit against the upstream `hilbert::Point::hilbert_transform` output via a 22-case fixture (`skilling_hilbert_key_matches_upstream_fixture` test).
+4. SIMD opportunity is small (Hilbert key computation is per-point, integer ops; not bandwidth-bound), so the in-tree path stays scalar.
 
-Feature flag: `permutation_hilbert = ["dep:hilbert", "dep:fast_hilbert"]`. Optional so kernel-only consumers don't pull these in (they wouldn't anyway since `permutation` is build-time-only, but the flag keeps the dep tree clean for embedded / minimal consumers).
+Feature flag: `permutation_hilbert = ["std", "dep:fast_hilbert"]`. The flag stays optional so kernel-only consumers that don't need any Hilbert support don't pull the LUT tables in.
 
 ### SIMD
 
@@ -281,32 +281,18 @@ Per [`02b_DEPLOYMENT_MATRIX.md`](02b_DEPLOYMENT_MATRIX.md):
 - **`Permutation::apply` IS kernel-safe.** It's a `(perm: &[u32], src: &[T], dst: &mut [T]) → ()` operation, fully borrowed, allocation-free, and SIMD-friendly via gather. The build-time constraint is on **constructing** a Permutation, not on **applying** one.
 - For TokenFS specifically: the `tokenfs_writer` constructs the permutation at image-build time (userspace, ample memory) and writes the resulting `[u32; n]` array into the sealed image. The `tokenfs_reader` (FUSE or kernel) loads the permutation array from the mmap'd image and applies it via `Permutation::apply` on demand — kernel-safe.
 
-### `permutation_hilbert` Cargo feature — supply-chain caveat (audit-R4 finding #1)
+### `permutation_hilbert` Cargo feature — dep-tree status (audit-R5 finding #158, closed)
 
-The `permutation_hilbert` Cargo feature is **userspace-only and build-time-only**. It must NOT be enabled when building:
+The `permutation_hilbert` Cargo feature now pulls only [`fast_hilbert`](https://crates.io/crates/fast_hilbert) 2.x (MIT, `no_std`-compatible, transitive deps: `cfg-if` only). The N-D path is implemented in-tree (`crates/tokenfs-algos/src/permutation/hilbert.rs::skilling_hilbert_key`).
 
-- the in-tree kernel module,
-- the FUSE bridge,
-- minimal / embedded consumers that audit their dep tree against RustSec advisories,
-- any consumer where `cargo deny check advisories` is part of the release gate without the ignore entries from this repo's `deny.toml`.
+**Resolved by:** dropping the upstream `hilbert` 0.1 crate dependency in favor of an in-tree Skilling N-D implementation (~200 lines including doc comments and the byte-interleave step). Bit-exact parity with the upstream output is enforced by the `skilling_hilbert_key_matches_upstream_fixture` test (22 fixture cases across `dim ∈ {3, 4, 5}` and `bits ∈ {3, 4, 5, 16}`).
 
-Reason: the upstream [`hilbert 0.1`](https://crates.io/crates/hilbert) crate transitively pulls dependencies that have open RustSec advisories with no upstream fix:
+**Audit history:**
 
-| Advisory | Crate | Reason | Path |
-|---|---|---|---|
-| **RUSTSEC-2022-0004** | `rustc-serialize 0.3.25` | Stack overflow in `Json::from_str` on deeply nested input (no safe upgrade) | `hilbert 0.1` → `spectral 0.6` → `num 0.1` → `num-bigint 0.1` → `rustc-serialize 0.3` |
-| **RUSTSEC-2021-0145** | `atty 0.2.14` | Unaligned read on Windows with custom global allocator + crate is unmaintained | `hilbert 0.1` → `criterion 0.3` → `atty 0.2` |
+- **R4 finding #1:** flagged the upstream `hilbert` 0.1 crate's transitive RUSTSEC-2022-0004 (`rustc-serialize 0.3` via `spectral 0.6` → `num 0.1`) and RUSTSEC-2021-0145 (`atty 0.2` via `criterion 0.3`). Mitigated short-term with `deny.toml` ignore entries and a usage scope note.
+- **R5 finding #158:** promoted the fix to "drop the dependency." This was implemented by writing the in-tree Skilling impl, removing the `dep:hilbert` and `dep:num` lines from `crates/tokenfs-algos/Cargo.toml`, and removing the two RUSTSEC ignore entries from `deny.toml`. `cargo deny check --all-features` now reports zero advisory findings.
 
-We do not call either vulnerable code path (`rustc_serialize::json::Json::from_str` is never invoked from our wrappers; the `atty` Windows path requires a custom allocator we never install). The dependencies are nonetheless present in the Cargo dep graph when the feature is enabled, so they show up under any audit tool.
-
-The repo's `deny.toml` includes explicit `ignore` entries for both advisories, scoped via documentation to the `permutation_hilbert` feature. The default-features build (the only one that kernel-adjacent consumers ship) is provably free of these advisories — verified via `cargo tree -p tokenfs-algos --no-default-features --features "std,avx2,neon"` showing zero hits for `atty` / `rustc-serialize` / `hilbert`.
-
-**TODO** (tracked under audit-R4 finding #1):
-
-1. Either fork the upstream `hilbert` crate to drop misclassified `[dependencies]` entries that should be `[dev-dependencies]` (the upstream crate only uses `criterion` and `spectral` for its own benchmarks and tests, but they are declared as runtime deps).
-2. Or replace the `hilbert` crate dependency with our own minimal Skilling N-D implementation. The 2D path already uses `fast_hilbert` (no transitive deps); only the N-D path needs replacing.
-
-Once either path lands, remove the `RUSTSEC-2022-0004` and `RUSTSEC-2021-0145` ignore entries from `deny.toml`.
+The feature is still **userspace-only and build-time-only** for the same reasons as the rest of the `permutation` module (allocates large work buffers; cannot be made stack-only). The kernel module, FUSE bridge, and minimal consumers should still leave it off — but the constraint is now "you don't need Hilbert curves at runtime," not "the crate has CVEs."
 
 ### Runtime-callable layout variants — open question
 
