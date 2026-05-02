@@ -24,6 +24,7 @@ mod tests;
 
 pub mod fuzzy;
 pub mod kernels;
+pub mod kernels_gather;
 #[cfg(feature = "std")]
 pub mod lsh;
 pub mod minhash;

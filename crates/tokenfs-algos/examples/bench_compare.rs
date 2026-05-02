@@ -60,6 +60,8 @@ fn main() {
     bench_search();
     bench_fuzzy_digest();
     bench_histogram_bit_marginals();
+    bench_minhash_update();
+    bench_simhash_update();
 }
 
 // ---------- environment header ----------
@@ -538,6 +540,112 @@ fn bench_similarity_dot_f32() {
                 black_box(similarity::distance::dot_f32(black_box(&a), black_box(&b)));
             }),
         );
+    }
+}
+
+fn bench_minhash_update() {
+    use tokenfs_algos::similarity::kernels_gather;
+    let seeds: [u64; 8] = core::array::from_fn(|i| 0xCAFE_BABE_u64 ^ (i as u64));
+    let table = kernels_gather::build_table_from_seeds(&seeds);
+
+    for &n in PAYLOAD_SIZES_BYTES {
+        let bytes = make_random_bytes(n);
+        emit(
+            "minhash-update-k8",
+            "scalar",
+            n,
+            measure(|| {
+                let mut sig = [u64::MAX; 8];
+                kernels_gather::update_minhash_scalar::<8>(black_box(&bytes), &table, &mut sig);
+                black_box(&sig);
+            }),
+        );
+
+        #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+        if kernels_gather::avx2::is_available() {
+            emit(
+                "minhash-update-k8",
+                "avx2-gather",
+                n,
+                measure(|| {
+                    let mut sig = [u64::MAX; 8];
+                    // SAFETY: availability checked above.
+                    unsafe {
+                        kernels_gather::avx2::update_minhash_8way(
+                            black_box(&bytes),
+                            &table,
+                            &mut sig,
+                        );
+                    }
+                    black_box(&sig);
+                }),
+            );
+        }
+        #[cfg(all(feature = "avx512", any(target_arch = "x86", target_arch = "x86_64")))]
+        if kernels_gather::avx512::is_available() {
+            emit(
+                "minhash-update-k8",
+                "avx512-gather",
+                n,
+                measure(|| {
+                    let mut sig = [u64::MAX; 8];
+                    // SAFETY: availability checked above.
+                    unsafe {
+                        kernels_gather::avx512::update_minhash_8way(
+                            black_box(&bytes),
+                            &table,
+                            &mut sig,
+                        );
+                    }
+                    black_box(&sig);
+                }),
+            );
+        }
+    }
+}
+
+fn bench_simhash_update() {
+    use tokenfs_algos::similarity::kernels_gather;
+    let seeds: [u64; kernels_gather::simhash::BITS] =
+        core::array::from_fn(|i| 0x9E37_79B9_7F4A_7C15_u64.wrapping_mul((i as u64) + 1));
+    let table = kernels_gather::simhash::build_table_from_seeds(&seeds);
+
+    for &n in PAYLOAD_SIZES_BYTES {
+        let bytes = make_random_bytes(n);
+        emit(
+            "simhash-update",
+            "scalar",
+            n,
+            measure(|| {
+                let mut acc = [0_i32; kernels_gather::simhash::BITS];
+                kernels_gather::simhash::update_accumulator_scalar(
+                    black_box(&bytes),
+                    &table,
+                    &mut acc,
+                );
+                black_box(&acc);
+            }),
+        );
+        #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+        if kernels_gather::simhash::avx2::is_available() {
+            emit(
+                "simhash-update",
+                "avx2-gather",
+                n,
+                measure(|| {
+                    let mut acc = [0_i32; kernels_gather::simhash::BITS];
+                    // SAFETY: availability checked above.
+                    unsafe {
+                        kernels_gather::simhash::avx2::update_accumulator(
+                            black_box(&bytes),
+                            &table,
+                            &mut acc,
+                        );
+                    }
+                    black_box(&acc);
+                }),
+            );
+        }
     }
 }
 
