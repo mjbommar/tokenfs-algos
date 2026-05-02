@@ -6,8 +6,17 @@
 //! - known tiny vectors match hand-computed values;
 //! - length mismatch returns None;
 //! - empty-vector behavior is stable and documented.
+//!
+//! As of v0.2 the dense-distance kernels live in [`crate::vector`]; the
+//! `similarity::kernels::scalar::*` paths exercised here are deprecated
+//! forwarders. This test module asserts the forwarding still produces
+//! the same numeric answers as the canonical [`crate::vector`] surface.
+//! New tests for the migrated kernels live in
+//! [`crate::vector::tests`](super::super::vector); this file is kept to
+//! prove the deprecated shim contract.
 
 #![allow(clippy::unwrap_used)] // Test code — panic on None is the desired failure mode.
+#![allow(deprecated)] // This file exists specifically to verify the deprecated shim.
 
 use crate::similarity::distance;
 use crate::similarity::kernels::scalar;

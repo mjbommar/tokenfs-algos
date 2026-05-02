@@ -1,23 +1,30 @@
-//! Dense distance and similarity primitives.
+//! Content-similarity primitives (MinHash, SimHash, LSH, fuzzy hashing).
 //!
-//! This module is the foundation of the similarity layer described in
-//! `docs/SIMILARITY_APPROXIMATION_ROADMAP.md`. The public contract follows
-//! the same ladder as histogram and fingerprint:
+//! As of v0.2 the dense-distance kernels (dot/L2/cosine for f32 and u32,
+//! plus the new hamming/jaccard/batched APIs) live in
+//! [`crate::vector`]. This module continues to own the *content-
+//! similarity* primitives — MinHash signatures, SimHash, LSH bands,
+//! fuzzy hashing — and re-exports the dense-distance helpers under
+//! [`distance`] for backward compatibility. New code should reach for
+//! [`crate::vector`] directly when the goal is just "two vectors → one
+//! number".
+//!
+//! ## Public contract
 //!
 //! ```text
-//! similarity::distance::cosine_u32(a, b)            // public, runtime-dispatched
-//! similarity::kernels::scalar::cosine_u32(a, b)     // pinned scalar reference
-//! similarity::kernels::avx2::cosine_u32(a, b)       // pinned AVX2 (when feature gate active)
-//! similarity::kernels::neon::cosine_u32(a, b)       // pinned NEON (when target is aarch64)
+//! similarity::distance::cosine_similarity_u32(a, b)   // dispatched (kept for compatibility)
+//! vector::cosine_similarity_u32(a, b)                 // canonical v0.2 entry point
+//! vector::kernels::scalar::cosine_similarity_u32(a, b) // pinned scalar reference
 //! ```
 //!
-//! At this stage only the scalar kernels exist. AVX2 and NEON kernels land in
-//! follow-up tasks; the public dispatcher already has the slot wired so adding
-//! a backend does not change the API.
+//! The pinned per-backend `similarity::kernels::*` paths (scalar / avx2 /
+//! neon) are deprecated forwarders to the new home; see
+//! [`mod@kernels`] for the migration shim.
 //!
-//! Existing count-vector distance functions in [`crate::divergence`] remain in
-//! place and are re-exported below under [`distance::counts`]; the unified
-//! `similarity` namespace is the recommended import path going forward.
+//! Existing count-vector distance functions in [`crate::divergence`] remain
+//! in place and are re-exported below under [`distance::counts`]; the
+//! unified `similarity` namespace is the recommended import path for the
+//! count-vector workloads.
 
 #[cfg(test)]
 mod tests;
@@ -31,6 +38,12 @@ pub mod minhash;
 pub mod simhash;
 
 /// Distance functions for raw vectors and count vectors.
+///
+/// As of v0.2 the dense-distance kernels live in [`crate::vector`]; this
+/// module forwards through to the new home for callers (simhash, minhash,
+/// LSH) that already import via `similarity::distance::*`. New code may
+/// prefer to call [`crate::vector::distance`] (or the top-level
+/// [`crate::vector`] re-exports) directly.
 pub mod distance {
     /// Re-exports of the count-vector distance functions in
     /// [`crate::divergence`].
@@ -43,18 +56,16 @@ pub mod distance {
         };
     }
 
-    use super::kernels;
-
     /// Inner product of two `u32` vectors using the runtime-dispatched kernel.
     #[must_use]
     pub fn dot_u32(a: &[u32], b: &[u32]) -> Option<u64> {
-        kernels::auto::dot_u32(a, b)
+        crate::vector::kernels::auto::dot_u32(a, b)
     }
 
     /// Manhattan / L1 distance of two `u32` vectors.
     #[must_use]
     pub fn l1_u32(a: &[u32], b: &[u32]) -> Option<u64> {
-        kernels::auto::l1_u32(a, b)
+        crate::vector::kernels::auto::l1_u32(a, b)
     }
 
     /// Squared L2 distance of two `u32` vectors.
@@ -63,13 +74,13 @@ pub mod distance {
     /// [`l2_u32`] when an actual Euclidean distance is required.
     #[must_use]
     pub fn l2_squared_u32(a: &[u32], b: &[u32]) -> Option<u64> {
-        kernels::auto::l2_squared_u32(a, b)
+        crate::vector::kernels::auto::l2_squared_u32(a, b)
     }
 
     /// Euclidean / L2 distance of two `u32` vectors as `f64`.
     #[must_use]
     pub fn l2_u32(a: &[u32], b: &[u32]) -> Option<f64> {
-        kernels::auto::l2_u32(a, b)
+        crate::vector::kernels::auto::l2_u32(a, b)
     }
 
     /// Cosine similarity of two `u32` vectors as `f64` in `[-1, 1]`.
@@ -78,43 +89,43 @@ pub mod distance {
     /// has zero norm.
     #[must_use]
     pub fn cosine_similarity_u32(a: &[u32], b: &[u32]) -> Option<f64> {
-        kernels::auto::cosine_similarity_u32(a, b)
+        crate::vector::kernels::auto::cosine_similarity_u32(a, b)
     }
 
     /// Cosine distance = `1 - cosine_similarity`.
     #[must_use]
     pub fn cosine_distance_u32(a: &[u32], b: &[u32]) -> Option<f64> {
-        kernels::auto::cosine_similarity_u32(a, b).map(|s| 1.0 - s)
+        crate::vector::kernels::auto::cosine_similarity_u32(a, b).map(|s| 1.0 - s)
     }
 
     /// Inner product of two `f32` vectors using the runtime-dispatched kernel.
     #[must_use]
     pub fn dot_f32(a: &[f32], b: &[f32]) -> Option<f32> {
-        kernels::auto::dot_f32(a, b)
+        crate::vector::kernels::auto::dot_f32(a, b)
     }
 
     /// Squared L2 distance of two `f32` vectors.
     #[must_use]
     pub fn l2_squared_f32(a: &[f32], b: &[f32]) -> Option<f32> {
-        kernels::auto::l2_squared_f32(a, b)
+        crate::vector::kernels::auto::l2_squared_f32(a, b)
     }
 
     /// Euclidean / L2 distance of two `f32` vectors.
     #[must_use]
     pub fn l2_f32(a: &[f32], b: &[f32]) -> Option<f32> {
-        kernels::auto::l2_squared_f32(a, b).map(crate::math::sqrt_f32)
+        crate::vector::kernels::auto::l2_squared_f32(a, b).map(crate::math::sqrt_f32)
     }
 
     /// Cosine similarity of two `f32` vectors in `[-1, 1]`.
     #[must_use]
     pub fn cosine_similarity_f32(a: &[f32], b: &[f32]) -> Option<f32> {
-        kernels::auto::cosine_similarity_f32(a, b)
+        crate::vector::kernels::auto::cosine_similarity_f32(a, b)
     }
 
     /// Cosine distance = `1 - cosine_similarity` for `f32`.
     #[must_use]
     pub fn cosine_distance_f32(a: &[f32], b: &[f32]) -> Option<f32> {
-        kernels::auto::cosine_similarity_f32(a, b).map(|s| 1.0 - s)
+        crate::vector::kernels::auto::cosine_similarity_f32(a, b).map(|s| 1.0 - s)
     }
 }
 

@@ -37,9 +37,15 @@ use tokenfs_algos::{
         bitap::Bitap16, bitap::Bitap64, packed_dfa::PackedDfa, packed_pair::PackedPair,
         rabin_karp::RabinKarp, shift_or::ShiftOr, two_way::TwoWay,
     },
-    similarity::{self, kernels as sim_kernels},
-    sketch,
+    similarity, sketch,
+    vector::kernels as vec_kernels,
 };
+// SVE backend lives in `similarity::kernels::sve` (the v0.2 vector module
+// only enumerates scalar/avx2/avx512/neon); access via the deprecated
+// shim until SVE work moves over.
+#[cfg(all(feature = "sve", target_arch = "aarch64"))]
+#[allow(deprecated)]
+use tokenfs_algos::similarity::kernels::sve as sve_kernels;
 
 const MEASURE_TARGET_MS: u64 = 30;
 const SAMPLES: usize = 11;
@@ -574,7 +580,7 @@ fn bench_similarity_dot_f32() {
             "scalar",
             payload_bytes,
             measure(|| {
-                black_box(sim_kernels::scalar::dot_f32(black_box(&a), black_box(&b)));
+                black_box(vec_kernels::scalar::dot_f32(black_box(&a), black_box(&b)));
             }),
         );
         emit(
@@ -592,18 +598,18 @@ fn bench_similarity_dot_f32() {
             payload_bytes,
             measure(|| {
                 // SAFETY: NEON is mandatory in the AArch64 ABI.
-                black_box(unsafe { sim_kernels::neon::dot_f32(black_box(&a), black_box(&b)) });
+                black_box(unsafe { vec_kernels::neon::dot_f32(black_box(&a), black_box(&b)) });
             }),
         );
         #[cfg(all(feature = "sve", target_arch = "aarch64"))]
-        if sim_kernels::sve::is_available() {
+        if sve_kernels::is_available() {
             emit(
                 "similarity-dot-f32",
                 "sve",
                 payload_bytes,
                 measure(|| {
                     // SAFETY: availability checked immediately above.
-                    black_box(unsafe { sim_kernels::sve::dot_f32(black_box(&a), black_box(&b)) });
+                    black_box(unsafe { sve_kernels::dot_f32(black_box(&a), black_box(&b)) });
                 }),
             );
         }
@@ -726,7 +732,7 @@ fn bench_similarity_l2_squared_f32() {
             "scalar",
             payload_bytes,
             measure(|| {
-                black_box(sim_kernels::scalar::l2_squared_f32(
+                black_box(vec_kernels::scalar::l2_squared_f32(
                     black_box(&a),
                     black_box(&b),
                 ));
@@ -751,21 +757,19 @@ fn bench_similarity_l2_squared_f32() {
             measure(|| {
                 // SAFETY: NEON is mandatory in the AArch64 ABI.
                 black_box(unsafe {
-                    sim_kernels::neon::l2_squared_f32(black_box(&a), black_box(&b))
+                    vec_kernels::neon::l2_squared_f32(black_box(&a), black_box(&b))
                 });
             }),
         );
         #[cfg(all(feature = "sve", target_arch = "aarch64"))]
-        if sim_kernels::sve::is_available() {
+        if sve_kernels::is_available() {
             emit(
                 "similarity-l2-squared-f32",
                 "sve",
                 payload_bytes,
                 measure(|| {
                     // SAFETY: availability checked immediately above.
-                    black_box(unsafe {
-                        sim_kernels::sve::l2_squared_f32(black_box(&a), black_box(&b))
-                    });
+                    black_box(unsafe { sve_kernels::l2_squared_f32(black_box(&a), black_box(&b)) });
                 }),
             );
         }

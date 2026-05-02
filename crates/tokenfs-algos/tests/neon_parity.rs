@@ -11,11 +11,16 @@
 //! exercises the NEON kernel against the pinned scalar reference.
 
 #![allow(missing_docs)]
-#![allow(clippy::unwrap_used)] // Test code — panic on None/Err is the desired failure mode.
+#![allow(clippy::unwrap_used)]
+// Test code — panic on None/Err is the desired failure mode.
+// The legacy `similarity::kernels::*` paths are deprecated re-exports of
+// `vector::kernels::*` (v0.2 module split); the parity coverage they
+// provide is still load-bearing while the deprecation is in effect.
+#![allow(deprecated)]
 #![cfg(all(feature = "neon", target_arch = "aarch64"))]
 
 use proptest::prelude::*;
-use tokenfs_algos::{bits, byteclass, fingerprint, hash, runlength, similarity, sketch};
+use tokenfs_algos::{bits, byteclass, fingerprint, hash, runlength, similarity, sketch, vector};
 
 fn synthetic_corpus() -> Vec<Vec<u8>> {
     let mut cases: Vec<Vec<u8>> = vec![
@@ -621,5 +626,116 @@ proptest! {
         prop_assert_eq!(actual, expected);
         // The auto-dispatched API must agree as well.
         prop_assert_eq!(hash::contains_u32_simd(&haystack, needle), expected);
+    }
+
+    // ---------- vector module: NEON hamming/jaccard parity ----------
+
+    #[test]
+    fn neon_vector_hamming_u64_matches_scalar(
+        a in proptest::collection::vec(any::<u64>(), 0..512),
+        seed in any::<u64>(),
+    ) {
+        let b: Vec<u64> = a.iter().enumerate()
+            .map(|(i, x)| x.wrapping_mul(seed.wrapping_add(i as u64 + 1)))
+            .collect();
+        let expected = vector::kernels::scalar::hamming_u64(&a, &b);
+        // SAFETY: NEON is mandatory on AArch64.
+        let actual = unsafe { vector::kernels::neon::hamming_u64(&a, &b) };
+        prop_assert_eq!(Some(actual), expected);
+        prop_assert_eq!(vector::hamming_u64(&a, &b), expected);
+    }
+
+    #[test]
+    fn neon_vector_jaccard_u64_matches_scalar(
+        a in proptest::collection::vec(any::<u64>(), 0..512),
+        seed in any::<u64>(),
+    ) {
+        let b: Vec<u64> = a.iter().enumerate()
+            .map(|(i, x)| x ^ seed.rotate_left(i as u32))
+            .collect();
+        let expected = vector::kernels::scalar::jaccard_u64(&a, &b).unwrap();
+        // SAFETY: NEON is mandatory on AArch64.
+        let actual = unsafe { vector::kernels::neon::jaccard_u64(&a, &b) };
+        prop_assert!((expected - actual).abs() < 1e-12,
+            "jaccard_u64 diverged: scalar={expected} neon={actual}");
+        let dispatched = vector::jaccard_u64(&a, &b).unwrap();
+        prop_assert!((expected - dispatched).abs() < 1e-12);
+    }
+
+    // ---------- vector module: NEON dot/L2 f32 parity ----------
+
+    #[test]
+    fn neon_vector_dot_l2_f32_match_scalar(
+        a in proptest::collection::vec(-256.0_f32..256.0, 0..1024),
+        seed in any::<u32>(),
+    ) {
+        let b: Vec<f32> = a.iter().enumerate()
+            .map(|(i, x)| x + (seed.wrapping_mul(i as u32 + 1) as f32 * 1e-3))
+            .collect();
+        let dot_s = vector::kernels::scalar::dot_f32(&a, &b).unwrap();
+        // SAFETY: NEON is mandatory on AArch64.
+        let dot_v = unsafe { vector::kernels::neon::dot_f32(&a, &b) };
+        let l1: f32 = a.iter().zip(b.iter()).map(|(&x, &y)| (x * y).abs()).sum();
+        let scale = l1.max(dot_s.abs()).max(dot_v.abs()).max(1.0);
+        prop_assert!((dot_s - dot_v).abs() / scale < 1e-3,
+            "vector::neon::dot_f32 diverged: scalar={dot_s} neon={dot_v} l1={l1}");
+
+        let l2_s = vector::kernels::scalar::l2_squared_f32(&a, &b).unwrap();
+        // SAFETY: NEON is mandatory on AArch64.
+        let l2_v = unsafe { vector::kernels::neon::l2_squared_f32(&a, &b) };
+        let scale = l2_s.abs().max(l2_v.abs()).max(1.0);
+        prop_assert!((l2_s - l2_v).abs() / scale < 5e-4,
+            "vector::neon::l2_squared_f32 diverged: scalar={l2_s} neon={l2_v}");
+    }
+
+    // ---------- vector module: batched many-vs-one parity ----------
+
+    #[test]
+    fn neon_vector_batched_dot_f32_one_to_many_matches_serial(
+        n_rows in 0_usize..16,
+        seed in any::<u32>(),
+    ) {
+        let stride = 64_usize;
+        let mut state = seed.wrapping_add(1);
+        let mut next_f32 = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        let query: Vec<f32> = (0..stride).map(|_| next_f32()).collect();
+        let db: Vec<f32> = (0..n_rows * stride).map(|_| next_f32()).collect();
+        let mut out_batched = vec![0.0_f32; n_rows];
+        vector::dot_f32_one_to_many(&query, &db, stride, &mut out_batched);
+        for (i, slot) in out_batched.iter().enumerate() {
+            let row = &db[i * stride..(i + 1) * stride];
+            let serial = vector::dot_f32(&query, row).unwrap();
+            prop_assert!((slot - serial).abs() < 1e-5,
+                "batched dot_f32 row {} diverged: got {} serial {}", i, slot, serial);
+        }
+    }
+
+    #[test]
+    fn neon_vector_batched_hamming_u64_one_to_many_matches_serial(
+        n_rows in 0_usize..16,
+        seed in any::<u64>(),
+    ) {
+        let stride = 8_usize;
+        let mut state = seed;
+        let mut next_u64 = || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        };
+        let query: Vec<u64> = (0..stride).map(|_| next_u64()).collect();
+        let db: Vec<u64> = (0..n_rows * stride).map(|_| next_u64()).collect();
+        let mut out_batched = vec![0_u32; n_rows];
+        vector::hamming_u64_one_to_many(&query, &db, stride, &mut out_batched);
+        for (i, slot) in out_batched.iter().enumerate() {
+            let row = &db[i * stride..(i + 1) * stride];
+            let serial = vector::hamming_u64(&query, row).unwrap();
+            prop_assert_eq!(*slot as u64, serial);
+        }
     }
 }

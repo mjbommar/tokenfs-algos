@@ -47,6 +47,7 @@ pub mod similarity;
 pub mod sketch;
 pub mod sketch_p2;
 pub mod structure;
+pub mod vector;
 pub mod windows;
 
 pub(crate) mod math;
