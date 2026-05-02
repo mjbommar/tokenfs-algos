@@ -72,6 +72,9 @@ num = { version = "0.4", optional = true, default-features = false, features = [
 criterion = "0.8"
 proptest = "1"
 serde_json = "1"
+# Mature pure-Rust succinct data structures crate. Used as a parity oracle
+# for `bits::rank_select` tests only; not a runtime dependency.
+sucds = "0.8"
 
 [[bench]]
 name = "histogram"
@@ -101,6 +104,10 @@ harness = false
 
 [[bench]]
 name = "bits_streamvbyte"
+harness = false
+
+[[bench]]
+name = "bits_rank_select"
 harness = false
 
 [[bench]]

@@ -1157,6 +1157,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sucds"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd324eaa05be64f105ea5269bb8aabd70e5dd57fa5c673b167f451b07d6c0dcd"
+dependencies = [
+ "anyhow",
+ "num-traits",
+]
+
+[[package]]
 name = "syn"
 version = "2.0.117"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1214,6 +1224,7 @@ dependencies = [
  "proptest",
  "rayon",
  "serde_json",
+ "sucds",
 ]
 
 [[package]]
