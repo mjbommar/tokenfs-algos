@@ -205,7 +205,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Download all perf artifacts (this workflow run)
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: perf-*
           merge-multiple: true
