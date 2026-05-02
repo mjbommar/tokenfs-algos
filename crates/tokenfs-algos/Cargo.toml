@@ -137,5 +137,25 @@ harness = false
 name = "approx_bloom"
 harness = false
 
+# Examples that compose multiple primitives via the ergonomic panicking
+# entry points (audit-R5 #157 moved these behind `panicking-shape-apis`).
+# The kernel/FUSE deployment build (no-default-features + alloc) does not
+# need them, so gate them out there.
+[[example]]
+name = "build_pipeline"
+required-features = ["panicking-shape-apis"]
+
+[[example]]
+name = "inverted_index"
+required-features = ["panicking-shape-apis"]
+
+[[example]]
+name = "dispatch_explain"
+required-features = ["panicking-shape-apis"]
+
+[[example]]
+name = "similarity_scan"
+required-features = ["panicking-shape-apis"]
+
 [lints]
 workspace = true

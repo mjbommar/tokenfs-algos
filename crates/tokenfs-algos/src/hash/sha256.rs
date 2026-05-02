@@ -1340,6 +1340,17 @@ fn detect_backend() -> HasherBackend {
 #[cfg(test)]
 mod tests {
     use super::{Hasher, HasherBackend, kernels, sha256};
+    // `Vec`, `String`, and the `vec!` / `format!` macros are not in the
+    // no-std prelude; alias them from `alloc` for the alloc-only build
+    // (audit-R6 finding #164).
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::format;
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::string::String;
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::vec;
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::vec::Vec;
 
     fn hex(bytes: &[u8]) -> String {
         let mut s = String::with_capacity(bytes.len() * 2);
@@ -1413,7 +1424,11 @@ mod tests {
         }
     }
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    // The runtime-availability tests below print a skip notice via
+    // `eprintln!` (only in `std` builds) when the SIMD path is missing on
+    // the host; gate them on `feature = "std"` so the alloc-only build
+    // compiles without pulling in stdio (audit-R6 #164).
+    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
     #[test]
     fn x86_shani_parity_matches_scalar() {
         if !kernels::x86_shani::is_available() {
@@ -1442,7 +1457,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(feature = "std", target_arch = "aarch64"))]
     #[test]
     fn aarch64_sha2_parity_matches_scalar() {
         if !kernels::aarch64_sha2::is_available() {
@@ -1477,7 +1492,7 @@ mod tests {
     /// that historically failed on real ARM silicon (CI run
     /// 25241406257); locking it in here makes the bug-class
     /// non-recurring.
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(feature = "std", target_arch = "aarch64"))]
     #[test]
     fn aarch64_sha2_known_vectors() {
         if !kernels::aarch64_sha2::is_available() {

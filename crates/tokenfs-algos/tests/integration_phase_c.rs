@@ -10,8 +10,14 @@
 //!
 //! Each test uses fixed PRNG seeds and small fixture sizes (well under one
 //! second per test) so the suite stays cheap on CI.
+//!
+//! Gated on `panicking-shape-apis` because the example compositions use the
+//! ergonomic panicking entry points (`streamvbyte_encode_u32`, `sha256_batch_st`,
+//! `l2_squared_f32_one_to_many`, `DynamicBitPacker::new`) which audit-R5 #157
+//! moved behind that on-by-default feature.
 
 #![allow(missing_docs)]
+#![cfg(feature = "panicking-shape-apis")]
 
 use tokenfs_algos::bitmap::{ArrayContainer, Container};
 use tokenfs_algos::bits::{

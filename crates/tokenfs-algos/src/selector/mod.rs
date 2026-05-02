@@ -98,6 +98,10 @@ pub fn hint(bytes: &[u8]) -> RepresentationHint {
 #[cfg(test)]
 mod tests {
     use super::{RepresentationHint, hint, signals};
+    // `Vec` is not in the no-std prelude; alias it from `alloc` for the
+    // alloc-only build (audit-R6 finding #164).
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::vec::Vec;
 
     #[test]
     fn hints_sparse_text_and_binary() {

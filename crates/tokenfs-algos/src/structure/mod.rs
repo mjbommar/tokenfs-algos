@@ -177,6 +177,10 @@ pub fn count_zero_pages_4k(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{is_zero_page, repeated_period, summarize};
+    // `vec!` is not in the no-std prelude; alias it from `alloc` for
+    // the alloc-only build (audit-R6 finding #164).
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::vec;
 
     #[test]
     fn detects_zero_and_sparse_data() {

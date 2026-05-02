@@ -66,6 +66,10 @@ pub fn h_next_given_prev_from_scratch(scratch: &BytePairScratch) -> f32 {
 mod tests {
     use super::{h_next_given_prev, h_next_given_prev_with_scratch};
     use crate::histogram::BytePairScratch;
+    // `Box` is not in the no-std prelude; alias it from `alloc` for
+    // the alloc-only build (audit-R6 finding #164).
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::boxed::Box;
 
     #[test]
     fn deterministic_next_byte_has_zero_conditional_entropy() {

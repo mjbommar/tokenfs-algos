@@ -589,6 +589,10 @@ pub mod kernels {
 #[cfg(test)]
 mod tests {
     use super::{kernels, popcount_u8_slice, popcount_u64_slice};
+    // `Vec` is not in the no-std prelude; alias it from `alloc` for the
+    // alloc-only build (audit-R6 finding #164).
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::vec::Vec;
 
     fn deterministic_u64_words(n: usize, seed: u64) -> Vec<u64> {
         let mut state = seed;

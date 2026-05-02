@@ -38,12 +38,17 @@
 //! # Examples
 //!
 //! ```
-//! use tokenfs_algos::hash::sha256_batch_st;
+//! use tokenfs_algos::hash::try_sha256_batch_st;
 //! let messages: [&[u8]; 3] = [b"a", b"bc", b"def"];
 //! let mut digests = [[0_u8; 32]; 3];
-//! sha256_batch_st(&messages, &mut digests);
+//! try_sha256_batch_st(&messages, &mut digests).expect("digests buffer matches messages len");
 //! assert_eq!(digests[0], tokenfs_algos::hash::sha256::sha256(b"a"));
 //! ```
+//!
+//! `try_sha256_batch_st` works under all feature configurations including
+//! `--no-default-features`. The panicking sibling `sha256_batch_st` is on
+//! by default but gated behind `panicking-shape-apis` for kernel/FUSE
+//! deployments (audit-R5 #157).
 
 use crate::hash::sha256::DIGEST_BYTES as SHA256_DIGEST_BYTES;
 use crate::hash::sha256::sha256 as sha256_one;
@@ -375,8 +380,29 @@ mod tests {
 
     use super::*;
     use crate::hash::sha256::sha256;
+    // `Vec` and `vec!` are not in the no-std prelude; alias them from
+    // `alloc` for the alloc-only build (audit-R6 finding #164). Both are
+    // only used inside `panicking-shape-apis`-gated tests / helpers, so
+    // the imports follow the same gate to avoid unused-import warnings
+    // when those tests are compiled out.
+    #[cfg(all(
+        feature = "panicking-shape-apis",
+        feature = "alloc",
+        not(feature = "std")
+    ))]
+    use alloc::vec;
+    #[cfg(all(
+        feature = "panicking-shape-apis",
+        feature = "alloc",
+        not(feature = "std")
+    ))]
+    use alloc::vec::Vec;
 
+    // The two helpers below are only consumed by tests that go through
+    // the panicking `sha256_batch_st` entry point; gate them so the
+    // alloc-only build doesn't see them as dead code (audit-R6 #164).
     /// Deterministic pseudo-random byte generator for repeatable tests.
+    #[cfg(feature = "panicking-shape-apis")]
     fn fill_pseudo_random(buf: &mut [u8], seed: u64) {
         let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
         for byte in buf {
@@ -387,6 +413,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     fn make_message(len: usize, seed: u64) -> Vec<u8> {
         let mut buf = vec![0_u8; len];
         fill_pseudo_random(&mut buf, seed);

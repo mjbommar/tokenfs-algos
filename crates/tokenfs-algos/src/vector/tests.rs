@@ -8,6 +8,19 @@
 
 use super::distance;
 use super::kernels::scalar;
+// `Vec` is not in the no-std prelude; alias it from `alloc` for the
+// `--no-default-features --features alloc` build (audit-R6 #164). The
+// `vec!` macro is only used inside `panicking-shape-apis`-gated tests
+// below, so import it under the same gate to avoid an unused-import
+// warning when the panicking entry points are compiled out.
+#[cfg(all(
+    feature = "panicking-shape-apis",
+    feature = "alloc",
+    not(feature = "std")
+))]
+use alloc::vec;
+#[cfg(all(feature = "alloc", not(feature = "std")))]
+use alloc::vec::Vec;
 
 const EPS: f64 = 1e-9;
 const EPS_F32: f32 = 1e-6;
@@ -266,7 +279,13 @@ fn dispatcher_hamming_jaccard_matches_scalar_at_sub_block_lengths() {
 }
 
 // ---------- batched many-vs-one parity ----------
+//
+// All `super::batch::*_one_to_many` entry points are compiled only when
+// the on-by-default `panicking-shape-apis` feature is enabled (audit-R5
+// #157). Gating each test on the same feature keeps default builds
+// covered while letting the alloc-only build compile (audit-R6 #164).
 
+#[cfg(feature = "panicking-shape-apis")]
 #[test]
 fn batched_dot_f32_one_to_many_matches_serial() {
     let stride = 16_usize;
@@ -295,6 +314,7 @@ fn batched_dot_f32_one_to_many_matches_serial() {
     }
 }
 
+#[cfg(feature = "panicking-shape-apis")]
 #[test]
 fn batched_l2_squared_f32_one_to_many_matches_serial() {
     let stride = 32_usize;
@@ -317,6 +337,7 @@ fn batched_l2_squared_f32_one_to_many_matches_serial() {
     }
 }
 
+#[cfg(feature = "panicking-shape-apis")]
 #[test]
 fn batched_cosine_similarity_f32_one_to_many_matches_serial() {
     let stride = 64_usize;
@@ -340,6 +361,7 @@ fn batched_cosine_similarity_f32_one_to_many_matches_serial() {
     }
 }
 
+#[cfg(feature = "panicking-shape-apis")]
 #[test]
 fn batched_cosine_similarity_f32_zero_query_returns_zero() {
     let stride = 8_usize;
@@ -353,6 +375,7 @@ fn batched_cosine_similarity_f32_zero_query_returns_zero() {
     }
 }
 
+#[cfg(feature = "panicking-shape-apis")]
 #[test]
 fn batched_hamming_u64_one_to_many_matches_serial() {
     let stride = 8_usize; // 512-bit signature.
@@ -377,6 +400,7 @@ fn batched_hamming_u64_one_to_many_matches_serial() {
     }
 }
 
+#[cfg(feature = "panicking-shape-apis")]
 #[test]
 fn batched_jaccard_u64_one_to_many_matches_serial() {
     let stride = 4_usize; // 256-bit signature (typical MinHash).
@@ -404,6 +428,7 @@ fn batched_jaccard_u64_one_to_many_matches_serial() {
     }
 }
 
+#[cfg(feature = "panicking-shape-apis")]
 #[test]
 fn batched_apis_handle_empty_db() {
     let stride = 16_usize;
@@ -422,6 +447,7 @@ fn batched_apis_handle_empty_db() {
     super::batch::jaccard_u64_one_to_many(&q64, &db64, stride, &mut out_f64);
 }
 
+#[cfg(feature = "panicking-shape-apis")]
 #[test]
 #[should_panic(expected = "stride must be > 0")]
 fn batched_panics_on_zero_stride() {
@@ -431,6 +457,7 @@ fn batched_panics_on_zero_stride() {
     super::batch::dot_f32_one_to_many(&query, &db, 0, &mut out);
 }
 
+#[cfg(feature = "panicking-shape-apis")]
 #[test]
 #[should_panic(expected = "not a multiple of stride")]
 fn batched_panics_on_non_multiple_db_length() {
@@ -440,6 +467,7 @@ fn batched_panics_on_non_multiple_db_length() {
     super::batch::dot_f32_one_to_many(&query, &db, 4, &mut out);
 }
 
+#[cfg(feature = "panicking-shape-apis")]
 #[test]
 #[should_panic(expected = "but db has")]
 fn batched_panics_on_out_length_mismatch() {

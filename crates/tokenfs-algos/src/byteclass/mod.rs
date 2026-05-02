@@ -1175,6 +1175,12 @@ mod tests {
         classify, classify_with_table, classify_with_table_scalar, is_ascii_dominant, kernels,
         printable_control_whitespace_high_bit_table, validate_utf8,
     };
+    // `Vec` and `vec!` are not in the no-std prelude; alias them from
+    // `alloc` for the alloc-only build (audit-R6 finding #164).
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::vec;
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::vec::Vec;
 
     #[test]
     fn classifies_ascii_text() {

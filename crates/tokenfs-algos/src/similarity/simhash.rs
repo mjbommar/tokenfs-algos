@@ -149,6 +149,12 @@ pub use table::{BITS as TABLE_BITS, build_byte_table_from_seeds, from_bytes_tabl
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    // `Vec` and `vec!` are not in the no-std prelude; alias them from
+    // `alloc` for the alloc-only build (audit-R6 finding #164).
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::vec;
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::vec::Vec;
 
     #[test]
     fn empty_input_is_zero_signature() {

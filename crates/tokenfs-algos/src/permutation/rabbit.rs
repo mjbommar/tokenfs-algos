@@ -2052,10 +2052,19 @@ mod tests {
         // contiguous block of three positions, regardless of which
         // block is first.
         let inv = inverse(&perm);
-        let first: std::collections::BTreeSet<u32> = inv[..3].iter().copied().collect();
-        let second: std::collections::BTreeSet<u32> = inv[3..].iter().copied().collect();
-        let group_a: std::collections::BTreeSet<u32> = [0, 1, 2].into_iter().collect();
-        let group_b: std::collections::BTreeSet<u32> = [3, 4, 5].into_iter().collect();
+        // Use `BTreeSet` (works on both alloc and std) so the test
+        // compiles under `--no-default-features --features alloc` while
+        // remaining unchanged under default builds (audit-R6 #164).
+        // The crate's `extern crate alloc` is only declared when std is
+        // off, so reach for the right path explicitly.
+        #[cfg(not(feature = "std"))]
+        use alloc::collections::BTreeSet;
+        #[cfg(feature = "std")]
+        use std::collections::BTreeSet;
+        let first: BTreeSet<u32> = inv[..3].iter().copied().collect();
+        let second: BTreeSet<u32> = inv[3..].iter().copied().collect();
+        let group_a: BTreeSet<u32> = [0, 1, 2].into_iter().collect();
+        let group_b: BTreeSet<u32> = [3, 4, 5].into_iter().collect();
         assert!(
             (first == group_a && second == group_b) || (first == group_b && second == group_a),
             "communities not grouped: first={first:?} second={second:?}"
@@ -2145,6 +2154,11 @@ mod tests {
         assert!(scores.is_empty());
     }
 
+    // Uses `std::panic::catch_unwind` to assert the panicking branch;
+    // gate on `feature = "std"` so the alloc-only build compiles
+    // (audit-R6 finding #164). The kernel-level invariant is also
+    // enforced by `debug_assert_eq!` inside the scalar kernel itself.
+    #[cfg(feature = "std")]
     #[test]
     fn scalar_kernel_panics_on_length_mismatch() {
         let result = std::panic::catch_unwind(|| {

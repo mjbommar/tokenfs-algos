@@ -179,6 +179,18 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    // `Vec` and `vec!` are not in the no-std prelude; alias them from
+    // `alloc` for the alloc-only build (audit-R6 finding #164). Pull in
+    // `BTreeSet` rather than `std::collections::HashSet` so the test
+    // compiles on the alloc-only profile.
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::collections::BTreeSet;
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::vec;
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::vec::Vec;
+    #[cfg(feature = "std")]
+    use std::collections::BTreeSet;
 
     fn deterministic_zipfian_bytes(n: usize, seed: u64) -> Vec<u8> {
         // Build a Zipfian-ish skewed byte stream: byte `i` gets weight
@@ -246,8 +258,7 @@ mod tests {
         let bound = sk.error_bound();
         // Reported set:
         let reported: Vec<(u8, u64)> = sk.top_k().collect();
-        let reported_set: std::collections::HashSet<u8> =
-            reported.iter().map(|(b, _)| *b).collect();
+        let reported_set: BTreeSet<u8> = reported.iter().map(|(b, _)| *b).collect();
 
         for (byte, &true_count) in truth.iter().enumerate() {
             if true_count > bound {

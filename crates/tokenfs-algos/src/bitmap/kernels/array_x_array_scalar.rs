@@ -210,6 +210,12 @@ pub fn symmetric_difference(a: &[u16], b: &[u16], out: &mut Vec<u16>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `Vec` and `vec!` are not in the no-std prelude; alias them from
+    // `alloc` for the alloc-only build (audit-R6 finding #164).
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::vec;
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::vec::Vec;
 
     #[test]
     fn intersect_basic() {

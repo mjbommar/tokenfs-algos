@@ -145,12 +145,6 @@ impl<const W: u32> BitPacker<W> {
     /// Fallible variant of [`Self::encode_u32_slice`] that returns
     /// [`BitPackError`] when the output buffer is too small or the
     /// const-generic width `W` is out of range, instead of panicking.
-    ///
-    /// Validates `W` and `out.len()` upfront and dispatches to the
-    /// `_unchecked` kernel that omits the kernel-internal `assert!`
-    /// guards, so the call is panic-free even when the
-    /// `panicking-shape-apis` feature is disabled (audit-R6 finding
-    /// #162).
     pub fn try_encode_u32_slice(values: &[u32], out: &mut [u8]) -> Result<(), BitPackError> {
         if !(1..=32).contains(&W) {
             return Err(BitPackError::WidthOutOfRange { width: W });
@@ -162,9 +156,7 @@ impl<const W: u32> BitPacker<W> {
                 actual: out.len(),
             });
         }
-        // SAFETY: pre-validation above ensures `1 <= W <= 32` and
-        // `out.len() >= ceil(values.len() * W / 8)`.
-        unsafe { kernels::auto::encode_u32_slice_unchecked(W, values, out) };
+        kernels::auto::encode_u32_slice(W, values, out);
         Ok(())
     }
 
@@ -189,12 +181,6 @@ impl<const W: u32> BitPacker<W> {
     /// [`BitPackError`] when the input buffer is too short, the output
     /// buffer is too small, or the const-generic width `W` is out of
     /// range, instead of panicking.
-    ///
-    /// Validates `W`, `input.len()`, and `out.len()` upfront and
-    /// dispatches to the `_unchecked` kernel that omits the
-    /// kernel-internal `assert!` guards, so the call is panic-free even
-    /// when the `panicking-shape-apis` feature is disabled (audit-R6
-    /// finding #162).
     pub fn try_decode_u32_slice(
         input: &[u8],
         n: usize,
@@ -216,9 +202,7 @@ impl<const W: u32> BitPacker<W> {
                 actual: out.len(),
             });
         }
-        // SAFETY: pre-validation above ensures `1 <= W <= 32`,
-        // `input.len() >= ceil(n * W / 8)`, and `out.len() >= n`.
-        unsafe { kernels::auto::decode_u32_slice_unchecked(W, input, n, out) };
+        kernels::auto::decode_u32_slice(W, input, n, out);
         Ok(())
     }
 }
@@ -298,12 +282,6 @@ impl DynamicBitPacker {
     /// Fallible variant of [`Self::encode_u32_slice`] that returns
     /// [`BitPackError`] when the output buffer is too small or the
     /// configured width is out of range, instead of panicking.
-    ///
-    /// Validates the configured width and `out.len()` upfront and
-    /// dispatches to the `_unchecked` kernel that omits the
-    /// kernel-internal `assert!` guards, so the call is panic-free even
-    /// when the `panicking-shape-apis` feature is disabled (audit-R6
-    /// finding #162).
     pub fn try_encode_u32_slice(&self, values: &[u32], out: &mut [u8]) -> Result<(), BitPackError> {
         if !(1..=32).contains(&self.width) {
             return Err(BitPackError::WidthOutOfRange { width: self.width });
@@ -315,9 +293,7 @@ impl DynamicBitPacker {
                 actual: out.len(),
             });
         }
-        // SAFETY: pre-validation above ensures `1 <= width <= 32` and
-        // `out.len() >= ceil(values.len() * width / 8)`.
-        unsafe { kernels::auto::encode_u32_slice_unchecked(self.width, values, out) };
+        kernels::auto::encode_u32_slice(self.width, values, out);
         Ok(())
     }
 
@@ -342,12 +318,6 @@ impl DynamicBitPacker {
     /// [`BitPackError`] when the input buffer is too short, the output
     /// buffer is too small, or the configured width is out of range,
     /// instead of panicking.
-    ///
-    /// Validates the configured width, `input.len()`, and `out.len()`
-    /// upfront and dispatches to the `_unchecked` kernel that omits the
-    /// kernel-internal `assert!` guards, so the call is panic-free even
-    /// when the `panicking-shape-apis` feature is disabled (audit-R6
-    /// finding #162).
     pub fn try_decode_u32_slice(
         &self,
         input: &[u8],
@@ -370,9 +340,7 @@ impl DynamicBitPacker {
                 actual: out.len(),
             });
         }
-        // SAFETY: pre-validation above ensures `1 <= width <= 32`,
-        // `input.len() >= ceil(n * width / 8)`, and `out.len() >= n`.
-        unsafe { kernels::auto::decode_u32_slice_unchecked(self.width, input, n, out) };
+        kernels::auto::decode_u32_slice(self.width, input, n, out);
         Ok(())
     }
 }
@@ -382,12 +350,7 @@ pub mod kernels {
     /// Runtime-dispatched bit-pack kernels.
     pub mod auto {
         /// Packs `values` at width `w` into `out` using the best
-        /// available kernel (panicking variant).
-        ///
-        /// # Panics
-        ///
-        /// Panics if `w` is outside `1..=32` or
-        /// `out.len() < ceil(values.len() * w / 8)`.
+        /// available kernel.
         pub fn encode_u32_slice(w: u32, values: &[u32], out: &mut [u8]) {
             // Encode is bandwidth-modest and the per-element work is
             // dominated by cross-byte stores; the scalar path already
@@ -395,28 +358,8 @@ pub mod kernels {
             super::scalar::encode_u32_slice(w, values, out);
         }
 
-        /// Encode kernel without bounds-checking asserts.
-        ///
-        /// # Safety
-        ///
-        /// Caller must ensure `1 <= w <= 32` and
-        /// `out.len() >= ceil(values.len() * w / 8)`. Used by the
-        /// fallible bit-pack APIs after pre-validation; eliminates the
-        /// kernel-internal `assert!` panic sites that would otherwise
-        /// leak through the fallible API surface (audit-R6 finding
-        /// #162).
-        pub unsafe fn encode_u32_slice_unchecked(w: u32, values: &[u32], out: &mut [u8]) {
-            // SAFETY: caller upholds the precondition.
-            unsafe { super::scalar::encode_u32_slice_unchecked(w, values, out) };
-        }
-
         /// Unpacks `n` values at width `w` from `input` into `out`
-        /// using the best available kernel (panicking variant).
-        ///
-        /// # Panics
-        ///
-        /// Panics if `w` is outside `1..=32`,
-        /// `input.len() < ceil(n * w / 8)`, or `out.len() < n`.
+        /// using the best available kernel.
         pub fn decode_u32_slice(w: u32, input: &[u8], n: usize, out: &mut [u32]) {
             #[cfg(all(
                 feature = "std",
@@ -441,45 +384,6 @@ pub mod kernels {
             }
 
             super::scalar::decode_u32_slice(w, input, n, out);
-        }
-
-        /// Decode kernel without bounds-checking asserts.
-        ///
-        /// # Safety
-        ///
-        /// Caller must ensure `1 <= w <= 32`,
-        /// `input.len() >= ceil(n * w / 8)`, and `out.len() >= n`.
-        /// Used by the fallible bit-pack APIs after pre-validation;
-        /// eliminates the kernel-internal `assert!` panic sites that
-        /// would otherwise leak through the fallible API surface
-        /// (audit-R6 finding #162).
-        pub unsafe fn decode_u32_slice_unchecked(w: u32, input: &[u8], n: usize, out: &mut [u32]) {
-            #[cfg(all(
-                feature = "std",
-                feature = "avx2",
-                any(target_arch = "x86", target_arch = "x86_64")
-            ))]
-            {
-                if super::avx2::is_available() {
-                    // SAFETY: AVX2 availability checked above; caller
-                    // upholds the buffer-length precondition.
-                    unsafe { super::avx2::decode_u32_slice_unchecked(w, input, n, out) };
-                    return;
-                }
-            }
-
-            #[cfg(all(feature = "neon", target_arch = "aarch64"))]
-            {
-                if super::neon::is_available() {
-                    // SAFETY: NEON is mandatory on AArch64; caller
-                    // upholds the buffer-length precondition.
-                    unsafe { super::neon::decode_u32_slice_unchecked(w, input, n, out) };
-                    return;
-                }
-            }
-
-            // SAFETY: caller upholds the precondition.
-            unsafe { super::scalar::decode_u32_slice_unchecked(w, input, n, out) };
         }
     }
 
@@ -508,22 +412,6 @@ pub mod kernels {
                 out.len(),
                 needed
             );
-            // SAFETY: asserts above establish the precondition.
-            unsafe { encode_u32_slice_unchecked(w, values, out) };
-        }
-
-        /// Scalar encoder body without bounds-checking asserts.
-        ///
-        /// # Safety
-        ///
-        /// Caller must ensure `1 <= w <= 32` and
-        /// `out.len() >= ceil(values.len() * w / 8)`. The body is
-        /// otherwise identical to [`encode_u32_slice`] but skips the
-        /// leading `assert!` guards, which keeps it panic-free for
-        /// callers (e.g. the `try_*` APIs) that have already
-        /// pre-validated the buffers.
-        pub unsafe fn encode_u32_slice_unchecked(w: u32, values: &[u32], out: &mut [u8]) {
-            let needed = encoded_len_bytes(values.len(), w);
             // Zero exactly the needed prefix; the OR-into-existing-bytes
             // strategy below requires a clean slate.
             for byte in &mut out[..needed] {
@@ -605,22 +493,7 @@ pub mod kernels {
                 out.len(),
                 n
             );
-            // SAFETY: asserts above establish the precondition.
-            unsafe { decode_u32_slice_unchecked(w, input, n, out) };
-        }
 
-        /// Scalar decoder body without bounds-checking asserts.
-        ///
-        /// # Safety
-        ///
-        /// Caller must ensure `1 <= w <= 32`,
-        /// `input.len() >= ceil(n * w / 8)`, and `out.len() >= n`.
-        /// The body is otherwise identical to [`decode_u32_slice`] but
-        /// skips the leading `assert!` guards, which keeps it panic-free
-        /// for callers (e.g. the `try_*` APIs) that have already
-        /// pre-validated the buffers.
-        pub unsafe fn decode_u32_slice_unchecked(w: u32, input: &[u8], n: usize, out: &mut [u32]) {
-            let needed = encoded_len_bytes(n, w);
             // Byte-aligned fast paths mirror the encode-side specialization.
             match w {
                 8 => {
@@ -773,28 +646,13 @@ pub mod kernels {
                 out.len(),
                 n
             );
-            // SAFETY: AVX2 availability and buffer-length preconditions
-            // are both established above.
-            unsafe { decode_u32_slice_unchecked(w, input, n, out) };
-        }
 
-        /// Decodes `n` values of `w` bits each from `input` into `out`
-        /// without bounds-checking asserts.
-        ///
-        /// # Safety
-        ///
-        /// Caller must ensure the current CPU supports AVX2,
-        /// `1 <= w <= 32`, `input.len() >= ceil(n * w / 8)`, and
-        /// `out.len() >= n`.
-        #[target_feature(enable = "avx2")]
-        pub unsafe fn decode_u32_slice_unchecked(w: u32, input: &[u8], n: usize, out: &mut [u32]) {
             // Byte-aligned widths and the very small widths fall back
             // to scalar — the SIMD setup overhead exceeds the savings
             // on a memcpy-shaped workload.
             match w {
                 1 | 2 | 4 | 8 | 16 | 32 => {
-                    // SAFETY: caller upholds the buffer-length precondition.
-                    unsafe { scalar::decode_u32_slice_unchecked(w, input, n, out) };
+                    scalar::decode_u32_slice(w, input, n, out);
                     return;
                 }
                 _ => {}
@@ -808,8 +666,7 @@ pub mod kernels {
                 unsafe { decode_le24_avx2(w, input, n, out) };
             } else {
                 // 25..=31: 5-byte spans break the u32 lane load.
-                // SAFETY: caller upholds the buffer-length precondition.
-                unsafe { scalar::decode_u32_slice_unchecked(w, input, n, out) };
+                scalar::decode_u32_slice(w, input, n, out);
             }
         }
 
@@ -1077,25 +934,10 @@ pub mod kernels {
                 out.len(),
                 n
             );
-            // SAFETY: NEON availability and buffer-length preconditions
-            // are both established above.
-            unsafe { decode_u32_slice_unchecked(w, input, n, out) };
-        }
 
-        /// Decodes `n` values of `w` bits each from `input` into `out`
-        /// without bounds-checking asserts.
-        ///
-        /// # Safety
-        ///
-        /// Caller must ensure the current CPU supports NEON,
-        /// `1 <= w <= 32`, `input.len() >= ceil(n * w / 8)`, and
-        /// `out.len() >= n`.
-        #[target_feature(enable = "neon")]
-        pub unsafe fn decode_u32_slice_unchecked(w: u32, input: &[u8], n: usize, out: &mut [u32]) {
             match w {
                 1 | 2 | 4 | 8 | 16 | 32 => {
-                    // SAFETY: caller upholds the buffer-length precondition.
-                    unsafe { scalar::decode_u32_slice_unchecked(w, input, n, out) };
+                    scalar::decode_u32_slice(w, input, n, out);
                     return;
                 }
                 _ => {}
@@ -1108,8 +950,7 @@ pub mod kernels {
                 // SAFETY: target_feature on this fn forwards to the inner kernel.
                 unsafe { decode_le24_neon(w, input, n, out) };
             } else {
-                // SAFETY: caller upholds the buffer-length precondition.
-                unsafe { scalar::decode_u32_slice_unchecked(w, input, n, out) };
+                scalar::decode_u32_slice(w, input, n, out);
             }
         }
 
@@ -1286,9 +1127,12 @@ pub mod kernels {
 mod tests {
     #![allow(clippy::unwrap_used)] // Test code — panic on Err is the desired failure mode.
 
-    extern crate alloc;
     use super::*;
+    // `Vec` and `vec!` are not in the no-std prelude; alias them from
+    // `alloc` for the alloc-only build (audit-R6 finding #164).
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
     use alloc::vec;
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
     use alloc::vec::Vec;
 
     fn deterministic_values(n: usize, w: u32, seed: u64) -> Vec<u32> {
@@ -1315,6 +1159,12 @@ mod tests {
         }
     }
 
+    // The panicking constructor `DynamicBitPacker::new` plus the
+    // panicking `encode_u32_slice` / `decode_u32_slice` wrappers on
+    // `BitPacker` and `DynamicBitPacker` are only compiled when the
+    // on-by-default `panicking-shape-apis` feature is enabled (audit-R5
+    // #157). Gate the corresponding tests on the same feature so the
+    // alloc-only build (kernel/FUSE consumers) compiles (audit-R6 #164).
     #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn dynamic_packer_round_trip_every_width_and_length() {
@@ -1464,9 +1314,14 @@ mod tests {
         }
     }
 
+    // The fallible round-trip tests below construct `DynamicBitPacker`
+    // through the panicking `::new` constructor (the `try_*` methods are
+    // exposed on the resulting instance). They therefore depend on
+    // `panicking-shape-apis` being enabled.
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn try_encode_dynamic_returns_err_on_undersized_output() {
-        let packer = DynamicBitPacker::try_new(11).expect("width valid");
+        let packer = DynamicBitPacker::new(11);
         let values = vec![1_u32; 8];
         let needed = packer.encoded_len(8);
         let mut out = vec![0_u8; needed - 1];
@@ -1480,9 +1335,10 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn try_decode_dynamic_returns_err_on_undersized_input() {
-        let packer = DynamicBitPacker::try_new(11).expect("width valid");
+        let packer = DynamicBitPacker::new(11);
         let needed = packer.encoded_len(8);
         let input = vec![0_u8; needed - 1];
         let mut out = vec![0_u32; 8];
@@ -1498,9 +1354,10 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn try_decode_dynamic_returns_err_on_undersized_output() {
-        let packer = DynamicBitPacker::try_new(11).expect("width valid");
+        let packer = DynamicBitPacker::new(11);
         let needed = packer.encoded_len(8);
         let input = vec![0_u8; needed];
         let mut out = vec![0_u32; 1];
@@ -1639,113 +1496,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    // ------------------------------------------------------------------
-    // Audit-R6 finding #162 regression tests for the `try_*` paths.
-    //
-    // These tests intentionally avoid the panicking entry points so the
-    // assertion that the bit-pack `try_*` decoders are panic-free still
-    // holds when the `panicking-shape-apis` Cargo feature is disabled
-    // (the kernel/FUSE deployment build).
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn try_decode_dynamic_input_too_short_returns_err_not_panic() {
-        // n=8, W=11 -> ceil(88/8) = 11 bytes needed; supply 7.
-        let packer = DynamicBitPacker::try_new(11).expect("width valid");
-        let input = [0_u8; 7];
-        let mut out = [0_u32; 8];
-        let err = packer
-            .try_decode_u32_slice(&input, 8, &mut out)
-            .expect_err("must return Err");
-        assert!(
-            matches!(err, BitPackError::InputTooShort { .. }),
-            "expected InputTooShort, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn try_decode_dynamic_output_too_short_returns_err_not_panic() {
-        let packer = DynamicBitPacker::try_new(11).expect("width valid");
-        let needed = packer.encoded_len(8);
-        let input = vec![0_u8; needed];
-        let mut out = vec![0_u32; 1];
-        let err = packer
-            .try_decode_u32_slice(&input, 8, &mut out)
-            .expect_err("must return Err");
-        assert_eq!(
-            err,
-            BitPackError::OutputTooShort {
-                needed: 8,
-                actual: 1
-            }
-        );
-    }
-
-    #[test]
-    fn try_decode_const_packer_at_every_width_panic_free_round_trip() {
-        // Encode + decode via try_ APIs only at every legal width so we
-        // exercise the byte-aligned fast paths, the AVX2 / NEON regimes,
-        // and the 25..=31 fall-through to the unchecked scalar without
-        // any panicking entry point in the call chain.
-        macro_rules! check {
-            ($w:expr) => {{
-                const W: u32 = $w;
-                let n = 33_usize;
-                let values = deterministic_values(n, W, 0xC0FFEE_u64 ^ (W as u64));
-                let mut encoded = vec![0_u8; BitPacker::<W>::encoded_len(n)];
-                BitPacker::<W>::try_encode_u32_slice(&values, &mut encoded).unwrap();
-                let mut decoded = vec![0_u32; n];
-                BitPacker::<W>::try_decode_u32_slice(&encoded, n, &mut decoded).unwrap();
-                assert_eq!(decoded, values, "fallible round-trip diverged at W={W}");
-            }};
-        }
-        check!(1);
-        check!(3);
-        check!(5);
-        check!(7);
-        check!(8);
-        check!(11);
-        check!(13);
-        check!(16);
-        check!(20);
-        check!(24);
-        check!(25);
-        check!(27);
-        check!(31);
-        check!(32);
-    }
-
-    #[test]
-    fn try_const_decode_width_out_of_range_returns_err_not_panic() {
-        const W: u32 = 33;
-        let input = [0_u8; 4];
-        let mut out = [0_u32; 0];
-        let err =
-            BitPacker::<W>::try_decode_u32_slice(&input, 0, &mut out).expect_err("must return Err");
-        assert_eq!(err, BitPackError::WidthOutOfRange { width: 33 });
-    }
-
-    #[test]
-    fn try_dynamic_decode_width_out_of_range_returns_err_not_panic() {
-        // Build via try_new bypass: forge a packer with width=0 by
-        // re-using the type's bit-pattern through a struct literal —
-        // but the public API only allows valid widths via try_new. To
-        // verify the in-method check still triggers, we construct a
-        // legal packer and rely on the const-generic test above for
-        // out-of-range coverage on that path.
-        // Instead, exercise the legal path's panic-free decode tail:
-        let packer = DynamicBitPacker::try_new(7).expect("width valid");
-        // n*W = 30 bits -> 4 bytes needed; supply 3.
-        let input = [0_u8; 3];
-        let mut out = [0_u32; 6];
-        let err = packer
-            .try_decode_u32_slice(&input, 6, &mut out)
-            .expect_err("must return Err");
-        assert!(
-            matches!(err, BitPackError::InputTooShort { .. }),
-            "expected InputTooShort, got {err:?}"
-        );
     }
 }

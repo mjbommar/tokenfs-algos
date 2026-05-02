@@ -46,13 +46,18 @@
 //! use tokenfs_algos::bits::RankSelectDict;
 //!
 //! let bits = [0xff_ff_ff_ff_00_00_00_00_u64];
-//! let dict = RankSelectDict::build(&bits, 64);
+//! let dict = RankSelectDict::try_build(&bits, 64).expect("bits long enough");
 //! assert_eq!(dict.rank1(32), 0);
 //! assert_eq!(dict.rank1(64), 32);
 //! assert_eq!(dict.select1(0), Some(32));
 //! assert_eq!(dict.select1(31), Some(63));
 //! assert_eq!(dict.select1(32), None);
 //! ```
+//!
+//! `try_build` works under all feature configurations including
+//! `--no-default-features`. The panicking sibling `RankSelectDict::build`
+//! is on by default but gated behind `panicking-shape-apis` for
+//! kernel/FUSE deployments (audit-R5 #157).
 
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::cast_lossless)]
@@ -735,6 +740,10 @@ mod tests {
     use super::*;
     use alloc::vec;
 
+    // The naïve oracles below are only consumed by tests that go through
+    // the panicking `RankSelectDict::build` constructor; gate them so the
+    // alloc-only build doesn't see them as dead code (audit-R6 #164).
+    #[cfg(feature = "panicking-shape-apis")]
     fn naive_rank1(bits: &[u64], n_bits: usize, i: usize) -> usize {
         assert!(i <= n_bits);
         let mut count = 0_usize;
@@ -747,6 +756,7 @@ mod tests {
         count
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     fn naive_select1(bits: &[u64], n_bits: usize, k: usize) -> Option<usize> {
         let mut remaining = k;
         for bit in 0..n_bits {
@@ -761,6 +771,7 @@ mod tests {
         None
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     fn naive_select0(bits: &[u64], n_bits: usize, k: usize) -> Option<usize> {
         let mut remaining = k;
         for bit in 0..n_bits {
@@ -787,6 +798,10 @@ mod tests {
             .collect()
     }
 
+    // The panicking `RankSelectDict::build` constructor is only compiled
+    // when the on-by-default `panicking-shape-apis` feature is enabled
+    // (audit-R5 #157); gate the helper plus every test that depends on
+    // it so the alloc-only build compiles (audit-R6 #164).
     #[cfg(feature = "panicking-shape-apis")]
     fn parity_check(bits: &[u64], n_bits: usize, sample_step: usize) {
         let dict = RankSelectDict::build(bits, n_bits);
@@ -1228,8 +1243,8 @@ mod tests {
     /// (where sucds' default Rank9SelIndex without hints is fast enough)
     /// — adding `select1_hints()` would cover sparse vectors but doesn't
     /// change the parity outcome.
-    #[cfg(feature = "panicking-shape-apis")]
     #[test]
+    #[cfg(feature = "panicking-shape-apis")]
     fn sucds_parity_dense_sparse_alternating() {
         use sucds::bit_vectors::{Rank, Rank9Sel, Select};
 
@@ -1361,64 +1376,6 @@ mod tests {
         assert_eq!(dict.len_bits(), 256);
         // Alternating pattern: half the bits are set.
         assert_eq!(dict.count_ones(), 128);
-    }
-
-    // ------------------------------------------------------------------
-    // Audit-R6 finding #162 regression tests for the `try_build` path.
-    //
-    // The `try_build` constructor must surface BitsTooShort rather than
-    // panic via internal `bits[index]` out-of-range access; the kernel
-    // build loop indexes `bits` only for words inside
-    // `min((b+1)*WORDS_PER_BLOCK, bits.len())` so the precondition
-    // `bits.len() * 64 >= n_bits` is sufficient. These tests pin that
-    // contract for the no-panicking-shape-apis build.
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn try_build_bits_one_word_short_returns_err_not_panic() {
-        // Need at least ceil(200/64) = 4 words, supply 3.
-        let bits = [u64::MAX; 3];
-        let err = RankSelectDict::try_build(&bits, 200).expect_err("must return Err");
-        assert_eq!(
-            err,
-            RankSelectError::BitsTooShort {
-                bits_len_words: 3,
-                requested_n_bits: 200
-            }
-        );
-    }
-
-    #[test]
-    fn try_build_with_zero_bits_succeeds_on_empty_slice() {
-        let bits: [u64; 0] = [];
-        let dict = RankSelectDict::try_build(&bits, 0).expect("zero bits is valid");
-        assert_eq!(dict.len_bits(), 0);
-        assert_eq!(dict.count_ones(), 0);
-    }
-
-    #[test]
-    fn try_build_then_query_panic_free_round_trip() {
-        // Build via try_build, then exercise rank1/select1/count_ones
-        // without involving the panicking constructor. Verifies the
-        // built dictionary is queryable on a no-panicking-shape-apis
-        // build.
-        let bits = [0xff_u64, 0xff_u64, 0xff_u64, 0xff_u64]; // 32 ones.
-        let dict = RankSelectDict::try_build(&bits, 256).expect("valid build");
-        assert_eq!(dict.count_ones(), 32);
-        assert_eq!(dict.rank1(8), 8);
-        assert_eq!(dict.select1(0), Some(0));
-        assert_eq!(dict.select1(7), Some(7));
-        assert_eq!(dict.select1(31), Some(64 + 64 + 64 + 7));
-    }
-
-    #[test]
-    fn try_build_with_partial_trailing_word_succeeds() {
-        // n_bits = 70 needs ceil(70/64) = 2 words; the build masks the
-        // trailing partial word so popcount/queries align with n_bits.
-        let bits = [u64::MAX, 0x3f_u64]; // 64 + 6 = 70 ones.
-        let dict = RankSelectDict::try_build(&bits, 70).expect("valid build");
-        assert_eq!(dict.len_bits(), 70);
-        assert_eq!(dict.count_ones(), 70);
     }
 
     #[cfg(feature = "panicking-shape-apis")]
