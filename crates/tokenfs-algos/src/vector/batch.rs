@@ -101,8 +101,20 @@ impl std::error::Error for BatchShapeError {}
 ///
 /// See module docs. Use [`try_dot_f32_one_to_many`] for a fallible
 /// variant that returns [`BatchShapeError`] instead.
+///
+/// Only compiled when the `panicking-shape-apis` Cargo feature is
+/// enabled (default). Kernel/FUSE consumers should disable that
+/// feature and use [`try_dot_f32_one_to_many`] (audit-R5 #157).
+#[cfg(feature = "panicking-shape-apis")]
 pub fn dot_f32_one_to_many(query: &[f32], db: &[f32], stride: usize, out: &mut [f32]) {
     assert_batch_shape(query.len(), db.len(), stride, out.len());
+    dot_f32_one_to_many_inner(query, db, stride, out);
+}
+
+/// Inner kernel for [`dot_f32_one_to_many`] / [`try_dot_f32_one_to_many`].
+/// Assumes shape invariants have already been checked by the caller.
+#[inline]
+fn dot_f32_one_to_many_inner(query: &[f32], db: &[f32], stride: usize, out: &mut [f32]) {
     if out.is_empty() {
         return;
     }
@@ -122,7 +134,7 @@ pub fn try_dot_f32_one_to_many(
     out: &mut [f32],
 ) -> Result<(), BatchShapeError> {
     check_batch_shape(query.len(), db.len(), stride, out.len())?;
-    dot_f32_one_to_many(query, db, stride, out);
+    dot_f32_one_to_many_inner(query, db, stride, out);
     Ok(())
 }
 
@@ -135,8 +147,21 @@ pub fn try_dot_f32_one_to_many(
 ///
 /// See module docs. Use [`try_l2_squared_f32_one_to_many`] for a
 /// fallible variant that returns [`BatchShapeError`] instead.
+///
+/// Only compiled when the `panicking-shape-apis` Cargo feature is
+/// enabled (default). Kernel/FUSE consumers should disable that
+/// feature and use [`try_l2_squared_f32_one_to_many`] (audit-R5 #157).
+#[cfg(feature = "panicking-shape-apis")]
 pub fn l2_squared_f32_one_to_many(query: &[f32], db: &[f32], stride: usize, out: &mut [f32]) {
     assert_batch_shape(query.len(), db.len(), stride, out.len());
+    l2_squared_f32_one_to_many_inner(query, db, stride, out);
+}
+
+/// Inner kernel for [`l2_squared_f32_one_to_many`] /
+/// [`try_l2_squared_f32_one_to_many`]. Assumes shape invariants have
+/// already been checked by the caller.
+#[inline]
+fn l2_squared_f32_one_to_many_inner(query: &[f32], db: &[f32], stride: usize, out: &mut [f32]) {
     if out.is_empty() {
         return;
     }
@@ -156,7 +181,7 @@ pub fn try_l2_squared_f32_one_to_many(
     out: &mut [f32],
 ) -> Result<(), BatchShapeError> {
     check_batch_shape(query.len(), db.len(), stride, out.len())?;
-    l2_squared_f32_one_to_many(query, db, stride, out);
+    l2_squared_f32_one_to_many_inner(query, db, stride, out);
     Ok(())
 }
 
@@ -173,6 +198,12 @@ pub fn try_l2_squared_f32_one_to_many(
 ///
 /// See module docs. Use [`try_cosine_similarity_f32_one_to_many`] for
 /// a fallible variant that returns [`BatchShapeError`] instead.
+///
+/// Only compiled when the `panicking-shape-apis` Cargo feature is
+/// enabled (default). Kernel/FUSE consumers should disable that
+/// feature and use [`try_cosine_similarity_f32_one_to_many`] (audit-R5
+/// #157).
+#[cfg(feature = "panicking-shape-apis")]
 pub fn cosine_similarity_f32_one_to_many(
     query: &[f32],
     db: &[f32],
@@ -180,6 +211,19 @@ pub fn cosine_similarity_f32_one_to_many(
     out: &mut [f32],
 ) {
     assert_batch_shape(query.len(), db.len(), stride, out.len());
+    cosine_similarity_f32_one_to_many_inner(query, db, stride, out);
+}
+
+/// Inner kernel for [`cosine_similarity_f32_one_to_many`] /
+/// [`try_cosine_similarity_f32_one_to_many`]. Assumes shape invariants
+/// have already been checked by the caller.
+#[inline]
+fn cosine_similarity_f32_one_to_many_inner(
+    query: &[f32],
+    db: &[f32],
+    stride: usize,
+    out: &mut [f32],
+) {
     if out.is_empty() {
         return;
     }
@@ -213,7 +257,7 @@ pub fn try_cosine_similarity_f32_one_to_many(
     out: &mut [f32],
 ) -> Result<(), BatchShapeError> {
     check_batch_shape(query.len(), db.len(), stride, out.len())?;
-    cosine_similarity_f32_one_to_many(query, db, stride, out);
+    cosine_similarity_f32_one_to_many_inner(query, db, stride, out);
     Ok(())
 }
 
@@ -230,12 +274,26 @@ pub fn try_cosine_similarity_f32_one_to_many(
 /// outside the regime where the narrowed `u32` cannot represent the
 /// per-pair bit count. Use [`try_hamming_u64_one_to_many`] for a
 /// fallible variant that returns [`BatchShapeError`] instead.
+///
+/// Only compiled when the `panicking-shape-apis` Cargo feature is
+/// enabled (default). Kernel/FUSE consumers should disable that
+/// feature and use [`try_hamming_u64_one_to_many`] (audit-R5 #157).
+#[cfg(feature = "panicking-shape-apis")]
 pub fn hamming_u64_one_to_many(query: &[u64], db: &[u64], stride: usize, out: &mut [u32]) {
     assert_batch_shape(query.len(), db.len(), stride, out.len());
     assert!(
         stride <= (u32::MAX as usize) / 64,
         "hamming_u64_one_to_many: stride={stride} would overflow u32 output"
     );
+    hamming_u64_one_to_many_inner(query, db, stride, out);
+}
+
+/// Inner kernel for [`hamming_u64_one_to_many`] /
+/// [`try_hamming_u64_one_to_many`]. Assumes shape invariants and the
+/// `stride <= u32::MAX / 64` bound have already been checked by the
+/// caller.
+#[inline]
+fn hamming_u64_one_to_many_inner(query: &[u64], db: &[u64], stride: usize, out: &mut [u32]) {
     if out.is_empty() {
         return;
     }
@@ -253,7 +311,8 @@ pub fn hamming_u64_one_to_many(query: &[u64], db: &[u64], stride: usize, out: &m
 /// The `stride > u32::MAX / 64` overflow check is **not** mapped to a
 /// [`BatchShapeError`] variant — that condition still panics, since it
 /// reflects an output-encoding overflow rather than a buffer-shape
-/// issue.
+/// issue. Even with `panicking-shape-apis` disabled, this stride bound
+/// remains a panicking precondition because no `try_*` mapping exists.
 pub fn try_hamming_u64_one_to_many(
     query: &[u64],
     db: &[u64],
@@ -261,7 +320,11 @@ pub fn try_hamming_u64_one_to_many(
     out: &mut [u32],
 ) -> Result<(), BatchShapeError> {
     check_batch_shape(query.len(), db.len(), stride, out.len())?;
-    hamming_u64_one_to_many(query, db, stride, out);
+    assert!(
+        stride <= (u32::MAX as usize) / 64,
+        "try_hamming_u64_one_to_many: stride={stride} would overflow u32 output"
+    );
+    hamming_u64_one_to_many_inner(query, db, stride, out);
     Ok(())
 }
 
@@ -275,8 +338,21 @@ pub fn try_hamming_u64_one_to_many(
 ///
 /// See module docs. Use [`try_jaccard_u64_one_to_many`] for a fallible
 /// variant that returns [`BatchShapeError`] instead.
+///
+/// Only compiled when the `panicking-shape-apis` Cargo feature is
+/// enabled (default). Kernel/FUSE consumers should disable that
+/// feature and use [`try_jaccard_u64_one_to_many`] (audit-R5 #157).
+#[cfg(feature = "panicking-shape-apis")]
 pub fn jaccard_u64_one_to_many(query: &[u64], db: &[u64], stride: usize, out: &mut [f64]) {
     assert_batch_shape(query.len(), db.len(), stride, out.len());
+    jaccard_u64_one_to_many_inner(query, db, stride, out);
+}
+
+/// Inner kernel for [`jaccard_u64_one_to_many`] /
+/// [`try_jaccard_u64_one_to_many`]. Assumes shape invariants have
+/// already been checked by the caller.
+#[inline]
+fn jaccard_u64_one_to_many_inner(query: &[u64], db: &[u64], stride: usize, out: &mut [f64]) {
     if out.is_empty() {
         return;
     }
@@ -296,12 +372,17 @@ pub fn try_jaccard_u64_one_to_many(
     out: &mut [f64],
 ) -> Result<(), BatchShapeError> {
     check_batch_shape(query.len(), db.len(), stride, out.len())?;
-    jaccard_u64_one_to_many(query, db, stride, out);
+    jaccard_u64_one_to_many_inner(query, db, stride, out);
     Ok(())
 }
 
 /// Validates the batched-API shape invariants and panics with a clear
 /// message on mismatch.
+///
+/// Only used by the panicking entry points (gated on
+/// `panicking-shape-apis`); the `try_*` variants call
+/// [`check_batch_shape`] instead.
+#[cfg(feature = "panicking-shape-apis")]
 #[inline]
 fn assert_batch_shape(query_len: usize, db_len: usize, stride: usize, out_len: usize) {
     assert!(stride > 0, "batched API: stride must be > 0");
@@ -360,10 +441,13 @@ mod tests {
     use alloc::vec;
 
     use super::{
-        BatchShapeError, cosine_similarity_f32_one_to_many, dot_f32_one_to_many,
-        hamming_u64_one_to_many, jaccard_u64_one_to_many, l2_squared_f32_one_to_many,
-        try_cosine_similarity_f32_one_to_many, try_dot_f32_one_to_many,
+        BatchShapeError, try_cosine_similarity_f32_one_to_many, try_dot_f32_one_to_many,
         try_hamming_u64_one_to_many, try_jaccard_u64_one_to_many, try_l2_squared_f32_one_to_many,
+    };
+    #[cfg(feature = "panicking-shape-apis")]
+    use super::{
+        cosine_similarity_f32_one_to_many, dot_f32_one_to_many, hamming_u64_one_to_many,
+        jaccard_u64_one_to_many, l2_squared_f32_one_to_many,
     };
 
     #[test]
@@ -413,6 +497,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn try_dot_returns_ok_and_matches_panic_version() {
         let query = [1.0_f32, 2.0, 3.0];
@@ -425,6 +510,7 @@ mod tests {
         assert_eq!(try_out, [1.0, 2.0]);
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn try_l2_squared_returns_ok_and_matches_panic_version() {
         let query = [1.0_f32, 2.0];
@@ -452,6 +538,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn try_cosine_returns_ok_and_matches_panic_version() {
         let query = [1.0_f32, 0.0];
@@ -478,6 +565,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn try_hamming_returns_ok_and_matches_panic_version() {
         let query = [0_u64, 0xff];
@@ -504,6 +592,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn try_jaccard_returns_ok_and_matches_panic_version() {
         let query = [0_u64, 0xff];
@@ -522,6 +611,7 @@ mod tests {
         assert_eq!(err, BatchShapeError::StrideZero);
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     #[should_panic(expected = "batched API: stride must be > 0")]
     fn dot_panics_still_on_stride_zero() {
@@ -529,6 +619,7 @@ mod tests {
         dot_f32_one_to_many(&[], &[], 0, &mut out);
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     #[should_panic(expected = "batched API")]
     fn cosine_panics_still_on_db_stride_mismatch() {

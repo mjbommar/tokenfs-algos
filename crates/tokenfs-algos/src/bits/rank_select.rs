@@ -150,6 +150,11 @@ impl<'a> RankSelectDict<'a> {
     /// Panics if `bits` is too short to hold `n_bits` bits, i.e. if
     /// `bits.len() * 64 < n_bits`. Use [`Self::try_build`] for a
     /// fallible variant that returns [`RankSelectError`] instead.
+    ///
+    /// Only compiled when the `panicking-shape-apis` Cargo feature is
+    /// enabled (default). Kernel/FUSE consumers should disable that
+    /// feature and use [`Self::try_build`] (audit-R5 #157).
+    #[cfg(feature = "panicking-shape-apis")]
     #[must_use]
     pub fn build(bits: &'a [u64], n_bits: usize) -> Self {
         Self::try_build(bits, n_bits)

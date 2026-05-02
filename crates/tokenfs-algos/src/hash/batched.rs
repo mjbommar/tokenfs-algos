@@ -53,6 +53,40 @@ use crate::hash::blake3::DIGEST_BYTES as BLAKE3_DIGEST_BYTES;
 #[cfg(feature = "blake3")]
 use crate::hash::blake3::blake3 as blake3_one;
 
+/// Failure modes for the fallible batched-hash APIs in this module
+/// ([`try_sha256_batch_st`] and friends).
+///
+/// Returned instead of panicking when the caller-supplied buffer
+/// shapes are inconsistent with the input message slice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HashBatchError {
+    /// `messages.len() != out.len()` — the digest output buffer must
+    /// match the input message count exactly.
+    LengthMismatch {
+        /// Caller-supplied `messages.len()`.
+        messages_len: usize,
+        /// Caller-supplied `out.len()`.
+        out_len: usize,
+    },
+}
+
+impl core::fmt::Display for HashBatchError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::LengthMismatch {
+                messages_len,
+                out_len,
+            } => write!(
+                f,
+                "hash batch length mismatch: messages.len()={messages_len} but out.len()={out_len}"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for HashBatchError {}
+
 /// Minimum batch size at which the `_par` variants fan out via rayon.
 ///
 /// Below this threshold the parallel variants delegate to their
@@ -62,6 +96,9 @@ use crate::hash::blake3::blake3 as blake3_one;
 /// payload until the batch is large enough to amortise pool wake-up.
 pub const BATCH_PARALLEL_THRESHOLD: usize = 256;
 
+/// Panicking shape-check helper used by the panicking entry points.
+/// Only compiled when the `panicking-shape-apis` feature is enabled.
+#[cfg(feature = "panicking-shape-apis")]
 #[inline]
 #[track_caller]
 fn assert_batch_lengths<T>(messages: &[&[u8]], out: &[T]) {
@@ -89,6 +126,10 @@ fn assert_batch_lengths<T>(messages: &[&[u8]], out: &[T]) {
 /// Panics if `messages.len() != out.len()`. This is a precondition violation
 /// on the caller-provided output buffer, not an input-validation failure.
 ///
+/// Only compiled when the `panicking-shape-apis` Cargo feature is
+/// enabled (default). Kernel/FUSE consumers should disable that
+/// feature and use [`try_sha256_batch_st`] (audit-R5 #157).
+///
 /// # Examples
 ///
 /// ```
@@ -97,11 +138,41 @@ fn assert_batch_lengths<T>(messages: &[&[u8]], out: &[T]) {
 /// let mut digests = [[0_u8; 32]; 2];
 /// sha256_batch_st(&messages, &mut digests);
 /// ```
+#[cfg(feature = "panicking-shape-apis")]
 pub fn sha256_batch_st(messages: &[&[u8]], out: &mut [[u8; SHA256_DIGEST_BYTES]]) {
     assert_batch_lengths(messages, out);
+    sha256_batch_st_inner(messages, out);
+}
+
+/// Inner kernel for [`sha256_batch_st`] / [`try_sha256_batch_st`].
+/// Assumes `messages.len() == out.len()`.
+#[inline]
+fn sha256_batch_st_inner(messages: &[&[u8]], out: &mut [[u8; SHA256_DIGEST_BYTES]]) {
     for (msg, dst) in messages.iter().zip(out.iter_mut()) {
         *dst = sha256_one(msg);
     }
+}
+
+/// Fallible variant of [`sha256_batch_st`] that returns
+/// [`HashBatchError::LengthMismatch`] when `messages.len() !=
+/// out.len()`, instead of panicking.
+///
+/// # Errors
+///
+/// Returns [`HashBatchError::LengthMismatch`] when the caller-supplied
+/// `out` buffer length does not match `messages.len()`.
+pub fn try_sha256_batch_st(
+    messages: &[&[u8]],
+    out: &mut [[u8; SHA256_DIGEST_BYTES]],
+) -> Result<(), HashBatchError> {
+    if messages.len() != out.len() {
+        return Err(HashBatchError::LengthMismatch {
+            messages_len: messages.len(),
+            out_len: out.len(),
+        });
+    }
+    sha256_batch_st_inner(messages, out);
+    Ok(())
 }
 
 /// Hash `messages.len()` byte slices into `out` using SHA-256, in parallel.
@@ -118,9 +189,22 @@ pub fn sha256_batch_st(messages: &[&[u8]], out: &mut [[u8; SHA256_DIGEST_BYTES]]
 /// # Panics
 ///
 /// Panics if `messages.len() != out.len()`.
-#[cfg(feature = "parallel")]
+///
+/// Only compiled when the `panicking-shape-apis` Cargo feature is
+/// enabled (default). Userspace consumers that need the rayon path
+/// without panic-on-mismatch should use [`try_sha256_batch_par`]
+/// (audit-R5 #157).
+#[cfg(all(feature = "parallel", feature = "panicking-shape-apis"))]
 pub fn sha256_batch_par(messages: &[&[u8]], out: &mut [[u8; SHA256_DIGEST_BYTES]]) {
     assert_batch_lengths(messages, out);
+    sha256_batch_par_inner(messages, out);
+}
+
+/// Inner kernel for [`sha256_batch_par`] / [`try_sha256_batch_par`].
+/// Assumes `messages.len() == out.len()`.
+#[cfg(feature = "parallel")]
+#[inline]
+fn sha256_batch_par_inner(messages: &[&[u8]], out: &mut [[u8; SHA256_DIGEST_BYTES]]) {
     if messages.len() < BATCH_PARALLEL_THRESHOLD {
         for (msg, dst) in messages.iter().zip(out.iter_mut()) {
             *dst = sha256_one(msg);
@@ -134,6 +218,29 @@ pub fn sha256_batch_par(messages: &[&[u8]], out: &mut [[u8; SHA256_DIGEST_BYTES]
         .for_each(|(msg, dst)| {
             *dst = sha256_one(msg);
         });
+}
+
+/// Fallible variant of [`sha256_batch_par`] that returns
+/// [`HashBatchError::LengthMismatch`] when `messages.len() !=
+/// out.len()`, instead of panicking.
+///
+/// # Errors
+///
+/// Returns [`HashBatchError::LengthMismatch`] when the caller-supplied
+/// `out` buffer length does not match `messages.len()`.
+#[cfg(feature = "parallel")]
+pub fn try_sha256_batch_par(
+    messages: &[&[u8]],
+    out: &mut [[u8; SHA256_DIGEST_BYTES]],
+) -> Result<(), HashBatchError> {
+    if messages.len() != out.len() {
+        return Err(HashBatchError::LengthMismatch {
+            messages_len: messages.len(),
+            out_len: out.len(),
+        });
+    }
+    sha256_batch_par_inner(messages, out);
+    Ok(())
 }
 
 // =============================================================================
@@ -149,12 +256,47 @@ pub fn sha256_batch_par(messages: &[&[u8]], out: &mut [[u8; SHA256_DIGEST_BYTES]
 /// # Panics
 ///
 /// Panics if `messages.len() != out.len()`.
-#[cfg(feature = "blake3")]
+///
+/// Only compiled when the `panicking-shape-apis` Cargo feature is
+/// enabled (default). Userspace consumers that prefer fallible
+/// signalling should use [`try_blake3_batch_st_32`] (audit-R5 #157).
+#[cfg(all(feature = "blake3", feature = "panicking-shape-apis"))]
 pub fn blake3_batch_st_32(messages: &[&[u8]], out: &mut [[u8; BLAKE3_DIGEST_BYTES]]) {
     assert_batch_lengths(messages, out);
+    blake3_batch_st_32_inner(messages, out);
+}
+
+/// Inner kernel for [`blake3_batch_st_32`] / [`try_blake3_batch_st_32`].
+/// Assumes `messages.len() == out.len()`.
+#[cfg(feature = "blake3")]
+#[inline]
+fn blake3_batch_st_32_inner(messages: &[&[u8]], out: &mut [[u8; BLAKE3_DIGEST_BYTES]]) {
     for (msg, dst) in messages.iter().zip(out.iter_mut()) {
         *dst = blake3_one(msg);
     }
+}
+
+/// Fallible variant of [`blake3_batch_st_32`] that returns
+/// [`HashBatchError::LengthMismatch`] when `messages.len() !=
+/// out.len()`, instead of panicking.
+///
+/// # Errors
+///
+/// Returns [`HashBatchError::LengthMismatch`] when the caller-supplied
+/// `out` buffer length does not match `messages.len()`.
+#[cfg(feature = "blake3")]
+pub fn try_blake3_batch_st_32(
+    messages: &[&[u8]],
+    out: &mut [[u8; BLAKE3_DIGEST_BYTES]],
+) -> Result<(), HashBatchError> {
+    if messages.len() != out.len() {
+        return Err(HashBatchError::LengthMismatch {
+            messages_len: messages.len(),
+            out_len: out.len(),
+        });
+    }
+    blake3_batch_st_32_inner(messages, out);
+    Ok(())
 }
 
 /// Hash `messages.len()` byte slices into `out` using BLAKE3, in parallel.
@@ -170,9 +312,25 @@ pub fn blake3_batch_st_32(messages: &[&[u8]], out: &mut [[u8; BLAKE3_DIGEST_BYTE
 /// # Panics
 ///
 /// Panics if `messages.len() != out.len()`.
-#[cfg(all(feature = "blake3", feature = "parallel"))]
+///
+/// Only compiled when the `panicking-shape-apis` Cargo feature is
+/// enabled (default). Userspace consumers that prefer fallible
+/// signalling should use [`try_blake3_batch_par_32`] (audit-R5 #157).
+#[cfg(all(
+    feature = "blake3",
+    feature = "parallel",
+    feature = "panicking-shape-apis"
+))]
 pub fn blake3_batch_par_32(messages: &[&[u8]], out: &mut [[u8; BLAKE3_DIGEST_BYTES]]) {
     assert_batch_lengths(messages, out);
+    blake3_batch_par_32_inner(messages, out);
+}
+
+/// Inner kernel for [`blake3_batch_par_32`] /
+/// [`try_blake3_batch_par_32`]. Assumes `messages.len() == out.len()`.
+#[cfg(all(feature = "blake3", feature = "parallel"))]
+#[inline]
+fn blake3_batch_par_32_inner(messages: &[&[u8]], out: &mut [[u8; BLAKE3_DIGEST_BYTES]]) {
     if messages.len() < BATCH_PARALLEL_THRESHOLD {
         for (msg, dst) in messages.iter().zip(out.iter_mut()) {
             *dst = blake3_one(msg);
@@ -188,8 +346,33 @@ pub fn blake3_batch_par_32(messages: &[&[u8]], out: &mut [[u8; BLAKE3_DIGEST_BYT
         });
 }
 
+/// Fallible variant of [`blake3_batch_par_32`] that returns
+/// [`HashBatchError::LengthMismatch`] when `messages.len() !=
+/// out.len()`, instead of panicking.
+///
+/// # Errors
+///
+/// Returns [`HashBatchError::LengthMismatch`] when the caller-supplied
+/// `out` buffer length does not match `messages.len()`.
+#[cfg(all(feature = "blake3", feature = "parallel"))]
+pub fn try_blake3_batch_par_32(
+    messages: &[&[u8]],
+    out: &mut [[u8; BLAKE3_DIGEST_BYTES]],
+) -> Result<(), HashBatchError> {
+    if messages.len() != out.len() {
+        return Err(HashBatchError::LengthMismatch {
+            messages_len: messages.len(),
+            out_len: out.len(),
+        });
+    }
+    blake3_batch_par_32_inner(messages, out);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)] // Test code — panic on Err is the desired failure mode.
+
     use super::*;
     use crate::hash::sha256::sha256;
 
@@ -214,6 +397,7 @@ mod tests {
     // SHA-256 parity
     // -------------------------------------------------------------------------
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn sha256_batch_st_single_message_matches_one_shot() {
         let msg = b"hello, world";
@@ -223,6 +407,7 @@ mod tests {
         assert_eq!(out[0], sha256(msg));
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn sha256_batch_st_empty_batch_is_no_op() {
         let messages: [&[u8]; 0] = [];
@@ -230,6 +415,7 @@ mod tests {
         sha256_batch_st(&messages, &mut out);
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn sha256_batch_st_empty_message() {
         let messages: [&[u8]; 1] = [b""];
@@ -238,6 +424,7 @@ mod tests {
         assert_eq!(out[0], sha256(b""));
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn sha256_batch_st_mixed_sizes() {
         let m0 = make_message(0, 1);
@@ -255,6 +442,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn sha256_batch_st_large_single_message() {
         let m = make_message(1 << 20, 0xDEAD_BEEF);
@@ -264,6 +452,7 @@ mod tests {
         assert_eq!(out[0], sha256(&m));
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     #[should_panic(expected = "hash batch length mismatch")]
     fn sha256_batch_st_panics_on_length_mismatch() {
@@ -272,6 +461,7 @@ mod tests {
         sha256_batch_st(&messages, &mut out);
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn sha256_batch_st_property_random_batches() {
         for &batch_size in &[1_usize, 2, 7, 100, 500] {
@@ -291,11 +481,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn try_sha256_batch_st_returns_err_on_length_mismatch() {
+        let messages: [&[u8]; 2] = [b"a", b"b"];
+        let mut out = [[0_u8; 32]; 1];
+        let err = try_sha256_batch_st(&messages, &mut out).unwrap_err();
+        assert_eq!(
+            err,
+            HashBatchError::LengthMismatch {
+                messages_len: 2,
+                out_len: 1
+            }
+        );
+    }
+
+    #[test]
+    fn try_sha256_batch_st_matches_one_shot() {
+        let messages: [&[u8]; 2] = [b"hello", b"world"];
+        let mut out = [[0_u8; 32]; 2];
+        try_sha256_batch_st(&messages, &mut out).unwrap();
+        assert_eq!(out[0], sha256(b"hello"));
+        assert_eq!(out[1], sha256(b"world"));
+    }
+
     // -------------------------------------------------------------------------
     // SHA-256 parallel parity (gated on `parallel`)
     // -------------------------------------------------------------------------
 
-    #[cfg(feature = "parallel")]
+    #[cfg(all(feature = "parallel", feature = "panicking-shape-apis"))]
     #[test]
     fn sha256_batch_par_matches_st_small_batch() {
         // Below threshold: should still match.
@@ -309,7 +522,7 @@ mod tests {
         assert_eq!(out_st, out_par);
     }
 
-    #[cfg(feature = "parallel")]
+    #[cfg(all(feature = "parallel", feature = "panicking-shape-apis"))]
     #[test]
     fn sha256_batch_par_matches_st_above_threshold() {
         // Above threshold: should fan out and still match.
@@ -325,7 +538,7 @@ mod tests {
         assert_eq!(out_st, out_par);
     }
 
-    #[cfg(feature = "parallel")]
+    #[cfg(all(feature = "parallel", feature = "panicking-shape-apis"))]
     #[test]
     fn sha256_batch_par_empty_batch_is_no_op() {
         let messages: [&[u8]; 0] = [];
@@ -333,7 +546,7 @@ mod tests {
         sha256_batch_par(&messages, &mut out);
     }
 
-    #[cfg(feature = "parallel")]
+    #[cfg(all(feature = "parallel", feature = "panicking-shape-apis"))]
     #[test]
     #[should_panic(expected = "hash batch length mismatch")]
     fn sha256_batch_par_panics_on_length_mismatch() {
@@ -342,11 +555,26 @@ mod tests {
         sha256_batch_par(&messages, &mut out);
     }
 
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn try_sha256_batch_par_returns_err_on_length_mismatch() {
+        let messages: [&[u8]; 1] = [b"a"];
+        let mut out = [[0_u8; 32]; 2];
+        let err = try_sha256_batch_par(&messages, &mut out).unwrap_err();
+        assert_eq!(
+            err,
+            HashBatchError::LengthMismatch {
+                messages_len: 1,
+                out_len: 2
+            }
+        );
+    }
+
     // -------------------------------------------------------------------------
     // BLAKE3 parity (gated on `blake3`)
     // -------------------------------------------------------------------------
 
-    #[cfg(feature = "blake3")]
+    #[cfg(all(feature = "blake3", feature = "panicking-shape-apis"))]
     #[test]
     fn blake3_batch_st_single_message_matches_one_shot() {
         use crate::hash::blake3::blake3;
@@ -357,7 +585,7 @@ mod tests {
         assert_eq!(out[0], blake3(msg));
     }
 
-    #[cfg(feature = "blake3")]
+    #[cfg(all(feature = "blake3", feature = "panicking-shape-apis"))]
     #[test]
     fn blake3_batch_st_empty_batch_is_no_op() {
         let messages: [&[u8]; 0] = [];
@@ -365,7 +593,7 @@ mod tests {
         blake3_batch_st_32(&messages, &mut out);
     }
 
-    #[cfg(feature = "blake3")]
+    #[cfg(all(feature = "blake3", feature = "panicking-shape-apis"))]
     #[test]
     fn blake3_batch_st_empty_message() {
         use crate::hash::blake3::blake3;
@@ -375,7 +603,7 @@ mod tests {
         assert_eq!(out[0], blake3(b""));
     }
 
-    #[cfg(feature = "blake3")]
+    #[cfg(all(feature = "blake3", feature = "panicking-shape-apis"))]
     #[test]
     fn blake3_batch_st_mixed_sizes() {
         use crate::hash::blake3::blake3;
@@ -394,7 +622,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "blake3")]
+    #[cfg(all(feature = "blake3", feature = "panicking-shape-apis"))]
     #[test]
     fn blake3_batch_st_large_single_message() {
         use crate::hash::blake3::blake3;
@@ -405,7 +633,7 @@ mod tests {
         assert_eq!(out[0], blake3(&m));
     }
 
-    #[cfg(feature = "blake3")]
+    #[cfg(all(feature = "blake3", feature = "panicking-shape-apis"))]
     #[test]
     #[should_panic(expected = "hash batch length mismatch")]
     fn blake3_batch_st_panics_on_length_mismatch() {
@@ -414,7 +642,7 @@ mod tests {
         blake3_batch_st_32(&messages, &mut out);
     }
 
-    #[cfg(feature = "blake3")]
+    #[cfg(all(feature = "blake3", feature = "panicking-shape-apis"))]
     #[test]
     fn blake3_batch_st_property_random_batches() {
         use crate::hash::blake3::blake3;
@@ -439,7 +667,11 @@ mod tests {
     // BLAKE3 parallel parity (gated on `blake3` + `parallel`)
     // -------------------------------------------------------------------------
 
-    #[cfg(all(feature = "blake3", feature = "parallel"))]
+    #[cfg(all(
+        feature = "blake3",
+        feature = "parallel",
+        feature = "panicking-shape-apis"
+    ))]
     #[test]
     fn blake3_batch_par_matches_st_small_batch() {
         let messages_owned: Vec<Vec<u8>> =
@@ -452,7 +684,11 @@ mod tests {
         assert_eq!(out_st, out_par);
     }
 
-    #[cfg(all(feature = "blake3", feature = "parallel"))]
+    #[cfg(all(
+        feature = "blake3",
+        feature = "parallel",
+        feature = "panicking-shape-apis"
+    ))]
     #[test]
     fn blake3_batch_par_matches_st_above_threshold() {
         let n = BATCH_PARALLEL_THRESHOLD * 4;
@@ -467,7 +703,11 @@ mod tests {
         assert_eq!(out_st, out_par);
     }
 
-    #[cfg(all(feature = "blake3", feature = "parallel"))]
+    #[cfg(all(
+        feature = "blake3",
+        feature = "parallel",
+        feature = "panicking-shape-apis"
+    ))]
     #[test]
     fn blake3_batch_par_empty_batch_is_no_op() {
         let messages: [&[u8]; 0] = [];
@@ -475,12 +715,46 @@ mod tests {
         blake3_batch_par_32(&messages, &mut out);
     }
 
-    #[cfg(all(feature = "blake3", feature = "parallel"))]
+    #[cfg(all(
+        feature = "blake3",
+        feature = "parallel",
+        feature = "panicking-shape-apis"
+    ))]
     #[test]
     #[should_panic(expected = "hash batch length mismatch")]
     fn blake3_batch_par_panics_on_length_mismatch() {
         let messages: [&[u8]; 1] = [b"a"];
         let mut out = [[0_u8; 32]; 2];
         blake3_batch_par_32(&messages, &mut out);
+    }
+
+    #[cfg(feature = "blake3")]
+    #[test]
+    fn try_blake3_batch_st_32_returns_err_on_length_mismatch() {
+        let messages: [&[u8]; 2] = [b"a", b"b"];
+        let mut out = [[0_u8; 32]; 1];
+        let err = try_blake3_batch_st_32(&messages, &mut out).unwrap_err();
+        assert_eq!(
+            err,
+            HashBatchError::LengthMismatch {
+                messages_len: 2,
+                out_len: 1
+            }
+        );
+    }
+
+    #[cfg(all(feature = "blake3", feature = "parallel"))]
+    #[test]
+    fn try_blake3_batch_par_32_returns_err_on_length_mismatch() {
+        let messages: [&[u8]; 1] = [b"a"];
+        let mut out = [[0_u8; 32]; 2];
+        let err = try_blake3_batch_par_32(&messages, &mut out).unwrap_err();
+        assert_eq!(
+            err,
+            HashBatchError::LengthMismatch {
+                messages_len: 1,
+                out_len: 2
+            }
+        );
     }
 }

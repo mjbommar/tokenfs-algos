@@ -113,3 +113,35 @@ Paper-linked primitive migration and consumer latency budgets are tracked
 in `docs/PAPER_PRIMITIVE_MIGRATION.md` and `docs/CONSUMER_LATENCY_BUDGETS.md`.
 Current calibration gates are summarized in
 `docs/CALIBRATION_GATES_2026-05-01.md`.
+
+## Cargo features
+
+The crate ships several Cargo features that gate optional functionality
+and tune the API surface for different deployment shapes:
+
+- **`std`** (default) — pulls in the standard library. Required for any
+  `OnceLock`-style globals, `std::error::Error` impls, and the
+  parallel/blake3 paths.
+- **`alloc`** — `Vec`/`Box`/`String` from the `alloc` crate. Implied by
+  `std`. Kernel and other no_std consumers want this without `std`.
+- **`avx2`** / **`avx512`** / **`neon`** / **`sve`** / **`sve2`** —
+  enable the corresponding SIMD backend. Architecture-mismatched
+  features compile to no-ops.
+- **`parallel`** — pulls in `rayon` for batched parallel kernels
+  (`*_batch_par`). Userspace only.
+- **`blake3`** — pulls in the `blake3` crate for content-addressable
+  hashing. Userspace only.
+- **`panicking-shape-apis`** (default) — exposes the panicking shape /
+  length-validating wrappers (`BitPacker::encode_u32_slice`,
+  `dot_f32_one_to_many`, `RankSelectDict::build`, `sha256_batch_st`,
+  `signature_batch_simd`, etc.). Each has a fallible `try_*` parallel
+  that returns a typed error. Kernel and FUSE consumers should disable
+  this feature so that only the `try_*` entry points are reachable on
+  the public surface (audit-R5 finding #157):
+
+  ```toml
+  tokenfs-algos = { version = "0.2", default-features = false, features = ["alloc"] }
+  ```
+- **`tunes-json`** / **`calibration`** / **`bench-internals`** /
+  **`permutation_hilbert`** — auxiliary features for tooling, paper
+  artifacts, micro-benches, and the Hilbert-curve permutation path.

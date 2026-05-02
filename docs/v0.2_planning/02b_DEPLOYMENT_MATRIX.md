@@ -14,8 +14,8 @@ Each of those operates under different constraints. `00_BOTTOM_UP_ANALYSIS.md` a
 
 | Consumer | Feature config | Stack budget | Threading | Allocation | Latency budget | SIMD posture | Determinism |
 |---|---|---|---|---|---|---|---|
-| **Linux kernel module** (Rust-for-Linux) | `default-features=false, features=["alloc"]` | **8-16 KB** | single thread / softirq context; **no rayon** | `gfp_t`-flagged Vec wrapper; **caller-provided slices preferred** | per-op µs | `kernel_fpu_begin/end` brackets per SIMD section (~hundred-cycle cost) | required for verified module |
-| **FUSE userspace daemon** (libfuse) | `default-features=true` | ~8 MB user stack | thread-per-request from libfuse worker pool | `Vec` / `Box` | per-request 10-50 µs warm; cold-mmap 200 µs+ | full | not required |
+| **Linux kernel module** (Rust-for-Linux) | `default-features=false, features=["alloc"]` (no `panicking-shape-apis`) | **8-16 KB** | single thread / softirq context; **no rayon** | `gfp_t`-flagged Vec wrapper; **caller-provided slices preferred** | per-op µs | `kernel_fpu_begin/end` brackets per SIMD section (~hundred-cycle cost) | required for verified module |
+| **FUSE userspace daemon** (libfuse) | `default-features=false, features=["alloc","std","avx2","neon"]` (no `panicking-shape-apis`) | ~8 MB user stack | thread-per-request from libfuse worker pool | `Vec` / `Box` | per-request 10-50 µs warm; cold-mmap 200 µs+ | full | not required |
 | **Userspace tool / build pipeline** (`tokenfs_writer`-class) | `default-features=true, features=["parallel","blake3"]` | ~8 MB | rayon multi-thread | `Vec` / `Box` | throughput-only | full | preferred for reproducibility |
 | **PostgreSQL extension** (Rust extension via `pgrx`-style) | `default-features=true, features=["parallel","blake3"]` | postgres backend ~2 MB | per-query, multi-thread within bg workers | postgres memory contexts; **caller-provided buffers preferred** | per-query latency varies | full but FPU brackets unnecessary outside aggregates | preferred for query plans |
 | **MinIO / Go service via cgo** | `default-features=true, features=["parallel","blake3"]` | Go goroutine ~8 KB initial (grows); cgo holds OS thread | Go scheduler; cgo bridges to OS thread | Go-managed buffers passed through cgo | cgo per-call ~200 ns overhead | full | not required |
@@ -68,6 +68,20 @@ Kernel-module verification (`fs-verity`-class workflows) requires bit-exact repr
 Two practical implications:
 - **SIMD reduction order** must be documented and held stable across versions. The Higham §3 dot-product tolerance model (just landed in `7eb0621`) makes "reduction order is part of the public contract" explicit.
 - **Tie-breaking in permutations / sorts** must be deterministic. RCM frontier ties on equal degree → break by vertex ID (lowest first).
+
+### Panicking entry points (audit-R5 #157)
+
+A panic in a Linux kernel softirq is fatal to the kernel; in libfuse it kills the FUSE handler. Several primitive entry points (`BitPacker::encode_u32_slice`, `streamvbyte_decode_u32`, `dot_f32_one_to_many`, `RankSelectDict::build`, `sha256_batch_st`, `signature_batch_simd`, etc.) historically asserted on caller-supplied shape mismatches and panicked on failure. Each now has a fallible `try_*` parallel that returns a typed error.
+
+The `panicking-shape-apis` Cargo feature gates the panicking variants behind `#[cfg(feature = "panicking-shape-apis")]`. The feature is **on by default** (back-compat for existing userspace consumers). Kernel and FUSE consumers should disable it:
+
+```toml
+tokenfs-algos = { version = "0.2", default-features = false, features = ["alloc"] }
+# add "std", "avx2", "neon" as appropriate; the FUSE row above is the
+# canonical "everything except the panicking shape wrappers" config.
+```
+
+Under that build, only the `try_*` wrappers are reachable on the public API; calls to the panicking constructors fail to compile. The kernel build is verified by `cargo check -p tokenfs-algos --no-default-features --features alloc --lib` (run via `cargo xtask security`).
 
 ## Implications for current planning
 
@@ -128,7 +142,7 @@ The deferral discipline still holds (don't build without a documented bottleneck
 
 ## Open questions
 
-1. **Should we have explicit `kernel`-safety tests in CI?** Current `xtask security` verifies the no_std + alloc lib build; doesn't verify "no rayon," "no blake3" (those are forbidden but absence of usage isn't directly tested in lib code). **Tentative: add a `--features alloc` test target that exercises every kernel-claimed-safe primitive and asserts they don't reach for std/rayon/blake3.**
+1. **Should we have explicit `kernel`-safety tests in CI?** Current `xtask security` verifies the no_std + alloc lib build (which now also implicitly verifies that no panicking shape wrappers are reachable when `panicking-shape-apis` is off — see audit-R5 #157 above); doesn't verify "no rayon," "no blake3" (those are forbidden but absence of usage isn't directly tested in lib code). **Tentative: add a `--features alloc` test target that exercises every kernel-claimed-safe primitive and asserts they don't reach for std/rayon/blake3.**
 
 2. **Is there a real near-term Postgres extension consumer?** If yes, the matrix shapes API choices (caller-provided buffers throughout); if no, design for kernel + FUSE first and let Postgres fit when a consumer materializes.
 

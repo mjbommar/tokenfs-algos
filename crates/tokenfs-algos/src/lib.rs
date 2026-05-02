@@ -3,6 +3,32 @@
 //! `tokenfs-algos` provides low-level, content-agnostic algorithms over byte
 //! slices. The public API starts with scalar reference implementations and is
 //! structured so SIMD backends can be added without changing callers.
+//!
+//! ## Cargo feature: `panicking-shape-apis`
+//!
+//! Several primitive entry points (e.g. [`bits::bit_pack::BitPacker::encode_u32_slice`],
+//! [`bits::streamvbyte::streamvbyte_decode_u32`], [`vector::batch::dot_f32_one_to_many`],
+//! [`bits::rank_select::RankSelectDict::build`], [`hash::set_membership::contains_u32_batch_simd`],
+//! [`hash::sha256_batch_st`], and [`similarity::minhash::signature_batch_simd`])
+//! validate caller-supplied shapes (lengths, widths, strides) and panic on
+//! mismatch. Each has a fallible `try_*` parallel that returns a typed error
+//! instead.
+//!
+//! For kernel- and FUSE-class consumers (per
+//! `docs/v0.2_planning/02b_DEPLOYMENT_MATRIX.md`) the panicking branches
+//! must not exist on the public surface — a panic in a kernel softirq is
+//! fatal. The on-by-default `panicking-shape-apis` Cargo feature gates the
+//! panicking variants behind `#[cfg(feature = "panicking-shape-apis")]`.
+//!
+//! Userspace consumers get the unchanged behaviour by default. Kernel
+//! consumers opt out:
+//!
+//! ```toml
+//! tokenfs-algos = { version = "0.2", default-features = false, features = ["alloc"] }
+//! ```
+//!
+//! Under that build, only the `try_*` wrappers are reachable; calls to the
+//! panicking constructors fail to compile. See audit-R5 finding #157.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 // AArch64 SVE / SVE2 intrinsics (`core::arch::aarch64::sv*`) are gated

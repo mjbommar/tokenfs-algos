@@ -164,6 +164,11 @@ pub const fn streamvbyte_data_max_len(n: usize) -> usize {
 /// is the return value. For a fallible variant that returns
 /// [`StreamvbyteError`] instead of panicking, use
 /// [`try_streamvbyte_encode_u32`].
+///
+/// Only compiled when the `panicking-shape-apis` Cargo feature is
+/// enabled (default). Kernel/FUSE consumers should disable that
+/// feature and use [`try_streamvbyte_encode_u32`] (audit-R5 #157).
+#[cfg(feature = "panicking-shape-apis")]
 pub fn streamvbyte_encode_u32(
     values: &[u32],
     control_out: &mut [u8],
@@ -197,7 +202,7 @@ pub fn try_streamvbyte_encode_u32(
             actual: data_out.len(),
         });
     }
-    Ok(streamvbyte_encode_u32(values, control_out, data_out))
+    Ok(kernels::auto::encode_u32(values, control_out, data_out))
 }
 
 /// Decodes `n` `u32` values from separate control + data byte streams.
@@ -213,6 +218,11 @@ pub fn try_streamvbyte_encode_u32(
 /// stream — when in doubt, size it via [`streamvbyte_data_max_len`]. For a
 /// fallible variant that returns [`StreamvbyteError`] instead of
 /// panicking, use [`try_streamvbyte_decode_u32`].
+///
+/// Only compiled when the `panicking-shape-apis` Cargo feature is
+/// enabled (default). Kernel/FUSE consumers should disable that
+/// feature and use [`try_streamvbyte_decode_u32`] (audit-R5 #157).
+#[cfg(feature = "panicking-shape-apis")]
 pub fn streamvbyte_decode_u32(control: &[u8], data: &[u8], n: usize, out: &mut [u32]) -> usize {
     kernels::auto::decode_u32(control, data, n, out)
 }
@@ -271,7 +281,7 @@ pub fn try_streamvbyte_decode_u32(
             }
         }
     }
-    Ok(streamvbyte_decode_u32(control, data, n, out))
+    Ok(kernels::auto::decode_u32(control, data, n, out))
 }
 
 /// Pinned Stream-VByte kernels.
