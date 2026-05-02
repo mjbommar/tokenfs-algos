@@ -132,6 +132,11 @@ impl<const W: u32> BitPacker<W> {
     /// are masked silently — callers that need range-checking should
     /// validate upstream. Use [`Self::try_encode_u32_slice`] for a
     /// fallible variant that returns [`BitPackError`] instead.
+    ///
+    /// Only compiled when the `panicking-shape-apis` Cargo feature is
+    /// enabled (default). Kernel/FUSE consumers should disable that
+    /// feature and use [`Self::try_encode_u32_slice`] (audit-R5 #157).
+    #[cfg(feature = "panicking-shape-apis")]
     pub fn encode_u32_slice(values: &[u32], out: &mut [u8]) {
         assert!(W >= 1 && W <= 32, "BitPacker width must be 1..=32");
         kernels::auto::encode_u32_slice(W, values, out);
@@ -151,7 +156,7 @@ impl<const W: u32> BitPacker<W> {
                 actual: out.len(),
             });
         }
-        Self::encode_u32_slice(values, out);
+        kernels::auto::encode_u32_slice(W, values, out);
         Ok(())
     }
 
@@ -162,6 +167,11 @@ impl<const W: u32> BitPacker<W> {
     /// Panics if `input.len() < Self::encoded_len(n)`, `out.len() < n`,
     /// or `W` is out of range `1..=32`. Use [`Self::try_decode_u32_slice`]
     /// for a fallible variant that returns [`BitPackError`] instead.
+    ///
+    /// Only compiled when the `panicking-shape-apis` Cargo feature is
+    /// enabled (default). Kernel/FUSE consumers should disable that
+    /// feature and use [`Self::try_decode_u32_slice`] (audit-R5 #157).
+    #[cfg(feature = "panicking-shape-apis")]
     pub fn decode_u32_slice(input: &[u8], n: usize, out: &mut [u32]) {
         assert!(W >= 1 && W <= 32, "BitPacker width must be 1..=32");
         kernels::auto::decode_u32_slice(W, input, n, out);
@@ -192,7 +202,7 @@ impl<const W: u32> BitPacker<W> {
                 actual: out.len(),
             });
         }
-        Self::decode_u32_slice(input, n, out);
+        kernels::auto::decode_u32_slice(W, input, n, out);
         Ok(())
     }
 }
@@ -214,6 +224,11 @@ impl DynamicBitPacker {
     ///
     /// Panics if `width` is outside `1..=32`. Use [`Self::try_new`] for
     /// a panic-free variant.
+    ///
+    /// Only compiled when the `panicking-shape-apis` Cargo feature is
+    /// enabled (default). Kernel/FUSE consumers should disable that
+    /// feature and use [`Self::try_new`] (audit-R5 #157).
+    #[cfg(feature = "panicking-shape-apis")]
     #[must_use]
     pub const fn new(width: u32) -> Self {
         assert!(
@@ -255,6 +270,11 @@ impl DynamicBitPacker {
     /// whose high bits exceed `self.width()` are masked silently. Use
     /// [`Self::try_encode_u32_slice`] for a fallible variant that
     /// returns [`BitPackError`] instead.
+    ///
+    /// Only compiled when the `panicking-shape-apis` Cargo feature is
+    /// enabled (default). Kernel/FUSE consumers should disable that
+    /// feature and use [`Self::try_encode_u32_slice`] (audit-R5 #157).
+    #[cfg(feature = "panicking-shape-apis")]
     pub fn encode_u32_slice(&self, values: &[u32], out: &mut [u8]) {
         kernels::auto::encode_u32_slice(self.width, values, out);
     }
@@ -273,7 +293,7 @@ impl DynamicBitPacker {
                 actual: out.len(),
             });
         }
-        self.encode_u32_slice(values, out);
+        kernels::auto::encode_u32_slice(self.width, values, out);
         Ok(())
     }
 
@@ -285,6 +305,11 @@ impl DynamicBitPacker {
     /// Panics if `input.len() < self.encoded_len(n)` or `out.len() < n`.
     /// Use [`Self::try_decode_u32_slice`] for a fallible variant that
     /// returns [`BitPackError`] instead.
+    ///
+    /// Only compiled when the `panicking-shape-apis` Cargo feature is
+    /// enabled (default). Kernel/FUSE consumers should disable that
+    /// feature and use [`Self::try_decode_u32_slice`] (audit-R5 #157).
+    #[cfg(feature = "panicking-shape-apis")]
     pub fn decode_u32_slice(&self, input: &[u8], n: usize, out: &mut [u32]) {
         kernels::auto::decode_u32_slice(self.width, input, n, out);
     }
@@ -315,7 +340,7 @@ impl DynamicBitPacker {
                 actual: out.len(),
             });
         }
-        self.decode_u32_slice(input, n, out);
+        kernels::auto::decode_u32_slice(self.width, input, n, out);
         Ok(())
     }
 }

@@ -27,20 +27,31 @@ pub mod sha256;
 #[cfg(feature = "blake3")]
 pub mod blake3;
 
-pub use batched::{BATCH_PARALLEL_THRESHOLD, sha256_batch_st};
-pub use set_membership::{
-    SetMembershipBatchError, contains_u32_batch_simd, contains_u32_simd,
-    try_contains_u32_batch_simd,
-};
+#[cfg(feature = "panicking-shape-apis")]
+pub use batched::sha256_batch_st;
+pub use batched::{BATCH_PARALLEL_THRESHOLD, HashBatchError, try_sha256_batch_st};
+#[cfg(feature = "panicking-shape-apis")]
+pub use set_membership::contains_u32_batch_simd;
+pub use set_membership::{SetMembershipBatchError, contains_u32_simd, try_contains_u32_batch_simd};
 
-#[cfg(feature = "parallel")]
+#[cfg(all(feature = "parallel", feature = "panicking-shape-apis"))]
 pub use batched::sha256_batch_par;
+#[cfg(feature = "parallel")]
+pub use batched::try_sha256_batch_par;
 
-#[cfg(feature = "blake3")]
+#[cfg(all(feature = "blake3", feature = "panicking-shape-apis"))]
 pub use batched::blake3_batch_st_32;
+#[cfg(feature = "blake3")]
+pub use batched::try_blake3_batch_st_32;
 
-#[cfg(all(feature = "blake3", feature = "parallel"))]
+#[cfg(all(
+    feature = "blake3",
+    feature = "parallel",
+    feature = "panicking-shape-apis"
+))]
 pub use batched::blake3_batch_par_32;
+#[cfg(all(feature = "blake3", feature = "parallel"))]
+pub use batched::try_blake3_batch_par_32;
 
 /// Pinned hash kernels.
 pub mod kernels {

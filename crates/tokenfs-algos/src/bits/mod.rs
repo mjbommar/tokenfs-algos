@@ -32,9 +32,11 @@ pub use popcount::{popcount_u8_slice, popcount_u64_slice};
 #[cfg(any(feature = "std", feature = "alloc"))]
 pub use rank_select::{RankSelectDict, RankSelectError};
 pub use streamvbyte::{
-    StreamvbyteError, streamvbyte_control_len, streamvbyte_data_max_len, streamvbyte_decode_u32,
-    streamvbyte_encode_u32, try_streamvbyte_decode_u32, try_streamvbyte_encode_u32,
+    StreamvbyteError, streamvbyte_control_len, streamvbyte_data_max_len,
+    try_streamvbyte_decode_u32, try_streamvbyte_encode_u32,
 };
+#[cfg(feature = "panicking-shape-apis")]
+pub use streamvbyte::{streamvbyte_decode_u32, streamvbyte_encode_u32};
 
 /// Pinned popcount kernels.
 ///

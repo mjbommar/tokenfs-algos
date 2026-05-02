@@ -78,6 +78,11 @@ pub fn contains_u32_simd(haystack: &[u32], needle: u32) -> bool {
 /// Panics if `needles.len() != out.len()`. Use
 /// [`try_contains_u32_batch_simd`] for a fallible variant that returns
 /// [`SetMembershipBatchError`] instead.
+///
+/// Only compiled when the `panicking-shape-apis` Cargo feature is
+/// enabled (default). Kernel/FUSE consumers should disable that
+/// feature and use [`try_contains_u32_batch_simd`] (audit-R5 #157).
+#[cfg(feature = "panicking-shape-apis")]
 pub fn contains_u32_batch_simd(haystack: &[u32], needles: &[u32], out: &mut [bool]) {
     assert_eq!(
         needles.len(),
@@ -103,7 +108,7 @@ pub fn try_contains_u32_batch_simd(
             out_len: out.len(),
         });
     }
-    contains_u32_batch_simd(haystack, needles, out);
+    kernels::auto::contains_u32_batch(haystack, needles, out);
     Ok(())
 }
 
@@ -657,10 +662,9 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
 
-    use super::{
-        SetMembershipBatchError, contains_u32_batch_simd, contains_u32_simd, kernels,
-        try_contains_u32_batch_simd,
-    };
+    #[cfg(feature = "panicking-shape-apis")]
+    use super::contains_u32_batch_simd;
+    use super::{SetMembershipBatchError, contains_u32_simd, kernels, try_contains_u32_batch_simd};
 
     fn deterministic_haystack(n: usize, seed: u64) -> Vec<u32> {
         let mut state = seed;
@@ -770,6 +774,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn batched_matches_scalar_batched() {
         let haystack: Vec<u32> = (0_u32..200).collect();
@@ -785,6 +790,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn batched_empty_inputs_no_op() {
         let haystack: [u32; 4] = [1, 2, 3, 4];
@@ -794,6 +800,7 @@ mod tests {
         contains_u32_batch_simd(&[], &needles, &mut out);
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn batched_empty_haystack_yields_all_false() {
         let needles = [1_u32, 2, 3, u32::MAX, 0];
@@ -802,6 +809,7 @@ mod tests {
         assert_eq!(out, [false; 5]);
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     #[should_panic(expected = "set_membership batch length mismatch")]
     fn batched_panics_on_length_mismatch() {
@@ -826,6 +834,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn try_batched_returns_ok_and_matches_panic_version() {
         let haystack: Vec<u32> = (0_u32..200).collect();

@@ -41,6 +41,26 @@ sub-agents.
 
 ### Audit-round-5 hardening
 
+- **#157 panicking shape APIs gated behind `panicking-shape-apis` Cargo
+  feature** — the panicking shape/length-validating public entry
+  points (`BitPacker::encode_u32_slice` / `decode_u32_slice`,
+  `DynamicBitPacker::new` / `encode_u32_slice` / `decode_u32_slice`,
+  `streamvbyte_encode_u32` / `streamvbyte_decode_u32`,
+  `RankSelectDict::build`, `dot_f32_one_to_many` /
+  `l2_squared_f32_one_to_many` / `cosine_similarity_f32_one_to_many` /
+  `hamming_u64_one_to_many` / `jaccard_u64_one_to_many`,
+  `contains_u32_batch_simd`, `sha256_batch_st` / `sha256_batch_par` /
+  `blake3_batch_st_32` / `blake3_batch_par_32`,
+  `signature_batch_simd<K>`) are now gated behind the new
+  `panicking-shape-apis` Cargo feature, which is **on by default** for
+  back-compat. New `try_*` siblings were added for the SHA-256 and
+  BLAKE3 batched hash entries (`try_sha256_batch_st` /
+  `try_sha256_batch_par` / `try_blake3_batch_st_32` /
+  `try_blake3_batch_par_32`) returning a new `HashBatchError` enum.
+  Kernel/FUSE consumers should disable the feature
+  (`default-features = false, features = ["alloc"]`) so that only the
+  fallible `try_*` entry points are reachable. **Not BREAKING**:
+  default-features build is unchanged.
 - **#155 streamvbyte SIMD tables → `const fn` statics** — the SSSE3 /
   AVX2 / NEON shuffle (4 KiB) and length (256 B) tables now live in
   static rodata instead of `OnceLock`-initialized lazy globals. The
@@ -71,9 +91,10 @@ sub-agents.
 - 84 AVX2 parity tests.
 - All `cargo xtask check`, aarch64 cross-clippy, and
   `cargo deny check advisories` gates green with zero suppressions.
-- Three audit-R5 items (#156 kernels_gather K=256 by-value; #157
-  panicking APIs at kernel boundary feature gate) are deferred to a
-  follow-on hardening pass.
+- Two audit-R5 items (#156 kernels_gather K=256 by-value) are deferred
+  to a follow-on hardening pass; #157 (panicking APIs at kernel
+  boundary feature gate) is closed by the `panicking-shape-apis` work
+  above.
 
 ## [0.2.2] — 2026-05-02
 

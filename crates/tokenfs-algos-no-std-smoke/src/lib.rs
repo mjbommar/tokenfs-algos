@@ -13,10 +13,15 @@ pub fn smoke() {
     let words: [u64; 4] = [0xDEAD_BEEF_0000_0000, 0, 0xFFFF_FFFF, 0xCAFE];
     let _popcount = bits::popcount_u64_slice(&words);
 
+    // Audit-R5 #157: kernel/FUSE consumers compile without
+    // `panicking-shape-apis`, so only the fallible `try_*` SHA-256
+    // batched entry is reachable. This smoke also pins that the
+    // fallible variant satisfies the kernel-safe surface.
     let bytes = [0_u8; 64];
     let mut digest = [[0_u8; 32]; 1];
     let messages: [&[u8]; 1] = [&bytes];
-    hash::sha256_batch_st(&messages, &mut digest);
+    hash::try_sha256_batch_st(&messages, &mut digest)
+        .expect("smoke: messages.len() matches digest.len()");
 
     let a = [1.0_f32, 2.0, 3.0];
     let b = [4.0_f32, 5.0, 6.0];

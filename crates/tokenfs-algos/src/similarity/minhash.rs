@@ -338,6 +338,11 @@ pub fn signature_simd<const K: usize>(
 /// Panics when `byte_slices.len() != out.len()`. Both lengths must
 /// match so the per-slice signatures land in the corresponding output
 /// slot.
+///
+/// Only compiled when the `panicking-shape-apis` Cargo feature is
+/// enabled (default). Kernel/FUSE consumers should disable that
+/// feature and use [`try_signature_batch_simd`] (audit-R5 #157).
+#[cfg(feature = "panicking-shape-apis")]
 pub fn signature_batch_simd<const K: usize>(
     byte_slices: &[&[u8]],
     table: &[[u64; K]; kernels_gather::TABLE_ROWS],
@@ -1163,6 +1168,7 @@ mod tests {
         assert_eq!(actual.slots(), &expected);
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn signature_batch_simd_matches_per_slice() {
         let seeds: [u64; 16] = core::array::from_fn(|i| 0x99AA_u64.wrapping_add(i as u64));
@@ -1179,6 +1185,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn signature_batch_simd_empty_batch_is_noop() {
         let seeds: [u64; 8] = make_test_seeds_8();
@@ -1189,6 +1196,7 @@ mod tests {
         assert!(out.is_empty());
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     #[should_panic(expected = "must match")]
     fn signature_batch_simd_panics_on_shape_mismatch() {

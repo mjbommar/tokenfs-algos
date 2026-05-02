@@ -10,7 +10,7 @@ readme = "../../README.md"
 publish = false
 
 [features]
-default = ["std", "avx2", "neon"]
+default = ["std", "avx2", "neon", "panicking-shape-apis"]
 std = []
 alloc = []
 nightly = []
@@ -19,6 +19,16 @@ calibration = ["std"]
 parallel = ["dep:rayon"]
 avx2 = []
 avx512 = ["nightly"]
+# Panicking wrappers for shape/size/range/length-validating public APIs.
+# When enabled (the default for back-compat), the existing panicking
+# variants (e.g. `BitPacker::encode_u32_slice`, `streamvbyte_decode_u32`,
+# `dot_f32_one_to_many`, `RankSelectDict::build`, `sha256_batch_st`,
+# `signature_batch_simd`) are exposed alongside their `try_*` siblings.
+# Kernel/FUSE consumers should disable this feature so that only the
+# fallible `try_*` entry points are reachable, eliminating panicking
+# branches at the kernel boundary (audit-R5 finding #157). Disable via
+# `default-features = false, features = ["alloc"]`.
+panicking-shape-apis = []
 # AVX-512 sub-feature backends. All gate runtime detection (`is_x86_feature_
 # detected!`) on the corresponding feature; compile-time gating uses only the
 # umbrella `avx512` flag to keep the feature matrix small. The named features
