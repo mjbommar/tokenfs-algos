@@ -591,6 +591,10 @@ impl<'a> CsrGraph<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The `format!` macro is not in the no-std prelude; alias it from
+    // `alloc` for the alloc-only build (audit-R6 finding #164).
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::format;
 
     #[test]
     fn identity_round_trip() {

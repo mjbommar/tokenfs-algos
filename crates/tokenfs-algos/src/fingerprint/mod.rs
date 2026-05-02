@@ -857,6 +857,10 @@ fn byte_class_bitmap(histogram: &[u32; 256]) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{BLOCK_SIZE, FingerprintKernel, block, extent, kernel_catalog, kernels};
+    // `Vec` is not in the no-std prelude; alias it from `alloc` for the
+    // alloc-only build (audit-R6 finding #164).
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::vec::Vec;
 
     #[test]
     fn zero_block_has_zero_entropy_and_one_run() {

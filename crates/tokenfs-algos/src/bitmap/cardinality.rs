@@ -25,6 +25,10 @@ pub fn cardinality(container: &Container) -> u32 {
 mod tests {
     use super::*;
     use crate::bitmap::containers::{ArrayContainer, BitmapContainer, RunContainer};
+    // `vec!` is not in the no-std prelude; alias it from `alloc` for
+    // the alloc-only build (audit-R6 finding #164).
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::vec;
 
     #[test]
     fn cardinality_bitmap() {

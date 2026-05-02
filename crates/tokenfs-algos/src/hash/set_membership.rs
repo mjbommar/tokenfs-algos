@@ -877,7 +877,11 @@ mod tests {
     // available on this host.
     // -----------------------------------------------------------------
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    // The runtime-availability tests below print a skip notice via
+    // `eprintln!` (only in `std` builds) when the SIMD path is missing on
+    // the host; gate them on `feature = "std"` so the alloc-only build
+    // compiles without pulling in stdio (audit-R6 #164).
+    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
     #[test]
     fn sse41_kernel_matches_scalar_when_available() {
         if !kernels::sse41::is_available() {
@@ -902,7 +906,11 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(all(
+        feature = "std",
+        feature = "avx2",
+        any(target_arch = "x86", target_arch = "x86_64")
+    ))]
     #[test]
     fn avx2_kernel_matches_scalar_when_available() {
         if !kernels::avx2::is_available() {
@@ -930,7 +938,11 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "avx512", any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(all(
+        feature = "std",
+        feature = "avx512",
+        any(target_arch = "x86", target_arch = "x86_64")
+    ))]
     #[test]
     fn avx512_kernel_matches_scalar_when_available() {
         if !kernels::avx512::is_available() {

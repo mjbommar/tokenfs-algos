@@ -1350,10 +1350,20 @@ pub fn concentration_ratio_u32(counts: &[u32], total: u64) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        CLog2Lut, CountMinSketch, Crc32cBackend, Crc32cHasher, HashBinSketch, MisraGries,
-        concentration_ratio_u32, crc32_hash_ngram_bins, crc32_hash2_bins, crc32_hash4_bins,
-        crc32c_bytes, entropy_from_counts_u32, entropy_from_counts_u32_lut, top_k_coverage_u32,
+        CLog2Lut, CountMinSketch, Crc32cHasher, HashBinSketch, MisraGries, concentration_ratio_u32,
+        crc32_hash_ngram_bins, crc32_hash2_bins, crc32_hash4_bins, crc32c_bytes,
+        entropy_from_counts_u32, entropy_from_counts_u32_lut, top_k_coverage_u32,
     };
+    // `Crc32cBackend::Sse42` is only constructible under `feature = "std"`;
+    // pull the enum into scope only on that build so we don't emit an
+    // unused-import warning when the cross-backend parity test is gated
+    // out (audit-R6 finding #164).
+    #[cfg(feature = "std")]
+    use super::Crc32cBackend;
+    // `Vec` is not in the no-std prelude; alias it from `alloc` for
+    // the alloc-only build (audit-R6 finding #164).
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::vec::Vec;
 
     #[test]
     fn misra_gries_tracks_heavy_candidate() {
@@ -1685,6 +1695,11 @@ mod tests {
 
     /// Force the streaming hasher onto every available backend and confirm
     /// they all produce the same CRC32C for the same chunked input.
+    ///
+    /// Gated on `feature = "std"` because the SSE4.2 backend variant
+    /// `Crc32cBackend::Sse42` and the runtime detection
+    /// `kernels::sse42::is_available()` require std (audit-R6 #164).
+    #[cfg(feature = "std")]
     #[test]
     fn crc32c_cross_backend_parity() {
         let payload = random_bytes(8_192);

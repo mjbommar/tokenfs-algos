@@ -200,6 +200,10 @@ const _BITMAP_WORDS_REF: usize = BITMAP_WORDS;
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `vec!` is not in the no-std prelude; alias it from `alloc` for
+    // the alloc-only build (audit-R6 finding #164).
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::vec;
 
     fn fill_bitmap(values: &[u16]) -> BitmapContainer {
         let mut bm = BitmapContainer::empty();

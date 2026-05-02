@@ -280,6 +280,10 @@ const fn pair_index(first: u8, second: u8) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{BytePairHistogram, BytePairScratch};
+    // `Box` is not in the no-std prelude; alias it from `alloc` for
+    // the alloc-only build (audit-R6 finding #164).
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::boxed::Box;
 
     #[test]
     fn counts_adjacent_pairs() {

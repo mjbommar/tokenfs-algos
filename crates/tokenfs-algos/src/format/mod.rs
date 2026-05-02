@@ -877,7 +877,11 @@ fn detect_entropy(bytes: &[u8]) -> Detection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The `vec!` and `format!` macros are not in the no-std prelude;
+    // alias them from `alloc` for the alloc-only build (audit-R6 #164).
+    use alloc::format;
     use alloc::string::ToString;
+    use alloc::vec;
     use alloc::vec::Vec;
 
     fn xorshift_bytes(seed: u64, n: usize) -> Vec<u8> {

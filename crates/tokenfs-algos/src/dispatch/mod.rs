@@ -1212,6 +1212,12 @@ mod tests {
         ProcessorProfile, ReadPattern, SourceHint, WorkloadShape, backend_kernel_support,
         detect_accelerators, histogram_kernel_catalog, plan_histogram,
     };
+    // `Vec`, `String`, and `vec!` are not in the no-std prelude; alias them
+    // from `alloc` whenever the crate is built without `std` so the test
+    // helpers below compile under `--no-default-features --features alloc`
+    // (audit-R6 finding #164).
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::vec::Vec;
 
     #[test]
     fn portable_profile_advertises_no_accelerators() {
@@ -1836,6 +1842,12 @@ mod tests {
         }
     }
 
+    // `plan_histogram_traced` is only compiled under `feature = "std"` (its
+    // signature returns a heap-allocated `Vec` of `RuleDecision`s and lives
+    // behind the std-gated planner tracing surface). Gating these two tests
+    // keeps the planner trace coverage in default builds while letting the
+    // alloc-only build compile (audit-R6 finding #164).
+    #[cfg(feature = "std")]
     #[test]
     fn planner_traced_returns_winner_in_trace() {
         use crate::dispatch::planner::plan_histogram_traced;
@@ -1854,6 +1866,7 @@ mod tests {
         assert_eq!(plan.reason, winning_rule.reason);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn planner_traced_records_misses_before_winner() {
         // For a workload that should reach a late rule, the trace should

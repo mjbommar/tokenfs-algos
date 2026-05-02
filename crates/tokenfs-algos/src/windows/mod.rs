@@ -225,6 +225,12 @@ const fn splitmix64(mut value: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{GearHash64, StrideWindows, ngrams, pack_ngram_le, strided, unpack_ngram_le};
+    // `Vec` and `vec!` are not in the no-std prelude; alias them from
+    // `alloc` for the alloc-only build (audit-R6 finding #164).
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::vec;
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::vec::Vec;
 
     #[test]
     fn ngrams_yield_overlapping_arrays() {

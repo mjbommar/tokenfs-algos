@@ -375,8 +375,29 @@ mod tests {
 
     use super::*;
     use crate::hash::sha256::sha256;
+    // `Vec` and `vec!` are not in the no-std prelude; alias them from
+    // `alloc` for the alloc-only build (audit-R6 finding #164). Both are
+    // only used inside `panicking-shape-apis`-gated tests / helpers, so
+    // the imports follow the same gate to avoid unused-import warnings
+    // when those tests are compiled out.
+    #[cfg(all(
+        feature = "panicking-shape-apis",
+        feature = "alloc",
+        not(feature = "std")
+    ))]
+    use alloc::vec;
+    #[cfg(all(
+        feature = "panicking-shape-apis",
+        feature = "alloc",
+        not(feature = "std")
+    ))]
+    use alloc::vec::Vec;
 
+    // The two helpers below are only consumed by tests that go through
+    // the panicking `sha256_batch_st` entry point; gate them so the
+    // alloc-only build doesn't see them as dead code (audit-R6 #164).
     /// Deterministic pseudo-random byte generator for repeatable tests.
+    #[cfg(feature = "panicking-shape-apis")]
     fn fill_pseudo_random(buf: &mut [u8], seed: u64) {
         let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
         for byte in buf {
@@ -387,6 +408,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     fn make_message(len: usize, seed: u64) -> Vec<u8> {
         let mut buf = vec![0_u8; len];
         fill_pseudo_random(&mut buf, seed);

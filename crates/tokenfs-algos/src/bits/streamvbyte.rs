@@ -936,7 +936,25 @@ mod tests {
     #![allow(clippy::unwrap_used)] // Test code — panic on Err is the desired failure mode.
 
     use super::*;
+    // The `vec!` macro and `Vec` type are not in the no-std prelude;
+    // alias them from `alloc` for the alloc-only build (audit-R6 #164).
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::vec;
+    // `Vec` is only referenced inside the `panicking-shape-apis`-gated
+    // round-trip helper below; gate the import so we don't emit an
+    // unused-import warning when that helper is compiled out.
+    #[cfg(all(
+        feature = "panicking-shape-apis",
+        feature = "alloc",
+        not(feature = "std")
+    ))]
+    use alloc::vec::Vec;
 
+    // Helper consumed only by tests that go through the panicking
+    // `streamvbyte_encode_u32` / `streamvbyte_decode_u32` entry points;
+    // gate so the alloc-only build doesn't see it as dead code
+    // (audit-R6 #164).
+    #[cfg(feature = "panicking-shape-apis")]
     fn deterministic_values(n: usize, seed: u64, max_bytes: u32) -> Vec<u32> {
         let mask: u32 = match max_bytes {
             1 => 0x0000_00ff,
@@ -975,6 +993,13 @@ mod tests {
         assert_eq!(streamvbyte_data_max_len(5), 20 + 3);
     }
 
+    // The panicking `streamvbyte_encode_u32` / `streamvbyte_decode_u32`
+    // entry points only exist when the on-by-default
+    // `panicking-shape-apis` feature is enabled (audit-R5 #157). The
+    // round-trip helpers below call them directly, so gate the whole
+    // family on that feature; the fallible `try_*` siblings are exercised
+    // by their own tests further down (audit-R6 finding #164).
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn round_trip_n_zero_writes_nothing() {
         let mut ctrl = [0_u8; 0];
@@ -986,6 +1011,7 @@ mod tests {
         assert_eq!(consumed, 0);
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     fn round_trip(values: &[u32]) {
         let n = values.len();
         let mut ctrl = vec![0_u8; streamvbyte_control_len(n)];
@@ -997,6 +1023,7 @@ mod tests {
         assert_eq!(out, values, "round-trip diverged at n={n}");
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn round_trip_all_widths_and_sizes() {
         for n in [0_usize, 1, 2, 3, 4, 5, 7, 8, 16, 100, 1024] {
@@ -1008,6 +1035,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn round_trip_each_code_specifically() {
         // Mix one of each code in a single group; verify byte budget and
@@ -1016,6 +1044,7 @@ mod tests {
         round_trip(&values);
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn round_trip_n_one_through_seven() {
         // Touches every (full-groups, tail) shape:
@@ -1034,6 +1063,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn round_trip_max_u32_values_use_four_bytes() {
         // Force the 4-byte code on every value in a full group.
@@ -1051,6 +1081,7 @@ mod tests {
         assert_eq!(out, values);
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn encoded_size_matches_spec_for_known_values() {
         // Each value is 1 byte → 4 data bytes total.
@@ -1158,6 +1189,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn scalar_decode_matches_encoded_bit_pattern_for_canonical_inputs() {
         // Shape the inputs to hit each code exactly once per group.
@@ -1167,7 +1199,11 @@ mod tests {
         round_trip(&values);
     }
 
-    #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(all(
+        feature = "panicking-shape-apis",
+        feature = "avx2",
+        any(target_arch = "x86", target_arch = "x86_64")
+    ))]
     #[test]
     fn ssse3_decode_matches_scalar_when_available() {
         if !kernels::ssse3::is_available() {
@@ -1194,7 +1230,11 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(all(
+        feature = "panicking-shape-apis",
+        feature = "avx2",
+        any(target_arch = "x86", target_arch = "x86_64")
+    ))]
     #[test]
     fn avx2_decode_matches_scalar_when_available() {
         if !kernels::avx2::is_available() {
@@ -1222,7 +1262,11 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+    #[cfg(all(
+        feature = "panicking-shape-apis",
+        feature = "neon",
+        target_arch = "aarch64"
+    ))]
     #[test]
     fn neon_decode_matches_scalar_when_available() {
         for n in [0_usize, 1, 4, 5, 8, 100, 1024] {
@@ -1245,6 +1289,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn dispatched_decode_matches_scalar_for_random_corpus() {
         // Independent of feature detection: the auto-dispatcher must
@@ -1340,6 +1385,10 @@ mod tests {
         );
     }
 
+    // The next two tests exercise the fallible `try_*` decode error paths
+    // but rely on the panicking `streamvbyte_encode_u32` to materialise
+    // the bit pattern they probe; gate them on `panicking-shape-apis`.
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn try_decode_returns_err_when_data_is_exhausted() {
         // Encode 4 four-byte values -> 1 control byte (0xff) + 16 data
@@ -1355,6 +1404,7 @@ mod tests {
         assert!(matches!(err, StreamvbyteError::DataExhausted { .. }));
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn try_decode_returns_ok_and_matches_scalar_on_valid_inputs() {
         for n in [0_usize, 1, 3, 4, 5, 100, 1024] {
@@ -1370,6 +1420,10 @@ mod tests {
         }
     }
 
+    // The "still panics" checks asset that the panicking variant retains
+    // its panicking behaviour; they're meaningless when the panicking API
+    // is compiled out.
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     #[should_panic(expected = "control_out too small")]
     fn encode_still_panics_on_undersized_control() {
@@ -1379,6 +1433,7 @@ mod tests {
         streamvbyte_encode_u32(&values, &mut ctrl, &mut data);
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     #[should_panic(expected = "decode output buffer too small")]
     fn decode_still_panics_on_undersized_output() {

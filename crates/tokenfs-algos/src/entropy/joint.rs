@@ -147,6 +147,10 @@ mod tests {
         PairEntropyShape, PairEntropyStrategy, h2_pairs, h2_pairs_with_scratch, plan_pair_entropy,
     };
     use crate::histogram::BytePairScratch;
+    // `Box` is not in the no-std prelude; alias it from `alloc` for
+    // the alloc-only build (audit-R6 finding #164).
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::boxed::Box;
 
     #[test]
     fn repeated_pair_joint_entropy_is_zero() {

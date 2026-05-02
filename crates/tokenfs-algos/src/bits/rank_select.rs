@@ -735,6 +735,10 @@ mod tests {
     use super::*;
     use alloc::vec;
 
+    // The naïve oracles below are only consumed by tests that go through
+    // the panicking `RankSelectDict::build` constructor; gate them so the
+    // alloc-only build doesn't see them as dead code (audit-R6 #164).
+    #[cfg(feature = "panicking-shape-apis")]
     fn naive_rank1(bits: &[u64], n_bits: usize, i: usize) -> usize {
         assert!(i <= n_bits);
         let mut count = 0_usize;
@@ -747,6 +751,7 @@ mod tests {
         count
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     fn naive_select1(bits: &[u64], n_bits: usize, k: usize) -> Option<usize> {
         let mut remaining = k;
         for bit in 0..n_bits {
@@ -761,6 +766,7 @@ mod tests {
         None
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     fn naive_select0(bits: &[u64], n_bits: usize, k: usize) -> Option<usize> {
         let mut remaining = k;
         for bit in 0..n_bits {
@@ -787,6 +793,11 @@ mod tests {
             .collect()
     }
 
+    // The panicking `RankSelectDict::build` constructor is only compiled
+    // when the on-by-default `panicking-shape-apis` feature is enabled
+    // (audit-R5 #157); gate the helper plus every test that depends on
+    // it so the alloc-only build compiles (audit-R6 #164).
+    #[cfg(feature = "panicking-shape-apis")]
     fn parity_check(bits: &[u64], n_bits: usize, sample_step: usize) {
         let dict = RankSelectDict::build(bits, n_bits);
         // rank1 endpoints
@@ -875,6 +886,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn empty_bitvector() {
         let bits: [u64; 0] = [];
@@ -886,6 +898,7 @@ mod tests {
         assert_eq!(dict.select0(0), None);
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn single_bit_set() {
         for pos in [
@@ -908,6 +921,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn single_bit_clear_in_dense() {
         for pos in [0_usize, 1, 63, 64, 255, 256, 1024, 4096] {
@@ -936,6 +950,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn all_zero_bitvector() {
         for n_bits in [1_usize, 7, 64, 255, 4096, 4097, 8192, 12345] {
@@ -950,6 +965,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn all_one_bitvector() {
         for n_bits in [1_usize, 7, 64, 255, 4096, 4097, 8192, 12345] {
@@ -970,6 +986,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn small_endpoints() {
         for n_bits in [
@@ -983,6 +1000,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn alternating_bitvector() {
         // 0xAAAA... — every other bit set.
@@ -992,6 +1010,7 @@ mod tests {
         parity_check(&bits, n_bits, 13);
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn dense_random_spans_multiple_superblocks() {
         let n_bits = 5 * SUPERBLOCK_BITS + 123;
@@ -999,6 +1018,7 @@ mod tests {
         parity_check(&bits, n_bits, 17);
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn sparse_one_per_superblock() {
         // One set bit at the start of each superblock.
@@ -1018,6 +1038,7 @@ mod tests {
         assert_eq!(dict.select1(n_superblocks), None);
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn dense_one_clear_per_superblock() {
         // One clear bit at the start of each superblock; rest dense.
@@ -1036,6 +1057,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn n_bits_one() {
         let bits_zero = vec![0_u64];
@@ -1053,6 +1075,7 @@ mod tests {
         assert_eq!(dict_one.select0(0), None);
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn n_bits_64() {
         for word in [
@@ -1069,6 +1092,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn spans_multiple_superblocks() {
         let n_superblocks = 5_usize;
@@ -1077,6 +1101,7 @@ mod tests {
         parity_check(&bits, n_bits, 23);
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn batch_rank_matches_scalar() {
         let n_bits = 10_000_usize;
@@ -1090,6 +1115,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn batch_select_matches_scalar() {
         let n_bits = 10_000_usize;
@@ -1189,6 +1215,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn memory_bytes_includes_index() {
         let bits = vec![0xAAAA_AAAA_AAAA_AAAA_u64; SUPERBLOCK_BITS / 64];
@@ -1212,6 +1239,7 @@ mod tests {
     /// — adding `select1_hints()` would cover sparse vectors but doesn't
     /// change the parity outcome.
     #[test]
+    #[cfg(feature = "panicking-shape-apis")]
     fn sucds_parity_dense_sparse_alternating() {
         use sucds::bit_vectors::{Rank, Rank9Sel, Select};
 
@@ -1345,6 +1373,7 @@ mod tests {
         assert_eq!(dict.count_ones(), 128);
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     #[should_panic(expected = "RankSelectDict::build: bits slice too short")]
     fn build_still_panics_on_too_short_bits() {
@@ -1354,6 +1383,7 @@ mod tests {
 
     /// Parity vs sucds across deterministic random bitvectors. Brute
     /// forces every rank position and a sampling of select positions.
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn sucds_parity_deterministic_random() {
         use sucds::bit_vectors::{Rank, Rank9Sel, Select};
@@ -1434,6 +1464,7 @@ mod tests {
     /// refactor reintroduces a `u32` cast in the rank/select read
     /// paths, the assertions on `rank1` and `select1` past the boundary
     /// will fail with a wrong (truncated) answer.
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn rank_select_no_truncation_past_u32_boundary() {
         // Build a small valid dictionary, then overwrite the cumulative
@@ -1554,6 +1585,7 @@ mod tests {
     /// Companion test: confirms `memory_bytes()` reports the correct
     /// 8-byte-per-superblock footprint after the audit-R6 #163 fix
     /// (was 4 bytes per superblock under the bug).
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn memory_bytes_reflects_u64_superblock_counts() {
         // 4 superblocks → 5 entries in `superblock_counts` (one trailing

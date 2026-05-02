@@ -897,6 +897,10 @@ pub fn update_minhash_kway_auto<const K: usize>(
 mod tests {
     #[cfg(all(feature = "alloc", not(feature = "std")))]
     use alloc::boxed::Box;
+    // `Vec` is not in the no-std prelude; alias it from `alloc` for the
+    // alloc-only build (audit-R6 finding #164).
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::vec::Vec;
 
     use super::*;
 

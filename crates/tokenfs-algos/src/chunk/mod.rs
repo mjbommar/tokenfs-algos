@@ -621,6 +621,10 @@ mod tests {
         CHUNK_AVG_SIZE_CAP, ChunkConfig, ChunkConfigError, FastCdcConfig, chunks, fastcdc_chunks,
         fastcdc_find_boundary, find_boundary, gear_hash, summarize_chunk_quality,
     };
+    // `Vec` is not in the no-std prelude; alias it from `alloc` for
+    // the alloc-only build (audit-R6 finding #164).
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::vec::Vec;
 
     #[test]
     fn chunk_config_new_saturates_on_extreme_avg_size() {

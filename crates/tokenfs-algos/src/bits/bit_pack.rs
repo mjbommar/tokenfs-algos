@@ -1128,6 +1128,12 @@ mod tests {
     #![allow(clippy::unwrap_used)] // Test code — panic on Err is the desired failure mode.
 
     use super::*;
+    // `Vec` and `vec!` are not in the no-std prelude; alias them from
+    // `alloc` for the alloc-only build (audit-R6 finding #164).
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::vec;
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::vec::Vec;
 
     fn deterministic_values(n: usize, w: u32, seed: u64) -> Vec<u32> {
         let mask = if w == 32 { u32::MAX } else { (1_u32 << w) - 1 };
@@ -1153,6 +1159,13 @@ mod tests {
         }
     }
 
+    // The panicking constructor `DynamicBitPacker::new` plus the
+    // panicking `encode_u32_slice` / `decode_u32_slice` wrappers on
+    // `BitPacker` and `DynamicBitPacker` are only compiled when the
+    // on-by-default `panicking-shape-apis` feature is enabled (audit-R5
+    // #157). Gate the corresponding tests on the same feature so the
+    // alloc-only build (kernel/FUSE consumers) compiles (audit-R6 #164).
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn dynamic_packer_round_trip_every_width_and_length() {
         for w in 1_u32..=32 {
@@ -1169,6 +1182,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn const_generic_packer_matches_dynamic() {
         // Spot-check the canonical token widths.
@@ -1209,6 +1223,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn empty_inputs_produce_empty_output() {
         for w in 1_u32..=32 {
@@ -1221,6 +1236,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn single_value_round_trips_at_every_width() {
         for w in 1_u32..=32 {
@@ -1236,6 +1252,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn high_bits_above_width_are_masked_silently() {
         // The contract: callers may pass arbitrary u32, but only the
@@ -1297,6 +1314,11 @@ mod tests {
         }
     }
 
+    // The fallible round-trip tests below construct `DynamicBitPacker`
+    // through the panicking `::new` constructor (the `try_*` methods are
+    // exposed on the resulting instance). They therefore depend on
+    // `panicking-shape-apis` being enabled.
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn try_encode_dynamic_returns_err_on_undersized_output() {
         let packer = DynamicBitPacker::new(11);
@@ -1313,6 +1335,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn try_decode_dynamic_returns_err_on_undersized_input() {
         let packer = DynamicBitPacker::new(11);
@@ -1331,6 +1354,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn try_decode_dynamic_returns_err_on_undersized_output() {
         let packer = DynamicBitPacker::new(11);
@@ -1349,6 +1373,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn try_dynamic_round_trip_matches_panicking_version() {
         for w in 1_u32..=32 {
@@ -1427,6 +1452,7 @@ mod tests {
         assert_eq!(decoded, values);
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     #[should_panic(expected = "encode output buffer too small")]
     fn dynamic_encode_still_panics_on_undersized_output() {
@@ -1437,6 +1463,7 @@ mod tests {
         packer.encode_u32_slice(&values, &mut out);
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     #[should_panic(expected = "decode input buffer too small")]
     fn dynamic_decode_still_panics_on_undersized_input() {
@@ -1447,6 +1474,7 @@ mod tests {
         packer.decode_u32_slice(&input, 8, &mut out);
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn unaligned_output_offsets_round_trip() {
         // The decoder writes to the caller's slice; verify that

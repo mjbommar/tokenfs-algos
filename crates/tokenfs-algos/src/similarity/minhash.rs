@@ -687,6 +687,12 @@ fn mix_two(a: u64, b: u64) -> u64 {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    // `Vec` and `vec!` are not in the no-std prelude; alias them from
+    // `alloc` for the alloc-only build (audit-R6 finding #164).
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::vec;
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::vec::Vec;
 
     /// Helper: hash a Rust set into u64 element hashes for test inputs.
     fn elements(items: &[u32]) -> impl Iterator<Item = u64> + '_ {

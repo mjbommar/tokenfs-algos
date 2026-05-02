@@ -106,6 +106,12 @@ pub fn xor_array_bitmap(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `Vec` and `vec!` are not in the no-std prelude; alias them from
+    // `alloc` for the alloc-only build (audit-R6 finding #164).
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::vec;
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::vec::Vec;
 
     fn deterministic_bitmap(seed: u64) -> [u64; BITMAP_WORDS] {
         let mut bm = [0_u64; BITMAP_WORDS];

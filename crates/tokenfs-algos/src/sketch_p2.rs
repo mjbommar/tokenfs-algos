@@ -387,6 +387,11 @@ mod tests {
         assert!(Estimator::memory_bytes() <= 256);
     }
 
+    // Uses `std::panic::catch_unwind` to verify the panicking branch of
+    // `Estimator::new`; gate on `feature = "std"` so the alloc-only build
+    // compiles. The fallible `try_new` path is exercised by
+    // `try_new_returns_error_for_invalid_p` below (audit-R6 #164).
+    #[cfg(feature = "std")]
     #[test]
     fn invalid_p_panics() {
         let result = std::panic::catch_unwind(|| Estimator::new(0.0));
