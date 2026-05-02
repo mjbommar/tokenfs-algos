@@ -32,6 +32,8 @@ pub mod divergence;
 pub mod entropy;
 pub mod error;
 pub mod fingerprint;
+#[cfg(any(feature = "std", feature = "alloc"))]
+pub mod format;
 pub mod hash;
 pub mod histogram;
 pub mod paper;

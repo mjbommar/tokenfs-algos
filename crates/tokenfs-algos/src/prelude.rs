@@ -18,6 +18,10 @@ pub use crate::fingerprint::{
     FingerprintKernelInfo, block as fingerprint_block, extent as fingerprint_extent,
     kernel_catalog as fingerprint_kernel_catalog,
 };
+#[cfg(any(feature = "std", feature = "alloc"))]
+pub use crate::format::{
+    Detection as FormatDetection, Format, Sniffer as FormatSniffer, detect as detect_format,
+};
 pub use crate::hash::{fnv1a64, mix64};
 pub use crate::histogram::{
     ByteHistogram, BytePairHistogram, BytePairScratch, HistogramBlockSignals, PlannedByteHistogram,
