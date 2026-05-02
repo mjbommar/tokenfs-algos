@@ -1990,3 +1990,34 @@ fn mix_u64(mut value: u64) -> u64 {
     value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
     value ^ (value >> 31)
 }
+
+/// Cache-tier reporting axis for v0.2 benches per
+/// `docs/v0.2_planning/02_CACHE_RESIDENCY.md` § "What this means for benchmarking".
+///
+/// Returns the canonical (label, size_bytes) pairs to bench at: in-L1
+/// (4 KB), in-L2 (256 KB), in-L3 (8 MB), in-DRAM (64 MB). Per-tier
+/// sizes chosen to fit in a "typical" P-core's cache hierarchy with
+/// margin (modern x86 L1d 48-64 KB, L2 1-4 MB, L3 16-128 MB).
+///
+/// Use as the third bench axis after (kernel, input shape):
+///
+/// ```ignore
+/// for (tier_label, size) in cache_tier_sizes() {
+///     let input = vec![0_u8; size];
+///     group.throughput(Throughput::Bytes(size as u64));
+///     group.bench_with_input(
+///         BenchmarkId::new(tier_label, size),
+///         &input,
+///         |b, bytes| b.iter(|| kernel(black_box(bytes))),
+///     );
+/// }
+/// ```
+#[allow(dead_code)]
+pub(crate) fn cache_tier_sizes() -> &'static [(&'static str, usize)] {
+    &[
+        ("in-L1", 4 * 1024),           // 4 KB — fits in L1d
+        ("in-L2", 256 * 1024),         // 256 KB — exceeds L1, fits in L2
+        ("in-L3", 8 * 1024 * 1024),    // 8 MB — exceeds L2, fits in L3
+        ("in-DRAM", 64 * 1024 * 1024), // 64 MB — exceeds L3, DRAM-bound
+    ]
+}
