@@ -4,6 +4,87 @@ All notable changes to this crate will be documented in this file. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.2.1] — 2026-05-02
+
+v0.2 hardening pass — no API changes, only test/bench/fuzz coverage
+fill-in. Closes the gaps identified in the post-v0.2.0 coverage audit.
+
+### Added — fuzz
+
+- 8 new fuzz targets in `fuzz/fuzz_targets/` for the v0.2 modules:
+  - `bits_streamvbyte_round_trip` — exercises the 256-entry shuffle
+    table on the dispatched (SSSE3/AVX2/NEON) decoder.
+  - `bitmap_intersect_parity` — Schlegel SSE4.2 array×array vs scalar
+    sorted-merge oracle, plus bitmap×bitmap AND in three variants
+    (`_card`/`_nocard`/`_justcard`) vs scalar word-AND oracle.
+  - `bits_bit_pack_round_trip` — round-trip across all widths W ∈ 1..=32.
+  - `bits_rank_select_consistency` — rank/select monotonicity and
+    inverse properties on `RankSelectDict`.
+  - `vector_distance_parity` — six metrics (dot/L2/cosine/dot_u32/
+    hamming/jaccard) dispatched vs scalar reference within Higham
+    1e-3 tolerance against L1 norm of products.
+  - `hash_batched_parity` — `sha256_batch_st` over up to 64 messages
+    vs serial `sha256` per message.
+  - `hash_set_membership_parity` — SIMD scan vs `slice::contains`.
+  - `permutation_apply_round_trip` — Fisher-Yates → apply → inverse
+    round-trip and `try_from_vec` validation.
+- All 8 targets pass a 2000-iteration smoke run with no panics.
+
+### Added — explicit AVX-512 parity tests
+
+- 14 new AVX-512 parity tests in `tests/avx2_parity.rs`, each
+  runtime-skipping when `is_x86_feature_detected!("avx512f")` is
+  false. Covers `bits::rank_select::*_batch` auto-dispatcher contract,
+  `vector::*_one_to_many` AVX-512 FMA paths (dot/L2/cosine/hamming/
+  jaccard), `bitmap::kernels::bitmap_x_bitmap_avx512` (and/or/xor/
+  andnot + VPOPCNTQ cardinality), and `hash::set_membership::avx512`.
+- 7 new NEON parity tests in `tests/neon_parity.rs`: NEON `_nocard`
+  bitmap parity (and/or), expanded streamvbyte round-trip + edge
+  cases, NEON parity for the L2/cosine/jaccard `_one_to_many` APIs.
+- Total: AVX2 parity 56 → 70 (+14); NEON parity 36 → 43 (+7).
+
+### Added — Phase C composition integration tests
+
+- `tests/integration_phase_c.rs` (3 tests, <0.01s combined runtime):
+  - `inverted_index_composition_roundtrips_and_agrees_on_intersection`
+    — `bitmap::Container` + `bits::streamvbyte`.
+  - `build_pipeline_composition_hash_batches_match_and_rcm_round_trips`
+    — `hash::sha256_batch_st` + `permutation::rcm` + `Permutation`.
+  - `similarity_scan_composition_bitpack_roundtrip_and_distance_parity`
+    — `bits::DynamicBitPacker` + `vector::*_one_to_many`.
+
+### Added — real-data env vars in v0.2 benches
+
+- Shared `support::real_files_as_bytes()` helper reading the
+  colon-separated `TOKENFS_ALGOS_REAL_FILES` env var. Each file's
+  bytes are loaded and passed to a per-bench `real_data_inputs()`
+  helper that converts to the bench's native input shape.
+- Wired into `bits_rank_select`, `bitmap_set_ops`, `bits_streamvbyte`,
+  and `similarity` benches. Default behavior (env unset) unchanged.
+- Per-bench input shapes: `rank_select` packs the low bit of every
+  byte into u64 words; `bitmap` derives sorted-dedup u16 vecs (low
+  12 bits) for array containers and `[u64; 1024]` for bitmap
+  containers; `streamvbyte` packs 4-byte LE windows masked to low
+  24 bits to match the synthetic posting-list-delta distribution;
+  `similarity` decodes f32 (clamped [-256, 256]), u32 (low 20 bits),
+  and full u64 lanes.
+
+### Added — bench history snapshots
+
+- `cargo xtask bench-history [--label <label>]` snapshots
+  `target/criterion/` canonical result files (`base/estimates.json`,
+  `new/estimates.json`, `new/sample.json`) into
+  `benches/_history/<label>/` for cross-release perf regression
+  detection. Defaults `<label>` to current short SHA.
+- `benches/_history/README.md` documents the layout and a manual
+  `jq` recipe for diffing snapshots on `mean.point_estimate`.
+
+### Notes
+
+- 679 lib + 70 AVX2 + 43 NEON + 13 SVE parity tests; integration suite
+  at 3 Phase C composition tests + existing parity/known_values/etc.
+- All `cargo xtask check` and aarch64 cross-clippy gates green.
+
 ## [0.2.0] — 2026-05-02
 
 The full Phase A + B + C surface from `docs/v0.2_planning/03_EXECUTION_PLAN.md`
