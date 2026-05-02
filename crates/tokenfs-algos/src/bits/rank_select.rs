@@ -42,7 +42,7 @@
 //!
 //! ## API
 //!
-//! ```no_run
+//! ```
 //! use tokenfs_algos::bits::RankSelectDict;
 //!
 //! let bits = [0xff_ff_ff_ff_00_00_00_00_u64];
