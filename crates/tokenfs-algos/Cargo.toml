@@ -122,5 +122,9 @@ harness = false
 name = "permutation_rcm"
 harness = false
 
+[[bench]]
+name = "approx_hll"
+harness = false
+
 [lints]
 workspace = true
