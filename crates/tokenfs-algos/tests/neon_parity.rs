@@ -956,3 +956,222 @@ proptest! {
         prop_assert_eq!(out_neon.as_slice(), out_scalar.as_slice());
     }
 }
+
+// =====================================================================
+// NEON _nocard variants (write-only, no popcount accumulator).
+//
+// The AVX-512 file tests `and_into_nocard`; mirror that here for NEON
+// so callers picking the _nocard fast path get the same parity guarantee.
+// =====================================================================
+
+#[test]
+fn neon_bitmap_x_bitmap_and_into_nocard_parity() {
+    let a = bitmap_words_seeded(0xC0FF_EE00);
+    let b = bitmap_words_seeded(0xDEAD_BEEF);
+    let mut out_simd = [0_u64; 1024];
+    let mut out_scalar = [0_u64; 1024];
+    bitmap::kernels::bitmap_x_bitmap_scalar::and_into_nocard(&a, &b, &mut out_scalar);
+    // SAFETY: NEON is mandatory on AArch64.
+    unsafe {
+        bitmap::kernels::bitmap_x_bitmap_neon::and_into_nocard(&a, &b, &mut out_simd);
+    }
+    assert_eq!(out_simd[..], out_scalar[..]);
+}
+
+#[test]
+fn neon_bitmap_x_bitmap_or_into_nocard_parity() {
+    let a = bitmap_words_seeded(0x1234_5678);
+    let b = bitmap_words_seeded(0x9abc_def0);
+    let mut out_simd = [0_u64; 1024];
+    let mut out_scalar = [0_u64; 1024];
+    bitmap::kernels::bitmap_x_bitmap_scalar::or_into_nocard(&a, &b, &mut out_scalar);
+    // SAFETY: NEON is mandatory on AArch64.
+    unsafe {
+        bitmap::kernels::bitmap_x_bitmap_neon::or_into_nocard(&a, &b, &mut out_simd);
+    }
+    assert_eq!(out_simd[..], out_scalar[..]);
+}
+
+// =====================================================================
+// NEON streamvbyte deeper coverage: edge cases + deterministic round-trip.
+//
+// The existing file has one `decode_matches_scalar_on_size_grid` and one
+// random-input round-trip proptest. Add explicit edge-case tests so the
+// NEON streamvbyte surface matches the AVX2 / SSSE3 coverage.
+// =====================================================================
+
+#[test]
+fn neon_bits_streamvbyte_round_trip_size_grid() {
+    // Round-trip — encode with the public API, decode with the NEON
+    // kernel directly, assert the values are recovered bit-exact and
+    // the consumed offset matches `written`.
+    for n in [
+        0_usize, 1, 2, 3, 4, 5, 7, 8, 9, 12, 16, 17, 31, 32, 33, 64, 100, 256, 1023, 1024, 4096,
+    ] {
+        for max in [1_u32, 2, 3, 4] {
+            let values = deterministic_streamvbyte_values(
+                n,
+                0x000C_0FFE_EF22_u64 ^ ((max as u64) << 16) ^ n as u64,
+                max,
+            );
+            let mut ctrl = vec![0_u8; bits::streamvbyte_control_len(n)];
+            let mut data = vec![0_u8; bits::streamvbyte_data_max_len(n)];
+            let written = bits::streamvbyte_encode_u32(&values, &mut ctrl, &mut data);
+
+            let mut decoded = vec![0_u32; n];
+            // SAFETY: NEON is mandatory on AArch64.
+            let consumed = unsafe {
+                bits::streamvbyte::kernels::neon::decode_u32(
+                    &ctrl,
+                    &data[..written],
+                    n,
+                    &mut decoded,
+                )
+            };
+            assert_eq!(
+                consumed, written,
+                "neon streamvbyte round-trip offset diverged at n={n} max_bytes={max}"
+            );
+            assert_eq!(
+                decoded, values,
+                "neon streamvbyte round-trip diverged at n={n} max_bytes={max}"
+            );
+        }
+    }
+}
+
+#[test]
+fn neon_bits_streamvbyte_decode_edge_cases() {
+    // Empty, all-zero, all-max-u32, and a hand-picked mix that lands a
+    // tail outside the 4-element NEON full group.
+    let cases: Vec<Vec<u32>> = vec![
+        Vec::new(),
+        vec![0],
+        vec![u32::MAX],
+        vec![0, 0, 0, 0],
+        vec![u32::MAX; 4],
+        vec![0, u32::MAX, 0, u32::MAX],
+        vec![0xff, 0xff_ff, 0xff_ff_ff, 0xff_ff_ff_ff],
+        // Length 5 — one full SVB group + 1 tail element.
+        vec![0xab, 0xcd_12, 0x34_56_78, 0xde_ad_be_ef, 0x42],
+        // Length 9 — two full groups + 1 tail.
+        vec![1, 2, 3, 4, 5, 6, 7, 8, u32::MAX],
+    ];
+    for values in cases {
+        let n = values.len();
+        let mut ctrl = vec![0_u8; bits::streamvbyte_control_len(n)];
+        let mut data = vec![0_u8; bits::streamvbyte_data_max_len(n)];
+        let written = bits::streamvbyte_encode_u32(&values, &mut ctrl, &mut data);
+
+        // Scalar reference for sanity.
+        let mut expected = vec![0_u32; n];
+        bits::streamvbyte::kernels::scalar::decode_u32(&ctrl, &data[..written], n, &mut expected);
+        assert_eq!(
+            expected, values,
+            "scalar round-trip broke on edge case len {n}"
+        );
+
+        // NEON kernel direct.
+        let mut actual = vec![0_u32; n];
+        // SAFETY: NEON is mandatory on AArch64.
+        let consumed = unsafe {
+            bits::streamvbyte::kernels::neon::decode_u32(&ctrl, &data[..written], n, &mut actual)
+        };
+        assert_eq!(
+            consumed, written,
+            "neon offset diverged on edge case len {n}"
+        );
+        assert_eq!(
+            actual, expected,
+            "neon streamvbyte diverged on edge case len {n}"
+        );
+    }
+}
+
+// =====================================================================
+// NEON vector batched many-vs-one: parity for L2/cosine/jaccard.
+//
+// The existing proptest! block covers `dot_f32_one_to_many` and
+// `hamming_u64_one_to_many`. Add deterministic parity tests for the
+// remaining three batched APIs so every entry in `vector::batch` has an
+// explicit NEON parity assertion.
+// =====================================================================
+
+#[test]
+fn neon_vector_l2_squared_f32_one_to_many_matches_scalar() {
+    let stride = 64_usize;
+    let n_rows = 12_usize;
+    let mut state = 0xC0FFEE_u32;
+    let mut next_f32 = || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        (state as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    let query: Vec<f32> = (0..stride).map(|_| next_f32()).collect();
+    let db: Vec<f32> = (0..n_rows * stride).map(|_| next_f32()).collect();
+    let mut out_batched = vec![0.0_f32; n_rows];
+    vector::l2_squared_f32_one_to_many(&query, &db, stride, &mut out_batched);
+    for (i, slot) in out_batched.iter().enumerate() {
+        let row = &db[i * stride..(i + 1) * stride];
+        let scalar = vector::kernels::scalar::l2_squared_f32(&query, row).unwrap();
+        // L2_squared is non-negative (no cancellation); 5e-4 vs the
+        // value scale matches the proptest tolerance.
+        let scale = scalar.abs().max((*slot).abs()).max(1.0);
+        assert!(
+            (slot - scalar).abs() / scale < 5e-4,
+            "neon l2_squared_f32_one_to_many[{i}] diverged: scalar={scalar} batched={slot}"
+        );
+    }
+}
+
+#[test]
+fn neon_vector_cosine_similarity_f32_one_to_many_matches_scalar() {
+    let stride = 64_usize;
+    let n_rows = 12_usize;
+    let mut state = 0xDEAD_BEEF_u32;
+    let mut next_f32 = || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        (state as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    let query: Vec<f32> = (0..stride).map(|_| next_f32()).collect();
+    let db: Vec<f32> = (0..n_rows * stride).map(|_| next_f32()).collect();
+    let mut out_batched = vec![0.0_f32; n_rows];
+    vector::cosine_similarity_f32_one_to_many(&query, &db, stride, &mut out_batched);
+    for (i, slot) in out_batched.iter().enumerate() {
+        let row = &db[i * stride..(i + 1) * stride];
+        let scalar = vector::kernels::scalar::cosine_similarity_f32(&query, row).unwrap();
+        // Cosine ∈ [-1, 1]; absolute tolerance is sufficient.
+        assert!(
+            (slot - scalar).abs() < 1e-3,
+            "neon cosine_similarity_f32_one_to_many[{i}] diverged: scalar={scalar} batched={slot}"
+        );
+    }
+}
+
+#[test]
+fn neon_vector_jaccard_u64_one_to_many_matches_scalar() {
+    let stride = 8_usize;
+    let n_rows = 12_usize;
+    let mut state = 0xF22_C0FFEE_u64;
+    let mut next_u64 = || {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    };
+    let query: Vec<u64> = (0..stride).map(|_| next_u64()).collect();
+    let db: Vec<u64> = (0..n_rows * stride).map(|_| next_u64()).collect();
+    let mut out_batched = vec![0.0_f64; n_rows];
+    vector::jaccard_u64_one_to_many(&query, &db, stride, &mut out_batched);
+    for (i, slot) in out_batched.iter().enumerate() {
+        let row = &db[i * stride..(i + 1) * stride];
+        let scalar = vector::kernels::scalar::jaccard_u64(&query, row).unwrap();
+        assert!(
+            (slot - scalar).abs() < 1e-12,
+            "neon jaccard_u64_one_to_many[{i}] diverged: scalar={scalar} batched={slot}"
+        );
+    }
+}

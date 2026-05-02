@@ -1627,3 +1627,468 @@ proptest! {
         prop_assert_eq!(out_simd, out_scalar);
     }
 }
+
+// =====================================================================
+// AVX-512 explicit parity tests
+//
+// Each AVX-512 test runtime-skips when the relevant feature isn't
+// detected. On dev hardware without AVX-512 these all early-return; on
+// AVX-512-capable hardware they exercise the kernel directly against
+// the pinned scalar reference. The whole section is gated on the
+// `avx512` Cargo feature so non-feature builds compile cleanly.
+// =====================================================================
+
+#[cfg(feature = "avx512")]
+fn avx512f_available() -> bool {
+    std::is_x86_feature_detected!("avx512f")
+}
+
+#[cfg(feature = "avx512")]
+fn avx512_popcnt_available() -> bool {
+    std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512vpopcntdq")
+}
+
+// ---------- bits::rank_select batch parity ----------
+//
+// `bits::rank_select::kernels::auto::{rank1_batch, select1_batch}` today
+// delegates to scalar (no AVX-512 batch kernel exists yet — see the
+// comment in src/bits/rank_select.rs § kernels). The parity tests below
+// pin the auto-dispatcher's contract against the scalar reference: any
+// future AVX-512 batch kernel must produce identical output.
+
+#[cfg(feature = "avx512")]
+#[test]
+fn avx512_bits_rank_select_rank1_batch_matches_scalar() {
+    if !avx512f_available() {
+        eprintln!("avx512f unavailable; skipping rank_select rank1_batch parity test");
+        return;
+    }
+    // Build a non-trivial bitmap and exercise rank1_batch on a dense
+    // grid of positions including endpoints and superblock boundaries.
+    let mut state = 0x000C_0FFE_EF22_u64;
+    let n_bits = 8 * 4096_usize;
+    let n_words = n_bits.div_ceil(64);
+    let bits: Vec<u64> = (0..n_words)
+        .map(|_| {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        })
+        .collect();
+    let dict = bits::RankSelectDict::build(&bits, n_bits);
+    let positions: Vec<usize> = vec![
+        0,
+        1,
+        7,
+        63,
+        64,
+        128,
+        256,
+        1024,
+        4095,
+        4096,
+        n_bits / 2,
+        n_bits,
+    ];
+    let mut expected = vec![0_usize; positions.len()];
+    bits::rank_select::kernels::scalar::rank1_batch(&dict, &positions, &mut expected);
+    let mut actual = vec![0_usize; positions.len()];
+    bits::rank_select::kernels::auto::rank1_batch(&dict, &positions, &mut actual);
+    assert_eq!(
+        actual, expected,
+        "auto::rank1_batch diverged from scalar reference under avx512"
+    );
+}
+
+#[cfg(feature = "avx512")]
+#[test]
+fn avx512_bits_rank_select_select1_batch_matches_scalar() {
+    if !avx512f_available() {
+        eprintln!("avx512f unavailable; skipping rank_select select1_batch parity test");
+        return;
+    }
+    let mut state = 0xDEAD_BEEF_u64;
+    let n_bits = 8 * 4096_usize;
+    let n_words = n_bits.div_ceil(64);
+    let bits: Vec<u64> = (0..n_words)
+        .map(|_| {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        })
+        .collect();
+    let dict = bits::RankSelectDict::build(&bits, n_bits);
+    let total = dict.count_ones();
+    // Pick a span across [0, total) and the boundary `total` (which
+    // must yield None per the contract).
+    let mut ks: Vec<usize> = vec![0, 1, 7];
+    if total > 0 {
+        for k in [total / 4, total / 2, (total * 3) / 4, total - 1] {
+            ks.push(k);
+        }
+    }
+    ks.push(total); // out-of-range -> None
+    let mut expected = vec![None; ks.len()];
+    bits::rank_select::kernels::scalar::select1_batch(&dict, &ks, &mut expected);
+    let mut actual = vec![None; ks.len()];
+    bits::rank_select::kernels::auto::select1_batch(&dict, &ks, &mut actual);
+    assert_eq!(
+        actual, expected,
+        "auto::select1_batch diverged from scalar reference under avx512"
+    );
+}
+
+// ---------- vector batch many-vs-one parity (AVX-512 single-pair underneath) ----------
+
+#[cfg(feature = "avx512")]
+#[test]
+fn avx512_vector_dot_f32_one_to_many_matches_scalar() {
+    if !avx512f_available() {
+        eprintln!("avx512f unavailable; skipping vector::dot_f32_one_to_many parity test");
+        return;
+    }
+    let stride = 64_usize;
+    let n_rows = 12_usize;
+    let mut state = 0xC0FFEE_u32;
+    let mut next_f32 = || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        (state as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    let query: Vec<f32> = (0..stride).map(|_| next_f32()).collect();
+    let db: Vec<f32> = (0..n_rows * stride).map(|_| next_f32()).collect();
+    let mut out_batched = vec![0.0_f32; n_rows];
+    vector::dot_f32_one_to_many(&query, &db, stride, &mut out_batched);
+    for (i, slot) in out_batched.iter().enumerate() {
+        let row = &db[i * stride..(i + 1) * stride];
+        // Use the L1-norm-of-products scale (Higham §3 / Wilkinson) so
+        // the cross-backend AVX-512 vs. scalar tolerance accounts for
+        // catastrophic cancellation on adversarial inputs.
+        let scalar_dot = vector::kernels::scalar::dot_f32(&query, row).unwrap();
+        let l1: f32 = query.iter().zip(row).map(|(&x, &y)| (x * y).abs()).sum();
+        let scale = l1.max(scalar_dot.abs()).max((*slot).abs()).max(1.0);
+        assert!(
+            (slot - scalar_dot).abs() / scale < 1e-3,
+            "avx512 dot_f32_one_to_many[{i}] diverged: scalar={scalar_dot} batched={slot}"
+        );
+    }
+}
+
+#[cfg(feature = "avx512")]
+#[test]
+fn avx512_vector_l2_squared_f32_one_to_many_matches_scalar() {
+    if !avx512f_available() {
+        eprintln!("avx512f unavailable; skipping vector::l2_squared_f32_one_to_many parity test");
+        return;
+    }
+    let stride = 64_usize;
+    let n_rows = 12_usize;
+    let mut state = 0xDEAD_BEEF_u32;
+    let mut next_f32 = || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        (state as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    let query: Vec<f32> = (0..stride).map(|_| next_f32()).collect();
+    let db: Vec<f32> = (0..n_rows * stride).map(|_| next_f32()).collect();
+    let mut out_batched = vec![0.0_f32; n_rows];
+    vector::l2_squared_f32_one_to_many(&query, &db, stride, &mut out_batched);
+    for (i, slot) in out_batched.iter().enumerate() {
+        let row = &db[i * stride..(i + 1) * stride];
+        let scalar = vector::kernels::scalar::l2_squared_f32(&query, row).unwrap();
+        // L2_squared has no cancellation — all squared terms are
+        // non-negative, so a tighter bound holds.
+        let scale = scalar.abs().max((*slot).abs()).max(1.0);
+        assert!(
+            (slot - scalar).abs() / scale < 5e-4,
+            "avx512 l2_squared_f32_one_to_many[{i}] diverged: scalar={scalar} batched={slot}"
+        );
+    }
+}
+
+#[cfg(feature = "avx512")]
+#[test]
+fn avx512_vector_cosine_similarity_f32_one_to_many_matches_scalar() {
+    if !avx512f_available() {
+        eprintln!(
+            "avx512f unavailable; skipping vector::cosine_similarity_f32_one_to_many parity test"
+        );
+        return;
+    }
+    let stride = 64_usize;
+    let n_rows = 12_usize;
+    let mut state = 0xBAD_C0DE_u32;
+    let mut next_f32 = || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        (state as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    let query: Vec<f32> = (0..stride).map(|_| next_f32()).collect();
+    let db: Vec<f32> = (0..n_rows * stride).map(|_| next_f32()).collect();
+    let mut out_batched = vec![0.0_f32; n_rows];
+    vector::cosine_similarity_f32_one_to_many(&query, &db, stride, &mut out_batched);
+    for (i, slot) in out_batched.iter().enumerate() {
+        let row = &db[i * stride..(i + 1) * stride];
+        let scalar = vector::kernels::scalar::cosine_similarity_f32(&query, row).unwrap();
+        // Cosine is bounded in [-1, 1]; a 1e-3 absolute tolerance is
+        // proportional to the worst-case Higham bound on dot/L2 above.
+        assert!(
+            (slot - scalar).abs() < 1e-3,
+            "avx512 cosine_similarity_f32_one_to_many[{i}] diverged: scalar={scalar} batched={slot}"
+        );
+    }
+}
+
+#[cfg(feature = "avx512")]
+#[test]
+fn avx512_vector_hamming_u64_one_to_many_matches_scalar() {
+    if !avx512_popcnt_available() {
+        eprintln!(
+            "avx512f+vpopcntdq unavailable; skipping vector::hamming_u64_one_to_many parity test"
+        );
+        return;
+    }
+    let stride = 8_usize;
+    let n_rows = 12_usize;
+    let mut state = 0xF22_C0FFEE_u64;
+    let mut next_u64 = || {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    };
+    let query: Vec<u64> = (0..stride).map(|_| next_u64()).collect();
+    let db: Vec<u64> = (0..n_rows * stride).map(|_| next_u64()).collect();
+    let mut out_batched = vec![0_u32; n_rows];
+    vector::hamming_u64_one_to_many(&query, &db, stride, &mut out_batched);
+    for (i, slot) in out_batched.iter().enumerate() {
+        let row = &db[i * stride..(i + 1) * stride];
+        let scalar = vector::kernels::scalar::hamming_u64(&query, row).unwrap();
+        assert_eq!(
+            *slot as u64, scalar,
+            "avx512 hamming_u64_one_to_many[{i}] diverged: scalar={scalar} batched={slot}"
+        );
+    }
+}
+
+#[cfg(feature = "avx512")]
+#[test]
+fn avx512_vector_jaccard_u64_one_to_many_matches_scalar() {
+    if !avx512_popcnt_available() {
+        eprintln!(
+            "avx512f+vpopcntdq unavailable; skipping vector::jaccard_u64_one_to_many parity test"
+        );
+        return;
+    }
+    let stride = 8_usize;
+    let n_rows = 12_usize;
+    let mut state = 0x000C_0FFE_EBAD_u64;
+    let mut next_u64 = || {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    };
+    let query: Vec<u64> = (0..stride).map(|_| next_u64()).collect();
+    let db: Vec<u64> = (0..n_rows * stride).map(|_| next_u64()).collect();
+    let mut out_batched = vec![0.0_f64; n_rows];
+    vector::jaccard_u64_one_to_many(&query, &db, stride, &mut out_batched);
+    for (i, slot) in out_batched.iter().enumerate() {
+        let row = &db[i * stride..(i + 1) * stride];
+        let scalar = vector::kernels::scalar::jaccard_u64(&query, row).unwrap();
+        assert!(
+            (slot - scalar).abs() < 1e-12,
+            "avx512 jaccard_u64_one_to_many[{i}] diverged: scalar={scalar} batched={slot}"
+        );
+    }
+}
+
+// ---------- bitmap::kernels::bitmap_x_bitmap_avx512 parity ----------
+
+#[cfg(feature = "avx512")]
+#[test]
+fn avx512_bitmap_x_bitmap_and_into_card_parity() {
+    if !avx512_popcnt_available() {
+        eprintln!(
+            "avx512f+vpopcntdq unavailable; skipping bitmap_x_bitmap_avx512 and_into parity test"
+        );
+        return;
+    }
+    let a = bitmap_words_seeded(0xC0FF_EE00);
+    let b = bitmap_words_seeded(0xDEAD_BEEF);
+    let mut out_simd = [0_u64; 1024];
+    let mut out_scalar = [0_u64; 1024];
+    let card_scalar = bitmap::kernels::bitmap_x_bitmap_scalar::and_into(&a, &b, &mut out_scalar);
+    // SAFETY: avx512f+vpopcntdq checked above.
+    let card_simd =
+        unsafe { bitmap::kernels::bitmap_x_bitmap_avx512::and_into(&a, &b, &mut out_simd) };
+    assert_eq!(card_simd, card_scalar);
+    assert_eq!(out_simd[..], out_scalar[..]);
+}
+
+#[cfg(feature = "avx512")]
+#[test]
+fn avx512_bitmap_x_bitmap_and_into_nocard_parity() {
+    if !avx512f_available() {
+        eprintln!(
+            "avx512f unavailable; skipping bitmap_x_bitmap_avx512 and_into_nocard parity test"
+        );
+        return;
+    }
+    let a = bitmap_words_seeded(0xC0FF_EE00);
+    let b = bitmap_words_seeded(0xDEAD_BEEF);
+    let mut out_simd = [0_u64; 1024];
+    let mut out_scalar = [0_u64; 1024];
+    bitmap::kernels::bitmap_x_bitmap_scalar::and_into_nocard(&a, &b, &mut out_scalar);
+    // SAFETY: avx512f checked above.
+    unsafe {
+        bitmap::kernels::bitmap_x_bitmap_avx512::and_into_nocard(&a, &b, &mut out_simd);
+    }
+    assert_eq!(out_simd[..], out_scalar[..]);
+}
+
+#[cfg(feature = "avx512")]
+#[test]
+fn avx512_bitmap_x_bitmap_or_into_card_parity() {
+    if !avx512_popcnt_available() {
+        eprintln!(
+            "avx512f+vpopcntdq unavailable; skipping bitmap_x_bitmap_avx512 or_into parity test"
+        );
+        return;
+    }
+    let a = bitmap_words_seeded(0x1234_5678);
+    let b = bitmap_words_seeded(0x9abc_def0);
+    let mut out_simd = [0_u64; 1024];
+    let mut out_scalar = [0_u64; 1024];
+    let card_scalar = bitmap::kernels::bitmap_x_bitmap_scalar::or_into(&a, &b, &mut out_scalar);
+    // SAFETY: avx512f+vpopcntdq checked above.
+    let card_simd =
+        unsafe { bitmap::kernels::bitmap_x_bitmap_avx512::or_into(&a, &b, &mut out_simd) };
+    assert_eq!(card_simd, card_scalar);
+    assert_eq!(out_simd[..], out_scalar[..]);
+}
+
+#[cfg(feature = "avx512")]
+#[test]
+fn avx512_bitmap_x_bitmap_xor_into_card_parity() {
+    if !avx512_popcnt_available() {
+        eprintln!(
+            "avx512f+vpopcntdq unavailable; skipping bitmap_x_bitmap_avx512 xor_into parity test"
+        );
+        return;
+    }
+    let a = bitmap_words_seeded(0xAAAA_5555);
+    let b = bitmap_words_seeded(0x5555_AAAA);
+    let mut out_simd = [0_u64; 1024];
+    let mut out_scalar = [0_u64; 1024];
+    let card_scalar = bitmap::kernels::bitmap_x_bitmap_scalar::xor_into(&a, &b, &mut out_scalar);
+    // SAFETY: avx512f+vpopcntdq checked above.
+    let card_simd =
+        unsafe { bitmap::kernels::bitmap_x_bitmap_avx512::xor_into(&a, &b, &mut out_simd) };
+    assert_eq!(card_simd, card_scalar);
+    assert_eq!(out_simd[..], out_scalar[..]);
+}
+
+#[cfg(feature = "avx512")]
+#[test]
+fn avx512_bitmap_x_bitmap_andnot_into_card_parity() {
+    if !avx512_popcnt_available() {
+        eprintln!(
+            "avx512f+vpopcntdq unavailable; skipping bitmap_x_bitmap_avx512 andnot_into parity test"
+        );
+        return;
+    }
+    let a = bitmap_words_seeded(0x0F0F_0F0F);
+    let b = bitmap_words_seeded(0xF0F0_F0F0);
+    let mut out_simd = [0_u64; 1024];
+    let mut out_scalar = [0_u64; 1024];
+    let card_scalar = bitmap::kernels::bitmap_x_bitmap_scalar::andnot_into(&a, &b, &mut out_scalar);
+    // SAFETY: avx512f+vpopcntdq checked above.
+    let card_simd =
+        unsafe { bitmap::kernels::bitmap_x_bitmap_avx512::andnot_into(&a, &b, &mut out_simd) };
+    assert_eq!(card_simd, card_scalar);
+    assert_eq!(out_simd[..], out_scalar[..]);
+}
+
+#[cfg(feature = "avx512")]
+#[test]
+fn avx512_bitmap_x_bitmap_just_cardinality_vpopcntq_parity() {
+    if !avx512_popcnt_available() {
+        eprintln!(
+            "avx512f+vpopcntdq unavailable; skipping bitmap_x_bitmap_avx512 cardinality parity test"
+        );
+        return;
+    }
+    let a = bitmap_words_seeded(0x1357_9bdf);
+    let b = bitmap_words_seeded(0x2468_ace0);
+    // SAFETY: avx512f+vpopcntdq checked above.
+    unsafe {
+        assert_eq!(
+            bitmap::kernels::bitmap_x_bitmap_avx512::and_cardinality(&a, &b),
+            bitmap::kernels::bitmap_x_bitmap_scalar::and_cardinality(&a, &b),
+            "avx512 and_cardinality (VPOPCNTQ) diverged"
+        );
+        assert_eq!(
+            bitmap::kernels::bitmap_x_bitmap_avx512::or_cardinality(&a, &b),
+            bitmap::kernels::bitmap_x_bitmap_scalar::or_cardinality(&a, &b),
+            "avx512 or_cardinality (VPOPCNTQ) diverged"
+        );
+        assert_eq!(
+            bitmap::kernels::bitmap_x_bitmap_avx512::xor_cardinality(&a, &b),
+            bitmap::kernels::bitmap_x_bitmap_scalar::xor_cardinality(&a, &b),
+            "avx512 xor_cardinality (VPOPCNTQ) diverged"
+        );
+        assert_eq!(
+            bitmap::kernels::bitmap_x_bitmap_avx512::andnot_cardinality(&a, &b),
+            bitmap::kernels::bitmap_x_bitmap_scalar::andnot_cardinality(&a, &b),
+            "avx512 andnot_cardinality (VPOPCNTQ) diverged"
+        );
+    }
+}
+
+// ---------- hash::set_membership AVX-512 parity ----------
+
+#[cfg(feature = "avx512")]
+#[test]
+fn avx512_hash_set_membership_contains_u32_parity() {
+    if !avx512f_available() {
+        eprintln!("avx512f unavailable; skipping hash::set_membership AVX-512 parity test");
+        return;
+    }
+    // Cover SIMD block boundaries: AVX-512 processes 16 lanes per vector.
+    for len in [
+        0_usize, 1, 3, 8, 15, 16, 17, 31, 32, 33, 47, 48, 64, 128, 256, 1023,
+    ] {
+        let haystack = deterministic_u32_haystack(len, 0xF22_F00D ^ (len as u64));
+        for &needle in &[0_u32, 1, u32::MAX, 0x8000_0000, 0xC0FFEE] {
+            let expected = hash::set_membership::kernels::scalar::contains_u32(&haystack, needle);
+            // SAFETY: avx512f checked above.
+            let actual =
+                unsafe { hash::set_membership::kernels::avx512::contains_u32(&haystack, needle) };
+            assert_eq!(
+                actual, expected,
+                "avx512 set_membership::contains_u32 diverged at len {len} needle {needle}"
+            );
+        }
+        if len > 0 {
+            for &pos in &[0_usize, len / 2, len - 1] {
+                let needle = haystack[pos];
+                let expected =
+                    hash::set_membership::kernels::scalar::contains_u32(&haystack, needle);
+                // SAFETY: avx512f checked above.
+                let actual = unsafe {
+                    hash::set_membership::kernels::avx512::contains_u32(&haystack, needle)
+                };
+                assert_eq!(
+                    actual, expected,
+                    "avx512 set_membership::contains_u32 diverged at len {len} pos {pos}"
+                );
+            }
+        }
+    }
+}
