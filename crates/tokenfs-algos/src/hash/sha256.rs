@@ -624,10 +624,22 @@ pub mod kernels {
         };
 
         /// Returns true when AArch64 FEAT_SHA2 is available at runtime.
+        ///
+        /// **Currently disabled.** The compress_block_sha2 schedule is
+        /// bit-divergent from the scalar reference on real ARM hardware
+        /// (Linux Cobalt-100 / Apple M1 / Windows Cobalt-100 all produce
+        /// the wrong digest at len=64 — see CI run 25241406257). QEMU
+        /// emulation passes, masking the bug locally. Hard-coding this
+        /// to `false` routes the dispatch through `scalar` until the
+        /// FEAT_SHA2 schedule is corrected against real silicon. Tracked
+        /// as a follow-up; reverting this single line re-enables the
+        /// path once it's correct.
         #[cfg(feature = "std")]
         #[must_use]
         pub fn is_available() -> bool {
-            std::arch::is_aarch64_feature_detected!("sha2")
+            // FIXME: re-enable once compress_block_sha2 matches scalar on
+            // real ARM hardware; see doc above.
+            false && std::arch::is_aarch64_feature_detected!("sha2")
         }
 
         #[cfg(not(feature = "std"))]
