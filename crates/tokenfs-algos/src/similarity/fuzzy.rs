@@ -1,15 +1,23 @@
 //! Fuzzy fingerprint primitives — locality-sensitive digests for file-level
 //! similarity that survive insertion, deletion, and shift.
 //!
-//! Per `docs/SIMILARITY_APPROXIMATION_ROADMAP.md` Phase 2. Currently only
-//! [`tlsh_like`] is implemented; CTPH (ssdeep-style) and sdhash-style
-//! variants are tracked as follow-ups in the SIMD/algorithm roadmap.
+//! Per `docs/SIMILARITY_APPROXIMATION_ROADMAP.md` Phase 2. Two families are
+//! currently implemented:
 //!
-//! The naming `tlsh_like` (vs. `tlsh`) is intentional: this is a
-//! quality-faithful reimplementation following the published TLSH paper
-//! and the Apache-2.0 reference, but produces digests that may diverge
-//! slightly from upstream byte-for-byte (different Pearson permutation
-//! seed, no header/footer chars). Distances are calibrated against the
-//! published "weak < 30, related < 100, unrelated > 150" thresholds.
+//! - [`tlsh_like`] — TLSH-style bucket-quartile digest (35 bytes), tuned
+//!   for files of >= 50 bytes with diverse byte content. Distance metric
+//!   is integer-valued; published thresholds (`< 30` near-duplicate,
+//!   `30..100` related, `> 150` unrelated).
+//! - [`ctph`] — Context-Triggered Piecewise Hashing (ssdeep-style), a
+//!   variable-length printable digest tuned for "did this file change a
+//!   little?" workloads. Distance metric is in `[0, 100]` (`0` identical,
+//!   `100` unrelated/incomparable).
+//!
+//! The naming `tlsh_like` (vs. `tlsh`) and the doc-level note on `ctph`
+//! are intentional: both are quality-faithful reimplementations of the
+//! published algorithms but make no promise of byte-for-byte parity with
+//! the canonical reference implementations. See each module for the
+//! specific deviations.
 
+pub mod ctph;
 pub mod tlsh_like;
