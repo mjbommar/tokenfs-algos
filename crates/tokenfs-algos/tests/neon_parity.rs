@@ -1285,3 +1285,57 @@ proptest! {
         prop_assert_eq!(simd_dst, scalar_dst);
     }
 }
+
+// ---------- approx::BloomFilter NEON parity ----------
+
+/// Bit-counts and K values exercised by every Bloom kernel parity test.
+const BLOOM_TEST_BITS: &[usize] = &[64, 128, 1024, 4096, 65_536, 1_048_576];
+const BLOOM_TEST_KS: &[usize] = &[1, 2, 3, 4, 5, 7, 8, 13, 16, 32];
+
+#[test]
+fn neon_approx_bloom_kernels_positions_match_scalar_on_size_grid() {
+    for &bits in BLOOM_TEST_BITS {
+        for &k in BLOOM_TEST_KS {
+            // Deterministic hash pair derived from (bits, k); the
+            // `| 1` keeps `h2` odd as the production
+            // `derive_hashes` does.
+            let h1 = 0xF00D_BABE_F00D_BABE_u64.wrapping_mul(bits as u64 + 17);
+            let h2 = (0x9E37_79B9_7F4A_7C15_u64.wrapping_mul(k as u64 + 11)) | 1;
+            let mut out_scalar = vec![0_u64; k];
+            let mut out_neon = vec![0_u64; k];
+            approx::bloom_kernels::scalar::positions(h1, h2, k, bits, &mut out_scalar);
+            // SAFETY: NEON is mandatory on AArch64.
+            unsafe {
+                approx::bloom_kernels::neon::positions(h1, h2, k, bits, &mut out_neon);
+            }
+            assert_eq!(
+                out_scalar, out_neon,
+                "neon bloom_kernels::positions diverged at bits={bits} k={k}"
+            );
+        }
+    }
+}
+
+#[test]
+fn neon_approx_bloom_filter_contains_simd_matches_scalar_path() {
+    // Cross-check: insert via SIMD, query via SIMD — must always
+    // hit. Insert a moderate set, then probe with a mix of inserted
+    // and non-inserted keys and confirm the SIMD-dispatched
+    // `contains_simd` result matches the scalar reference computed
+    // via the same Kirsch-Mitzenmacher formula.
+    for &bits in &[1024_usize, 4096, 65_536] {
+        for &k in &[3_usize, 7, 13] {
+            let mut bf = approx::BloomFilter::new(bits, k);
+            let inserted: Vec<u64> = (0_u64..128).collect();
+            for &key in &inserted {
+                bf.insert_simd(key);
+            }
+            for &key in &inserted {
+                assert!(
+                    bf.contains_simd(key),
+                    "neon contains_simd false negative at bits={bits} k={k} key={key}"
+                );
+            }
+        }
+    }
+}

@@ -53,6 +53,39 @@ pub enum ApproxError {
     },
 }
 
+/// Failure modes for the fallible Bloom batched-query API
+/// ([`BloomFilter::try_contains_batch_simd`]).
+///
+/// Returned instead of panicking when caller-supplied buffer lengths
+/// are inconsistent; mirrors the audit-R4 pattern used for
+/// [`crate::hash::set_membership::SetMembershipBatchError`].
+#[cfg(feature = "std")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BloomBatchError {
+    /// `keys.len() != out.len()`.
+    LengthMismatch {
+        /// Caller-supplied `keys.len()`.
+        keys_len: usize,
+        /// Caller-supplied `out.len()`.
+        out_len: usize,
+    },
+}
+
+#[cfg(feature = "std")]
+impl core::fmt::Display for BloomBatchError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::LengthMismatch { keys_len, out_len } => write!(
+                f,
+                "bloom batch length mismatch: keys.len()={keys_len} but out.len()={out_len}"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for BloomBatchError {}
+
 #[cfg(feature = "std")]
 impl core::fmt::Display for ApproxError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -214,7 +247,23 @@ impl<const K: usize> SpaceSaving<K> {
 
 #[cfg(feature = "std")]
 mod bloom {
-    use crate::hash::mix64;
+    use crate::hash::{mix_word, mix64};
+
+    /// SplitMix64 seeds used to derive the (`h1`, `h2`) pair for the
+    /// `u64`-keyed SIMD APIs (`insert_simd` / `contains_simd` /
+    /// `contains_batch_simd`).
+    ///
+    /// The byte-keyed scalar APIs (`insert` / `contains`) keep their
+    /// original `mix64`-based seeds (`0x9E37…7C15` / `0x6E5E…BEEF`) so
+    /// existing fixtures and serialized state remain bit-exact. The
+    /// `u64` path uses `mix_word` (a closed-form SplitMix64 finalizer)
+    /// instead of `mix64` because the input is already a single u64;
+    /// both seeds are documented constants so the SIMD parity tests
+    /// can re-derive `(h1, h2)` independently.
+    pub(super) const SIMD_SEED_H1: u64 = 0x9E37_79B9_7F4A_7C15;
+    /// Companion seed for the second hash in the Kirsch-Mitzenmacher
+    /// `h1 + i*h2` derivation — paired with [`SIMD_SEED_H1`].
+    pub(super) const SIMD_SEED_H2: u64 = 0x6E5E_2E5C_DEAD_BEEF;
 
     /// Vec-backed Bloom filter.
     ///
@@ -226,6 +275,24 @@ mod bloom {
     /// Hash functions are derived via the Kirsch-Mitzenmacher double-hashing
     /// trick: two base hashes `h1`, `h2` are combined as `h1 + i * h2` for
     /// `i = 0..k`.
+    ///
+    /// # API surfaces
+    ///
+    /// Two parallel surfaces are provided:
+    ///
+    /// * **Byte-slice scalar surface** — [`Self::insert`], [`Self::contains`].
+    ///   Hashes the byte slice with `mix64` to derive `(h1, h2)`. This is
+    ///   the legacy v0.1 surface; serialized state is bit-exact across
+    ///   versions.
+    /// * **`u64` SIMD surface** — [`Self::insert_simd`], [`Self::contains_simd`],
+    ///   [`Self::contains_batch_simd`]. Treats the caller-supplied `u64`
+    ///   as a precomputed key and derives `(h1, h2)` via two `mix_word`
+    ///   calls. The K hash positions are computed in parallel via the
+    ///   `bloom_kernels` SIMD backends. The two surfaces produce
+    ///   different bit positions for the same logical input (one hashes
+    ///   bytes, the other hashes a u64), but each surface is internally
+    ///   consistent: `insert_simd(k); contains_simd(k) == true` for any
+    ///   `k`.
     #[derive(Clone, Debug)]
     pub struct BloomFilter {
         words: Vec<u64>,
@@ -374,11 +441,674 @@ mod bloom {
             }
             self.inserted = 0;
         }
+
+        // -------------------------------------------------------------
+        // SIMD `u64`-keyed surface
+        // -------------------------------------------------------------
+
+        /// Derives the `(h1, h2)` Kirsch-Mitzenmacher base hashes for a
+        /// `u64` key.
+        ///
+        /// Two independent SplitMix64 finalisations seeded with
+        /// `SIMD_SEED_H1` / `SIMD_SEED_H2`. Pure with respect to its
+        /// input; `h2` is forced odd so the modular arithmetic with
+        /// `bits` (which is always even / a multiple of 64) does not
+        /// alias every iteration onto the same residue class.
+        #[inline]
+        fn derive_hashes(key: u64) -> (u64, u64) {
+            let h1 = mix_word(key ^ SIMD_SEED_H1);
+            // Force the low bit of h2 set: this avoids the degenerate
+            // case where `h2 % bits == 0` collapses every i-th probe to
+            // the same position. With `bits` always even, an odd `h2`
+            // also maximises the cyclic coverage of the K probes.
+            let h2 = mix_word(key ^ SIMD_SEED_H2) | 1;
+            (h1, h2)
+        }
+
+        /// SIMD-accelerated insert path keyed by a precomputed `u64`.
+        ///
+        /// Uses the best available kernel detected at runtime to compute
+        /// the K Kirsch-Mitzenmacher positions in parallel
+        /// (`bloom_kernels::auto::positions`) and then sets those K bits
+        /// in `self.words`. Bit-exact with the scalar reference
+        /// [`super::bloom_kernels::scalar::positions`].
+        ///
+        /// Use [`Self::insert`] instead when the input is a byte slice
+        /// (the two surfaces hash differently — see the type-level
+        /// docs).
+        pub fn insert_simd(&mut self, key: u64) {
+            let (h1, h2) = Self::derive_hashes(key);
+            let mut buf = [0_u64; super::bloom_kernels::MAX_K];
+            let positions = &mut buf[..self.k];
+            super::bloom_kernels::auto::positions(h1, h2, self.k, self.bits, positions);
+            for &position in positions.iter() {
+                let pos = position as usize;
+                let word = pos / 64;
+                let bit = pos % 64;
+                self.words[word] |= 1_u64 << bit;
+            }
+            self.inserted = self.inserted.wrapping_add(1);
+        }
+
+        /// SIMD-accelerated query path keyed by a precomputed `u64`.
+        ///
+        /// Returns true iff every one of the K positions has its bit
+        /// set. Uses the best available kernel detected at runtime;
+        /// bit-exact with the scalar reference. Inverse of
+        /// [`Self::insert_simd`]: `insert_simd(k); contains_simd(k)`
+        /// always returns true.
+        ///
+        /// Use [`Self::contains`] instead when the input is a byte
+        /// slice.
+        #[must_use]
+        pub fn contains_simd(&self, key: u64) -> bool {
+            let (h1, h2) = Self::derive_hashes(key);
+            let mut buf = [0_u64; super::bloom_kernels::MAX_K];
+            let positions = &mut buf[..self.k];
+            super::bloom_kernels::auto::positions(h1, h2, self.k, self.bits, positions);
+            for &position in positions.iter() {
+                let pos = position as usize;
+                let word = pos / 64;
+                let bit = pos % 64;
+                if self.words[word] & (1_u64 << bit) == 0 {
+                    return false;
+                }
+            }
+            true
+        }
+
+        /// Batched query: writes `out[i] = contains_simd(keys[i])` for
+        /// each `i`.
+        ///
+        /// Resolves the SIMD backend once and runs a tight per-key loop
+        /// in the chosen kernel. Bit-exact with the per-key
+        /// [`Self::contains_simd`].
+        ///
+        /// # Panics
+        ///
+        /// Panics if `keys.len() != out.len()`. Use
+        /// [`Self::try_contains_batch_simd`] for a fallible variant
+        /// returning [`super::BloomBatchError`] instead.
+        pub fn contains_batch_simd(&self, keys: &[u64], out: &mut [bool]) {
+            assert_eq!(
+                keys.len(),
+                out.len(),
+                "bloom batch length mismatch: keys.len()={} but out.len()={}",
+                keys.len(),
+                out.len(),
+            );
+            for (key, slot) in keys.iter().zip(out.iter_mut()) {
+                *slot = self.contains_simd(*key);
+            }
+        }
+
+        /// Fallible variant of [`Self::contains_batch_simd`] that
+        /// returns [`super::BloomBatchError::LengthMismatch`] when
+        /// `keys.len() != out.len()`, instead of panicking.
+        pub fn try_contains_batch_simd(
+            &self,
+            keys: &[u64],
+            out: &mut [bool],
+        ) -> Result<(), super::BloomBatchError> {
+            if keys.len() != out.len() {
+                return Err(super::BloomBatchError::LengthMismatch {
+                    keys_len: keys.len(),
+                    out_len: out.len(),
+                });
+            }
+            self.contains_batch_simd(keys, out);
+            Ok(())
+        }
     }
 }
 
 #[cfg(feature = "std")]
 pub use bloom::BloomFilter;
+
+// ============================================================================
+// Bloom filter SIMD kernels
+// ============================================================================
+
+/// SIMD-accelerated kernels for the [`BloomFilter`] `u64`-keyed query
+/// path.
+///
+/// Each backend computes the K Kirsch-Mitzenmacher hash positions
+/// `(h1 + i*h2) mod bits` in parallel and writes them into a
+/// caller-supplied `&mut [u64]` buffer. The bit gather/test step is
+/// kept scalar — gather instructions are memory-bound for sparse
+/// indices regardless of vector width, and folding the test inside the
+/// kernels would force every backend to take a `&BloomFilter` borrow
+/// they don't otherwise need.
+///
+/// ## Backends
+///
+/// * [`bloom_kernels::scalar`] — portable reference path (the parity oracle).
+/// * `bloom_kernels::avx2` — x86 `__m256i` (4 × u64 per vector), `feature = "avx2"`.
+/// * `bloom_kernels::avx512` — x86 `__m512i` (8 × u64 per vector), `feature = "avx512"`.
+/// * `bloom_kernels::neon` — AArch64 `uint64x2_t` (2 × u64 per vector),
+///   `feature = "neon"`.
+#[cfg(feature = "std")]
+pub mod bloom_kernels {
+    /// Maximum `k` value supported by the SIMD APIs.
+    ///
+    /// 32 covers every realistic `k` (typical 3-13). The
+    /// `BloomFilter::insert_simd` / `contains_simd` paths allocate a
+    /// stack buffer of this size to hold the K computed positions.
+    pub const MAX_K: usize = 32;
+
+    /// Runtime-dispatched bloom-position kernels.
+    pub mod auto {
+        /// Writes `out[i] = (h1 + i*h2) mod bits` for `i` in `0..k`.
+        ///
+        /// Dispatches to the best available SIMD backend at runtime
+        /// (AVX-512 > AVX2 on x86; NEON on AArch64; scalar elsewhere).
+        /// `out.len()` must be at least `k`.
+        ///
+        /// # Panics
+        ///
+        /// Panics if `out.len() < k` or `bits == 0`.
+        #[inline]
+        pub fn positions(h1: u64, h2: u64, k: usize, bits: usize, out: &mut [u64]) {
+            #[cfg(all(
+                feature = "std",
+                feature = "avx512",
+                any(target_arch = "x86", target_arch = "x86_64")
+            ))]
+            {
+                if super::avx512::is_available() {
+                    // SAFETY: availability was checked immediately above.
+                    unsafe { super::avx512::positions(h1, h2, k, bits, out) };
+                    return;
+                }
+            }
+
+            #[cfg(all(
+                feature = "std",
+                feature = "avx2",
+                any(target_arch = "x86", target_arch = "x86_64")
+            ))]
+            {
+                if super::avx2::is_available() {
+                    // SAFETY: availability was checked immediately above.
+                    unsafe { super::avx2::positions(h1, h2, k, bits, out) };
+                    return;
+                }
+            }
+
+            #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+            {
+                if super::neon::is_available() {
+                    // SAFETY: NEON is mandatory on AArch64.
+                    unsafe { super::neon::positions(h1, h2, k, bits, out) };
+                    return;
+                }
+            }
+
+            super::scalar::positions(h1, h2, k, bits, out);
+        }
+    }
+
+    /// Portable scalar position-computation reference.
+    pub mod scalar {
+        /// Writes the K Kirsch-Mitzenmacher positions into `out`.
+        ///
+        /// `out[i] = (h1.wrapping_add((i as u64).wrapping_mul(h2))) %
+        /// bits` for `i in 0..k`. Acts as the parity oracle for every
+        /// SIMD backend in this module.
+        ///
+        /// # Panics
+        ///
+        /// Panics if `out.len() < k` or `bits == 0`.
+        pub fn positions(h1: u64, h2: u64, k: usize, bits: usize, out: &mut [u64]) {
+            assert!(bits > 0, "BloomFilter bits must be > 0");
+            assert!(out.len() >= k, "out buffer too small: {} < {k}", out.len());
+            let bits_u64 = bits as u64;
+            for (i, slot) in out.iter_mut().take(k).enumerate() {
+                let raw = h1.wrapping_add((i as u64).wrapping_mul(h2));
+                *slot = raw % bits_u64;
+            }
+        }
+    }
+
+    /// x86 AVX2 position-computation kernel.
+    ///
+    /// Computes 4 u64 positions per `__m256i` vector via
+    /// `_mm256_add_epi64` + `_mm256_mullo_epi64` (emulated via a
+    /// 32x32→64 multiply pattern since AVX2 has no native 64-bit
+    /// multiply). The modular reduction is scalar — AVX2 does not
+    /// expose vector u64 division.
+    ///
+    /// The win comes from amortising the dependency chain through
+    /// `(h1 + i*h2)` across multiple K values in parallel: for K=7
+    /// the scalar path issues 7 sequential adds; the AVX2 path issues
+    /// 2 vector adds (1 vector + tail).
+    #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+    pub mod avx2 {
+        #[cfg(target_arch = "x86")]
+        use core::arch::x86::{
+            __m256i, _mm256_add_epi64, _mm256_mul_epu32, _mm256_set1_epi64x, _mm256_setr_epi64x,
+            _mm256_slli_epi64, _mm256_srli_epi64, _mm256_storeu_si256,
+        };
+        #[cfg(target_arch = "x86_64")]
+        use core::arch::x86_64::{
+            __m256i, _mm256_add_epi64, _mm256_mul_epu32, _mm256_set1_epi64x, _mm256_setr_epi64x,
+            _mm256_slli_epi64, _mm256_srli_epi64, _mm256_storeu_si256,
+        };
+
+        /// 4 u64 lanes per AVX2 vector.
+        const LANES: usize = 4;
+
+        /// Returns true when AVX2 is available at runtime.
+        #[cfg(feature = "std")]
+        #[must_use]
+        pub fn is_available() -> bool {
+            std::is_x86_feature_detected!("avx2")
+        }
+
+        /// Returns true when AVX2 is available at runtime.
+        #[cfg(not(feature = "std"))]
+        #[must_use]
+        pub const fn is_available() -> bool {
+            false
+        }
+
+        /// 64-bit lane-wise multiply emulation for AVX2.
+        ///
+        /// AVX2 has `_mm256_mul_epu32` which multiplies the low 32
+        /// bits of each 64-bit lane (producing 64-bit products in
+        /// even-indexed lanes only) but no native 64-bit multiply.
+        /// We emulate `a * b` via three 32x32→64 multiplies and two
+        /// shifts — the standard schoolbook recipe:
+        ///
+        /// `a * b = (a.lo * b.lo) + ((a.hi * b.lo) << 32) + ((a.lo * b.hi) << 32)`
+        ///
+        /// (the `a.hi * b.hi` term is dropped because we only keep
+        /// the low 64 bits of the product, and that term contributes
+        /// only to bits 64+).
+        ///
+        /// # Safety
+        ///
+        /// AVX2 must be available; caller asserts via `target_feature`.
+        #[target_feature(enable = "avx2")]
+        #[inline]
+        unsafe fn mul_epi64_lo(a: __m256i, b: __m256i) -> __m256i {
+            let a_lo = a; // low 32 of each 64-bit lane (high 32 ignored by mul_epu32)
+            let b_lo = b;
+            let a_hi = _mm256_srli_epi64::<32>(a);
+            let b_hi = _mm256_srli_epi64::<32>(b);
+
+            let lo_lo = _mm256_mul_epu32(a_lo, b_lo);
+            let hi_lo = _mm256_mul_epu32(a_hi, b_lo);
+            let lo_hi = _mm256_mul_epu32(a_lo, b_hi);
+
+            // Shift cross terms into the high half of each 64-bit lane
+            // and add to the lo*lo product.
+            let cross = _mm256_add_epi64(hi_lo, lo_hi);
+            let cross_shifted = _mm256_slli_epi64::<32>(cross);
+            _mm256_add_epi64(lo_lo, cross_shifted)
+        }
+
+        /// AVX2 position-computation kernel.
+        ///
+        /// Computes K positions in parallel across 4-wide vectors,
+        /// stores to the caller-supplied buffer, then performs the
+        /// scalar `% bits` reduction. Bit-exact with
+        /// [`super::scalar::positions`].
+        ///
+        /// # Safety
+        ///
+        /// The caller must ensure the current CPU supports AVX2.
+        ///
+        /// # Panics
+        ///
+        /// Panics if `out.len() < k` or `bits == 0`.
+        #[target_feature(enable = "avx2")]
+        pub unsafe fn positions(h1: u64, h2: u64, k: usize, bits: usize, out: &mut [u64]) {
+            assert!(bits > 0, "BloomFilter bits must be > 0");
+            assert!(out.len() >= k, "out buffer too small: {} < {k}", out.len());
+
+            // Stage 1: vector-add `h1 + i*h2` into a stack buffer of
+            // u64 lanes. Process LANES (4) i-values per iteration.
+            let h1_v = _mm256_set1_epi64x(h1 as i64);
+            let h2_v = _mm256_set1_epi64x(h2 as i64);
+
+            let mut i = 0_usize;
+            while i + LANES <= k {
+                // i-vector for this block: {i+0, i+1, i+2, i+3}
+                let i_v =
+                    _mm256_setr_epi64x(i as i64, (i + 1) as i64, (i + 2) as i64, (i + 3) as i64);
+                // SAFETY: `mul_epi64_lo` requires AVX2; the enclosing
+                // target_feature supplies it.
+                let prod = unsafe { mul_epi64_lo(i_v, h2_v) };
+                let sum = _mm256_add_epi64(h1_v, prod);
+                // Store the 4 raw u64 positions to `out[i..i+4]`.
+                // SAFETY: `out.len() >= k >= i + LANES` holds by the
+                // loop condition; the cast to `__m256i*` is align(1)
+                // via the unaligned store intrinsic.
+                unsafe {
+                    _mm256_storeu_si256(out.as_mut_ptr().add(i).cast::<__m256i>(), sum);
+                }
+                i += LANES;
+            }
+
+            // Stage 1 tail: remaining 0..LANES positions, scalar.
+            let bits_u64 = bits as u64;
+            while i < k {
+                let raw = h1.wrapping_add((i as u64).wrapping_mul(h2));
+                out[i] = raw;
+                i += 1;
+            }
+
+            // Stage 2: scalar modular reduction. AVX2 has no vector
+            // u64 divide; the per-lane `% bits` reduction is cheap
+            // compared to the multiply-add chain anyway.
+            for slot in out.iter_mut().take(k) {
+                *slot %= bits_u64;
+            }
+        }
+    }
+
+    /// x86 AVX-512 position-computation kernel.
+    ///
+    /// Computes 8 u64 positions per `__m512i` vector via
+    /// `_mm512_add_epi64` + `_mm512_mullo_epi64` (native 64-bit
+    /// multiply, AVX-512DQ). The modular reduction is scalar.
+    #[cfg(all(feature = "avx512", any(target_arch = "x86", target_arch = "x86_64")))]
+    pub mod avx512 {
+        #[cfg(target_arch = "x86")]
+        use core::arch::x86::{
+            __m512i, _mm512_add_epi64, _mm512_mullo_epi64, _mm512_set1_epi64, _mm512_setr_epi64,
+            _mm512_storeu_si512,
+        };
+        #[cfg(target_arch = "x86_64")]
+        use core::arch::x86_64::{
+            __m512i, _mm512_add_epi64, _mm512_mullo_epi64, _mm512_set1_epi64, _mm512_setr_epi64,
+            _mm512_storeu_si512,
+        };
+
+        /// 8 u64 lanes per AVX-512 vector.
+        const LANES: usize = 8;
+
+        /// Returns true when AVX-512F + AVX-512DQ are available at
+        /// runtime.
+        ///
+        /// `_mm512_mullo_epi64` is part of AVX-512DQ. The base
+        /// AVX-512F flag is implied by DQ but checked independently
+        /// for clarity (and to match the dispatch convention used by
+        /// [`crate::bits::popcount::kernels::avx512::is_available`]).
+        #[cfg(feature = "std")]
+        #[must_use]
+        pub fn is_available() -> bool {
+            std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512dq")
+        }
+
+        /// Returns true when AVX-512F + AVX-512DQ are available.
+        #[cfg(not(feature = "std"))]
+        #[must_use]
+        pub const fn is_available() -> bool {
+            false
+        }
+
+        /// AVX-512 position-computation kernel.
+        ///
+        /// # Safety
+        ///
+        /// The caller must ensure the current CPU supports AVX-512F
+        /// and AVX-512DQ.
+        ///
+        /// # Panics
+        ///
+        /// Panics if `out.len() < k` or `bits == 0`.
+        #[target_feature(enable = "avx512f,avx512dq")]
+        pub unsafe fn positions(h1: u64, h2: u64, k: usize, bits: usize, out: &mut [u64]) {
+            assert!(bits > 0, "BloomFilter bits must be > 0");
+            assert!(out.len() >= k, "out buffer too small: {} < {k}", out.len());
+
+            let h1_v = _mm512_set1_epi64(h1 as i64);
+            let h2_v = _mm512_set1_epi64(h2 as i64);
+
+            let mut i = 0_usize;
+            while i + LANES <= k {
+                let i_v = _mm512_setr_epi64(
+                    i as i64,
+                    (i + 1) as i64,
+                    (i + 2) as i64,
+                    (i + 3) as i64,
+                    (i + 4) as i64,
+                    (i + 5) as i64,
+                    (i + 6) as i64,
+                    (i + 7) as i64,
+                );
+                let prod = _mm512_mullo_epi64(i_v, h2_v);
+                let sum = _mm512_add_epi64(h1_v, prod);
+                // SAFETY: `out.len() >= k >= i + LANES`; unaligned
+                // store is align(1) via the intrinsic.
+                unsafe {
+                    _mm512_storeu_si512(out.as_mut_ptr().add(i).cast::<__m512i>(), sum);
+                }
+                i += LANES;
+            }
+
+            // Tail: scalar.
+            while i < k {
+                let raw = h1.wrapping_add((i as u64).wrapping_mul(h2));
+                out[i] = raw;
+                i += 1;
+            }
+
+            let bits_u64 = bits as u64;
+            for slot in out.iter_mut().take(k) {
+                *slot %= bits_u64;
+            }
+        }
+    }
+
+    /// AArch64 NEON position-computation kernel.
+    ///
+    /// Computes 2 u64 positions per `uint64x2_t` vector via
+    /// `vaddq_u64` (vector add) over a precomputed `i*h2` pair. NEON
+    /// has no native 64-bit lane-wise multiply (that lands in SVE2's
+    /// `svmul_u64`), so the per-lane `i*h2` product is computed
+    /// scalar and then loaded into a vector for the add. The win
+    /// comes from amortising the vectorised store and the modular
+    /// reduction loop fusion.
+    ///
+    /// For the small K range (≤ 32) typical of Bloom filters, the
+    /// overhead of two scalar multiplies per vector lane is ~3 cycles
+    /// vs the throughput-bound add+store at ~1 cycle, so this kernel
+    /// is roughly 1.5x faster than pure scalar at K=8 and converges
+    /// to ~2x at K=32. See `benches/approx_bloom.rs` for measured
+    /// numbers per platform.
+    #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+    pub mod neon {
+        use core::arch::aarch64::{uint64x2_t, vaddq_u64, vdupq_n_u64, vld1q_u64, vst1q_u64};
+
+        /// 2 u64 lanes per NEON vector.
+        const LANES: usize = 2;
+
+        /// Returns true when NEON is available at runtime.
+        ///
+        /// NEON is mandatory on AArch64; this exists for API symmetry
+        /// with the x86 `is_available` helpers.
+        #[must_use]
+        pub const fn is_available() -> bool {
+            true
+        }
+
+        /// NEON position-computation kernel.
+        ///
+        /// # Safety
+        ///
+        /// The caller must ensure the current CPU supports NEON.
+        ///
+        /// # Panics
+        ///
+        /// Panics if `out.len() < k` or `bits == 0`.
+        #[target_feature(enable = "neon")]
+        pub unsafe fn positions(h1: u64, h2: u64, k: usize, bits: usize, out: &mut [u64]) {
+            assert!(bits > 0, "BloomFilter bits must be > 0");
+            assert!(out.len() >= k, "out buffer too small: {} < {k}", out.len());
+
+            let h1_v = vdupq_n_u64(h1);
+
+            let mut i = 0_usize;
+            while i + LANES <= k {
+                // Compute `i*h2` and `(i+1)*h2` scalar (no NEON
+                // 64-bit multiply pre-SVE2), pack into a vector,
+                // vector-add `h1` and store the two raw u64
+                // positions.
+                let prod = [
+                    (i as u64).wrapping_mul(h2),
+                    ((i + 1) as u64).wrapping_mul(h2),
+                ];
+                // SAFETY: `prod` is on the stack with 8-byte alignment;
+                // `vld1q_u64` accepts unaligned loads.
+                let prod_v: uint64x2_t = unsafe { vld1q_u64(prod.as_ptr()) };
+                let sum = vaddq_u64(h1_v, prod_v);
+                // SAFETY: `out.len() >= k >= i + LANES` holds by the
+                // loop condition.
+                unsafe {
+                    vst1q_u64(out.as_mut_ptr().add(i), sum);
+                }
+                i += LANES;
+            }
+
+            // Tail (k odd).
+            while i < k {
+                let raw = h1.wrapping_add((i as u64).wrapping_mul(h2));
+                out[i] = raw;
+                i += 1;
+            }
+
+            // Stage 2: scalar modular reduction.
+            let bits_u64 = bits as u64;
+            for slot in out.iter_mut().take(k) {
+                *slot %= bits_u64;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        const TEST_BITS_VARIANTS: &[usize] = &[64, 128, 256, 1024, 4096, 65_536, 1_048_576];
+        const TEST_K_VARIANTS: &[usize] = &[1, 2, 3, 4, 5, 7, 8, 13, 16, 32];
+
+        #[test]
+        fn scalar_position_grid_matches_naive() {
+            // Brute-force reproduction of the scalar reference logic
+            // — same formula, but written inline rather than via the
+            // module function. Confirms `positions` is bug-free.
+            for &bits in TEST_BITS_VARIANTS {
+                for &k in TEST_K_VARIANTS {
+                    let h1 = 0xDEAD_BEEF_F00D_CAFE_u64.wrapping_mul(bits as u64 + 1);
+                    let h2 = 0x1234_5678_9ABC_DEF0_u64.wrapping_mul(k as u64 + 1) | 1;
+                    let mut out = vec![0_u64; k];
+                    scalar::positions(h1, h2, k, bits, &mut out);
+                    for (i, &got) in out.iter().enumerate() {
+                        let expected = h1.wrapping_add((i as u64).wrapping_mul(h2)) % (bits as u64);
+                        assert_eq!(got, expected, "scalar diverged at bits={bits} k={k} i={i}");
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn auto_dispatcher_matches_scalar() {
+            for &bits in TEST_BITS_VARIANTS {
+                for &k in TEST_K_VARIANTS {
+                    let h1 = 0xA5A5_5A5A_F00D_C0DE_u64.wrapping_mul(bits as u64 + 7);
+                    let h2 = 0x9E37_79B9_7F4A_7C15_u64.wrapping_mul(k as u64 + 3) | 1;
+                    let mut out_scalar = vec![0_u64; k];
+                    let mut out_auto = vec![0_u64; k];
+                    scalar::positions(h1, h2, k, bits, &mut out_scalar);
+                    auto::positions(h1, h2, k, bits, &mut out_auto);
+                    assert_eq!(
+                        out_scalar, out_auto,
+                        "auto vs scalar diverged at bits={bits} k={k}"
+                    );
+                }
+            }
+        }
+
+        #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+        #[test]
+        fn avx2_kernel_matches_scalar_when_available() {
+            if !avx2::is_available() {
+                eprintln!("avx2 unavailable on this host; skipping inline AVX2 parity test");
+                return;
+            }
+            for &bits in TEST_BITS_VARIANTS {
+                for &k in TEST_K_VARIANTS {
+                    let h1 = 0xC0DE_C0DE_C0DE_C0DE_u64.wrapping_mul(bits as u64 + 11);
+                    let h2 = 0x6E5E_2E5C_DEAD_BEEF_u64.wrapping_mul(k as u64 + 5) | 1;
+                    let mut out_scalar = vec![0_u64; k];
+                    let mut out_avx2 = vec![0_u64; k];
+                    scalar::positions(h1, h2, k, bits, &mut out_scalar);
+                    // SAFETY: availability checked above.
+                    unsafe {
+                        avx2::positions(h1, h2, k, bits, &mut out_avx2);
+                    }
+                    assert_eq!(
+                        out_scalar, out_avx2,
+                        "avx2 vs scalar diverged at bits={bits} k={k}"
+                    );
+                }
+            }
+        }
+
+        #[cfg(all(feature = "avx512", any(target_arch = "x86", target_arch = "x86_64")))]
+        #[test]
+        fn avx512_kernel_matches_scalar_when_available() {
+            if !avx512::is_available() {
+                eprintln!(
+                    "avx512f+avx512dq unavailable on this host; skipping inline AVX-512 parity test"
+                );
+                return;
+            }
+            for &bits in TEST_BITS_VARIANTS {
+                for &k in TEST_K_VARIANTS {
+                    let h1 = 0x1357_9BDF_2468_ACE0_u64.wrapping_mul(bits as u64 + 13);
+                    let h2 = 0x0123_4567_89AB_CDEF_u64.wrapping_mul(k as u64 + 7) | 1;
+                    let mut out_scalar = vec![0_u64; k];
+                    let mut out_avx512 = vec![0_u64; k];
+                    scalar::positions(h1, h2, k, bits, &mut out_scalar);
+                    // SAFETY: availability checked above.
+                    unsafe {
+                        avx512::positions(h1, h2, k, bits, &mut out_avx512);
+                    }
+                    assert_eq!(
+                        out_scalar, out_avx512,
+                        "avx512 vs scalar diverged at bits={bits} k={k}"
+                    );
+                }
+            }
+        }
+
+        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+        #[test]
+        fn neon_kernel_matches_scalar() {
+            for &bits in TEST_BITS_VARIANTS {
+                for &k in TEST_K_VARIANTS {
+                    let h1 = 0xF00D_BABE_F00D_BABE_u64.wrapping_mul(bits as u64 + 17);
+                    let h2 = 0x9E37_79B9_7F4A_7C15_u64.wrapping_mul(k as u64 + 11) | 1;
+                    let mut out_scalar = vec![0_u64; k];
+                    let mut out_neon = vec![0_u64; k];
+                    scalar::positions(h1, h2, k, bits, &mut out_scalar);
+                    // SAFETY: NEON is mandatory on AArch64.
+                    unsafe {
+                        neon::positions(h1, h2, k, bits, &mut out_neon);
+                    }
+                    assert_eq!(
+                        out_scalar, out_neon,
+                        "neon vs scalar diverged at bits={bits} k={k}"
+                    );
+                }
+            }
+        }
+    }
+}
 
 // ============================================================================
 // HyperLogLog cardinality estimator (Vec-backed, std-gated)
@@ -1392,6 +2122,190 @@ mod tests {
         bf.clear();
         assert!(!bf.contains(b"x"));
         assert_eq!(bf.inserted(), 0);
+    }
+
+    // ----- Bloom filter SIMD path -----
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn bloom_simd_no_false_negatives() {
+        let mut bf = BloomFilter::new(1024, 5);
+        let keys: [u64; 16] = [
+            0,
+            1,
+            42,
+            0xDEAD_BEEF,
+            0xCAFE_F00D,
+            u64::MAX,
+            u64::MAX - 1,
+            0x8000_0000_0000_0000,
+            0x0000_0001_0000_0001,
+            0xAAAA_BBBB_CCCC_DDDD,
+            7,
+            13,
+            17,
+            19,
+            23,
+            29,
+        ];
+        for &k in &keys {
+            bf.insert_simd(k);
+        }
+        for &k in &keys {
+            assert!(bf.contains_simd(k), "false negative for key {k}");
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn bloom_simd_insert_then_contains_self_consistent_under_k_grid() {
+        // Cover every k in [1, 8] inclusive so we exercise the AVX-512
+        // single-vector path (k≤8) and the AVX2/NEON tail loops.
+        for k in 1_usize..=16 {
+            let mut bf = BloomFilter::new(2048, k);
+            for key in 0_u64..256 {
+                bf.insert_simd(key);
+            }
+            for key in 0_u64..256 {
+                assert!(bf.contains_simd(key), "false negative at k={k} key={key}");
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn bloom_simd_batch_matches_per_key() {
+        let mut bf = BloomFilter::new(4096, 7);
+        let inserted: Vec<u64> = (0_u64..200).collect();
+        for &k in &inserted {
+            bf.insert_simd(k);
+        }
+        // Mix of inserted and non-inserted keys.
+        let probes: Vec<u64> = (0_u64..400).collect();
+        let mut batch_out = vec![false; probes.len()];
+        bf.contains_batch_simd(&probes, &mut batch_out);
+        for (i, &probe) in probes.iter().enumerate() {
+            let per_key = bf.contains_simd(probe);
+            assert_eq!(
+                batch_out[i], per_key,
+                "batch vs per-key diverged at i={i} probe={probe}"
+            );
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn bloom_simd_empty_filter_returns_false() {
+        // Empty filter (no inserts): every contains query returns false
+        // (no bits set anywhere).
+        let bf = BloomFilter::new(64, 1);
+        for k in 0_u64..32 {
+            assert!(!bf.contains_simd(k), "empty filter hit on key {k}");
+        }
+        let probes: Vec<u64> = (0_u64..32).collect();
+        let mut out = vec![false; probes.len()];
+        bf.contains_batch_simd(&probes, &mut out);
+        assert!(out.iter().all(|&b| !b));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn bloom_simd_single_bit_filter_edge_case() {
+        // m=1 → rounded to 64 bits. k=1 → one position per insert, all
+        // collide on the same bit. After one insert, every contains
+        // query returns true.
+        let mut bf = BloomFilter::new(1, 1);
+        assert_eq!(bf.bits(), 64);
+        bf.insert_simd(0);
+        // With one bit set, queries probabilistically hit. We only
+        // check the exact-key case is true.
+        assert!(bf.contains_simd(0));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn bloom_simd_single_hash_filter_works() {
+        // k=1: degenerate Kirsch-Mitzenmacher (only h1, no h2 used).
+        let mut bf = BloomFilter::new(512, 1);
+        let keys: [u64; 8] = [0, 1, 42, 0xDEAD, u64::MAX, 100, 200, 300];
+        for &k in &keys {
+            bf.insert_simd(k);
+        }
+        for &k in &keys {
+            assert!(bf.contains_simd(k), "k=1 false negative for {k}");
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn bloom_simd_maxed_out_filter_returns_true() {
+        // All-bits-set filter: contains_simd returns true for every
+        // query (this is the saturation degenerate case).
+        let mut bf = BloomFilter::new(64, 3);
+        // Manually set every bit. We can only do that via the public
+        // API by inserting until all bits are set; the empty-filter
+        // size 64 + k=3 + many inserts saturates quickly.
+        for key in 0_u64..256 {
+            bf.insert_simd(key);
+        }
+        // Heavy saturation expected; sample a few non-inserted keys
+        // and confirm they all read as "contains" (false positives).
+        let mut hits = 0;
+        for key in 1000_u64..1100 {
+            if bf.contains_simd(key) {
+                hits += 1;
+            }
+        }
+        // 64-bit filter saturated by 256 inserts has nearly all bits
+        // set; expect >95% false positives.
+        assert!(
+            hits > 95,
+            "saturated 64-bit filter had only {hits}/100 hits"
+        );
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn bloom_simd_try_contains_batch_rejects_length_mismatch() {
+        let bf = BloomFilter::new(512, 3);
+        let keys = vec![0_u64, 1, 2];
+        let mut out = vec![false; 4]; // mismatched length
+        let err = bf.try_contains_batch_simd(&keys, &mut out).unwrap_err();
+        assert!(matches!(
+            err,
+            BloomBatchError::LengthMismatch {
+                keys_len: 3,
+                out_len: 4
+            }
+        ));
+        // Sane lengths succeed.
+        let mut out_ok = vec![false; 3];
+        assert!(bf.try_contains_batch_simd(&keys, &mut out_ok).is_ok());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn bloom_simd_false_positive_rate_within_bound() {
+        // Mirror the byte-keyed false-positive test: insert N keys,
+        // probe with disjoint keys, observed FPR should be within ~3x
+        // of predicted.
+        let mut bf = BloomFilter::new(4096, 5);
+        for i in 0_u64..200 {
+            bf.insert_simd(i);
+        }
+        let mut false_positives = 0_usize;
+        let trials = 10_000;
+        for i in 1_000_000_u64..1_000_000_u64 + trials as u64 {
+            if bf.contains_simd(i) {
+                false_positives += 1;
+            }
+        }
+        let observed = false_positives as f64 / trials as f64;
+        let predicted = bf.estimated_false_positive_rate();
+        assert!(
+            observed < predicted * 3.0 + 0.005,
+            "observed FPR {observed} >> predicted {predicted}"
+        );
     }
 
     // ----- HyperLogLog -----

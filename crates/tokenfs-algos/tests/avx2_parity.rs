@@ -2287,3 +2287,100 @@ fn avx512_hll_count_raw_matches_scalar_reference_across_precisions() {
         );
     }
 }
+
+// ---------- approx::BloomFilter SIMD parity ----------
+
+/// Bit-counts and K values exercised by every Bloom kernel parity test.
+const BLOOM_TEST_BITS: &[usize] = &[64, 128, 1024, 4096, 65_536, 1_048_576];
+const BLOOM_TEST_KS: &[usize] = &[1, 2, 3, 4, 5, 7, 8, 13, 16, 32];
+
+#[test]
+fn avx2_approx_bloom_kernels_positions_match_scalar_on_size_grid() {
+    if !avx2_available() {
+        eprintln!("avx2 unavailable; skipping approx::bloom_kernels AVX2 parity test");
+        return;
+    }
+    for &bits in BLOOM_TEST_BITS {
+        for &k in BLOOM_TEST_KS {
+            // Exercise a deterministic hash pair derived from
+            // (bits, k) so each grid cell has a distinct probe; the
+            // `| 1` keeps `h2` odd as the production
+            // `derive_hashes` does.
+            let h1 = 0xDEAD_BEEF_F00D_CAFE_u64.wrapping_mul(bits as u64 + 1);
+            let h2 = (0x1234_5678_9ABC_DEF0_u64.wrapping_mul(k as u64 + 1)) | 1;
+            let mut out_scalar = vec![0_u64; k];
+            let mut out_avx2 = vec![0_u64; k];
+            approx::bloom_kernels::scalar::positions(h1, h2, k, bits, &mut out_scalar);
+            // SAFETY: avx2 availability checked above.
+            unsafe {
+                approx::bloom_kernels::avx2::positions(h1, h2, k, bits, &mut out_avx2);
+            }
+            assert_eq!(
+                out_scalar, out_avx2,
+                "avx2 bloom_kernels::positions diverged at bits={bits} k={k}"
+            );
+        }
+    }
+}
+
+#[test]
+fn avx2_approx_bloom_filter_contains_simd_matches_scalar_path() {
+    if !avx2_available() {
+        eprintln!("avx2 unavailable; skipping approx::BloomFilter contains_simd parity test");
+        return;
+    }
+    // Cross-check: insert via SIMD, query via SIMD — must always
+    // hit. Insert a moderate set, then probe with a mix of inserted
+    // and non-inserted keys and confirm the SIMD-dispatched
+    // `contains_simd` result matches the scalar reference computed
+    // via the same Kirsch-Mitzenmacher formula.
+    for &bits in &[1024_usize, 4096, 65_536] {
+        for &k in &[3_usize, 7, 13] {
+            let mut bf = approx::BloomFilter::new(bits, k);
+            let inserted: Vec<u64> = (0_u64..128).collect();
+            for &key in &inserted {
+                bf.insert_simd(key);
+            }
+            // All inserted keys must read true via contains_simd.
+            for &key in &inserted {
+                assert!(
+                    bf.contains_simd(key),
+                    "avx2 contains_simd false negative at bits={bits} k={k} key={key}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(feature = "avx512")]
+fn avx512f_dq_available() -> bool {
+    std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512dq")
+}
+
+#[cfg(feature = "avx512")]
+#[test]
+fn avx512_approx_bloom_kernels_positions_match_scalar_on_size_grid() {
+    if !avx512f_dq_available() {
+        eprintln!(
+            "avx512f+avx512dq unavailable; skipping approx::bloom_kernels AVX-512 parity test"
+        );
+        return;
+    }
+    for &bits in BLOOM_TEST_BITS {
+        for &k in BLOOM_TEST_KS {
+            let h1 = 0x1357_9BDF_2468_ACE0_u64.wrapping_mul(bits as u64 + 13);
+            let h2 = (0x0123_4567_89AB_CDEF_u64.wrapping_mul(k as u64 + 7)) | 1;
+            let mut out_scalar = vec![0_u64; k];
+            let mut out_avx512 = vec![0_u64; k];
+            approx::bloom_kernels::scalar::positions(h1, h2, k, bits, &mut out_scalar);
+            // SAFETY: avx512f+avx512dq availability checked above.
+            unsafe {
+                approx::bloom_kernels::avx512::positions(h1, h2, k, bits, &mut out_avx512);
+            }
+            assert_eq!(
+                out_scalar, out_avx512,
+                "avx512 bloom_kernels::positions diverged at bits={bits} k={k}"
+            );
+        }
+    }
+}

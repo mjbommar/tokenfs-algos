@@ -126,5 +126,9 @@ harness = false
 name = "approx_hll"
 harness = false
 
+[[bench]]
+name = "approx_bloom"
+harness = false
+
 [lints]
 workspace = true
