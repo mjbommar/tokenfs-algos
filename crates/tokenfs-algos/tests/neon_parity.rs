@@ -361,15 +361,15 @@ proptest! {
             .collect();
         let dot_s = similarity::kernels::scalar::dot_f32(&a, &b).unwrap();
         let dot_v = similarity::distance::dot_f32(&a, &b).unwrap();
-        let scale = dot_s.abs().max(dot_v.abs()).max(1.0);
-        // f32 reduction-order tolerance: see avx2_parity.rs for the full
-        // explanation. dot_f32 over 1024 elements with cancellation can
-        // drift up to ~2% on adversarial seeds (windows-aarch64 NEON tree
-        // shape, observed flake at 1.86% on PR #2 CI); 3% gives a safety
-        // margin without admitting genuine kernel bugs. L2_squared sums
-        // squared terms only so cancellation can't blow it up.
-        prop_assert!((dot_s - dot_v).abs() / scale < 3e-2,
-            "dot_f32 diverged: scalar={dot_s} neon={dot_v}");
+        // Higham dot-product noise scale: see avx2_parity.rs for the full
+        // explanation. Comparing against sum(|a*b|) (with a |dot| floor) is
+        // the right scale because cancellation makes |dot| << sum(|a*b|) on
+        // adversarial proptest seeds; relative error against |dot| can hit
+        // 5–10% even with correct kernels.
+        let l1_prod: f32 = a.iter().zip(b.iter()).map(|(&x, &y)| (x * y).abs()).sum();
+        let scale = l1_prod.max(dot_s.abs()).max(dot_v.abs()).max(1.0);
+        prop_assert!((dot_s - dot_v).abs() / scale < 1e-3,
+            "dot_f32 diverged: scalar={dot_s} neon={dot_v} l1_prod={l1_prod}");
 
         let l2_s = similarity::kernels::scalar::l2_squared_f32(&a, &b).unwrap();
         let l2_v = similarity::distance::l2_squared_f32(&a, &b).unwrap();

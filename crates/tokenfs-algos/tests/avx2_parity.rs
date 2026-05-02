@@ -549,17 +549,21 @@ proptest! {
         // (8-way tree vs left-to-right) so a few ULP of difference is expected.
         let dot_s = similarity::kernels::scalar::dot_f32(&a, &b).unwrap();
         let dot_v = similarity::distance::dot_f32(&a, &b).unwrap();
-        let scale = dot_s.abs().max(dot_v.abs()).max(1.0);
-        // f32 reduction-order tolerance: scalar = left-to-right accumulator,
-        // SIMD = pairwise tree (8 lanes for AVX2). Over 1024 floats with
-        // input magnitude up to 1000 and cancellation possible, partial sums
-        // can be 10x the final sum. Empirically (proptest case discovered on
-        // windows-aarch64 NEON) adversarial seeds reach ~2% relative error;
-        // 3% gives a safety margin without admitting genuine kernel bugs (a
-        // real divergence would be >>10%). L2_squared has no cancellation
-        // (all squared terms are non-negative) so it stays within 5e-4.
-        prop_assert!((dot_s - dot_v).abs() / scale < 3e-2,
-            "dot_f32 diverged: scalar={dot_s} avx2={dot_v}");
+        // Higham §3 / Wilkinson dot-product error bound:
+        //   |fl(dot) - exact| <= n * eps * sum(|a_i*b_i|)
+        // i.e. the realistic noise floor is proportional to the L1 norm of
+        // products, NOT the final dot value. Under catastrophic cancellation
+        // |dot| << sum(|a*b|), so dividing the diff by |dot| inflates the
+        // reported relative error to 5–10%+ even when both kernels are
+        // correct. Comparing against sum(|a*b|) (with a |dot| floor for the
+        // non-cancellation regime) gives a stable bound that catches genuine
+        // kernel divergence (would be >>1e-3) without flaking on adversarial
+        // seeds. L2_squared has no cancellation (all squared terms are
+        // non-negative) so it stays within 5e-4 against the dot-style scale.
+        let l1_prod: f32 = a.iter().zip(b.iter()).map(|(&x, &y)| (x * y).abs()).sum();
+        let scale = l1_prod.max(dot_s.abs()).max(dot_v.abs()).max(1.0);
+        prop_assert!((dot_s - dot_v).abs() / scale < 1e-3,
+            "dot_f32 diverged: scalar={dot_s} avx2={dot_v} l1_prod={l1_prod}");
 
         let l2_s = similarity::kernels::scalar::l2_squared_f32(&a, &b).unwrap();
         let l2_v = similarity::distance::l2_squared_f32(&a, &b).unwrap();
