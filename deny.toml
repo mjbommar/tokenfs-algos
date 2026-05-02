@@ -12,7 +12,39 @@ targets = [
 unmaintained = "workspace"
 unsound = "all"
 yanked = "deny"
-ignore = []
+# Each ignore below is scoped to the optional `permutation_hilbert` feature
+# of `tokenfs-algos`. That feature pulls the upstream `hilbert` 0.1 crate,
+# which transitively brings `criterion 0.3` -> `atty 0.2` and
+# `spectral 0.6` -> `num 0.1` -> `rustc-serialize 0.3`. Per
+# `docs/v0.2_planning/14_PERMUTATION.md` § 8 ("Environment fitness"), the
+# `permutation` module is build-time-only / userspace-only — the kernel
+# module, FUSE bridge, and minimal/embedded consumers must NOT enable
+# `permutation_hilbert`. The default-features build (the only one that
+# kernel-adjacent consumers ship) is free of these advisories; verified
+# via `cargo tree -p tokenfs-algos --no-default-features --features
+# "std,avx2,neon"` showing zero hits for atty/rustc-serialize/hilbert.
+#
+# Revisit when:
+#   * upstream `hilbert` drops its dev-only `criterion 0.3` / `spectral 0.6`
+#     deps (audit-R4 finding #1 TODO), or
+#   * we ship our own minimal Skilling N-D implementation and remove the
+#     `dep:hilbert` line from `crates/tokenfs-algos/Cargo.toml`.
+ignore = [
+    # RUSTSEC-2022-0004: rustc-serialize 0.3 stack overflow in JSON parser.
+    # Pulled in transitively by `hilbert 0.1` -> `spectral 0.6` -> `num 0.1`
+    # -> `num-bigint 0.1` -> `rustc-serialize 0.3`. We never call
+    # `rustc_serialize::json::Json::from_str` and never expose any JSON
+    # parsing surface to it; the dependency is dead-code from our
+    # perspective. See docs/v0.2_planning/14_PERMUTATION.md § 8.
+    { id = "RUSTSEC-2022-0004", reason = "rustc-serialize 0.3 pulled in transitively by `hilbert` 0.1 only when the `permutation_hilbert` feature is enabled. Feature is userspace-only and build-time-only per docs/v0.2_planning/14_PERMUTATION.md § 8. Revisit when upstream `hilbert` drops the dep or we ship our own Skilling N-D impl." },
+    # RUSTSEC-2021-0145: atty 0.2 unaligned-read on Windows + unmaintained.
+    # Pulled in transitively by `hilbert 0.1` -> `criterion 0.3` (a dev
+    # dep of `hilbert` itself, surfaced through Cargo's resolver) ->
+    # `atty 0.2`. The vulnerable code path is Windows-only and requires a
+    # custom global allocator; we do not call it. See
+    # docs/v0.2_planning/14_PERMUTATION.md § 8.
+    { id = "RUSTSEC-2021-0145", reason = "atty 0.2 (unsound + unmaintained) pulled in transitively by `hilbert` 0.1 only when the `permutation_hilbert` feature is enabled. Feature is userspace-only and build-time-only per docs/v0.2_planning/14_PERMUTATION.md § 8. Revisit when upstream `hilbert` drops the dep or we ship our own Skilling N-D impl." },
+]
 
 [bans]
 multiple-versions = "warn"
