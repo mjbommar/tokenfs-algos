@@ -520,9 +520,17 @@ fn masked_word(bits: &[u64], index: usize, n_bits: usize) -> u64 {
 ///
 /// # Panics
 ///
-/// In debug builds, panics if `k >= word.count_ones()`. In release
-/// builds the result is unspecified for out-of-range `k` — callers
-/// must clamp before calling.
+/// In debug builds, panics if `k >= word.count_ones()`.
+///
+/// # Out-of-range behaviour
+///
+/// In release builds the function returns the sentinel `64` (one past
+/// the last valid bit position) when `k >= 64` or `k >=
+/// word.count_ones()`. The release-mode early return is required to
+/// avoid undefined behaviour from `_pdep_u64(1 << k, …)` shifts when
+/// `k >= 64`, and silent garbage from
+/// `select_in_word_broadword`'s `k.wrapping_mul(L8)` step when `k`
+/// exceeds 7 bits per byte (audit-R7 finding #1).
 #[inline]
 #[must_use]
 pub fn select_in_word(word: u64, k: u32) -> u32 {
@@ -531,6 +539,15 @@ pub fn select_in_word(word: u64, k: u32) -> u32 {
         "select_in_word: k = {k} out of range for word with {} bits set",
         word.count_ones()
     );
+
+    // Release-mode guard. In debug builds the `debug_assert!` above
+    // panics first; in release builds we return the "not found"
+    // sentinel `64` rather than triggering UB in `_pdep_u64` (shift by
+    // ≥ 64) or producing garbage in the broadword path (where `k *
+    // L8` would overflow the 7-bit-per-byte budget). Audit-R7 #1.
+    if k >= 64 || k >= word.count_ones() {
+        return 64;
+    }
 
     // BMI2 fast path — `_pdep_u64(1 << k, word)` deposits the k-th 1-bit
     // mask into `word`'s 1-bit positions; one trailing-zero count gives
@@ -544,7 +561,8 @@ pub fn select_in_word(word: u64, k: u32) -> u32 {
         use core::arch::x86::_pdep_u64;
         #[cfg(target_arch = "x86_64")]
         use core::arch::x86_64::_pdep_u64;
-        // SAFETY: target_feature gating above asserts BMI2 is present.
+        // SAFETY: target_feature gating above asserts BMI2 is present;
+        // the `k < 64` guard above ensures the shift is well-defined.
         let mask = unsafe { _pdep_u64(1_u64 << k, word) };
         return mask.trailing_zeros();
     }
@@ -588,6 +606,14 @@ pub fn select_in_word_broadword(word: u64, k: u32) -> u32 {
         "select_in_word_broadword: k = {k} out of range for word with {} bits set",
         word.count_ones()
     );
+
+    // Release-mode guard. The `k.wrapping_mul(L8)` step below requires
+    // `k` to fit in 7 bits per byte; out-of-range `k` would silently
+    // produce garbage. Mirror the `select_in_word` sentinel and return
+    // 64 ("not found"). Audit-R7 #1.
+    if k >= 64 || k >= word.count_ones() {
+        return 64;
+    }
 
     const L8: u64 = 0x0101_0101_0101_0101;
     const H8: u64 = 0x8080_8080_8080_8080;
@@ -1218,6 +1244,45 @@ mod tests {
             assert_eq!(select_in_word(word, 0), pos);
             assert_eq!(select_in_word_broadword(word, 0), pos);
         }
+    }
+
+    /// Release-mode guard for `select_in_word` / `select_in_word_broadword`:
+    /// `k >= 64` (which would shift `1u64 << k` past the bit width and
+    /// trigger UB on the BMI2 path, or feed a value too large for the
+    /// 7-bit-per-byte SWAR step on the broadword path) and
+    /// `k >= word.count_ones()` (which would fall off the cumulative-sum
+    /// search) must return the `64` sentinel rather than panic or
+    /// produce garbage. Audit-R7 #1.
+    ///
+    /// In debug builds the `debug_assert!` panics first; we exercise
+    /// the release-mode guard directly by guarding the assertions
+    /// behind `cfg(not(debug_assertions))`. Either way, the function
+    /// must not invoke UB, which this test would catch under Miri or
+    /// `RUSTFLAGS="-Zsanitizer=undefined"`.
+    #[test]
+    fn select_in_word_release_guard_handles_k_ge_64_or_count() {
+        // k >= word.count_ones() — release guard returns 64, debug
+        // mode panics via debug_assert (which is intentional contract).
+        #[cfg(not(debug_assertions))]
+        {
+            assert_eq!(select_in_word(0_u64, 0), 64);
+            assert_eq!(select_in_word_broadword(0_u64, 0), 64);
+            assert_eq!(select_in_word(1_u64, 1), 64);
+            assert_eq!(select_in_word_broadword(1_u64, 1), 64);
+            // k >= 64 — would be UB / garbage without the guard.
+            assert_eq!(select_in_word(u64::MAX, 64), 64);
+            assert_eq!(select_in_word_broadword(u64::MAX, 64), 64);
+            assert_eq!(select_in_word(u64::MAX, u32::MAX), 64);
+            assert_eq!(select_in_word_broadword(u64::MAX, u32::MAX), 64);
+        }
+
+        // The guard logic itself is independent of the runtime
+        // assertion mode — even under debug_assertions we can verify
+        // the boundary by checking the in-range query right before the
+        // sentinel. This catches any regression that breaks the valid
+        // path at the boundary.
+        assert_eq!(select_in_word(u64::MAX, 63), 63);
+        assert_eq!(select_in_word_broadword(u64::MAX, 63), 63);
     }
 
     #[cfg(feature = "panicking-shape-apis")]
