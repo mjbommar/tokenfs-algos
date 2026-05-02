@@ -72,5 +72,13 @@ harness = false
 name = "planner"
 harness = false
 
+[[bench]]
+name = "hash_batched"
+harness = false
+
+[[bench]]
+name = "bits_popcount"
+harness = false
+
 [lints]
 workspace = true

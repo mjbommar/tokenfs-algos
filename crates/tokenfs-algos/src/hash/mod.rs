@@ -10,11 +10,28 @@
 //! For BLAKE3 (parallel content-addressable hash with variable-length
 //! output) gated behind the `blake3` cargo feature, see the [`blake3`]
 //! submodule.
+//!
+//! For batched per-message hashing of many small inputs (the canonical
+//! Merkle-leaf workload), see the [`batched`] submodule and its re-exports
+//! [`sha256_batch_st`], [`sha256_batch_par`], [`blake3_batch_st_32`], and
+//! [`blake3_batch_par_32`].
 
+pub mod batched;
 pub mod sha256;
 
 #[cfg(feature = "blake3")]
 pub mod blake3;
+
+pub use batched::{BATCH_PARALLEL_THRESHOLD, sha256_batch_st};
+
+#[cfg(feature = "parallel")]
+pub use batched::sha256_batch_par;
+
+#[cfg(feature = "blake3")]
+pub use batched::blake3_batch_st_32;
+
+#[cfg(all(feature = "blake3", feature = "parallel"))]
+pub use batched::blake3_batch_par_32;
 
 /// Pinned hash kernels.
 pub mod kernels {

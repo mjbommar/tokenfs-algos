@@ -24,6 +24,7 @@
 extern crate alloc;
 
 pub mod approx;
+pub mod bits;
 pub mod byteclass;
 pub mod chunk;
 pub mod dispatch;

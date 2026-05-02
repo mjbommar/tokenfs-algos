@@ -15,7 +15,7 @@
 #![cfg(all(feature = "neon", target_arch = "aarch64"))]
 
 use proptest::prelude::*;
-use tokenfs_algos::{byteclass, fingerprint, runlength, similarity, sketch};
+use tokenfs_algos::{bits, byteclass, fingerprint, runlength, similarity, sketch};
 
 fn synthetic_corpus() -> Vec<Vec<u8>> {
     let mut cases: Vec<Vec<u8>> = vec![
@@ -270,6 +270,60 @@ fn neon_runlength_transitions_match_scalar_reference_on_unaligned_subslices() {
     }
 }
 
+#[test]
+fn neon_bits_popcount_u64_matches_scalar_on_synthetic_corpus() {
+    // Lengths span every plausible SIMD block boundary in the popcount
+    // kernels: 2 u64 (NEON 16-byte vec), 16 u64 (NEON 8x-unrolled
+    // 128B), 4 u64 (AVX2 32-byte vec), 8 u64 (AVX-512 64-byte vec).
+    let lengths = [
+        0_usize, 1, 2, 3, 4, 5, 7, 8, 15, 16, 31, 32, 33, 63, 64, 65, 127, 128, 255, 256, 257, 511,
+        1023, 1024, 1025, 4095,
+    ];
+    let mut state = 0xF22_C0FFEE_u64;
+    for len in lengths {
+        let words: Vec<u64> = (0..len)
+            .map(|_| {
+                state ^= state >> 12;
+                state ^= state << 25;
+                state ^= state >> 27;
+                state.wrapping_mul(0x2545_f491_4f6c_dd1d)
+            })
+            .collect();
+        let expected = bits::kernels::scalar::popcount_u64_slice(&words);
+        // SAFETY: NEON is mandatory on AArch64.
+        let actual = unsafe { bits::kernels::neon::popcount_u64_slice(&words) };
+        assert_eq!(
+            actual, expected,
+            "neon bits::popcount_u64_slice diverged at len {len}"
+        );
+        // Dispatched API must agree.
+        assert_eq!(
+            bits::popcount_u64_slice(&words),
+            expected,
+            "dispatched bits::popcount_u64_slice diverged at len {len}"
+        );
+    }
+}
+
+#[test]
+fn neon_bits_popcount_u8_matches_scalar_on_unaligned_subslices() {
+    let bytes = (0_usize..16_384)
+        .map(|i| (i.wrapping_mul(29) ^ (i >> 3).wrapping_mul(37)) as u8)
+        .collect::<Vec<_>>();
+
+    for slice in unaligned_subslices(&bytes) {
+        let expected = bits::kernels::scalar::popcount_u8_slice(slice);
+        // SAFETY: NEON is mandatory on AArch64.
+        let actual = unsafe { bits::kernels::neon::popcount_u8_slice(slice) };
+        assert_eq!(
+            actual,
+            expected,
+            "neon bits::popcount_u8_slice diverged on slice len {}",
+            slice.len()
+        );
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: 96,
@@ -433,5 +487,27 @@ proptest! {
             sketch::kernels::neon::crc32_hash4_bins(&bytes, &mut neon_bins);
         }
         prop_assert_eq!(neon_bins, scalar_bins);
+    }
+
+    #[test]
+    fn neon_bits_popcount_u64_matches_scalar_for_random_words(
+        words in proptest::collection::vec(any::<u64>(), 0..2048),
+    ) {
+        let expected = bits::kernels::scalar::popcount_u64_slice(&words);
+        // SAFETY: NEON is mandatory on AArch64.
+        let actual = unsafe { bits::kernels::neon::popcount_u64_slice(&words) };
+        prop_assert_eq!(actual, expected);
+        prop_assert_eq!(bits::popcount_u64_slice(&words), expected);
+    }
+
+    #[test]
+    fn neon_bits_popcount_u8_matches_scalar_for_random_bytes(
+        bytes in proptest::collection::vec(any::<u8>(), 0..16_384),
+    ) {
+        let expected = bits::kernels::scalar::popcount_u8_slice(&bytes);
+        // SAFETY: NEON is mandatory on AArch64.
+        let actual = unsafe { bits::kernels::neon::popcount_u8_slice(&bytes) };
+        prop_assert_eq!(actual, expected);
+        prop_assert_eq!(bits::popcount_u8_slice(&bytes), expected);
     }
 }
