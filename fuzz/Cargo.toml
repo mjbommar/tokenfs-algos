@@ -54,3 +54,59 @@ path = "fuzz_targets/runlength_transitions_dispatch_parity.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "bits_streamvbyte_round_trip"
+path = "fuzz_targets/bits_streamvbyte_round_trip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bits_bit_pack_round_trip"
+path = "fuzz_targets/bits_bit_pack_round_trip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bits_rank_select_consistency"
+path = "fuzz_targets/bits_rank_select_consistency.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bitmap_intersect_parity"
+path = "fuzz_targets/bitmap_intersect_parity.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vector_distance_parity"
+path = "fuzz_targets/vector_distance_parity.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hash_batched_parity"
+path = "fuzz_targets/hash_batched_parity.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hash_set_membership_parity"
+path = "fuzz_targets/hash_set_membership_parity.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "permutation_apply_round_trip"
+path = "fuzz_targets/permutation_apply_round_trip.rs"
+test = false
+doc = false
+bench = false
