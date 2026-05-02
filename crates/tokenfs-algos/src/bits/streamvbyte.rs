@@ -182,6 +182,11 @@ pub fn streamvbyte_encode_u32(
 /// instead of panicking.
 ///
 /// Returns the number of data bytes written on success.
+///
+/// This routine validates every length precondition upfront and then
+/// dispatches to `_unchecked` kernels that contain no `assert!` /
+/// panicking-index sites, so the call is panic-free even when the
+/// `panicking-shape-apis` feature is disabled (audit-R6 finding #162).
 pub fn try_streamvbyte_encode_u32(
     values: &[u32],
     control_out: &mut [u8],
@@ -202,7 +207,11 @@ pub fn try_streamvbyte_encode_u32(
             actual: data_out.len(),
         });
     }
-    Ok(kernels::auto::encode_u32(values, control_out, data_out))
+    // SAFETY: pre-validation above ensures both buffers meet the
+    // _unchecked kernel preconditions (control_out big enough for the
+    // ceil(n/4) control bytes, data_out big enough for the worst-case
+    // 4*n + tail-padding bytes).
+    Ok(unsafe { kernels::auto::encode_u32_unchecked(values, control_out, data_out) })
 }
 
 /// Decodes `n` `u32` values from separate control + data byte streams.
@@ -232,6 +241,13 @@ pub fn streamvbyte_decode_u32(control: &[u8], data: &[u8], n: usize, out: &mut [
 /// when the data stream runs out partway through, instead of panicking.
 ///
 /// Returns the number of data bytes consumed on success.
+///
+/// Validates `control.len()`, `out.len()`, and walks the control stream
+/// to bound the implied data length against `data.len()` before
+/// dispatching to the `_unchecked` kernel. The kernels themselves no
+/// longer contain `assert!` / panicking-index sites, so this routine is
+/// panic-free even when the `panicking-shape-apis` feature is disabled
+/// (audit-R6 finding #162).
 pub fn try_streamvbyte_decode_u32(
     control: &[u8],
     data: &[u8],
@@ -252,7 +268,7 @@ pub fn try_streamvbyte_decode_u32(
         });
     }
     // Walk the control stream to verify the implied data length fits
-    // before invoking the panicking kernel. This matches the kernel's
+    // before invoking the kernel. This matches the kernel's
     // own data-byte accounting (full groups + padded tail).
     let full_groups = n / GROUP;
     let mut implied_data: usize = 0;
@@ -281,14 +297,24 @@ pub fn try_streamvbyte_decode_u32(
             }
         }
     }
-    Ok(kernels::auto::decode_u32(control, data, n, out))
+    // SAFETY: pre-validation above ensures `control.len() >= ceil(n/4)`,
+    // `out.len() >= n`, and the implied data length fits inside `data`.
+    Ok(unsafe { kernels::auto::decode_u32_unchecked(control, data, n, out) })
 }
 
 /// Pinned Stream-VByte kernels.
 pub mod kernels {
     /// Runtime-dispatched Stream-VByte kernels.
     pub mod auto {
-        /// Runtime-dispatched encode.
+        /// Runtime-dispatched encode (panicking variant).
+        ///
+        /// Asserts caller-supplied buffer lengths before dispatching to
+        /// the `_unchecked` kernel.
+        ///
+        /// # Panics
+        ///
+        /// Panics if `control_out.len() < ceil(values.len()/4)` or
+        /// `data_out.len() < streamvbyte_data_max_len(values.len())`.
         pub fn encode_u32(values: &[u32], control_out: &mut [u8], data_out: &mut [u8]) -> usize {
             // Encode is bandwidth-modest; the scalar path already runs at
             // near memory speed. SIMD-encode wins are small and the spec
@@ -296,7 +322,37 @@ pub mod kernels {
             super::scalar::encode_u32(values, control_out, data_out)
         }
 
-        /// Runtime-dispatched decode.
+        /// Runtime-dispatched encode kernel without bounds-checking
+        /// asserts.
+        ///
+        /// # Safety
+        ///
+        /// Caller must ensure
+        /// `control_out.len() >= streamvbyte_control_len(values.len())`
+        /// and
+        /// `data_out.len() >= streamvbyte_data_max_len(values.len())`.
+        /// Used by [`super::super::try_streamvbyte_encode_u32`] after
+        /// pre-validation; eliminates the `assert!` panic sites that
+        /// would otherwise leak through the fallible API surface
+        /// (audit-R6 finding #162).
+        pub unsafe fn encode_u32_unchecked(
+            values: &[u32],
+            control_out: &mut [u8],
+            data_out: &mut [u8],
+        ) -> usize {
+            // SAFETY: caller upholds the buffer-length precondition.
+            unsafe { super::scalar::encode_u32_unchecked(values, control_out, data_out) }
+        }
+
+        /// Runtime-dispatched decode (panicking variant).
+        ///
+        /// Asserts caller-supplied buffer lengths before dispatching to
+        /// the `_unchecked` kernel.
+        ///
+        /// # Panics
+        ///
+        /// Panics if `control.len() < ceil(n/4)`, `out.len() < n`, or
+        /// `data` runs out partway through the decode.
         pub fn decode_u32(control: &[u8], data: &[u8], n: usize, out: &mut [u32]) -> usize {
             #[cfg(all(
                 feature = "std",
@@ -323,6 +379,56 @@ pub mod kernels {
             }
 
             super::scalar::decode_u32(control, data, n, out)
+        }
+
+        /// Runtime-dispatched decode kernel without bounds-checking
+        /// asserts.
+        ///
+        /// # Safety
+        ///
+        /// Caller must ensure `control.len() >= ceil(n/4)`,
+        /// `out.len() >= n`, and `data.len()` is at least the implied
+        /// length encoded in the control stream (sum of `code+1` over
+        /// each 2-bit code in the first `ceil(n/4)` control bytes).
+        /// Used by [`super::super::try_streamvbyte_decode_u32`] after
+        /// pre-validation; eliminates the `assert!` panic sites that
+        /// would otherwise leak through the fallible API surface
+        /// (audit-R6 finding #162).
+        pub unsafe fn decode_u32_unchecked(
+            control: &[u8],
+            data: &[u8],
+            n: usize,
+            out: &mut [u32],
+        ) -> usize {
+            #[cfg(all(
+                feature = "std",
+                feature = "avx2",
+                any(target_arch = "x86", target_arch = "x86_64")
+            ))]
+            {
+                if super::avx2::is_available() {
+                    // SAFETY: availability checked above; caller upholds
+                    // the buffer-length precondition.
+                    return unsafe { super::avx2::decode_u32_unchecked(control, data, n, out) };
+                }
+                if super::ssse3::is_available() {
+                    // SAFETY: availability checked above; caller upholds
+                    // the buffer-length precondition.
+                    return unsafe { super::ssse3::decode_u32_unchecked(control, data, n, out) };
+                }
+            }
+
+            #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+            {
+                if super::neon::is_available() {
+                    // SAFETY: NEON is mandatory on AArch64; caller
+                    // upholds the buffer-length precondition.
+                    return unsafe { super::neon::decode_u32_unchecked(control, data, n, out) };
+                }
+            }
+
+            // SAFETY: caller upholds the buffer-length precondition.
+            unsafe { super::scalar::decode_u32_unchecked(control, data, n, out) }
         }
     }
 
@@ -372,7 +478,29 @@ pub mod kernels {
                 data_out.len(),
                 streamvbyte_data_max_len(n)
             );
+            // SAFETY: asserts above establish the precondition.
+            unsafe { encode_u32_unchecked(values, control_out, data_out) }
+        }
 
+        /// Scalar encoder body without bounds-checking asserts.
+        ///
+        /// # Safety
+        ///
+        /// Caller must ensure
+        /// `control_out.len() >= streamvbyte_control_len(values.len())`
+        /// and
+        /// `data_out.len() >= streamvbyte_data_max_len(values.len())`.
+        /// Indexing inside this routine is otherwise identical to
+        /// [`encode_u32`] but does not include the leading `assert!`
+        /// guards, which keeps it panic-free for the
+        /// `try_streamvbyte_encode_u32` path even when
+        /// `panicking-shape-apis` is disabled.
+        pub unsafe fn encode_u32_unchecked(
+            values: &[u32],
+            control_out: &mut [u8],
+            data_out: &mut [u8],
+        ) -> usize {
+            let n = values.len();
             let mut data_pos = 0_usize;
             let mut ctrl_pos = 0_usize;
 
@@ -452,7 +580,33 @@ pub mod kernels {
                 out.len(),
                 n
             );
+            // SAFETY: asserts above establish the buffer-length
+            // preconditions; the implied data length is asserted via
+            // the natural `data[data_pos..]` slicing inside the kernel
+            // when this panicking entry point is used directly.
+            unsafe { decode_u32_unchecked(control, data, n, out) }
+        }
 
+        /// Scalar decoder body without bounds-checking asserts.
+        ///
+        /// # Safety
+        ///
+        /// Caller must ensure `control.len() >= streamvbyte_control_len(n)`,
+        /// `out.len() >= n`, and the data stream is long enough for the
+        /// implied byte sum encoded in the first `streamvbyte_control_len(n)`
+        /// control bytes (sum of `code+1` over each 2-bit code; padded
+        /// slots in the tail group still consume their byte).
+        ///
+        /// Used by [`super::super::try_streamvbyte_decode_u32`] after
+        /// pre-validation walks the control stream itself; eliminates
+        /// the `assert!` panic sites that would otherwise leak through
+        /// the fallible API surface (audit-R6 finding #162).
+        pub unsafe fn decode_u32_unchecked(
+            control: &[u8],
+            data: &[u8],
+            n: usize,
+            out: &mut [u32],
+        ) -> usize {
             let mut data_pos = 0_usize;
             let mut written = 0_usize;
             let full_groups = n / GROUP;
@@ -649,7 +803,27 @@ pub mod kernels {
                 out.len(),
                 n
             );
+            // SAFETY: SSSE3 availability and the buffer-length
+            // preconditions are both established above.
+            unsafe { decode_u32_unchecked(control, data, n, out) }
+        }
 
+        /// SSSE3 PSHUFB-based decode without bounds-checking asserts.
+        ///
+        /// # Safety
+        ///
+        /// Caller must ensure the current CPU supports SSSE3,
+        /// `control.len() >= streamvbyte_control_len(n)`,
+        /// `out.len() >= n`, and `data.len()` covers the implied byte
+        /// sum from the control stream (so the scalar tail fallback can
+        /// finish without overrunning `data`).
+        #[target_feature(enable = "ssse3")]
+        pub unsafe fn decode_u32_unchecked(
+            control: &[u8],
+            data: &[u8],
+            n: usize,
+            out: &mut [u32],
+        ) -> usize {
             let shuf = shuffle_table();
             let lens = length_table();
 
@@ -687,12 +861,17 @@ pub mod kernels {
             // when `n % 4 != 0`.
             let written = g * GROUP;
             if written < n {
-                data_pos += scalar::decode_u32(
-                    &control[g..],
-                    &data[data_pos..],
-                    n - written,
-                    &mut out[written..],
-                );
+                // SAFETY: caller upholds the buffer-length preconditions
+                // for the unchecked scalar fallback (the slice subranges
+                // share their parents' validity).
+                data_pos += unsafe {
+                    scalar::decode_u32_unchecked(
+                        &control[g..],
+                        &data[data_pos..],
+                        n - written,
+                        &mut out[written..],
+                    )
+                };
             }
 
             data_pos
@@ -758,7 +937,27 @@ pub mod kernels {
                 out.len(),
                 n
             );
+            // SAFETY: AVX2 availability and buffer-length preconditions
+            // are both established above.
+            unsafe { decode_u32_unchecked(control, data, n, out) }
+        }
 
+        /// AVX2 dual-pumped PSHUFB decode without bounds-checking
+        /// asserts.
+        ///
+        /// # Safety
+        ///
+        /// Caller must ensure the current CPU supports AVX2,
+        /// `control.len() >= streamvbyte_control_len(n)`,
+        /// `out.len() >= n`, and `data.len()` covers the implied byte
+        /// sum from the control stream.
+        #[target_feature(enable = "avx2")]
+        pub unsafe fn decode_u32_unchecked(
+            control: &[u8],
+            data: &[u8],
+            n: usize,
+            out: &mut [u32],
+        ) -> usize {
             let shuf = shuffle_table();
             let lens = length_table();
 
@@ -834,12 +1033,17 @@ pub mod kernels {
             // bytes of data slack, plus any partial trailing group.
             let written = g * GROUP;
             if written < n {
-                data_pos += scalar::decode_u32(
-                    &control[g..],
-                    &data[data_pos..],
-                    n - written,
-                    &mut out[written..],
-                );
+                // SAFETY: caller upholds the buffer-length preconditions
+                // on `control`, `data`, and `out`; the slice subranges
+                // share their parents' validity.
+                data_pos += unsafe {
+                    scalar::decode_u32_unchecked(
+                        &control[g..],
+                        &data[data_pos..],
+                        n - written,
+                        &mut out[written..],
+                    )
+                };
             }
 
             data_pos
@@ -887,7 +1091,26 @@ pub mod kernels {
                 out.len(),
                 n
             );
+            // SAFETY: NEON availability and buffer-length preconditions
+            // are both established above.
+            unsafe { decode_u32_unchecked(control, data, n, out) }
+        }
 
+        /// NEON `vqtbl1q_u8` decode without bounds-checking asserts.
+        ///
+        /// # Safety
+        ///
+        /// Caller must ensure the current CPU supports NEON,
+        /// `control.len() >= streamvbyte_control_len(n)`,
+        /// `out.len() >= n`, and `data.len()` covers the implied byte
+        /// sum from the control stream.
+        #[target_feature(enable = "neon")]
+        pub unsafe fn decode_u32_unchecked(
+            control: &[u8],
+            data: &[u8],
+            n: usize,
+            out: &mut [u32],
+        ) -> usize {
             let shuf = shuffle_table();
             let lens = length_table();
 
@@ -918,12 +1141,17 @@ pub mod kernels {
 
             let written = g * GROUP;
             if written < n {
-                data_pos += scalar::decode_u32(
-                    &control[g..],
-                    &data[data_pos..],
-                    n - written,
-                    &mut out[written..],
-                );
+                // SAFETY: caller upholds the buffer-length preconditions
+                // on `control`, `data`, and `out`; the slice subranges
+                // share their parents' validity.
+                data_pos += unsafe {
+                    scalar::decode_u32_unchecked(
+                        &control[g..],
+                        &data[data_pos..],
+                        n - written,
+                        &mut out[written..],
+                    )
+                };
             }
 
             data_pos
@@ -935,7 +1163,10 @@ pub mod kernels {
 mod tests {
     #![allow(clippy::unwrap_used)] // Test code — panic on Err is the desired failure mode.
 
+    extern crate alloc;
     use super::*;
+    use alloc::vec;
+    use alloc::vec::Vec;
 
     fn deterministic_values(n: usize, seed: u64, max_bytes: u32) -> Vec<u32> {
         let mask: u32 = match max_bytes {
@@ -975,6 +1206,7 @@ mod tests {
         assert_eq!(streamvbyte_data_max_len(5), 20 + 3);
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn round_trip_n_zero_writes_nothing() {
         let mut ctrl = [0_u8; 0];
@@ -986,6 +1218,7 @@ mod tests {
         assert_eq!(consumed, 0);
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     fn round_trip(values: &[u32]) {
         let n = values.len();
         let mut ctrl = vec![0_u8; streamvbyte_control_len(n)];
@@ -997,6 +1230,7 @@ mod tests {
         assert_eq!(out, values, "round-trip diverged at n={n}");
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn round_trip_all_widths_and_sizes() {
         for n in [0_usize, 1, 2, 3, 4, 5, 7, 8, 16, 100, 1024] {
@@ -1008,6 +1242,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn round_trip_each_code_specifically() {
         // Mix one of each code in a single group; verify byte budget and
@@ -1016,6 +1251,7 @@ mod tests {
         round_trip(&values);
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn round_trip_n_one_through_seven() {
         // Touches every (full-groups, tail) shape:
@@ -1034,6 +1270,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn round_trip_max_u32_values_use_four_bytes() {
         // Force the 4-byte code on every value in a full group.
@@ -1051,6 +1288,7 @@ mod tests {
         assert_eq!(out, values);
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn encoded_size_matches_spec_for_known_values() {
         // Each value is 1 byte → 4 data bytes total.
@@ -1158,6 +1396,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn scalar_decode_matches_encoded_bit_pattern_for_canonical_inputs() {
         // Shape the inputs to hit each code exactly once per group.
@@ -1167,7 +1406,11 @@ mod tests {
         round_trip(&values);
     }
 
-    #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(all(
+        feature = "panicking-shape-apis",
+        feature = "avx2",
+        any(target_arch = "x86", target_arch = "x86_64")
+    ))]
     #[test]
     fn ssse3_decode_matches_scalar_when_available() {
         if !kernels::ssse3::is_available() {
@@ -1194,7 +1437,11 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(all(
+        feature = "panicking-shape-apis",
+        feature = "avx2",
+        any(target_arch = "x86", target_arch = "x86_64")
+    ))]
     #[test]
     fn avx2_decode_matches_scalar_when_available() {
         if !kernels::avx2::is_available() {
@@ -1222,7 +1469,11 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+    #[cfg(all(
+        feature = "panicking-shape-apis",
+        feature = "neon",
+        target_arch = "aarch64"
+    ))]
     #[test]
     fn neon_decode_matches_scalar_when_available() {
         for n in [0_usize, 1, 4, 5, 8, 100, 1024] {
@@ -1245,6 +1496,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn dispatched_decode_matches_scalar_for_random_corpus() {
         // Independent of feature detection: the auto-dispatcher must
@@ -1348,7 +1600,7 @@ mod tests {
         let values = vec![0xff_ff_ff_ff_u32; 4];
         let mut ctrl = vec![0_u8; streamvbyte_control_len(values.len())];
         let mut data = vec![0_u8; streamvbyte_data_max_len(values.len())];
-        streamvbyte_encode_u32(&values, &mut ctrl, &mut data);
+        try_streamvbyte_encode_u32(&values, &mut ctrl, &mut data).unwrap();
         let truncated = &data[..8];
         let mut out = vec![0_u32; 4];
         let err = try_streamvbyte_decode_u32(&ctrl, truncated, 4, &mut out).unwrap_err();
@@ -1361,7 +1613,7 @@ mod tests {
             let values = deterministic_values(n, 0xC0DE ^ (n as u64), 4);
             let mut ctrl = vec![0_u8; streamvbyte_control_len(n)];
             let mut data = vec![0_u8; streamvbyte_data_max_len(n)];
-            let written = streamvbyte_encode_u32(&values, &mut ctrl, &mut data);
+            let written = try_streamvbyte_encode_u32(&values, &mut ctrl, &mut data).unwrap();
             let mut out = vec![0_u32; n];
             let consumed =
                 try_streamvbyte_decode_u32(&ctrl, &data[..written], n, &mut out).unwrap();
@@ -1370,6 +1622,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     #[should_panic(expected = "control_out too small")]
     fn encode_still_panics_on_undersized_control() {
@@ -1379,6 +1632,7 @@ mod tests {
         streamvbyte_encode_u32(&values, &mut ctrl, &mut data);
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     #[should_panic(expected = "decode output buffer too small")]
     fn decode_still_panics_on_undersized_output() {
@@ -1386,5 +1640,123 @@ mod tests {
         let data = vec![0_u8; 16];
         let mut out = vec![0_u32; 1];
         streamvbyte_decode_u32(&ctrl, &data, 5, &mut out);
+    }
+
+    // ------------------------------------------------------------------
+    // Audit-R6 finding #162 regression tests for the `try_*` paths.
+    //
+    // These tests intentionally avoid the panicking entry points so the
+    // assertion that `try_streamvbyte_decode_u32` is panic-free still
+    // holds when the `panicking-shape-apis` Cargo feature is disabled
+    // (the kernel/FUSE deployment build).
+    // ------------------------------------------------------------------
+
+    /// Helper: encode via the fallible API and assert success. Used by
+    /// the `try_*` regression tests below so they compile without the
+    /// `panicking-shape-apis` feature.
+    fn try_encode_or_panic(values: &[u32]) -> (Vec<u8>, Vec<u8>, usize) {
+        let n = values.len();
+        let mut ctrl = vec![0_u8; streamvbyte_control_len(n)];
+        let mut data = vec![0_u8; streamvbyte_data_max_len(n)];
+        let written =
+            try_streamvbyte_encode_u32(values, &mut ctrl, &mut data).expect("encode succeeded");
+        (ctrl, data, written)
+    }
+
+    #[test]
+    fn try_decode_data_too_short_for_implied_length_returns_err_not_panic() {
+        // Control byte 0xFF implies 4 four-byte values -> 16 data bytes.
+        // Provide only 7 data bytes so the third value's 4-byte read
+        // would exceed the buffer.
+        let ctrl = [0xff_u8];
+        let data = [0_u8; 7];
+        let mut out = [0_u32; 4];
+        let err =
+            try_streamvbyte_decode_u32(&ctrl, &data, 4, &mut out).expect_err("must return Err");
+        assert!(
+            matches!(err, StreamvbyteError::DataExhausted { .. }),
+            "expected DataExhausted, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn try_decode_undersized_output_returns_err_not_panic() {
+        // n=4 but out has length 0.
+        let ctrl = [0x00_u8];
+        let data = [0_u8; 4];
+        let mut out: [u32; 0] = [];
+        let err =
+            try_streamvbyte_decode_u32(&ctrl, &data, 4, &mut out).expect_err("must return Err");
+        assert_eq!(
+            err,
+            StreamvbyteError::OutputTooShort {
+                needed: 4,
+                actual: 0
+            }
+        );
+    }
+
+    #[test]
+    fn try_decode_undersized_control_returns_err_not_panic() {
+        // n=5 needs ceil(5/4) = 2 control bytes; supply only 1.
+        let ctrl = [0x00_u8; 1];
+        let data = [0_u8; 32];
+        let mut out = [0_u32; 5];
+        let err =
+            try_streamvbyte_decode_u32(&ctrl, &data, 5, &mut out).expect_err("must return Err");
+        assert_eq!(
+            err,
+            StreamvbyteError::ControlTooShort {
+                needed: 2,
+                actual: 1
+            }
+        );
+    }
+
+    #[test]
+    fn try_decode_tail_padding_data_underflow_returns_err_not_panic() {
+        // n=5 -> 1 full group + tail of 1; the encoder pads the
+        // remaining 3 tail slots with 1-byte zero codes. If the data
+        // is one byte short of even the implied tail, the try_ path
+        // must surface DataExhausted rather than panic in the kernel.
+        let values = vec![1_u32, 2, 3, 4, 5];
+        let (ctrl, data, written) = try_encode_or_panic(&values);
+        // Drop one byte off the end of the encoded data.
+        let truncated = &data[..written - 1];
+        let mut out = vec![0_u32; values.len()];
+        let err = try_streamvbyte_decode_u32(&ctrl, truncated, values.len(), &mut out)
+            .expect_err("must return Err");
+        assert!(
+            matches!(err, StreamvbyteError::DataExhausted { .. }),
+            "expected DataExhausted, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn try_encode_undersized_data_returns_err_not_panic() {
+        let values = vec![0xff_ff_ff_ff_u32; 4];
+        let mut ctrl = vec![0_u8; streamvbyte_control_len(values.len())];
+        let mut data = vec![0_u8; 1]; // far too small.
+        let err =
+            try_streamvbyte_encode_u32(&values, &mut ctrl, &mut data).expect_err("must return Err");
+        assert!(
+            matches!(err, StreamvbyteError::OutputTooShort { .. }),
+            "expected OutputTooShort, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn try_round_trip_via_fallible_apis_only() {
+        // Exercise the full fallible round-trip across (full groups +
+        // tail) shapes without ever invoking the panicking variants.
+        for n in [0_usize, 1, 3, 4, 5, 7, 8, 100, 1024] {
+            let values = deterministic_values(n, 0xF00D ^ (n as u64), 4);
+            let (ctrl, data, written) = try_encode_or_panic(&values);
+            let mut out = vec![0_u32; n];
+            let consumed = try_streamvbyte_decode_u32(&ctrl, &data[..written], n, &mut out)
+                .expect("decode succeeded");
+            assert_eq!(consumed, written);
+            assert_eq!(out, values, "fallible round-trip diverged at n={n}");
+        }
     }
 }
