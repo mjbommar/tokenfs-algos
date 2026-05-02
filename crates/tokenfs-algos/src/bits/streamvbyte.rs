@@ -53,6 +53,15 @@
 //! The final group is always decoded via the scalar tail when fewer than
 //! 16 bytes of valid data remain, which keeps the SIMD inner loop free of
 //! buffer-overrun checks.
+//!
+//! ## Tables
+//!
+//! The 4 KiB shuffle table and 256 B length table are pure functions of
+//! the 256 possible control-byte values, so they are produced at compile
+//! time by [`const fn`] initializers and stored as `static` rodata. This
+//! keeps the SIMD kernels usable in `no_std` / kernel-mode builds (no
+//! `std::sync::OnceLock` runtime initializer required) and removes the
+//! first-use latency from the hot path.
 
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::cast_lossless)]
@@ -480,53 +489,55 @@ pub mod kernels {
 
     /// Per-control-byte length and shuffle tables for the SIMD decoders.
     ///
-    /// Both tables are pure functions of the control byte and are derived
-    /// once at first use. The shuffle table follows the Lemire C
-    /// reference: index `0xFF` zeros the destination lane (both
-    /// `_mm_shuffle_epi8` and `vqtbl1q_u8` clear bytes for indices with
-    /// bit 7 set / >= 16).
+    /// Both tables are pure functions of the control byte. They are
+    /// produced at compile time via `const fn` initializers and live in
+    /// `static` rodata, so this module compiles unchanged in `no_std`
+    /// kernel-mode builds (no `OnceLock` / runtime initializer required)
+    /// and the first SIMD decode pays no synchronization or table-build
+    /// cost.
+    ///
+    /// The shuffle table follows the Lemire C reference: index `0xFF`
+    /// zeros the destination lane (both `_mm_shuffle_epi8` and
+    /// `vqtbl1q_u8` clear bytes for indices with bit 7 set / >= 16).
     #[cfg(any(
-        all(
-            feature = "std",
-            feature = "avx2",
-            any(target_arch = "x86", target_arch = "x86_64")
-        ),
+        all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")),
         all(feature = "neon", target_arch = "aarch64")
     ))]
     pub(super) mod tables {
-        /// `LENGTH_TABLE[c]` is the number of data bytes the control byte
-        /// `c` consumes — the sum of `(code_i + 1)` over the four codes.
-        /// Range is 4..=16.
+        /// Shuffle table: 256 entries of `[u8; 16]`. 4 KiB total.
         ///
         /// `SHUFFLE_TABLE[c]` is the 16-byte permutation that turns a
         /// 16-byte data window into four little-endian `u32` lanes; lanes
         /// past the encoded width hold `0xFF` so the SIMD shuffle zeros
         /// them.
-        ///
-        /// Constructed at runtime once and shared via [`OnceLock`]. The
-        /// table is 256 × 16 = 4 KiB plus 256 × 1 = 256 B; at first use
-        /// the cost is dominated by computing the shuffle pattern, which
-        /// is constant work.
-        use std::sync::OnceLock;
+        pub(crate) static SHUFFLE_TABLE: [[u8; 16]; 256] = build_shuffle_table();
 
-        /// Shuffle table: 256 entries of `[u8; 16]`. 4 KiB total.
-        static SHUFFLE: OnceLock<[[u8; 16]; 256]> = OnceLock::new();
         /// Length table: 256 entries of `u8`. 256 B total.
-        static LENGTHS: OnceLock<[u8; 256]> = OnceLock::new();
+        ///
+        /// `LENGTH_TABLE[c]` is the number of data bytes the control byte
+        /// `c` consumes — the sum of `(code_i + 1)` over the four codes.
+        /// Range is 4..=16.
+        pub(crate) static LENGTH_TABLE: [u8; 256] = build_length_table();
 
-        /// Returns the (potentially first-use-initialized) shuffle table.
+        /// Returns a reference to the static shuffle table.
+        ///
+        /// Kept as a function (vs. exposing `SHUFFLE_TABLE` directly) so
+        /// callers do not have to spell the array type and so the SIMD
+        /// kernels read from the same accessor in every build.
         #[inline]
         pub(crate) fn shuffle_table() -> &'static [[u8; 16]; 256] {
-            SHUFFLE.get_or_init(build_shuffle_table)
+            &SHUFFLE_TABLE
         }
 
-        /// Returns the (potentially first-use-initialized) length table.
+        /// Returns a reference to the static length table.
+        ///
+        /// See [`shuffle_table`] for the rationale behind the accessor.
         #[inline]
         pub(crate) fn length_table() -> &'static [u8; 256] {
-            LENGTHS.get_or_init(build_length_table)
+            &LENGTH_TABLE
         }
 
-        /// Builds the shuffle table.
+        /// Builds the shuffle table at compile time.
         ///
         /// For each control byte `c`, decode the four 2-bit codes
         /// `c1, c2, c3, c4` (low→high). Each integer takes `code_i + 1`
@@ -534,9 +545,10 @@ pub mod kernels {
         /// contiguous bytes; we fill the first `code_i + 1` of each
         /// 4-byte lane with consecutive source byte indices, and the
         /// remaining lanes with `0xFF` so PSHUFB / TBL writes zero.
-        fn build_shuffle_table() -> [[u8; 16]; 256] {
+        const fn build_shuffle_table() -> [[u8; 16]; 256] {
             let mut table = [[0xff_u8; 16]; 256];
-            for c in 0_usize..256 {
+            let mut c = 0_usize;
+            while c < 256 {
                 let codes = [
                     (c & 0b11) as u8,
                     ((c >> 2) & 0b11) as u8,
@@ -545,25 +557,32 @@ pub mod kernels {
                 ];
                 let mut shuffle = [0xff_u8; 16];
                 let mut src = 0_u8;
-                for lane in 0..4 {
+                let mut lane = 0_usize;
+                while lane < 4 {
                     let len = codes[lane] + 1;
-                    for byte in 0..len {
+                    let mut byte = 0_u8;
+                    while byte < len {
                         shuffle[lane * 4 + byte as usize] = src;
                         src += 1;
+                        byte += 1;
                     }
                     // Lane bytes [len..4] stay 0xFF → zeroed by shuffle.
+                    lane += 1;
                 }
                 table[c] = shuffle;
+                c += 1;
             }
             table
         }
 
-        /// Builds the length table.
-        fn build_length_table() -> [u8; 256] {
+        /// Builds the length table at compile time.
+        const fn build_length_table() -> [u8; 256] {
             let mut table = [0_u8; 256];
-            for c in 0_usize..256 {
+            let mut c = 0_usize;
+            while c < 256 {
                 let l = (c & 0b11) + ((c >> 2) & 0b11) + ((c >> 4) & 0b11) + ((c >> 6) & 0b11) + 4;
                 table[c] = l as u8;
+                c += 1;
             }
             table
         }
@@ -1040,11 +1059,7 @@ mod tests {
     // the tables module) is compiled in. The encoder/decoder don't use
     // the tables themselves; they're a pure-SIMD asset.
     #[cfg(any(
-        all(
-            feature = "std",
-            feature = "avx2",
-            any(target_arch = "x86", target_arch = "x86_64")
-        ),
+        all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")),
         all(feature = "neon", target_arch = "aarch64")
     ))]
     #[test]
@@ -1081,11 +1096,7 @@ mod tests {
     }
 
     #[cfg(any(
-        all(
-            feature = "std",
-            feature = "avx2",
-            any(target_arch = "x86", target_arch = "x86_64")
-        ),
+        all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")),
         all(feature = "neon", target_arch = "aarch64")
     ))]
     #[test]
@@ -1101,11 +1112,7 @@ mod tests {
     }
 
     #[cfg(any(
-        all(
-            feature = "std",
-            feature = "avx2",
-            any(target_arch = "x86", target_arch = "x86_64")
-        ),
+        all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")),
         all(feature = "neon", target_arch = "aarch64")
     ))]
     #[test]
@@ -1119,11 +1126,7 @@ mod tests {
     }
 
     #[cfg(any(
-        all(
-            feature = "std",
-            feature = "avx2",
-            any(target_arch = "x86", target_arch = "x86_64")
-        ),
+        all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")),
         all(feature = "neon", target_arch = "aarch64")
     ))]
     #[test]
