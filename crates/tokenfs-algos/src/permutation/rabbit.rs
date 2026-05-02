@@ -1,8 +1,8 @@
 //! Rabbit Order — community-detection-driven graph permutation.
 //!
 //! See `docs/v0.2_planning/14_PERMUTATION.md` § 3 for the spec and
-//! `docs/v0.2_planning/03_EXECUTION_PLAN.md` § "Sprint 47-49" for the
-//! sprint-level milestone.
+//! `docs/v0.2_planning/03_EXECUTION_PLAN.md` § "Sprint 47-49 / 50-52"
+//! for the sprint-level milestones.
 //!
 //! ## Algorithm
 //!
@@ -27,16 +27,17 @@
 //! 5. DFS the dendrogram in pre-order; the leaf-visit sequence is the
 //!    new ordering.
 //!
-//! ## Sequential baseline scope
+//! ## Sequential baseline + SIMD modularity-gain inner loop
 //!
-//! **This is the Sprint 47-49 sequential baseline only.** The reference
-//! C++ implementation (`araij/rabbit_order`) parallelises step 3 via
-//! per-thread merge buffers and a concurrent hash map; the SIMD inner
-//! loop for the modularity-gain dot product and the concurrent merging
-//! land in Sprint 50-52 and Sprint 53-55 respectively (see
-//! `03_EXECUTION_PLAN.md` Phase D1). This file is single-threaded,
-//! single-pass (no recursive multi-level), and uses sorted `Vec`-backed
-//! adjacency rather than a concurrent hash map.
+//! The Sprint 47-49 sequential baseline is the agglomeration loop in
+//! [`rabbit_order`]. Sprint 50-52 lifts the per-pair modularity-gain
+//! kernel into the [`kernels`] module with scalar / AVX2 / AVX-512 /
+//! NEON variants. The reference C++ implementation
+//! (`araij/rabbit_order`) further parallelises step 3 via per-thread
+//! merge buffers and a concurrent hash map; that lives in Sprint 53-55
+//! (see `03_EXECUTION_PLAN.md` Phase D1). This file remains
+//! single-threaded, single-pass (no recursive multi-level), and uses
+//! sorted `Vec`-backed adjacency rather than a concurrent hash map.
 //!
 //! ## Determinism
 //!
@@ -47,6 +48,12 @@
 //! * The dendrogram DFS uses the merge-tree structure directly; the
 //!   resulting permutation is reproducible bit-for-bit across runs and
 //!   architectures.
+//! * SIMD kernels in [`kernels`] are bit-exact with the scalar reference
+//!   per neighbour pair (integer arithmetic; no floating-point reduction
+//!   order to track). When the i64 fast path triggers (small inputs),
+//!   results round-trip exactly with the i128 scalar; when it cannot
+//!   trigger, the kernels fall back to the i128 scalar in-place. See
+//!   [`kernels`] for the precise eligibility predicate.
 //!
 //! ## Complexity
 //!
@@ -215,6 +222,13 @@ pub fn rabbit_order(graph: CsrGraph<'_>) -> Permutation {
     // by collecting parent->children adjacency post-hoc.
     let mut merges: Vec<Merge> = Vec::with_capacity(n);
 
+    // Scratch buffers for the per-iteration columnar projection that
+    // [`best_merge_target`] passes into the SIMD modularity-gain
+    // kernel. Reused across every heap pop so the inner loop avoids
+    // millions of small Vec allocations on dense graphs.
+    let mut scratch_weights: Vec<u64> = Vec::with_capacity(64);
+    let mut scratch_degrees: Vec<u64> = Vec::with_capacity(64);
+
     while let Some(Reverse((rec_deg, u))) = heap.pop() {
         let u_idx = u as usize;
         if !alive[u_idx] {
@@ -229,7 +243,14 @@ pub fn rabbit_order(graph: CsrGraph<'_>) -> Permutation {
 
         // Find the neighbour `v` maximising dQ(u, v). Tie-break on
         // ascending neighbour ID so merges are deterministic.
-        let best = best_merge_target(u, &adj[u_idx], &weighted_degree, total_edge_weight);
+        let best = best_merge_target(
+            u,
+            &adj[u_idx],
+            &weighted_degree,
+            total_edge_weight,
+            &mut scratch_weights,
+            &mut scratch_degrees,
+        );
 
         let Some(v) = best else {
             // No neighbour offers a positive modularity gain. `u`
@@ -319,15 +340,50 @@ fn consolidate_neighbours(v: u32, raw: &[u32], self_loop: &mut [u64]) -> AdjList
 /// and require it strictly positive (which is equivalent to `dQ > 0`).
 /// The arithmetic is done in `i128` to avoid overflow on dense large
 /// graphs (`2 * m * w` can exceed `u64` for `m`, `w` near 2^32).
+///
+/// The per-pair score evaluation is delegated to
+/// [`kernels::auto::modularity_gains_neighbor_batch`] so the inner loop
+/// picks up SIMD acceleration when the runtime backend (AVX2 / AVX-512
+/// / NEON) is available and the input fits the i64 fast path. Both the
+/// score values and the tie-breaking semantics are bit-exact with the
+/// pre-SIMD scalar implementation.
+///
+/// `scratch_weights` and `scratch_degrees` are caller-owned scratch
+/// vectors that this function clears and re-fills with the columnar
+/// projection of `u_adj`. Reusing them across heap pops keeps the
+/// agglomeration loop allocation-light on dense graphs.
 fn best_merge_target(
     u: u32,
     u_adj: &AdjList,
     weighted_degree: &[u64],
     total_edge_weight: u64,
+    scratch_weights: &mut Vec<u64>,
+    scratch_degrees: &mut Vec<u64>,
 ) -> Option<u32> {
-    let m = i128::from(total_edge_weight);
-    let two_m = 2_i128 * m;
-    let deg_u = i128::from(weighted_degree[u as usize]);
+    if u_adj.is_empty() {
+        return None;
+    }
+
+    // Project the adjacency into the columnar layout the kernel
+    // expects. The scratch buffers grow monotonically across calls so
+    // amortised allocation cost is O(max neighbour count) overall.
+    scratch_weights.clear();
+    scratch_degrees.clear();
+    scratch_weights.reserve(u_adj.len());
+    scratch_degrees.reserve(u_adj.len());
+    for &(v, w) in u_adj {
+        scratch_weights.push(w);
+        scratch_degrees.push(weighted_degree[v as usize]);
+    }
+    let self_degree = weighted_degree[u as usize];
+    let m_doubled = u128::from(total_edge_weight).saturating_mul(2);
+
+    let scores = kernels::auto::modularity_gains_neighbor_batch(
+        scratch_weights,
+        scratch_degrees,
+        self_degree,
+        m_doubled,
+    );
 
     let mut best_v: Option<u32> = None;
     // Score must strictly exceed zero for a merge to happen; we then
@@ -337,10 +393,7 @@ fn best_merge_target(
     // previous best" cases into one comparison sequence.
     let mut best_score: i128 = 0;
 
-    for &(v, w) in u_adj {
-        let deg_v = i128::from(weighted_degree[v as usize]);
-        let w_i = i128::from(w);
-        let score = two_m * w_i - deg_u * deg_v;
+    for (&(v, _), &score) in u_adj.iter().zip(scores.iter()) {
         match best_v {
             None if score > 0 => {
                 best_v = Some(v);
@@ -355,6 +408,672 @@ fn best_merge_target(
         }
     }
     best_v
+}
+
+pub mod kernels {
+    //! Per-neighbour modularity-gain kernels for [`super::rabbit_order`].
+    //!
+    //! Sprint 50-52 lifts the per-pair score computation out of the
+    //! sequential agglomeration loop and into a kernel module with
+    //! scalar / AVX2 / AVX-512 / NEON variants. The shared API computes
+    //! the integer modularity-gain *score*
+    //!
+    //! ```text
+    //! score(u, v) = 2 * m * w(u, v) - deg(u) * deg(v)
+    //! ```
+    //!
+    //! for every neighbour `v_i` of a fixed community `u`. The score is
+    //! symbolically equivalent to the modularity-gain function `dQ`
+    //! scaled by the constant `2 * m^2`, so it preserves the sign and
+    //! ordering of `dQ` without any floating-point arithmetic. Callers
+    //! pick the merge target by argmax over the resulting `i128` slice.
+    //!
+    //! ## Determinism guarantee
+    //!
+    //! Every backend produces **bit-exact** results given the same
+    //! inputs. There is no floating-point reduction order to track. The
+    //! SIMD backends compute via integer multiplies that are
+    //! semantically equivalent to the scalar reference, with the only
+    //! ambient choice being whether the **i64 fast path** is eligible
+    //! (see below). Eligibility itself is a pure function of the input
+    //! magnitudes, so the same inputs always pick the same code path on
+    //! the same backend.
+    //!
+    //! ## i64 fast path eligibility
+    //!
+    //! When `m_doubled < 2^32` AND `self_degree < 2^32` AND every entry
+    //! of `neighbor_weights` and `neighbor_degrees` is `< 2^32`, both
+    //! products `2 * m * w` and `deg(u) * deg(v)` fit in `u64`, their
+    //! difference fits in `i65`, and the SIMD backends use 32-bit-input
+    //! widening multiplies (`_mm256_mul_epu32`, `_mm512_mul_epu32`,
+    //! `vmull_u32`) to evaluate the score in `i64` lanes. For inputs
+    //! larger than the bound, every backend transparently delegates to
+    //! [`scalar::modularity_gains_neighbor_batch`] for the i128
+    //! arithmetic (the SIMD lanes do not have a portable widening
+    //! multiply that produces 128-bit results).
+    //!
+    //! For TokenFS-typical workloads (200 K vertices, average degree
+    //! 5-20, weights bounded by a small constant) the fast path covers
+    //! 100% of inputs; for adversarial dense graphs with weighted
+    //! degree near `u64::MAX` the scalar fallback preserves correctness.
+    //!
+    //! ## Surface
+    //!
+    //! Each backend exposes the same function signature:
+    //!
+    //! ```text
+    //! fn modularity_gains_neighbor_batch(
+    //!     neighbor_weights: &[u64],   // w(u, v_i)
+    //!     neighbor_degrees: &[u64],   // deg(v_i)
+    //!     self_degree: u64,           // deg(u)
+    //!     m_doubled: u128,            // 2 * total edge weight
+    //! ) -> Vec<i128>;                 // score(u, v_i) per neighbour
+    //! ```
+    //!
+    //! [`auto::modularity_gains_neighbor_batch`] is the runtime-dispatched
+    //! entry point used by the agglomeration loop. External consumers
+    //! that wish to pin a specific backend (e.g. for benchmarking) call
+    //! into [`scalar`], [`avx2`] (x86 only), [`avx512`] (x86 only), or
+    //! `neon` (aarch64 only) directly.
+
+    /// Portable scalar reference implementation.
+    ///
+    /// Bit-exact ground truth for every other backend. Always uses
+    /// `i128` arithmetic so it is safe even on adversarial dense
+    /// graphs whose products overflow `u64`.
+    pub mod scalar {
+        #[cfg(not(feature = "std"))]
+        use alloc::vec::Vec;
+
+        /// Computes the per-neighbour modularity-gain score for one
+        /// fixed community `u`.
+        ///
+        /// Returns a vector of `i128` scores, one per neighbour,
+        /// satisfying:
+        ///
+        /// ```text
+        /// score[i] = i128(m_doubled) * i128(neighbor_weights[i])
+        ///          - i128(self_degree) * i128(neighbor_degrees[i])
+        /// ```
+        ///
+        /// `m_doubled` is `u128` because `2 * m` can exceed `u64::MAX`
+        /// when `m` itself approaches `u64::MAX / 2`. The intermediate
+        /// products and the final difference fit in `i128` for any
+        /// `u64`-sized inputs because `u64 * u64` fits in `u128`, and
+        /// the difference of two non-negative `u128` values fits in
+        /// `i128` when each operand is at most `i128::MAX`.
+        ///
+        /// # Panics
+        ///
+        /// Panics if `neighbor_weights.len() != neighbor_degrees.len()`.
+        ///
+        /// Also panics if `m_doubled` overflows `i128` when cast (only
+        /// possible if `m_doubled > i128::MAX`, which would require
+        /// `total_edge_weight > i128::MAX / 2 ≈ 2^126`, unreachable for
+        /// any realistic graph).
+        #[must_use]
+        pub fn modularity_gains_neighbor_batch(
+            neighbor_weights: &[u64],
+            neighbor_degrees: &[u64],
+            self_degree: u64,
+            m_doubled: u128,
+        ) -> Vec<i128> {
+            assert_eq!(
+                neighbor_weights.len(),
+                neighbor_degrees.len(),
+                "scalar::modularity_gains_neighbor_batch: neighbor_weights.len() ({}) != neighbor_degrees.len() ({})",
+                neighbor_weights.len(),
+                neighbor_degrees.len()
+            );
+            let two_m = i128::try_from(m_doubled)
+                .expect("m_doubled exceeds i128::MAX: total edge weight > 2^126");
+            let deg_u = i128::from(self_degree);
+
+            let mut out = Vec::with_capacity(neighbor_weights.len());
+            for (&w, &deg_v) in neighbor_weights.iter().zip(neighbor_degrees) {
+                let w_i = i128::from(w);
+                let deg_v_i = i128::from(deg_v);
+                out.push(two_m * w_i - deg_u * deg_v_i);
+            }
+            out
+        }
+
+        /// Returns true when the i64 fast path is eligible for the
+        /// given inputs.
+        ///
+        /// The predicate is `m_doubled < 2^31 && self_degree < 2^31 &&
+        /// max(neighbor_weights) < 2^31 && max(neighbor_degrees) <
+        /// 2^31`. Under that bound both products `m_doubled * w` and
+        /// `self_degree * deg` fit in `i63 ⊂ i64` (since each operand
+        /// is at most `2^31 - 1`, the product is at most
+        /// `(2^31 - 1)^2 < 2^62`), and the SIMD backends evaluate the
+        /// score
+        ///
+        /// ```text
+        /// score = 2 * m * w - deg(u) * deg(v)
+        /// ```
+        ///
+        /// in `i64` lanes without overflow. The result still widens
+        /// cleanly to `i128` for the API return type.
+        ///
+        /// The bound is intentionally conservative: AVX2's
+        /// `_mm256_mul_epu32` produces an unsigned 64-bit product
+        /// that we reinterpret as `i64` for the lane-wise subtraction.
+        /// Reinterpreting a `u64 > i64::MAX` as `i64` would silently
+        /// flip its sign, so we cap inputs at `2^31` to keep the
+        /// product comfortably inside `i64::MAX`.
+        ///
+        /// Public so external callers (benches, `dispatch::planner`)
+        /// can pre-classify their inputs without re-deriving the bound.
+        #[must_use]
+        pub fn fast_path_eligible(
+            neighbor_weights: &[u64],
+            neighbor_degrees: &[u64],
+            self_degree: u64,
+            m_doubled: u128,
+        ) -> bool {
+            const BOUND: u64 = 1_u64 << 31;
+            if m_doubled >= u128::from(BOUND) {
+                return false;
+            }
+            if self_degree >= BOUND {
+                return false;
+            }
+            if neighbor_weights.iter().any(|&w| w >= BOUND) {
+                return false;
+            }
+            if neighbor_degrees.iter().any(|&d| d >= BOUND) {
+                return false;
+            }
+            true
+        }
+    }
+
+    #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+    pub mod avx2 {
+        //! AVX2 modularity-gain kernel.
+        //!
+        //! 4 lanes per iteration via `_mm256_mul_epu32` (low 32 bits of
+        //! each 64-bit lane → 64-bit product). When the i64 fast path
+        //! is not eligible (see [`super::scalar::fast_path_eligible`]),
+        //! delegates to [`super::scalar::modularity_gains_neighbor_batch`].
+
+        #[cfg(not(feature = "std"))]
+        use alloc::vec::Vec;
+
+        #[cfg(target_arch = "x86")]
+        use core::arch::x86::{
+            __m256i, _mm256_loadu_si256, _mm256_mul_epu32, _mm256_set1_epi64x, _mm256_storeu_si256,
+            _mm256_sub_epi64,
+        };
+        #[cfg(target_arch = "x86_64")]
+        use core::arch::x86_64::{
+            __m256i, _mm256_loadu_si256, _mm256_mul_epu32, _mm256_set1_epi64x, _mm256_storeu_si256,
+            _mm256_sub_epi64,
+        };
+
+        /// 4 i64 lanes per AVX2 vector.
+        const LANES: usize = 4;
+
+        /// Returns true when AVX2 is available at runtime.
+        #[cfg(feature = "std")]
+        #[must_use]
+        pub fn is_available() -> bool {
+            std::is_x86_feature_detected!("avx2")
+        }
+
+        /// Returns true when AVX2 is available at runtime.
+        #[cfg(not(feature = "std"))]
+        #[must_use]
+        pub const fn is_available() -> bool {
+            false
+        }
+
+        /// AVX2 implementation of the modularity-gain batch kernel.
+        ///
+        /// See [`super::scalar::modularity_gains_neighbor_batch`] for
+        /// the score definition. Bit-exact with the scalar reference
+        /// (integer arithmetic; no FP reduction order in play).
+        ///
+        /// # Safety
+        ///
+        /// Caller must ensure AVX2 is available and that
+        /// `neighbor_weights.len() == neighbor_degrees.len()`.
+        #[target_feature(enable = "avx2")]
+        #[must_use]
+        pub unsafe fn modularity_gains_neighbor_batch(
+            neighbor_weights: &[u64],
+            neighbor_degrees: &[u64],
+            self_degree: u64,
+            m_doubled: u128,
+        ) -> Vec<i128> {
+            debug_assert_eq!(neighbor_weights.len(), neighbor_degrees.len());
+            let n = neighbor_weights.len();
+            if !super::scalar::fast_path_eligible(
+                neighbor_weights,
+                neighbor_degrees,
+                self_degree,
+                m_doubled,
+            ) {
+                return super::scalar::modularity_gains_neighbor_batch(
+                    neighbor_weights,
+                    neighbor_degrees,
+                    self_degree,
+                    m_doubled,
+                );
+            }
+
+            // Pre-allocate the output Vec; we write through the
+            // backing storage directly to avoid per-element `Vec::push`
+            // bookkeeping in the hot loop.
+            let mut out: Vec<i128> = Vec::with_capacity(n);
+            // SIMD lanes operate in i64; widen to i128 on store. This
+            // avoids needing a portable 128-bit lane-wise multiply,
+            // which neither AVX2 nor AVX-512 provides.
+            let two_m = m_doubled as i64;
+            let deg_u = self_degree as i64;
+            // SAFETY: avx2 is enabled by the enclosing target_feature.
+            let two_m_v = _mm256_set1_epi64x(two_m);
+            let deg_u_v = _mm256_set1_epi64x(deg_u);
+
+            let out_ptr = out.as_mut_ptr();
+            let mut tmp = [0_i64; LANES];
+            let mut i = 0;
+            while i + LANES <= n {
+                // SAFETY: bounds checked by loop condition.
+                let w_v = unsafe {
+                    _mm256_loadu_si256(neighbor_weights.as_ptr().add(i).cast::<__m256i>())
+                };
+                let d_v = unsafe {
+                    _mm256_loadu_si256(neighbor_degrees.as_ptr().add(i).cast::<__m256i>())
+                };
+                // `_mm256_mul_epu32` multiplies the LOW 32 bits of each
+                // 64-bit lane. Eligibility ensures every lane's value
+                // fits in u32, so the upper 32 bits are zero and we
+                // get the full product.
+                let prod_w = _mm256_mul_epu32(two_m_v, w_v);
+                let prod_d = _mm256_mul_epu32(deg_u_v, d_v);
+                let score = _mm256_sub_epi64(prod_w, prod_d);
+                // SAFETY: tmp is 32-byte writable; aligned-tolerant store.
+                unsafe { _mm256_storeu_si256(tmp.as_mut_ptr().cast::<__m256i>(), score) };
+                // Widen each i64 lane to i128 and write directly into
+                // the pre-allocated Vec storage. Faster than four
+                // `Vec::push` calls because it bypasses the length
+                // bookkeeping per element.
+                // SAFETY: `i + LANES <= n <= out.capacity()` ensures
+                // every write is in-bounds; `out_ptr` is non-null and
+                // properly aligned for `i128` (Vec::with_capacity
+                // guarantees both).
+                for (lane_idx, &lane) in tmp.iter().enumerate() {
+                    unsafe {
+                        out_ptr.add(i + lane_idx).write(i128::from(lane));
+                    }
+                }
+                i += LANES;
+            }
+            // Tail: scalar with the same eligibility-guarded i64 path.
+            while i < n {
+                let w = neighbor_weights[i] as i64;
+                let d = neighbor_degrees[i] as i64;
+                let score = two_m * w - deg_u * d;
+                // SAFETY: `i < n <= out.capacity()`.
+                unsafe {
+                    out_ptr.add(i).write(i128::from(score));
+                }
+                i += 1;
+            }
+            // SAFETY: every slot in `0..n` has been initialised above.
+            unsafe {
+                out.set_len(n);
+            }
+            out
+        }
+    }
+
+    #[cfg(all(feature = "avx512", any(target_arch = "x86", target_arch = "x86_64")))]
+    pub mod avx512 {
+        //! AVX-512 modularity-gain kernel.
+        //!
+        //! 8 lanes per iteration via `_mm512_mullo_epi64` (native i64
+        //! multiply, AVX-512DQ). Falls back to scalar when the i64
+        //! fast path is not eligible.
+
+        #[cfg(not(feature = "std"))]
+        use alloc::vec::Vec;
+
+        #[cfg(target_arch = "x86")]
+        use core::arch::x86::{
+            __m512i, _mm512_loadu_si512, _mm512_mullo_epi64, _mm512_set1_epi64,
+            _mm512_storeu_si512, _mm512_sub_epi64,
+        };
+        #[cfg(target_arch = "x86_64")]
+        use core::arch::x86_64::{
+            __m512i, _mm512_loadu_si512, _mm512_mullo_epi64, _mm512_set1_epi64,
+            _mm512_storeu_si512, _mm512_sub_epi64,
+        };
+
+        /// 8 i64 lanes per AVX-512 vector.
+        const LANES: usize = 8;
+
+        /// Returns true when AVX-512F + AVX-512DQ are available.
+        #[cfg(feature = "std")]
+        #[must_use]
+        pub fn is_available() -> bool {
+            std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512dq")
+        }
+
+        /// Returns true when AVX-512F + AVX-512DQ are available.
+        #[cfg(not(feature = "std"))]
+        #[must_use]
+        pub const fn is_available() -> bool {
+            false
+        }
+
+        /// AVX-512 implementation of the modularity-gain batch kernel.
+        ///
+        /// See [`super::scalar::modularity_gains_neighbor_batch`] for
+        /// the score definition. Bit-exact with the scalar reference.
+        ///
+        /// # Safety
+        ///
+        /// Caller must ensure AVX-512F + AVX-512DQ are available and
+        /// that `neighbor_weights.len() == neighbor_degrees.len()`.
+        #[target_feature(enable = "avx512f,avx512dq")]
+        #[must_use]
+        pub unsafe fn modularity_gains_neighbor_batch(
+            neighbor_weights: &[u64],
+            neighbor_degrees: &[u64],
+            self_degree: u64,
+            m_doubled: u128,
+        ) -> Vec<i128> {
+            debug_assert_eq!(neighbor_weights.len(), neighbor_degrees.len());
+            let n = neighbor_weights.len();
+            if !super::scalar::fast_path_eligible(
+                neighbor_weights,
+                neighbor_degrees,
+                self_degree,
+                m_doubled,
+            ) {
+                return super::scalar::modularity_gains_neighbor_batch(
+                    neighbor_weights,
+                    neighbor_degrees,
+                    self_degree,
+                    m_doubled,
+                );
+            }
+
+            let mut out: Vec<i128> = Vec::with_capacity(n);
+            let two_m = m_doubled as i64;
+            let deg_u = self_degree as i64;
+            // SAFETY: avx512f+dq enabled by the enclosing target_feature.
+            let two_m_v = _mm512_set1_epi64(two_m);
+            let deg_u_v = _mm512_set1_epi64(deg_u);
+
+            let out_ptr = out.as_mut_ptr();
+            let mut tmp = [0_i64; LANES];
+            let mut i = 0;
+            while i + LANES <= n {
+                // SAFETY: bounds checked.
+                let w_v = unsafe {
+                    _mm512_loadu_si512(neighbor_weights.as_ptr().add(i).cast::<__m512i>())
+                };
+                let d_v = unsafe {
+                    _mm512_loadu_si512(neighbor_degrees.as_ptr().add(i).cast::<__m512i>())
+                };
+                let prod_w = _mm512_mullo_epi64(two_m_v, w_v);
+                let prod_d = _mm512_mullo_epi64(deg_u_v, d_v);
+                let score = _mm512_sub_epi64(prod_w, prod_d);
+                // SAFETY: tmp is 64-byte writable; aligned-tolerant store.
+                unsafe { _mm512_storeu_si512(tmp.as_mut_ptr().cast::<__m512i>(), score) };
+                // SAFETY: `i + LANES <= n <= out.capacity()`.
+                for (lane_idx, &lane) in tmp.iter().enumerate() {
+                    unsafe {
+                        out_ptr.add(i + lane_idx).write(i128::from(lane));
+                    }
+                }
+                i += LANES;
+            }
+            while i < n {
+                let w = neighbor_weights[i] as i64;
+                let d = neighbor_degrees[i] as i64;
+                let score = two_m.wrapping_mul(w).wrapping_sub(deg_u.wrapping_mul(d));
+                // SAFETY: `i < n <= out.capacity()`.
+                unsafe {
+                    out_ptr.add(i).write(i128::from(score));
+                }
+                i += 1;
+            }
+            // SAFETY: every slot in `0..n` has been initialised above.
+            unsafe {
+                out.set_len(n);
+            }
+            out
+        }
+    }
+
+    #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+    pub mod neon {
+        //! AArch64 NEON modularity-gain kernel.
+        //!
+        //! 2 lanes per iteration via `vmull_u32` (widening 32x32→64
+        //! multiply). Falls back to scalar when the i64 fast path is
+        //! not eligible.
+
+        #[cfg(not(feature = "std"))]
+        use alloc::vec::Vec;
+
+        use core::arch::aarch64::{
+            int64x2_t, uint32x2_t, vld1_u32, vmull_u32, vreinterpretq_s64_u64, vst1q_s64, vsubq_s64,
+        };
+
+        /// 2 i64 lanes per NEON vector.
+        const LANES: usize = 2;
+
+        /// Returns true when NEON is available.
+        ///
+        /// NEON is mandatory on AArch64; this is unconditionally true.
+        #[must_use]
+        pub const fn is_available() -> bool {
+            true
+        }
+
+        /// Loads two `u32` lanes from a `&[u64]` slice into a NEON
+        /// `uint32x2_t` register.
+        ///
+        /// Eligibility-checked callers ensure each `u64` value fits in
+        /// `u32`, so we read the low 32 bits of each 64-bit slot via a
+        /// scratch buffer. A direct gather would require `vld2q_u32` /
+        /// `vuzp` shuffles; the scratch is simpler and the loop is
+        /// memory-bandwidth bound at this lane width regardless.
+        #[target_feature(enable = "neon")]
+        #[inline]
+        unsafe fn load_u32x2_low_from_u64(slice: &[u64], i: usize) -> uint32x2_t {
+            let a = slice[i] as u32;
+            let b = slice[i + 1] as u32;
+            let buf = [a, b];
+            // SAFETY: buf is 8 bytes contiguous, vld1_u32 reads 8 bytes.
+            unsafe { vld1_u32(buf.as_ptr()) }
+        }
+
+        /// NEON implementation of the modularity-gain batch kernel.
+        ///
+        /// See [`super::scalar::modularity_gains_neighbor_batch`] for
+        /// the score definition. Bit-exact with the scalar reference.
+        ///
+        /// # Safety
+        ///
+        /// Caller must ensure NEON is available (always true on
+        /// AArch64) and that `neighbor_weights.len() ==
+        /// neighbor_degrees.len()`.
+        #[target_feature(enable = "neon")]
+        #[must_use]
+        pub unsafe fn modularity_gains_neighbor_batch(
+            neighbor_weights: &[u64],
+            neighbor_degrees: &[u64],
+            self_degree: u64,
+            m_doubled: u128,
+        ) -> Vec<i128> {
+            debug_assert_eq!(neighbor_weights.len(), neighbor_degrees.len());
+            let n = neighbor_weights.len();
+            if !super::scalar::fast_path_eligible(
+                neighbor_weights,
+                neighbor_degrees,
+                self_degree,
+                m_doubled,
+            ) {
+                return super::scalar::modularity_gains_neighbor_batch(
+                    neighbor_weights,
+                    neighbor_degrees,
+                    self_degree,
+                    m_doubled,
+                );
+            }
+
+            let mut out: Vec<i128> = Vec::with_capacity(n);
+            let two_m = m_doubled as i64;
+            let deg_u = self_degree as i64;
+            // Broadcast the scalar low-32 of two_m / deg_u as a uint32x2_t.
+            // Eligibility guarantees both fit in u32.
+            let two_m_lo = [two_m as u32, two_m as u32];
+            let deg_u_lo = [deg_u as u32, deg_u as u32];
+            // SAFETY: arrays are 8 bytes contiguous; neon enabled.
+            let two_m_v = unsafe { vld1_u32(two_m_lo.as_ptr()) };
+            let deg_u_v = unsafe { vld1_u32(deg_u_lo.as_ptr()) };
+
+            let out_ptr = out.as_mut_ptr();
+            let mut tmp = [0_i64; LANES];
+            let mut i = 0;
+            while i + LANES <= n {
+                // SAFETY: bounds checked; eligibility ensures values fit u32.
+                let w_v = unsafe { load_u32x2_low_from_u64(neighbor_weights, i) };
+                let d_v = unsafe { load_u32x2_low_from_u64(neighbor_degrees, i) };
+                // vmull_u32 widens 32x32→64 per lane: uint32x2_t * uint32x2_t → uint64x2_t.
+                let prod_w_u = vmull_u32(two_m_v, w_v);
+                let prod_d_u = vmull_u32(deg_u_v, d_v);
+                // Reinterpret as signed for the subtraction. The values
+                // fit in u63 by eligibility, so the bit pattern is the
+                // same as i64.
+                let prod_w_s = vreinterpretq_s64_u64(prod_w_u);
+                let prod_d_s = vreinterpretq_s64_u64(prod_d_u);
+                let score: int64x2_t = vsubq_s64(prod_w_s, prod_d_s);
+                // SAFETY: tmp is 16 bytes contiguous.
+                unsafe { vst1q_s64(tmp.as_mut_ptr(), score) };
+                // SAFETY: `i + LANES <= n <= out.capacity()`.
+                for (lane_idx, &lane) in tmp.iter().enumerate() {
+                    unsafe {
+                        out_ptr.add(i + lane_idx).write(i128::from(lane));
+                    }
+                }
+                i += LANES;
+            }
+            // Tail (n is odd).
+            while i < n {
+                let w = neighbor_weights[i] as i64;
+                let d = neighbor_degrees[i] as i64;
+                let score = two_m * w - deg_u * d;
+                // SAFETY: `i < n <= out.capacity()`.
+                unsafe {
+                    out_ptr.add(i).write(i128::from(score));
+                }
+                i += 1;
+            }
+            // SAFETY: every slot in `0..n` has been initialised above.
+            unsafe {
+                out.set_len(n);
+            }
+            out
+        }
+    }
+
+    /// Runtime-dispatched modularity-gain kernel.
+    pub mod auto {
+        #[cfg(not(feature = "std"))]
+        use alloc::vec::Vec;
+
+        /// Computes the per-neighbour modularity-gain score using the
+        /// best available SIMD backend.
+        ///
+        /// Equivalent to [`super::scalar::modularity_gains_neighbor_batch`]
+        /// bit-for-bit. See the [`super`] module documentation for the
+        /// score definition, the i64 fast path eligibility predicate,
+        /// and the determinism guarantee.
+        ///
+        /// # Panics
+        ///
+        /// Panics if `neighbor_weights.len() != neighbor_degrees.len()`.
+        #[must_use]
+        pub fn modularity_gains_neighbor_batch(
+            neighbor_weights: &[u64],
+            neighbor_degrees: &[u64],
+            self_degree: u64,
+            m_doubled: u128,
+        ) -> Vec<i128> {
+            assert_eq!(
+                neighbor_weights.len(),
+                neighbor_degrees.len(),
+                "modularity_gains_neighbor_batch: neighbor_weights.len() ({}) != neighbor_degrees.len() ({})",
+                neighbor_weights.len(),
+                neighbor_degrees.len()
+            );
+            #[cfg(all(
+                feature = "std",
+                feature = "avx512",
+                any(target_arch = "x86", target_arch = "x86_64")
+            ))]
+            {
+                if super::avx512::is_available() {
+                    // SAFETY: AVX-512F + AVX-512DQ availability checked
+                    // immediately above; lengths match.
+                    return unsafe {
+                        super::avx512::modularity_gains_neighbor_batch(
+                            neighbor_weights,
+                            neighbor_degrees,
+                            self_degree,
+                            m_doubled,
+                        )
+                    };
+                }
+            }
+            #[cfg(all(
+                feature = "std",
+                feature = "avx2",
+                any(target_arch = "x86", target_arch = "x86_64")
+            ))]
+            {
+                if super::avx2::is_available() {
+                    // SAFETY: AVX2 availability checked immediately above; lengths match.
+                    return unsafe {
+                        super::avx2::modularity_gains_neighbor_batch(
+                            neighbor_weights,
+                            neighbor_degrees,
+                            self_degree,
+                            m_doubled,
+                        )
+                    };
+                }
+            }
+            #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+            {
+                if super::neon::is_available() {
+                    // SAFETY: NEON is mandatory on AArch64; lengths match.
+                    return unsafe {
+                        super::neon::modularity_gains_neighbor_batch(
+                            neighbor_weights,
+                            neighbor_degrees,
+                            self_degree,
+                            m_doubled,
+                        )
+                    };
+                }
+            }
+            super::scalar::modularity_gains_neighbor_batch(
+                neighbor_weights,
+                neighbor_degrees,
+                self_degree,
+                m_doubled,
+            )
+        }
+    }
 }
 
 /// Absorbs community `u` into community `v`.
@@ -1005,7 +1724,374 @@ mod tests {
     //     print(u, v)
     // ```
     //
-    // Parity is left for Sprint 50-52 / Sprint 53-55 once the SIMD
-    // and concurrent variants land; the sequential baseline shipped
-    // here is verified by the property and quality tests above.
+    // Parity against the C++ reference is left for Sprint 53-55 (the
+    // concurrent-merging port) once we share the same fixture format
+    // end-to-end; the sequential baseline shipped here is verified by
+    // the property and quality tests above, and the SIMD inner loop
+    // (Sprint 50-52) is verified by the kernel parity tests below.
+
+    // ---------------------------------------------------------------------
+    // Sprint 50-52: SIMD modularity-gain inner loop parity tests.
+    //
+    // Every SIMD backend must produce bit-exact results vs the scalar
+    // reference for both the i64-fast-path regime (every input < 2^32)
+    // and the i128-fallback regime (any input >= 2^32). The
+    // `rabbit_order` permutation must remain unchanged whether the
+    // SIMD path or the scalar path was selected at runtime.
+
+    use super::kernels;
+
+    /// Deterministic seed-driven generator of `(weights, degrees)`
+    /// vectors with values bounded by `bound`. Used to drive the
+    /// SIMD-vs-scalar parity tests across both fast-path and
+    /// scalar-fallback regimes.
+    fn random_neighbor_batch(n: usize, seed: u64, bound: u64) -> (Vec<u64>, Vec<u64>) {
+        let mut state = seed | 1;
+        let mut next = || -> u64 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        };
+        let mut weights = Vec::with_capacity(n);
+        let mut degrees = Vec::with_capacity(n);
+        for _ in 0..n {
+            weights.push(next() % bound);
+            degrees.push(next() % bound);
+        }
+        (weights, degrees)
+    }
+
+    #[test]
+    fn scalar_kernel_matches_inline_formula() {
+        // Triangle with weights: m_doubled = 6, deg_u = 2, neighbors
+        // are [(deg_v=2, w=1), (deg_v=2, w=1)]. Score per neighbour:
+        //   2*m*w - deg_u*deg_v = 6*1 - 2*2 = 2
+        let weights = vec![1_u64, 1];
+        let degrees = vec![2_u64, 2];
+        let scores = kernels::scalar::modularity_gains_neighbor_batch(&weights, &degrees, 2, 6);
+        assert_eq!(scores, vec![2_i128, 2_i128]);
+    }
+
+    #[test]
+    fn scalar_kernel_handles_empty_input() {
+        let scores: Vec<i128> = kernels::scalar::modularity_gains_neighbor_batch(&[], &[], 5, 10);
+        assert!(scores.is_empty());
+    }
+
+    #[test]
+    fn scalar_kernel_panics_on_length_mismatch() {
+        let result = std::panic::catch_unwind(|| {
+            kernels::scalar::modularity_gains_neighbor_batch(&[1, 2, 3], &[1, 2], 1, 1)
+        });
+        assert!(result.is_err(), "expected panic on length mismatch");
+    }
+
+    #[test]
+    fn scalar_kernel_handles_large_inputs_via_i128() {
+        // Inputs exceed the u32 fast-path bound; the scalar path stays
+        // correct via i128 arithmetic. Use values that would overflow
+        // i64: 2*m * w = 2 * (2^60) * (2^4) = 2^65.
+        let m = 1_u64 << 60;
+        let m_doubled = u128::from(m).saturating_mul(2);
+        let w = 1_u64 << 4;
+        let deg_u = 2_u64;
+        let deg_v = 4_u64;
+        let scores =
+            kernels::scalar::modularity_gains_neighbor_batch(&[w], &[deg_v], deg_u, m_doubled);
+        let two_m = i128::try_from(m_doubled).expect("test m_doubled fits i128");
+        let expected = two_m * i128::from(w) - i128::from(deg_u) * i128::from(deg_v);
+        assert_eq!(scores, vec![expected]);
+        // And confirm fast_path_eligible says no.
+        assert!(!kernels::scalar::fast_path_eligible(
+            &[w],
+            &[deg_v],
+            deg_u,
+            m_doubled
+        ));
+    }
+
+    #[test]
+    fn fast_path_eligibility_matches_threshold() {
+        // m_doubled exactly at 2^31 is NOT eligible (strict <).
+        assert!(!kernels::scalar::fast_path_eligible(
+            &[1],
+            &[1],
+            1,
+            1_u128 << 31
+        ));
+        // self_degree at 2^31 - 1 IS eligible.
+        assert!(kernels::scalar::fast_path_eligible(
+            &[1],
+            &[1],
+            (1_u64 << 31) - 1,
+            1
+        ));
+        // A single neighbour weight at 2^31 disqualifies.
+        assert!(!kernels::scalar::fast_path_eligible(
+            &[1, 1_u64 << 31, 1],
+            &[1, 1, 1],
+            1,
+            1
+        ));
+        // A single neighbour degree at 2^31 disqualifies.
+        assert!(!kernels::scalar::fast_path_eligible(
+            &[1, 1, 1],
+            &[1, 1, 1_u64 << 31],
+            1,
+            1
+        ));
+        // Empty input is trivially eligible.
+        assert!(kernels::scalar::fast_path_eligible(&[], &[], 0, 0));
+    }
+
+    /// AVX2 must produce bit-exact results vs the scalar reference
+    /// across a range of fast-path-eligible inputs and lengths.
+    #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+    #[test]
+    fn avx2_kernel_matches_scalar_on_fast_path() {
+        if !kernels::avx2::is_available() {
+            // AVX2 not available at runtime; skip without failing.
+            // The scalar test above covers the contract.
+            return;
+        }
+        // Sweep N across {0, 1, 3, 4, 5, 7, 8, 9, 16, 17, 100, 1024}
+        // to exercise the SIMD body, the SIMD/tail boundary, and the
+        // tail itself.
+        for &n in &[0_usize, 1, 3, 4, 5, 7, 8, 9, 16, 17, 100, 1024] {
+            let (weights, degrees) = random_neighbor_batch(n, 0xC0FFEE_u64 ^ n as u64, 1_000_000);
+            let self_degree = 12345_u64;
+            let m_doubled = 9_876_543_u128;
+            let scalar_out = kernels::scalar::modularity_gains_neighbor_batch(
+                &weights,
+                &degrees,
+                self_degree,
+                m_doubled,
+            );
+            // SAFETY: AVX2 detected at runtime above.
+            let avx2_out = unsafe {
+                kernels::avx2::modularity_gains_neighbor_batch(
+                    &weights,
+                    &degrees,
+                    self_degree,
+                    m_doubled,
+                )
+            };
+            assert_eq!(
+                avx2_out, scalar_out,
+                "avx2 kernel diverges from scalar at n={n}"
+            );
+        }
+    }
+
+    /// Stress the i64 fast path with values near the eligibility
+    /// boundary (`< 2^31`). These produce per-pair products near
+    /// `2^62`, which is the largest magnitude the SIMD lanes can hold
+    /// without flipping the sign bit.
+    #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+    #[test]
+    fn avx2_kernel_handles_boundary_values() {
+        if !kernels::avx2::is_available() {
+            return;
+        }
+        let near_max = (1_u64 << 31) - 1;
+        let weights = vec![near_max; 16];
+        let degrees = vec![near_max; 16];
+        let self_degree = near_max;
+        let m_doubled = u128::from(near_max);
+        let scalar_out = kernels::scalar::modularity_gains_neighbor_batch(
+            &weights,
+            &degrees,
+            self_degree,
+            m_doubled,
+        );
+        // SAFETY: AVX2 detected.
+        let avx2_out = unsafe {
+            kernels::avx2::modularity_gains_neighbor_batch(
+                &weights,
+                &degrees,
+                self_degree,
+                m_doubled,
+            )
+        };
+        assert_eq!(avx2_out, scalar_out);
+    }
+
+    /// AVX2 must defer to the scalar path (bit-exact) when an input
+    /// exceeds the i64 fast-path bound.
+    #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+    #[test]
+    fn avx2_kernel_falls_back_to_scalar_on_large_inputs() {
+        if !kernels::avx2::is_available() {
+            return;
+        }
+        // m_doubled exceeds the u32 bound, forcing the i128 fallback.
+        let m_doubled = (1_u128 << 40) | 7;
+        let weights = vec![1_u64, 2, 3, 4, 5];
+        let degrees = vec![10_u64, 20, 30, 40, 50];
+        let self_degree = 1_000_u64;
+        let scalar_out = kernels::scalar::modularity_gains_neighbor_batch(
+            &weights,
+            &degrees,
+            self_degree,
+            m_doubled,
+        );
+        // SAFETY: AVX2 detected.
+        let avx2_out = unsafe {
+            kernels::avx2::modularity_gains_neighbor_batch(
+                &weights,
+                &degrees,
+                self_degree,
+                m_doubled,
+            )
+        };
+        assert_eq!(avx2_out, scalar_out);
+    }
+
+    /// AVX-512 parity, identical structure to the AVX2 test.
+    #[cfg(all(feature = "avx512", any(target_arch = "x86", target_arch = "x86_64")))]
+    #[test]
+    fn avx512_kernel_matches_scalar_on_fast_path() {
+        if !kernels::avx512::is_available() {
+            return;
+        }
+        for &n in &[0_usize, 1, 3, 7, 8, 9, 15, 16, 17, 100, 1024] {
+            let (weights, degrees) = random_neighbor_batch(n, 0xDEADBEEF_u64 ^ n as u64, 1_000_000);
+            let self_degree = 7777_u64;
+            let m_doubled = 1_234_567_u128;
+            let scalar_out = kernels::scalar::modularity_gains_neighbor_batch(
+                &weights,
+                &degrees,
+                self_degree,
+                m_doubled,
+            );
+            // SAFETY: AVX-512F + AVX-512DQ detected at runtime.
+            let avx512_out = unsafe {
+                kernels::avx512::modularity_gains_neighbor_batch(
+                    &weights,
+                    &degrees,
+                    self_degree,
+                    m_doubled,
+                )
+            };
+            assert_eq!(
+                avx512_out, scalar_out,
+                "avx512 kernel diverges from scalar at n={n}"
+            );
+        }
+    }
+
+    /// NEON parity, identical structure to the AVX2 test.
+    #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+    #[test]
+    fn neon_kernel_matches_scalar_on_fast_path() {
+        if !kernels::neon::is_available() {
+            return;
+        }
+        for &n in &[0_usize, 1, 2, 3, 4, 5, 7, 8, 17, 100, 1024] {
+            let (weights, degrees) = random_neighbor_batch(n, 0xBABE_u64 ^ n as u64, 1_000_000);
+            let self_degree = 5555_u64;
+            let m_doubled = 7_654_321_u128;
+            let scalar_out = kernels::scalar::modularity_gains_neighbor_batch(
+                &weights,
+                &degrees,
+                self_degree,
+                m_doubled,
+            );
+            // SAFETY: NEON is mandatory on AArch64.
+            let neon_out = unsafe {
+                kernels::neon::modularity_gains_neighbor_batch(
+                    &weights,
+                    &degrees,
+                    self_degree,
+                    m_doubled,
+                )
+            };
+            assert_eq!(
+                neon_out, scalar_out,
+                "neon kernel diverges from scalar at n={n}"
+            );
+        }
+    }
+
+    /// `auto::modularity_gains_neighbor_batch` must equal scalar for
+    /// every input regardless of which backend the runtime selects.
+    #[test]
+    fn auto_kernel_matches_scalar() {
+        for &n in &[0_usize, 1, 3, 4, 5, 8, 16, 17, 100, 1024] {
+            let (weights, degrees) =
+                random_neighbor_batch(n, 0xF00D_BABE_u64 ^ n as u64, 1_000_000);
+            let self_degree = 17_u64;
+            let m_doubled = 32_768_u128;
+            let scalar_out = kernels::scalar::modularity_gains_neighbor_batch(
+                &weights,
+                &degrees,
+                self_degree,
+                m_doubled,
+            );
+            let auto_out = kernels::auto::modularity_gains_neighbor_batch(
+                &weights,
+                &degrees,
+                self_degree,
+                m_doubled,
+            );
+            assert_eq!(
+                auto_out, scalar_out,
+                "auto kernel diverges from scalar at n={n}"
+            );
+        }
+    }
+
+    /// Larger graph: confirm `rabbit_order` itself produces an
+    /// identical permutation regardless of which kernel backend the
+    /// runtime selects. Since `auto::modularity_gains_neighbor_batch`
+    /// is bit-exact with `scalar::modularity_gains_neighbor_batch`,
+    /// the two `rabbit_order(...)` calls must coincide.
+    ///
+    /// To force "scalar" inside `rabbit_order`, we cannot easily
+    /// rewire the dispatcher mid-call; instead we run `rabbit_order`
+    /// twice on the same input and assert the result is deterministic
+    /// (covered by the existing `determinism_same_input_same_output`
+    /// test) and additionally cross-check the kernel-level parity on
+    /// a representative slice of intermediate inputs the agglomeration
+    /// loop would have produced.
+    #[test]
+    fn rabbit_order_unchanged_with_simd_dispatch() {
+        // Build a 100-vertex random graph that traverses the
+        // agglomeration loop many times.
+        let n = 100_u32;
+        let (offsets, neighbors) = erdos_renyi_csr(n, 4, 0xC0FFEE_u64);
+        let g = CsrGraph {
+            n,
+            offsets: &offsets,
+            neighbors: &neighbors,
+        };
+        let perm_first = rabbit_order(g);
+        let perm_second = rabbit_order(g);
+        assert_eq!(
+            perm_first, perm_second,
+            "rabbit_order must be deterministic across calls"
+        );
+        // And independently verify a few representative inner-loop
+        // batches against scalar.
+        for &n_neigh in &[1_usize, 4, 7, 16] {
+            let (weights, degrees) =
+                random_neighbor_batch(n_neigh, 0xC0FFEE_u64 ^ n_neigh as u64, 1_000);
+            let self_degree = 10_u64;
+            let m_doubled = 100_u128;
+            let scalar_out = kernels::scalar::modularity_gains_neighbor_batch(
+                &weights,
+                &degrees,
+                self_degree,
+                m_doubled,
+            );
+            let auto_out = kernels::auto::modularity_gains_neighbor_batch(
+                &weights,
+                &degrees,
+                self_degree,
+                m_doubled,
+            );
+            assert_eq!(scalar_out, auto_out);
+        }
+    }
 }

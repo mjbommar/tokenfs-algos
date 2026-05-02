@@ -27,6 +27,7 @@ use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use support::cache_tier_sizes;
+use tokenfs_algos::permutation::rabbit::kernels;
 use tokenfs_algos::permutation::{CsrGraph, Permutation, rabbit_order, rcm};
 
 /// Vertex counts swept by the build benchmark.
@@ -289,10 +290,86 @@ fn bench_apply_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+/// Neighbour-batch sizes swept by the modularity-gain inner-loop
+/// bench. Spans the realistic "few neighbours per merge" regime
+/// (10-100, average for TokenFS-typical sparse graphs) up through the
+/// stress regime (10K, representative of dense super-vertex
+/// adjacency after several merge rounds).
+const RABBIT_NEIGHBOR_COUNTS: &[usize] = &[10, 100, 1_000, 10_000];
+
+/// Builds a deterministic neighbour-batch payload for the modularity-
+/// gain inner-loop benchmark. Values are bounded by `2^30` so the
+/// inputs fit the i64 fast path (`< 2^32`) regardless of which
+/// SIMD backend the runtime selects.
+fn modularity_gain_inputs(n: usize, seed: u64) -> (Vec<u64>, Vec<u64>) {
+    let mut state = seed | 1;
+    let mut next = || -> u64 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    };
+    let bound = 1_u64 << 30;
+    let mut weights = Vec::with_capacity(n);
+    let mut degrees = Vec::with_capacity(n);
+    for _ in 0..n {
+        weights.push(next() % bound);
+        degrees.push(next() % bound);
+    }
+    (weights, degrees)
+}
+
+/// Benchmarks the modularity-gain SIMD inner loop in isolation,
+/// comparing scalar vs the runtime-dispatched best backend across
+/// a sweep of neighbour-batch sizes.
+///
+/// The bench reports throughput in elements/sec (one element = one
+/// neighbour scored), which makes the scalar-vs-SIMD speedup ratio
+/// visible directly in the criterion output. The scalar arm always
+/// runs the i128 reference; the auto arm picks AVX-512 → AVX2 → NEON
+/// → scalar at runtime per the dispatcher in
+/// [`tokenfs_algos::permutation::rabbit::kernels::auto`].
+fn bench_modularity_gain_kernel(c: &mut Criterion) {
+    let mut group = c.benchmark_group("permutation_rabbit/modularity_gain");
+    let self_degree = 12_345_u64;
+    let m_doubled = 9_876_543_u128;
+
+    for &n in RABBIT_NEIGHBOR_COUNTS {
+        let (weights, degrees) = modularity_gain_inputs(n, 0xC0FFEE_u64 ^ n as u64);
+        group.throughput(Throughput::Elements(n as u64));
+
+        let id_scalar = format!("scalar/n={n}");
+        group.bench_with_input(BenchmarkId::from_parameter(id_scalar), &(), |b, _| {
+            b.iter(|| {
+                kernels::scalar::modularity_gains_neighbor_batch(
+                    black_box(&weights),
+                    black_box(&degrees),
+                    black_box(self_degree),
+                    black_box(m_doubled),
+                )
+            });
+        });
+
+        let id_auto = format!("auto/n={n}");
+        group.bench_with_input(BenchmarkId::from_parameter(id_auto), &(), |b, _| {
+            b.iter(|| {
+                kernels::auto::modularity_gains_neighbor_batch(
+                    black_box(&weights),
+                    black_box(&degrees),
+                    black_box(self_degree),
+                    black_box(m_doubled),
+                )
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_rcm_build,
     bench_rabbit_build,
-    bench_apply_throughput
+    bench_apply_throughput,
+    bench_modularity_gain_kernel
 );
 criterion_main!(benches);
