@@ -787,6 +787,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     fn parity_check(bits: &[u64], n_bits: usize, sample_step: usize) {
         let dict = RankSelectDict::build(bits, n_bits);
         // rank1 endpoints
@@ -875,6 +876,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn empty_bitvector() {
         let bits: [u64; 0] = [];
@@ -886,6 +888,7 @@ mod tests {
         assert_eq!(dict.select0(0), None);
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn single_bit_set() {
         for pos in [
@@ -908,6 +911,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn single_bit_clear_in_dense() {
         for pos in [0_usize, 1, 63, 64, 255, 256, 1024, 4096] {
@@ -936,6 +940,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn all_zero_bitvector() {
         for n_bits in [1_usize, 7, 64, 255, 4096, 4097, 8192, 12345] {
@@ -950,6 +955,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn all_one_bitvector() {
         for n_bits in [1_usize, 7, 64, 255, 4096, 4097, 8192, 12345] {
@@ -970,6 +976,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn small_endpoints() {
         for n_bits in [
@@ -983,6 +990,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn alternating_bitvector() {
         // 0xAAAA... — every other bit set.
@@ -992,6 +1000,7 @@ mod tests {
         parity_check(&bits, n_bits, 13);
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn dense_random_spans_multiple_superblocks() {
         let n_bits = 5 * SUPERBLOCK_BITS + 123;
@@ -999,6 +1008,7 @@ mod tests {
         parity_check(&bits, n_bits, 17);
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn sparse_one_per_superblock() {
         // One set bit at the start of each superblock.
@@ -1018,6 +1028,7 @@ mod tests {
         assert_eq!(dict.select1(n_superblocks), None);
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn dense_one_clear_per_superblock() {
         // One clear bit at the start of each superblock; rest dense.
@@ -1036,6 +1047,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn n_bits_one() {
         let bits_zero = vec![0_u64];
@@ -1053,6 +1065,7 @@ mod tests {
         assert_eq!(dict_one.select0(0), None);
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn n_bits_64() {
         for word in [
@@ -1069,6 +1082,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn spans_multiple_superblocks() {
         let n_superblocks = 5_usize;
@@ -1077,6 +1091,7 @@ mod tests {
         parity_check(&bits, n_bits, 23);
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn batch_rank_matches_scalar() {
         let n_bits = 10_000_usize;
@@ -1090,6 +1105,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn batch_select_matches_scalar() {
         let n_bits = 10_000_usize;
@@ -1189,6 +1205,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn memory_bytes_includes_index() {
         let bits = vec![0xAAAA_AAAA_AAAA_AAAA_u64; SUPERBLOCK_BITS / 64];
@@ -1211,6 +1228,7 @@ mod tests {
     /// (where sucds' default Rank9SelIndex without hints is fast enough)
     /// — adding `select1_hints()` would cover sparse vectors but doesn't
     /// change the parity outcome.
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn sucds_parity_dense_sparse_alternating() {
         use sucds::bit_vectors::{Rank, Rank9Sel, Select};
@@ -1345,6 +1363,65 @@ mod tests {
         assert_eq!(dict.count_ones(), 128);
     }
 
+    // ------------------------------------------------------------------
+    // Audit-R6 finding #162 regression tests for the `try_build` path.
+    //
+    // The `try_build` constructor must surface BitsTooShort rather than
+    // panic via internal `bits[index]` out-of-range access; the kernel
+    // build loop indexes `bits` only for words inside
+    // `min((b+1)*WORDS_PER_BLOCK, bits.len())` so the precondition
+    // `bits.len() * 64 >= n_bits` is sufficient. These tests pin that
+    // contract for the no-panicking-shape-apis build.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn try_build_bits_one_word_short_returns_err_not_panic() {
+        // Need at least ceil(200/64) = 4 words, supply 3.
+        let bits = [u64::MAX; 3];
+        let err = RankSelectDict::try_build(&bits, 200).expect_err("must return Err");
+        assert_eq!(
+            err,
+            RankSelectError::BitsTooShort {
+                bits_len_words: 3,
+                requested_n_bits: 200
+            }
+        );
+    }
+
+    #[test]
+    fn try_build_with_zero_bits_succeeds_on_empty_slice() {
+        let bits: [u64; 0] = [];
+        let dict = RankSelectDict::try_build(&bits, 0).expect("zero bits is valid");
+        assert_eq!(dict.len_bits(), 0);
+        assert_eq!(dict.count_ones(), 0);
+    }
+
+    #[test]
+    fn try_build_then_query_panic_free_round_trip() {
+        // Build via try_build, then exercise rank1/select1/count_ones
+        // without involving the panicking constructor. Verifies the
+        // built dictionary is queryable on a no-panicking-shape-apis
+        // build.
+        let bits = [0xff_u64, 0xff_u64, 0xff_u64, 0xff_u64]; // 32 ones.
+        let dict = RankSelectDict::try_build(&bits, 256).expect("valid build");
+        assert_eq!(dict.count_ones(), 32);
+        assert_eq!(dict.rank1(8), 8);
+        assert_eq!(dict.select1(0), Some(0));
+        assert_eq!(dict.select1(7), Some(7));
+        assert_eq!(dict.select1(31), Some(64 + 64 + 64 + 7));
+    }
+
+    #[test]
+    fn try_build_with_partial_trailing_word_succeeds() {
+        // n_bits = 70 needs ceil(70/64) = 2 words; the build masks the
+        // trailing partial word so popcount/queries align with n_bits.
+        let bits = [u64::MAX, 0x3f_u64]; // 64 + 6 = 70 ones.
+        let dict = RankSelectDict::try_build(&bits, 70).expect("valid build");
+        assert_eq!(dict.len_bits(), 70);
+        assert_eq!(dict.count_ones(), 70);
+    }
+
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     #[should_panic(expected = "RankSelectDict::build: bits slice too short")]
     fn build_still_panics_on_too_short_bits() {
@@ -1354,6 +1431,7 @@ mod tests {
 
     /// Parity vs sucds across deterministic random bitvectors. Brute
     /// forces every rank position and a sampling of select positions.
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn sucds_parity_deterministic_random() {
         use sucds::bit_vectors::{Rank, Rank9Sel, Select};
@@ -1434,6 +1512,7 @@ mod tests {
     /// refactor reintroduces a `u32` cast in the rank/select read
     /// paths, the assertions on `rank1` and `select1` past the boundary
     /// will fail with a wrong (truncated) answer.
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn rank_select_no_truncation_past_u32_boundary() {
         // Build a small valid dictionary, then overwrite the cumulative
@@ -1554,6 +1633,7 @@ mod tests {
     /// Companion test: confirms `memory_bytes()` reports the correct
     /// 8-byte-per-superblock footprint after the audit-R6 #163 fix
     /// (was 4 bytes per superblock under the bug).
+    #[cfg(feature = "panicking-shape-apis")]
     #[test]
     fn memory_bytes_reflects_u64_superblock_counts() {
         // 4 superblocks → 5 entries in `superblock_counts` (one trailing
