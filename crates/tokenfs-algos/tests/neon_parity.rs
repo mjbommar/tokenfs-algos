@@ -17,7 +17,7 @@
 
 use proptest::prelude::*;
 use tokenfs_algos::{
-    bitmap, bits, byteclass, fingerprint, hash, runlength, similarity, sketch, vector,
+    approx, bitmap, bits, byteclass, fingerprint, hash, runlength, similarity, sketch, vector,
 };
 
 fn synthetic_corpus() -> Vec<Vec<u8>> {
@@ -1173,5 +1173,115 @@ fn neon_vector_jaccard_u64_one_to_many_matches_scalar() {
             (slot - scalar).abs() < 1e-12,
             "neon jaccard_u64_one_to_many[{i}] diverged: scalar={scalar} batched={slot}"
         );
+    }
+}
+
+// ---------- approx::HyperLogLog NEON parity (Sprint 44) ----------
+
+fn deterministic_hll_register_blob(precision: u32, seed: u64) -> Vec<u8> {
+    let m = 1_usize << precision;
+    let mut hll = approx::HyperLogLog::new(precision);
+    let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    for _ in 0..(4 * m) {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        let h = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+        hll.insert_hash(h);
+    }
+    hll.register_bytes().to_vec()
+}
+
+#[test]
+fn neon_hll_merge_matches_scalar_reference_across_precisions() {
+    for precision in [4_u32, 5, 6, 8, 10, 12, 14, 16] {
+        let dst_seed = 0xA1A1_F00D_u64 ^ (precision as u64);
+        let src_seed = 0xB2B2_C0FFEE_u64 ^ (precision as u64);
+        let dst_initial = deterministic_hll_register_blob(precision, dst_seed);
+        let src = deterministic_hll_register_blob(precision, src_seed);
+
+        let mut scalar_dst = dst_initial.clone();
+        approx::hll_kernels::scalar::merge(&mut scalar_dst, &src);
+
+        let mut simd_dst = dst_initial.clone();
+        // SAFETY: NEON is mandatory on AArch64.
+        unsafe {
+            approx::hll_kernels::neon::merge(&mut simd_dst, &src);
+        }
+        assert_eq!(
+            simd_dst, scalar_dst,
+            "NEON HLL merge diverged at precision={precision}"
+        );
+    }
+}
+
+#[test]
+fn neon_hll_count_raw_matches_scalar_reference_across_precisions() {
+    for precision in [4_u32, 5, 6, 8, 10, 12, 14, 16] {
+        let registers =
+            deterministic_hll_register_blob(precision, 0xDEAD_BEEF ^ (precision as u64));
+        let m = registers.len() as f64;
+        let alpha = match precision {
+            4 => 0.673,
+            5 => 0.697,
+            _ => 0.7213 / (1.0 + 1.079 / m),
+        };
+        let scalar = approx::hll_kernels::scalar::count_raw(&registers, alpha);
+        // SAFETY: NEON is mandatory on AArch64.
+        let actual = unsafe { approx::hll_kernels::neon::count_raw(&registers, alpha) };
+        let rel_err = if scalar == 0.0 {
+            0.0
+        } else {
+            (scalar - actual).abs() / scalar.abs()
+        };
+        assert!(
+            rel_err < 1e-12,
+            "NEON HLL count_raw diverged at precision={precision}: \
+             scalar={scalar} neon={actual} rel_err={rel_err}"
+        );
+    }
+}
+
+#[test]
+fn neon_hll_merge_handles_unaligned_lengths_via_scalar_tail() {
+    for len in [
+        0_usize, 1, 7, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 257,
+    ] {
+        let mut a: Vec<u8> = (0..len).map(|i| (i.wrapping_mul(17) % 64) as u8).collect();
+        let b: Vec<u8> = (0..len).map(|i| (i.wrapping_mul(31) % 64) as u8).collect();
+        let mut expected = a.clone();
+        approx::hll_kernels::scalar::merge(&mut expected, &b);
+
+        // SAFETY: NEON is mandatory on AArch64.
+        unsafe { approx::hll_kernels::neon::merge(&mut a, &b) };
+        assert_eq!(
+            a, expected,
+            "NEON HLL merge diverged on unaligned len {len}"
+        );
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 64,
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn neon_hll_merge_proptest_matches_scalar(
+        precision in 4_u32..=14,
+        dst_seed in any::<u64>(),
+        src_seed in any::<u64>(),
+    ) {
+        let dst_initial = deterministic_hll_register_blob(precision, dst_seed);
+        let src = deterministic_hll_register_blob(precision, src_seed);
+
+        let mut scalar_dst = dst_initial.clone();
+        approx::hll_kernels::scalar::merge(&mut scalar_dst, &src);
+
+        let mut simd_dst = dst_initial;
+        // SAFETY: NEON is mandatory on AArch64.
+        unsafe { approx::hll_kernels::neon::merge(&mut simd_dst, &src) };
+        prop_assert_eq!(simd_dst, scalar_dst);
     }
 }

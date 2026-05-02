@@ -118,5 +118,9 @@ harness = false
 name = "bitmap_set_ops"
 harness = false
 
+[[bench]]
+name = "approx_hll"
+harness = false
+
 [lints]
 workspace = true
