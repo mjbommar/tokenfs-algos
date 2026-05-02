@@ -175,3 +175,22 @@ Existing `benches/similarity.rs` covers most of this. Add:
 4. **Cosine in u32 form** — the existing `cosine_similarity_u32` returns `Option<f64>` because the magnitude calc requires sqrt. Worth offering a "no-sqrt" variant returning the raw `dot² / (|a|² × |b|²)` for ranking-only use? **Tentative: not yet; revisit if a consumer asks.**
 
 5. **K-NN top-K helper** that fuses the batched distance computation with a streaming top-K heap update. **Tentative: defer to v0.3 because it crosses with `sort` module decisions; ship the batched distances first as the building block.**
+
+## § 9 Environment fitness
+
+Per [`02b_DEPLOYMENT_MATRIX.md`](02b_DEPLOYMENT_MATRIX.md):
+
+| API | Kernel module | FUSE | Userspace | Postgres ext | cgo (Go) | Python (PyO3) |
+|---|---|---|---|---|---|---|
+| `dot_f32`, `l2_squared_f32`, `cosine_similarity_f32` | ✅ stateless | ✅ | ✅ | ✅ pgvector-class | ⚠️ batch from cgo | ✅ batch on numpy |
+| `try_dot_u32`, `l1_u32`, `l2_squared_u32` | ✅ | ✅ | ✅ | ✅ | ⚠️ batch | ✅ |
+| `hamming_u64`, `jaccard_u64` | ✅ AVX-512 VPOPCNTQ shines | ✅ | ✅ | ✅ | ✅ batch | ✅ |
+| `*_one_to_many` batched form | ✅ caller-provided output | ✅ | ✅ | ✅ ANN inner loop | ✅ | ✅ batch |
+
+**Notes:**
+- All kernels are stateless and operate on borrowed slices. No allocation. Kernel-safe across the board.
+- Single-pair operations on 1024-element vectors take ~3-10 µs depending on backend; well within FUSE per-request budget and below the cgo per-call overhead so calling per-pair from Go is *acceptable but wasteful*.
+- The `*_one_to_many` batched form is the canonical pgvector shape — query embedding × N database vectors. Hot for ANN, hot for "find similar object" in CDN/MinIO.
+- AVX-512 FMA gives ~30 GB/s on f32; the `kernel_fpu_begin` overhead is amortized over a 1024-element vector pair (~4 KB total bytes touched), so kernel SIMD use is net-positive.
+- For Postgres pgvector-extension consumers: this module is the natural inner-loop replacement. Could become an upstream contribution path or a documented dependency.
+- Reproducibility: the SIMD reduction tree (8-way pairwise for AVX2, 16-way for AVX-512, 4-way for NEON) is part of the public contract. Same input + same backend = bit-exact same output across versions, but cross-backend results differ within the documented `1e-3` Higham tolerance.

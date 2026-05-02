@@ -236,3 +236,25 @@ The bench compares `original-order BFS` vs `RCM-order BFS` vs `Rabbit-order BFS`
 4. **Phase ordering**: Hilbert is independent of RCM/Rabbit and trivial — could ship before RCM. **Tentative: yes — Hilbert in B5 alongside RCM in B4 because they're independent.**
 
 5. **Multi-level RCM** (split graph into k components, RCM each)? **Tentative: skip; Rabbit covers the multi-level quality regime.**
+
+## § 8 Environment fitness
+
+Per [`02b_DEPLOYMENT_MATRIX.md`](02b_DEPLOYMENT_MATRIX.md):
+
+| API | Kernel module | FUSE | Userspace (build pipeline) | Postgres ext | cgo (Go) | Python (PyO3) |
+|---|---|---|---|---|---|---|
+| `rcm(graph)` | ❌ build-time only | ❌ | ✅ | ⚠️ uncommon | ⚠️ uncommon | ✅ research |
+| `hilbert_2d(points)` | ❌ build-time only | ❌ | ✅ | ⚠️ for spatial indexes | ⚠️ batch only | ✅ |
+| `rabbit_order(graph)` | ❌ build-time only | ❌ | ✅ | ❌ too heavy | ❌ | ✅ research |
+| `Permutation::apply` | ✅ stateless | ✅ | ✅ | ✅ | ✅ batch | ✅ |
+| `Permutation::inverse` | ✅ allocates output Vec | ✅ | ✅ | ⚠️ palloc-aware | ✅ | ✅ |
+
+**Critical note:** the `permutation` module is **inherently a build-time / batch-analytics primitive**, not a hot-path one. RCM, Hilbert, and Rabbit Order all operate on graph adjacency or point sets to produce a permutation that is then *applied once* and stored as part of the image / dataset layout.
+
+- **TokenFS use:** invoked by `tokenfs_writer` at image build time to compute the inode/extent ordering that makes `tokenfs_reader` faster. Output is part of the sealed image manifest.
+- **Postgres use:** uncommon but possible for offline index-build-time clustering (BRIN summary range optimization, pgvector index construction).
+- **Research use:** common for graph experiments — RCM/Rabbit/Hilbert as preprocessing for downstream graph algorithms.
+- **Kernel module use:** never. The permutation is consumed (via `apply`) at read time, but the permutation itself was computed offline.
+- **cgo use:** the permutation arrays are typically large (millions of u32s); keep at batch granularity — Go calls `rcm(adjacency)` once per graph, not per-vertex.
+
+`Permutation::apply` is the only API in this module that's hot-path-capable; it's stateless and SIMD-friendly (sequential gather for sorted permutations, scatter for arbitrary).

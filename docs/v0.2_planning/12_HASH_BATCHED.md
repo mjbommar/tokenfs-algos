@@ -179,3 +179,44 @@ pub fn contains_u32_batch_simd(haystack: &[u32], needles: &[u32], out: &mut [boo
 4. **Whether to expose BLAKE3's internal `ChunkState` directly** — the Rust `blake3` crate's `guts` module is unstable. We'd be coupling to a non-public API. **Tentative: stay on the public API for v0.2.**
 
 5. **AArch64 SHA-2 extension** (`FEAT_SHA2`): the `sha2` crate already uses these where available. We don't need to wrap it; `sha256_batch` rayon-parallel just composes correctly.
+
+## § 5 Environment fitness — IMPORTANT REVISION
+
+Per [`02b_DEPLOYMENT_MATRIX.md`](02b_DEPLOYMENT_MATRIX.md), the original `blake3_batch` spec used `rayon` which is forbidden in kernel modules. **Revised API:**
+
+```rust
+// Single-thread, internal-multi-stream-SIMD via blake3::guts machinery.
+// Kernel-safe (modulo blake3 needing std — see notes).
+#[cfg(feature = "blake3")]
+pub fn blake3_batch_st_32(messages: &[&[u8]], out: &mut [[u8; 32]]);
+
+// Rayon-parallel convenience wrapper. Userspace only.
+#[cfg(all(feature = "blake3", feature = "parallel"))]
+pub fn blake3_batch_par_32(messages: &[&[u8]], out: &mut [[u8; 32]]);
+
+// Same pattern for SHA-256.
+pub fn sha256_batch_st(messages: &[&[u8]], out: &mut [[u8; 32]]);
+#[cfg(feature = "parallel")]
+pub fn sha256_batch_par(messages: &[&[u8]], out: &mut [[u8; 32]]);
+```
+
+| API | Kernel module | FUSE | Userspace | Postgres ext | cgo (Go) | Python (PyO3) |
+|---|---|---|---|---|---|---|
+| `blake3_batch_st_32` | ❌ blake3 needs std | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `blake3_batch_par_32` | ❌ rayon | ✅ | ✅ | ⚠️ multi-thread within bg worker only | ✅ | ✅ |
+| `sha256_batch_st` | ✅ `sha2` is no_std-clean | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `sha256_batch_par` | ❌ rayon | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `contains_u32_simd` | ✅ | ✅ | ✅ | ✅ | ⚠️ batch | ✅ |
+| `contains_u32_batch_simd` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+**Critical reframings:**
+
+1. **`blake3` requires std** — per `Cargo.toml`'s `blake3 = ["dep:blake3", "std"]`, the blake3 feature gate already implies std. **The kernel content-addressing answer is `sha256_batch_st` only.** The `sha256_batch_st` variant is no_std + alloc + kernel-safe via the `sha2` crate's no_std support and ARMv8 SHA-2 acceleration via `cpufeatures`.
+
+2. **Single-thread vs parallel naming convention** — `_st` suffix for single-thread (kernel-safe), `_par` suffix for rayon-parallel (userspace). The default function name (no suffix) is reserved for the highest-quality single-thread variant, so kernel consumers pick `blake3_batch_32` and get the safe path.
+
+3. **Per-element cgo cost** — Go calling `contains_u32_simd` for one needle has ~200 ns cgo overhead. Always use `contains_u32_batch_simd` from cgo. Document this clearly.
+
+4. **Postgres parallel-query mechanism** — Postgres bg workers parallelize at the query level; the SIMD primitives don't need to do their own rayon. **Use `_st` variants in Postgres extensions** unless the extension explicitly fans out across cores in user code.
+
+**Verification action**: extend `xtask security` to assert that the no_std + alloc lib build doesn't reach for `blake3` (already in forbidden list) and that no_default + alloc + std (no parallel) compiles every public API.

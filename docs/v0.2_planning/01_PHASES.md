@@ -1,6 +1,6 @@
 # Phases & dependency tree
 
-**Status:** plan, 2026-05-02. Phases are dependency-ordered; rate of work is contributor's choice.
+**Status:** plan, 2026-05-02. Phases are dependency-ordered; rate of work is contributor's choice. Phase ordering is consumer-agnostic: the same dependency tree applies regardless of whether the immediate consumer is TokenFS reader, Postgres extension, or a CDN edge cache. Consumer-environment fitness per primitive is documented in [`02b_DEPLOYMENT_MATRIX.md`](02b_DEPLOYMENT_MATRIX.md) and in each module doc's "Environment fitness" section.
 
 ## Dependency graph
 
@@ -54,27 +54,27 @@
 
 ## Phase A — roots (no inter-module deps)
 
-These can ship in any order; nothing depends on anything else here.
+These can ship in any order; nothing depends on anything else here. **All Phase A primitives are kernel-safe** in their `_st` (single-thread) variants; rayon-parallel variants are userspace-only. See each module's "Environment fitness" section.
 
-| # | Module / primitive | Doc | Estimated complexity |
-|---|---|---|---|
-| A1 | `bits::popcount` (scalar + AVX2 + AVX-512 VPOPCNTQ + NEON VCNT) | [`10_BITS.md`](10_BITS.md) § 4 | small (1-2 days) |
-| A2 | `bits::bit_pack` (arbitrary widths 1-32) | [`10_BITS.md`](10_BITS.md) § 2 | medium (3-5 days) |
-| A3 | `hash::batched_blake3` + `hash::batched_sha256` | [`12_HASH_BATCHED.md`](12_HASH_BATCHED.md) § 2 | small (2-3 days) |
-| A4 | `hash::set_membership_simd` | [`12_HASH_BATCHED.md`](12_HASH_BATCHED.md) § 3 | small (1-2 days) |
-| A5 | `vector::distance` (5 metrics × scalar/AVX2/AVX-512/NEON) | [`13_VECTOR.md`](13_VECTOR.md) | medium (5-7 days) |
+| # | Module / primitive | Doc | Estimated complexity | Kernel-safe? |
+|---|---|---|---|---|
+| A1 | `bits::popcount` (scalar + AVX2 + AVX-512 VPOPCNTQ + NEON VCNT) | [`10_BITS.md`](10_BITS.md) § 4 | small (1-2 days) | ✅ |
+| A2 | `bits::bit_pack` (arbitrary widths 1-32) | [`10_BITS.md`](10_BITS.md) § 2 | medium (3-5 days) | ✅ |
+| A3 | `hash::sha256_batch_st` + (userspace) `hash::blake3_batch_*` | [`12_HASH_BATCHED.md`](12_HASH_BATCHED.md) § 2 | small (2-3 days) | ✅ SHA-256 only; blake3 is std-only |
+| A4 | `hash::set_membership_simd` | [`12_HASH_BATCHED.md`](12_HASH_BATCHED.md) § 3 | small (1-2 days) | ✅ |
+| A5 | `vector::distance` (5 metrics × scalar/AVX2/AVX-512/NEON) | [`13_VECTOR.md`](13_VECTOR.md) | medium (5-7 days) | ✅ |
 
 **Phase A ship gate:** all 5 primitives have scalar oracle + at least one SIMD backend with parity tests, dispatched via existing `dispatch::` infrastructure, with criterion benches showing measurable speedup over scalar on representative inputs.
 
 ## Phase B — high-leverage primitives that build on Phase A
 
-| # | Module / primitive | Depends on | Doc |
-|---|---|---|---|
-| B1 | `bits::rank_select` | A1 popcount | [`10_BITS.md`](10_BITS.md) § 5 |
-| B2 | `bits::streamvbyte` (encode + decode) | A2 bit_pack scaffolding | [`10_BITS.md`](10_BITS.md) § 3 |
-| B3 | `bitmap::roaring` (intersection/union/difference/cardinality) | A1 popcount | [`11_BITMAP.md`](11_BITMAP.md) |
-| B4 | `permutation::rcm` (Reverse Cuthill-McKee) | none (A1 popcount used by argsort optionally) | [`14_PERMUTATION.md`](14_PERMUTATION.md) § 2 |
-| B5 | `permutation::hilbert` (2D/N-D Hilbert curve sort) | none | [`14_PERMUTATION.md`](14_PERMUTATION.md) § 4 |
+| # | Module / primitive | Depends on | Doc | Kernel-safe? |
+|---|---|---|---|---|
+| B1 | `bits::rank_select` | A1 popcount | [`10_BITS.md`](10_BITS.md) § 5 | ✅ (queries); ⚠️ build allocates |
+| B2 | `bits::streamvbyte` (encode + decode) | A2 bit_pack scaffolding | [`10_BITS.md`](10_BITS.md) § 3 | ✅ |
+| B3 | `bitmap::roaring` (intersection/union/difference/cardinality) | A1 popcount | [`11_BITMAP.md`](11_BITMAP.md) | ✅ (caller-provided output) |
+| B4 | `permutation::rcm` (Reverse Cuthill-McKee) | none (A1 popcount used by argsort optionally) | [`14_PERMUTATION.md`](14_PERMUTATION.md) § 2 | ❌ build-time only |
+| B5 | `permutation::hilbert` (2D/N-D Hilbert curve sort) | none | [`14_PERMUTATION.md`](14_PERMUTATION.md) § 4 | ❌ build-time only |
 
 **Phase B ship gate:** parity tests against scalar reference (or against a known-good external impl: `roaring`-rs scalar for B3; `sprs::reverse_cuthill_mckee` for B4); criterion benches; for B3, head-to-head numbers against the `roaring` crate's scalar inner loops on intersection of two ~10K-cardinality posting lists.
 

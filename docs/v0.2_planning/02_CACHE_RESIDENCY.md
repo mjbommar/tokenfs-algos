@@ -1,19 +1,30 @@
 # Cache residency analysis
 
-**Status:** design-pressure doc, 2026-05-02. The piece both `data-structures.md` and `FS_PRIMITIVES_GAP.md` miss.
+**Status:** design-pressure doc, 2026-05-02. The piece both `data-structures.md` and `FS_PRIMITIVES_GAP.md` miss for TokenFS scale; *also* relevant at Postgres / CDN / MinIO scale where conclusions flip.
 
 ## Why this doc exists
 
-For a TokenFS image at 130K paths / 228K extents / 2K vocab, the entire hot metadata working set (inode table + extent metadata + fingerprint array + vocab) is **~22 MB** — fits in a single L3 cache. Most modern P-cores have 24-32 MB L3.
+The cache-tier picture varies dramatically across consumers. The same primitive may be in-L3 for TokenFS-rootfs scale and DRAM-bound for Postgres-scale. Module designs need to handle both regimes; benches need to report numbers at multiple working-set sizes.
 
-This single fact reorders the primitive priority list. When everything is L3-resident:
+For a TokenFS image at 130K paths / 228K extents / 2K vocab, the entire hot metadata working set (inode table + extent metadata + fingerprint array + vocab) is **~22 MB** — fits in a single L3 cache. Most modern P-cores have 24-32 MB L3. **This single fact reorders the primitive priority list for TokenFS-scale consumers** but does NOT generalize to larger consumers.
 
+For a Postgres pgvector index over 1M ~768D embeddings, the working set is ~3 GB — DRAM-bound. The bottleneck shifts from L3-gather latency to DRAM streaming bandwidth.
+
+For a MinIO content-fingerprint table over 10M objects, the working set is ~320 MB — partially DRAM-bound, with bloom-filter pre-checks ideally L1/L2-resident.
+
+When the working set is L3-resident (TokenFS regime):
 - **Compression / size optimization is wasted effort.** The table fits anyway.
 - **Random-gather kernels (~30 ns per L3 hit) are the bottleneck**, not bandwidth (~30 GB/s of L2/L3 transfer).
 - **SIMD doesn't help random gathers**; only locality-improving layouts do.
 - **The right design objective is "what queries stay inside L3?"** not "how fast do you process bytes once L1-loaded?"
 
-The prior docs talk about throughput (GB/s) but never about cache tier. This doc fills that gap.
+When the working set is DRAM-bound (Postgres / MinIO / CDN regime):
+- **Compression matters** — saving 30% of a 3 GB embedding table saves 1 GB of RAM that's otherwise pageable.
+- **Streaming bandwidth dominates** at the DRAM tier (~30 GB/s/core); SIMD that doubles per-byte throughput halves wall time.
+- **NUMA-locality and prefetch matter** at the page granularity, not at the cache-line granularity.
+- **The right design objective is "minimize bytes touched per query"** — bit-packing, succinct DS, Roaring containers all pay direct dividends.
+
+The prior docs talk about throughput (GB/s) but never about cache tier. This doc fills that gap for both regimes.
 
 ## Hardware reference numbers
 
@@ -54,6 +65,54 @@ For an Ubuntu-rootfs-class image (130K paths, 228K extents, 2K vocab tokens):
 | 4-gram inverted index posting lists | varies | huge | hundreds of MB to GB | DRAM | |
 | Token streams (packed u11) | ~1.4 B/token | varies | MB to GB per image | DRAM / mmap | |
 | Extent payloads | varies | varies | GB-scale | mmap / NVMe | Cold-path on first read |
+
+## Other consumer cardinality regimes
+
+### Postgres extension scale
+
+For a Postgres database with 1M-100M-row tables:
+
+| Table | Per-entry | Cardinality | Total | Tier | Notes |
+|---|---|---|---|---|---|
+| GIN posting list (per indexed term) | varies | 100K-10M tids | 1-100 MB | L3-DRAM border | Roaring-style intersection bound |
+| pgvector embedding table | ~3 KB (~768D f32) | 100K-10M | 300 MB - 30 GB | DRAM | Vector distance scan |
+| BRIN summary | ~32 B per range | 1K-100K ranges | 32 KB - 3 MB | L1-L2 | Lookup pre-filter |
+| Bloom filter index | ~1 byte/element | per-page | 8 KB / page | L1 per probe | Membership test |
+
+**Implication:** Roaring set ops at Postgres scale are full streaming DRAM ops, not in-cache. Stream-VByte for column compression matters because tables don't fit RAM, period. Vector distance is bandwidth-bound on the DRAM streaming of vectors.
+
+### MinIO / object-store scale
+
+| Table | Per-entry | Cardinality | Total | Tier | Notes |
+|---|---|---|---|---|---|
+| Object metadata | ~256 B | 10M objects | 2.5 GB | DRAM | ~one-cache-line per probe |
+| Content-fingerprint table | 32 B (SHA-256) | 10M | 320 MB | DRAM | dedup pre-check |
+| Bloom filter for "exists" pre-check | 8-16 bits/key | 10M | 10-20 MB | L3 | sub-µs probe |
+| Per-tenant aggregate stats | ~64 B | 1K-10K tenants | < 1 MB | L1-L2 | hot |
+
+**Implication:** Bloom SIMD matters here in a way it doesn't at TokenFS scale. Postgres "exists" probes are a real consumer. MinIO bulk dedup queries also.
+
+### CDN edge scale
+
+| Table | Per-entry | Cardinality | Total | Tier | Notes |
+|---|---|---|---|---|---|
+| Per-edge cache directory | ~32 B | 10M entries | 320 MB | DRAM | per-request lookup |
+| MinHash sketches per object | 256 B | 10M | 2.5 GB | DRAM | similarity LSH |
+| Bloom for "have this object" | 1 byte/key | 10M | 10 MB | L3 | per-request pre-check |
+| Per-tenant LRU heads | ~8 B | 100K | < 1 MB | L1 | hot |
+
+**Implication:** the CDN-edge primitive set is **Bloom + MinHash + Roaring**, all of which we either have skeletal versions of (Bloom, MinHash) or are planning (Roaring SIMD). The deferral-trigger reframing in `20_DEFERRED.md` reflects this.
+
+### Build-time pipeline (TokenFS, MinIO, CDN edge ingest)
+
+| Workload | Per-extent compute | Total work for 200K extents |
+|---|---|---|
+| BLAKE3 over extent payloads (avg 4 KB) | ~1.3 µs scalar / ~0.4 µs AVX-512 | ~250 ms / ~80 ms |
+| SHA-256 with SHA-NI | ~1 µs | ~200 ms |
+| F22 fingerprint per block | ~1.4 µs (current AVX2) | ~280 ms |
+| Roaring-encode posting list | varies | 100s of ms |
+
+**Implication:** the build pipeline is the canonical "batched cryptographic hash" workload. The same 200K-Merkle-leaves shape applies in TokenFS (extents), MinIO (objects), and CDN ingest. Cross-consumer batch API.
 
 ## Implications for primitive design
 

@@ -263,3 +263,23 @@ Report:
 - Zhang et al., "FESIA: A Fast and SIMD-Efficient Set Intersection Approach on Modern CPUs", ICDE 2020.
 - Diez-Canas, "Faster-Than-Native Alternatives for x86 VP2INTERSECT Instructions", arXiv 2112.06342, 2021.
 - CRoaring AVX-512 gap list: https://github.com/RoaringBitmap/CRoaring/issues/454.
+
+## § 14 Environment fitness
+
+Per [`02b_DEPLOYMENT_MATRIX.md`](02b_DEPLOYMENT_MATRIX.md):
+
+| API | Kernel module | FUSE | Userspace | Postgres ext | cgo (Go) | Python (PyO3) |
+|---|---|---|---|---|---|---|
+| `BitmapContainer` AND/OR/XOR/ANDNOT in-place | ✅ 8 KB stack OK | ✅ | ✅ | ✅ | ✅ batched | ✅ |
+| `BitmapContainer::*_cardinality` | ✅ AVX-512 VPOPCNTQ is *the* kernel SIMD win | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `ArrayContainer` intersect (Schlegel pcmpistrm) | ✅ 16 B SIMD lanes; 256-entry shuffle table is rodata | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `ArrayContainer` allocating output | ⚠️ caller-provided output Vec | ✅ | ✅ | ⚠️ palloc-friendly variant | ✅ | ✅ |
+| `Container` enum dispatch | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `RunContainer` interval ops | ✅ scalar; small footprint | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+**Notes:**
+- Bitmap containers are 8 KB — fit on kernel stack but only just. Two-input ops total 16 KB temp; safe with caller-provided output (`out: &mut BitmapContainer`).
+- `intersect_vector16`'s 256-entry shuffle table is 4 KiB of static rodata — kernel-safe, fits L1.
+- The `_card`, `_nocard`, `_justcard` variants exist specifically because *most* boolean queries want cardinality without materializing the result (Postgres "EXISTS"-style queries, MinIO "is overlap nonempty"). All three variants are kernel-safe.
+- Postgres GIN bitmap-scan executor could consume these primitives directly; this is potentially the highest-leverage non-TokenFS adoption path.
+- AVX-512 VPOPCNTQ in kernel SIMD section: real ~10x win over AVX2 software popcount. The `kernel_fpu_begin` overhead is amortized over a typical 8 KB bitmap operation.

@@ -283,3 +283,21 @@ impl<'a> RankSelectDict<'a> {
 4. **`RankSelectDict` ownership**: should it own the bit slice or borrow? If it borrows, `tokenfs-paper` can mmap a sealed image's bit data and build the index over it. **Tentative: borrow (lifetime parameter); add `RankSelectDictOwned` wrapper if a consumer needs ownership.**
 
 5. **SVE/SVE2 backends**: NEON-equivalent kernels are written; SVE/SVE2 backends could vectorize-and-go on Graviton 3+. **Tentative: defer to v0.3 like other modules.**
+
+## § 7 Environment fitness
+
+Per [`02b_DEPLOYMENT_MATRIX.md`](02b_DEPLOYMENT_MATRIX.md):
+
+| API | Kernel module | FUSE | Userspace | Postgres ext | cgo (Go) | Python (PyO3) |
+|---|---|---|---|---|---|---|
+| `popcount_u64_slice` / `popcount_u8_slice` | ✅ | ✅ | ✅ | ✅ | ⚠️ wrap as batch | ✅ |
+| `BitPacker<W>::encode/decode` | ✅ | ✅ | ✅ | ✅ | ✅ batched | ✅ |
+| `streamvbyte_encode_u32` / `_decode_u32` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `RankSelectDict::build` | ⚠️ uses Vec — needs `kernel-alloc` flag | ✅ | ✅ | ⚠️ palloc-aware variant | ✅ | ✅ |
+| `RankSelectDict::rank1` / `select1` | ✅ once built | ✅ | ✅ | ✅ | ⚠️ batch wrapper | ✅ |
+
+**Notes:**
+- All kernels are stateless or operate on borrowed slices. The 4 KiB Stream-VByte shuffle table and 16 B popcount nibble LUT are static rodata.
+- `RankSelectDict::build` is the only allocating API; for kernel use, `tokenfs-algos` should expose a `build_into(bits, n_bits, out_superblocks: &mut Vec<u32>, out_blocks: &mut Vec<u16>)` variant where the caller provides the output Vec (Rust-for-Linux's flag-bearing Vec wrapper).
+- Single-element popcount via cgo has ~200 ns overhead per call vs ~few-ns kernel; **always wrap as batch (`popcount_u64_batch(slices: &[&[u64]])`) at the cgo boundary**.
+- Rank/select queries are individually sub-µs and fit any consumer. Build cost is one-shot — typically run by the writer/build-pipeline consumer (userspace), not the reader.

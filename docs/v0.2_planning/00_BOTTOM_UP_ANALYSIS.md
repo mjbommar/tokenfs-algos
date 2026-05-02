@@ -25,62 +25,115 @@ Current `FS_PRIMITIVES_GAP.md` ranks tier-1 primitives by "what fits in the v1 m
 
 **The critical observation:** for kernels operating on already-mapped data, **memory bandwidth is the wall, not compute.** SIMD helps because it amortizes per-byte instruction overhead, not because the kernel is compute-bound. The right design objective is **minimize bytes touched per logical query**, not "go fast on the bytes you do touch." The prior docs talk about throughput (GB/s) but never make bytes-touched-per-query first-class.
 
-## Layer 1 — what TokenFS actually moves
+## Layer 1 — what consumers actually move
 
-The data shapes from `tokenfs-paper/docs/data-structures.md`:
+The crate's named consumers (per `_references/README.md` and `AGENTS.md`) span multiple environments with different table cardinalities. See [`02b_DEPLOYMENT_MATRIX.md`](02b_DEPLOYMENT_MATRIX.md) for the full constraint matrix.
 
-1. **Extent payloads** — variable-length (1KB–1MB), content-addressed. Read pattern: "give me extent N's bytes." Cold-cache disk-bound; warm-cache mmap-bound.
-2. **Inode records** — fixed ~64B each, indexed by inode number. Read: "give me inode N." 
-3. **Path strings** — variable-length, in a giant FST or sorted block. Read: "is this path here, what's its inode?"
-4. **Token streams** — packed bit-fields of u11/u12/u16 token IDs per extent. Read: "scan tokens for n-gram match" or "decode tokens to bytes."
-5. **Fingerprints** — 32B/extent, F22 cluster signature. Read: "scan all fingerprints to find similar to this one."
-6. **Inverted-index posting lists** — sorted u32 extent IDs, Stream-VByte/Roaring encoded. Read: "intersect posting list of token A with posting list of token B."
+### Workload examples by consumer
 
-The **cardinalities** for an Ubuntu-rootfs class image (~130K paths, ~228K extents, ~2K vocab):
+#### TokenFS image reader (FUSE, kernel module, build pipeline)
 
-| Table | Cardinality × per-entry size | Total | Cache tier |
-|---|---|---|---|
-| Vocab table | ~2K × ~16B avg | ~32 KB | **L1** (32 KB) |
-| Inode table | ~130K × 64B | ~8 MB | **L2/L3** |
-| Extent metadata sidecar | ~228K × 32B | ~7 MB | **L2/L3** |
-| Fingerprint array (F22) | ~228K × 32B | ~7 MB | **L2/L3** |
-| **Hot metadata combined** | | **~22 MB** | **fits in 32 MB L3** |
-| Token n-gram inverted index | varies | MB-GB | DRAM |
-| Extent payloads | varies | GB | mmap / disk |
+Data shapes from `tokenfs-paper/docs/data-structures.md`:
 
-**The single most important fact in either prior doc, that neither states:** the entire hot-metadata working set fits in L3. A full metadata scan is ~10 ms warm. This means:
+1. **Extent payloads** — variable-length (1KB–1MB), content-addressed.
+2. **Inode records** — fixed ~64B each, indexed by inode number.
+3. **Path strings** — variable-length, in a giant FST or sorted block.
+4. **Token streams** — packed bit-fields of u11/u12/u16 token IDs per extent.
+5. **Fingerprints** — 32B/extent, F22 cluster signature.
+6. **Inverted-index posting lists** — sorted u32 extent IDs, Stream-VByte/Roaring encoded.
 
+#### Postgres extension consumer (pgvector-class, GIN-bitmap-class)
+
+1. **Index tuples** — 100M-1B rows × 16-32B index entries = GB-scale; never fits cache.
+2. **Bitmap-scan posting lists** — Roaring-encoded result sets; mid-scan sizes 100K-10M elements.
+3. **Vector embeddings** — pgvector-class, ~768D f32 ~3KB each; millions of rows.
+
+#### MinIO / Go service via cgo
+
+1. **Object metadata** — millions of objects × ~256B per metadata record = GB.
+2. **Content fingerprints** — N × 32B SHA-256 entries; dedup pre-checks via Bloom.
+3. **Cross-tenant analytics** — TB-scale aggregates.
+
+#### CDN edge cache
+
+1. **Per-edge cache directory** — ~10M entries at typical edge.
+2. **MinHash similarity sketches** — for cross-edge dedup; ~256B per object.
+3. **Bloom filter pre-checks** — sub-µs membership at request handling time.
+
+### Cardinality / cache-residency comparison
+
+| Workload | Hot working set | Cache tier (modern x86) |
+|---|---|---|
+| TokenFS-rootfs hot metadata (~130K paths, ~228K extents) | **~26 MB** | **L3** (fits in 32 MB) |
+| TokenFS-large image (10M extents) | ~640 MB | DRAM |
+| Postgres GIN bitmap-scan working set | 10s of MB to GB | L3-DRAM border |
+| Postgres pgvector ~768D × 1M embeddings | ~3 GB | DRAM |
+| MinIO metadata table (10M objects) | ~2.5 GB | DRAM |
+| CDN edge cache directory (10M entries × 32B) | ~320 MB | DRAM |
+
+**The TokenFS-image hot-metadata-fits-in-L3 fact** (the single most important observation that prior `data-structures.md` and `FS_PRIMITIVES_GAP.md` miss for TokenFS's typical scale) **does NOT generalize**. For Postgres-class or MinIO-class workloads, nothing fits in L3 and bandwidth dominates differently.
+
+For TokenFS specifically, this means:
 - "Save bytes in inode table" optimizations are wasted effort. The table fits anyway.
 - The right design pressure is **"what query patterns can be answered without leaving L3?"**
 - Random gathers within L3 cost ~30 ns each. SIMD doesn't help gathers; only locality does.
 
+For Postgres / MinIO / CDN-class consumers:
+- **Compression matters** — saving 30% of a 3 GB embedding table saves 1 GB of RAM that's otherwise pageable.
+- **Streaming bandwidth dominates** at the DRAM tier (~30 GB/s/core); SIMD that doubles per-byte throughput halves wall time.
+- **Locality permutations** still matter, but at a different granularity (page-level, not cache-line-level).
+
+The same primitives serve both regimes; the **bench harness should report numbers at multiple working-set sizes** (in-L1, in-L2, in-L3, in-DRAM) so consumers can pick the right operating point. See [`02_CACHE_RESIDENCY.md`](02_CACHE_RESIDENCY.md) for the bench-axis convention.
+
 ## Layer 2 — what queries bind on what primitive
 
-Two traffic patterns:
+Cross-consumer mapping: same primitive families tend to serve multiple consumer environments, but the bottleneck shape differs.
 
-**Hot path (FUSE-mounted runtime):**
+### TokenFS reader paths
+
+**Hot path (FUSE / kernel module runtime):**
 - `lookup(path) → inode` — Path FST traversal in `fst` crate. Already optimized. Nothing for `tokenfs-algos` to do.
 - `read(inode, offset, length) → bytes` — inode lookup + extent map binary search + payload mmap. Cache-miss-bound (~3-5 misses warm, ~80 ns each = ~few µs). Pure compute primitives don't help. **Layout primitives** (CSR co-location, locality-improving permutations) help.
 
-**Cold path (analytics / AI ingestion):**
-- `intersect token A AND token B posting lists` — Roaring container ops on bitmap×bitmap, array×array, array×bitmap pairs. **THIS is where SIMD pays off.** Documented 30-60 GB/s on AVX-512 for dense intersections.
-- `decode tokens for extent` — bit-unpack u11/u12 packed stream. Every read of a tokenized extent runs this. Throughput dictates whether tokens are a fast or slow path.
-- `find files like X` (MinHash brute force) — N × hash budget. SIMD MinHash 5-10 GB/s on AVX-512.
-- `verify image Merkle root` — hash all 200K extent leaves. Batched BLAKE3 wrapper unblocks this.
+**Cold path (analytics / AI ingestion / build pipeline):**
+- `intersect token A AND token B posting lists` — Roaring container ops on bitmap×bitmap, array×array, array×bitmap pairs.
+- `decode tokens for extent` — bit-unpack u11/u12 packed stream.
+- `find files like X` — MinHash brute force OR vector distance over fingerprints.
+- `verify image Merkle root` — hash all 200K extent leaves.
 - `is content fingerprint Y in this image?` — Bloom pre-check, then content-addressed table lookup.
 
-| Workload | Real bottleneck | Right primitive |
-|---|---|---|
-| `read(inode, off)` warm | log-N cache misses through extent map | Layout (CSR co-loc) — *not* SIMD |
-| `read(inode, off)` cold | page faults (~80 µs) | Prefetch — *not* SIMD |
-| `lookup(path)` | FST traversal in `fst` crate | *Nothing for us to add* |
-| Build-time Merkle | hashing 200K small extents | **Batched BLAKE3** |
-| Build-time CAS dedup | SHA-256 over extent payloads | **Batched SHA-256** |
-| Analytics: posting list intersect | Roaring container ops | **Roaring SIMD** |
-| Analytics: posting list payload | Stream-VByte decode | **Stream-VByte SIMD** |
-| Analytics: token decode for scan | bit-unpack u11/u12 stream | **Bit-pack/unpack SIMD** |
-| Analytics: similarity rank | dot / L2 / cosine over fingerprints | **Dense vector distances** |
-| Analytics: vocab lookup | hash-set membership in 2K entries | **Hash-set membership SIMD** |
+### Postgres extension paths
+
+- `bitmap_scan(index)` predicate — Roaring-style intersection of two posting lists per WHERE clause.
+- `pgvector(query, k)` ANN search — vector distance kernel applied to N database vectors.
+- `bloom_index_check(value)` — Bloom membership pre-check before heap scan.
+- `approx_count_distinct(column)` — HyperLogLog merge across partitions.
+
+### MinIO/CDN paths
+
+- `is_duplicate(content_hash)` — Bloom pre-check then content-addressed lookup.
+- `find_similar(object)` — MinHash-LSH band-and-hash, vector distance for re-rank.
+- `verify_etag(content)` — batched SHA-256 / BLAKE3.
+- `dedup_metadata` — Roaring set intersection on per-tenant fingerprint sets.
+
+### Workload → primitive mapping
+
+| Workload | Real bottleneck | Right primitive | Consumers |
+|---|---|---|---|
+| `read(inode, off)` warm | log-N cache misses through extent map | Layout (CSR co-loc) — *not* SIMD | TokenFS |
+| `read(inode, off)` cold | page faults (~80 µs) | Prefetch — *not* SIMD | TokenFS |
+| `lookup(path)` | FST traversal in `fst` crate | *Nothing for us to add* | TokenFS |
+| Build-time Merkle | hashing N small extents | **Batched BLAKE3 / SHA-256** | TokenFS, MinIO, CDN |
+| Build-time CAS dedup | SHA-256 over payloads | **Batched SHA-256** | TokenFS, MinIO |
+| Posting-list intersect | Roaring container ops | **Roaring SIMD** | TokenFS, Postgres, MinIO |
+| Posting-list payload | Stream-VByte decode | **Stream-VByte SIMD** | TokenFS, Postgres, columnar DBs |
+| Token decode for scan | bit-unpack u11/u12 stream | **Bit-pack/unpack SIMD** | TokenFS, columnar DBs |
+| Similarity rank | dot / L2 / cosine over vectors | **Dense vector distances** | TokenFS, Postgres pgvector, MinIO, CDN |
+| Vocab/set lookup | hash-set membership | **Hash-set membership SIMD** | TokenFS, Postgres, all CASes |
+| Image-build layout | min-bandwidth permutation | **`permutation` (RCM/Rabbit/Hilbert)** | TokenFS only (build-time) |
+| Bloom pre-check | per-element bit-test | **Bloom SIMD** (deferred — see `20_DEFERRED.md`) | Postgres, MinIO, CDN |
+| Approx distinct rollup | HLL merge | **HyperLogLog SIMD merge** (deferred) | Postgres, OLAP DBs |
+| MinHash signature | windowed hash | **MinHash SIMD** (deferred) | TokenFS, CDN edge dedup |
 
 ## Layer 3 — what the prior docs got wrong
 
@@ -90,12 +143,13 @@ Two traffic patterns:
 2. **Path FST listed Tier-1 #2 with "None we should build."** Don't list non-work as work.
 3. **Tier 1 mixes structures (F22, Path FST, CSR adjacency) with primitives (Roaring, CHD).** Inconsistent abstraction level. Bottom-up: only primitives belong in `tokenfs-algos`'s queue. Structures are `tokenfs-paper` compositions.
 4. **Stream-VByte and bit-unpack listed as dependencies of #3 but not as Tier-1 work themselves.** They're foundational for *three* unrelated consumers (posting lists, token streams, succinct DS). Move to Tier-A.
-5. **Dense vector distance kernels ranked Tier 3 "for HNSW".** They're the inner loop of *any* vector similarity work — MinHash signature distance, F22 fingerprint comparison, brute-force ANN. Universal kernel mis-classified as speculative.
+5. **Dense vector distance kernels ranked Tier 3 "for HNSW".** They're the inner loop of *any* vector similarity work — MinHash signature distance, F22 fingerprint comparison, brute-force ANN, **and Postgres pgvector**. Universal kernel mis-classified as speculative.
 6. **`xxhash3 / wyhash SIMD` listed v0.2.** Premature. Current FNV/CRC32C path hasn't shown a throughput problem in any documented bench. Don't add a hash family without a documented bottleneck.
-7. **Cache-residency analysis missing entirely.** The single most important design pressure for a 22 MB working set isn't mentioned.
+7. **Cache-residency analysis missing entirely.** The single most important design pressure for the 22 MB TokenFS working set isn't mentioned. Multi-consumer cache regimes aren't either.
 8. **Physical-layout / permutation primitives missing.** TokenFS's read-only nature unlocks "given similarity graph + dedup hypergraph, emit inode ordering that minimizes spatial random access." This is pure-compute over u32/u64 arrays — clean `tokenfs-algos` material. **Not in either prior doc.** Adding `permutation` module here.
 9. **Token-decoder throughput barely mentioned.** Every read of a tokenized extent runs the decoder. If decoder is 1 GB/s vs raw bytes at 30 GB/s, tokens are a slow path. The SIMD primitives that make decode fast (bit-unpack, table-lookup gather) are universal `tokenfs-algos` material — but `FS_PRIMITIVES_GAP.md` puts decode in `bbpe`'s lap and never asks what primitives make it fast.
-10. **HNSW for 6-D fingerprints stays on the list** even though `data-structures.md` open question #5 admits this is unjustified at our scale. Cut.
+10. **HNSW for 6-D fingerprints stays on the list** even though `data-structures.md` open question #5 admits this is unjustified at our scale. Cut. (Reconsider for Postgres pgvector consumers separately — different scale.)
+11. **Multi-consumer constraints missing.** No mention of kernel module / FUSE / Postgres / cgo deployment differences. The `blake3_batch` spec used `rayon`, which is forbidden in kernel modules. Caller-provided-scratch pattern (§77 lesson) needed across more APIs than I initially called out. See [`02b_DEPLOYMENT_MATRIX.md`](02b_DEPLOYMENT_MATRIX.md).
 
 ## Layer 4 — corrected ranking
 
@@ -130,6 +184,12 @@ See [`20_DEFERRED.md`](20_DEFERRED.md). Items: wavelet tree, FM-index, HNSW, vec
 
 ## What this means for v0.2
 
-The v0.2 ship target becomes: **`bits` + `bitmap` + batched-hash + `vector` + `permutation`**, in roughly that dependency order (see `01_PHASES.md`). This is 5 modules' worth of work, not 14. Each module has a small enough surface to land cleanly in 1-2 weeks of focused implementation; together they unblock essentially every Tier-1 + Tier-2 structure in the v1 manifest layout.
+The v0.2 ship target becomes: **`bits` + `bitmap` + batched-hash + `vector` + `permutation`**, in roughly that dependency order (see `01_PHASES.md`). This is 5 modules' worth of work, not 14. Each module has a small enough surface to land cleanly in 1-2 weeks of focused implementation; together they:
+- Unblock essentially every Tier-1 + Tier-2 structure in the v1 TokenFS manifest layout.
+- Provide a Roaring-SIMD path that's the missing piece for both TokenFS analytics AND Postgres GIN-bitmap-scan extension consumers.
+- Provide vector-distance kernels that are pgvector-equivalent (and could become an upstream contribution).
+- Provide batched cryptographic hash that fits both TokenFS Merkle and MinIO/CDN content-addressing.
 
-Tier C items wait for documented consumer demand. Tier D items wait for a documented bottleneck. This is the discipline that keeps the crate's surface area aligned with what the consumers actually bind on, instead of growing speculatively.
+Each module spec ends with an "Environment fitness" section per `02b_DEPLOYMENT_MATRIX.md`, calling out which APIs are kernel-safe, which require std/rayon, and which are inherently userspace.
+
+Tier C items wait for documented consumer demand from **any** environment (not just TokenFS). Tier D items wait for a documented bottleneck. This is the discipline that keeps the crate's surface area aligned with what consumers actually bind on, instead of growing speculatively.
