@@ -557,8 +557,37 @@ where
     let mut current_run = 0_usize;
     let mut rl_bytes = 0_u32;
 
+    // F22 extents are scanned block-at-a-time downstream (see
+    // BLOCK_SIZE = 256). Fetch the next block while we're still
+    // computing the histogram and run-length state for the current
+    // one. The hint never dereferences and is a no-op-cost when the
+    // address would step past the end of the input.
+    //
+    // Only enabled for extents larger than the L2 fast path; below
+    // that the HW streamer keeps up and the per-line branch + prefetch
+    // op becomes overhead. 64 KiB matches the F22 EXTENT_HASH_EXACT
+    // boundary, so the larger sampled-H4 path is the one that runs
+    // with prefetch and the small exact path stays untouched.
+    const PREFETCH_AHEAD_BYTES: usize = BLOCK_SIZE;
+    let prefetch_enable = bytes.len() >= EXTENT_HASH_EXACT_MAX_BYTES;
+    let bytes_ptr = bytes.as_ptr();
+    let bytes_len = bytes.len();
+
     for (index, &byte) in bytes.iter().enumerate() {
         histogram[byte as usize] += 1;
+
+        // One prefetch per cache line ahead of the read cursor. Skip
+        // when there isn't a full block beyond the current point or
+        // the input is too small to benefit.
+        if prefetch_enable && index % 64 == 0 && index + PREFETCH_AHEAD_BYTES < bytes_len {
+            // SAFETY: bound checked above; prefetch hint never
+            // dereferences the address.
+            unsafe {
+                crate::primitives::prefetch::prefetch_t0(
+                    bytes_ptr.add(index + PREFETCH_AHEAD_BYTES),
+                );
+            }
+        }
 
         if index == 0 || byte == current_byte {
             current_byte = byte;

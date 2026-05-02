@@ -559,12 +559,44 @@ pub mod avx2 {
         debug_assert_eq!(a.len(), b.len());
         let mut acc = _mm256_setzero_ps();
         let mut i = 0;
+
+        // Prefetch lookahead: 256 bytes (64 f32 lanes) places the
+        // prefetch window roughly one L1 fill latency ahead of the
+        // FMA. We only fire prefetches when the input is large enough
+        // to outrun the L1 streamer (about 8 KiB on a 12th-gen Intel
+        // Core), and only every 4 iterations to avoid saturating the
+        // load-store unit. Inside the gate, the prefetch is two
+        // independent lines per fire (one per input stream).
+        const PREFETCH_AHEAD_FLOATS: usize = 64;
+        const PREFETCH_GROUP_ITERS: usize = 4;
+        // Threshold tuned on a 12th-gen Intel: below ~64 KiB the L1
+        // streamer alone keeps up with the FMA, and the prefetch
+        // overhead becomes a net loss. See bench_compare's
+        // similarity-dot-f32 row for the cross-over data.
+        let prefetch_enable = a.len() >= 16_384;
+
+        let mut iter_index = 0_usize;
         while i + LANES_F32 <= a.len() {
             // SAFETY: bounds checked.
             let va = unsafe { _mm256_loadu_ps(a.as_ptr().add(i)) };
             let vb = unsafe { _mm256_loadu_ps(b.as_ptr().add(i)) };
+            if prefetch_enable
+                && iter_index.is_multiple_of(PREFETCH_GROUP_ITERS)
+                && i + LANES_F32 + PREFETCH_AHEAD_FLOATS <= a.len()
+            {
+                // SAFETY: bound-checked above; prefetch is hint-only.
+                unsafe {
+                    crate::primitives::prefetch::prefetch_t0(
+                        a.as_ptr().add(i + PREFETCH_AHEAD_FLOATS).cast::<u8>(),
+                    );
+                    crate::primitives::prefetch::prefetch_t0(
+                        b.as_ptr().add(i + PREFETCH_AHEAD_FLOATS).cast::<u8>(),
+                    );
+                }
+            }
             acc = _mm256_fmadd_ps(va, vb, acc);
             i += LANES_F32;
+            iter_index += 1;
         }
         // SAFETY: AVX2 enabled.
         let total = unsafe { hadd_f32x8(acc) };

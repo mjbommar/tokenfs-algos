@@ -18,6 +18,19 @@ fn main() {
         format_bytes(profile.cache.l2_bytes),
         format_bytes(profile.cache.l3_bytes),
     );
+    println!(
+        "  accelerators: amx_tile={} amx_int8={} amx_bf16={} sme={} sme2={}",
+        profile.accelerators.amx_tile,
+        profile.accelerators.amx_int8,
+        profile.accelerators.amx_bf16,
+        profile.accelerators.sme,
+        profile.accelerators.sme2,
+    );
+    println!(
+        "    summary: any_amx={} any_sme={}",
+        profile.accelerators.has_any_amx(),
+        profile.accelerators.has_any_sme(),
+    );
     println!();
 
     println!("histogram kernel catalog");
