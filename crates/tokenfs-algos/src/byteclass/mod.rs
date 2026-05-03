@@ -161,153 +161,26 @@ pub mod kernels {
     }
 
     /// Portable scalar byte-class classifier.
-    pub mod scalar {
-        use crate::byteclass::{ByteClassCounts, Utf8Validation};
-
-        /// Counts coarse byte classes in one scalar pass.
-        #[must_use]
-        pub fn classify(bytes: &[u8]) -> ByteClassCounts {
-            let mut counts = ByteClassCounts::default();
-            add(bytes, &mut counts);
-            counts
-        }
-
-        pub(super) fn add(bytes: &[u8], counts: &mut ByteClassCounts) {
-            for &byte in bytes {
-                match byte {
-                    b'\t' | b'\n' | b'\r' | b' ' => counts.whitespace += 1,
-                    0x20..=0x7e => counts.printable_ascii += 1,
-                    0x00..=0x1f | 0x7f => counts.control += 1,
-                    0x80..=0xff => counts.high_bit += 1,
-                }
-            }
-        }
-
-        /// Validates UTF-8 with the scalar reference path.
-        #[must_use]
-        pub fn validate_utf8(bytes: &[u8]) -> Utf8Validation {
-            match core::str::from_utf8(bytes) {
-                Ok(_) => Utf8Validation {
-                    valid: true,
-                    valid_up_to: bytes.len(),
-                    error_len: 0,
-                },
-                Err(error) => Utf8Validation {
-                    valid: false,
-                    valid_up_to: error.valid_up_to(),
-                    error_len: error.error_len().unwrap_or(0) as u8,
-                },
-            }
-        }
-    }
+    #[cfg(feature = "arch-pinned-kernels")]
+    pub mod scalar;
+    #[cfg(not(feature = "arch-pinned-kernels"))]
+    #[allow(dead_code, unreachable_pub)]
+    pub(crate) mod scalar;
 
     /// AVX2 byte-class classifier.
-    #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
-    pub mod avx2 {
-        use super::scalar;
-        use crate::byteclass::ByteClassCounts;
-
-        #[cfg(target_arch = "x86")]
-        use core::arch::x86::{
-            __m256i, _mm256_cmpeq_epi8, _mm256_cmpgt_epi8, _mm256_loadu_si256,
-            _mm256_movemask_epi8, _mm256_set1_epi8,
-        };
-        #[cfg(target_arch = "x86_64")]
-        use core::arch::x86_64::{
-            __m256i, _mm256_cmpeq_epi8, _mm256_cmpgt_epi8, _mm256_loadu_si256,
-            _mm256_movemask_epi8, _mm256_set1_epi8,
-        };
-
-        const LANES: usize = 32;
-
-        /// Returns true when AVX2 is available at runtime.
-        #[cfg(feature = "std")]
-        #[must_use]
-        pub fn is_available() -> bool {
-            std::is_x86_feature_detected!("avx2")
-        }
-
-        /// Returns true when AVX2 is available at runtime.
-        #[cfg(not(feature = "std"))]
-        #[must_use]
-        pub const fn is_available() -> bool {
-            false
-        }
-
-        /// Counts coarse byte classes with AVX2.
-        ///
-        /// # Safety
-        ///
-        /// The caller must ensure the current CPU supports AVX2.
-        #[target_feature(enable = "avx2")]
-        #[must_use]
-        pub unsafe fn classify(bytes: &[u8]) -> ByteClassCounts {
-            let mut counts = ByteClassCounts::default();
-            let mut index = 0;
-
-            let space = _mm256_set1_epi8(b' ' as i8);
-            let tab = _mm256_set1_epi8(b'\t' as i8);
-            let newline = _mm256_set1_epi8(b'\n' as i8);
-            let carriage_return = _mm256_set1_epi8(b'\r' as i8);
-            let delete = _mm256_set1_epi8(0x7f_i8);
-
-            while index + LANES <= bytes.len() {
-                let chunk =
-                    unsafe { _mm256_loadu_si256(bytes.as_ptr().add(index).cast::<__m256i>()) };
-
-                let high_bit_mask = _mm256_movemask_epi8(chunk) as u32;
-                let low_control_mask =
-                    (_mm256_movemask_epi8(_mm256_cmpgt_epi8(space, chunk)) as u32) & !high_bit_mask;
-                let space_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, space)) as u32;
-                let whitespace_mask = space_mask
-                    | (_mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, tab)) as u32)
-                    | (_mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, newline)) as u32)
-                    | (_mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, carriage_return)) as u32);
-                let delete_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, delete)) as u32;
-                let control_mask = (low_control_mask | delete_mask) & !whitespace_mask;
-                let printable_mask = !(high_bit_mask | low_control_mask | delete_mask | space_mask);
-
-                counts.high_bit += u64::from(high_bit_mask.count_ones());
-                counts.whitespace += u64::from(whitespace_mask.count_ones());
-                counts.control += u64::from(control_mask.count_ones());
-                counts.printable_ascii += u64::from(printable_mask.count_ones());
-
-                index += LANES;
-            }
-
-            scalar::add(&bytes[index..], &mut counts);
-            counts
-        }
-
-        /// Validates UTF-8 with the AVX2 Keiser-Lemire 3-pshufb DFA.
-        ///
-        /// Returns the same triple as [`super::scalar::validate_utf8`] /
-        /// `core::str::from_utf8`. On detected error, falls back to scalar
-        /// diagnosis to recover precise `valid_up_to` and `error_len`.
-        ///
-        /// # When this wins (and when it doesn't)
-        ///
-        /// On valid UTF-8 text at multi-KiB lengths this is roughly 2× the
-        /// scalar `core::str::from_utf8` path (measured ~134 GiB/s vs ~61
-        /// GiB/s on a 1 MiB text fixture). On inputs whose very first bytes
-        /// are invalid UTF-8 (e.g. random binary), the scalar path is
-        /// faster because it bails on the first illegal byte; this kernel
-        /// must run a full 64-byte SIMD chunk before falling back to scalar
-        /// for precise diagnosis. Callers that already know the input is
-        /// likely binary should call [`super::scalar::validate_utf8`]
-        /// directly.
-        ///
-        /// # Safety
-        ///
-        /// The caller must ensure the current CPU supports AVX2.
-        #[target_feature(enable = "avx2")]
-        #[must_use]
-        pub unsafe fn validate_utf8(bytes: &[u8]) -> crate::byteclass::Utf8Validation {
-            // SAFETY: `target_feature(enable = "avx2")` propagates the AVX2
-            // requirement to the inner module-level entry point.
-            unsafe { crate::byteclass::utf8_avx2::validate_utf8(bytes) }
-        }
-    }
+    #[cfg(all(
+        feature = "arch-pinned-kernels",
+        feature = "avx2",
+        any(target_arch = "x86", target_arch = "x86_64")
+    ))]
+    pub mod avx2;
+    #[cfg(all(
+        not(feature = "arch-pinned-kernels"),
+        feature = "avx2",
+        any(target_arch = "x86", target_arch = "x86_64")
+    ))]
+    #[allow(dead_code, unreachable_pub)]
+    pub(crate) mod avx2;
 
     /// AVX-512BW byte-class classifier.
     ///
@@ -315,109 +188,19 @@ pub mod kernels {
     /// and uses native `__mmask64`-returning compare intrinsics
     /// (`_mm512_cmpeq_epi8_mask`, `_mm512_cmplt_epi8_mask`) instead of
     /// `movemask`. Per-class counts come straight from `mask.count_ones()`.
-    #[cfg(all(feature = "avx512", any(target_arch = "x86", target_arch = "x86_64")))]
-    pub mod avx512 {
-        use super::scalar;
-        use crate::byteclass::ByteClassCounts;
-
-        #[cfg(target_arch = "x86")]
-        use core::arch::x86::{
-            __m512i, _mm512_cmpeq_epi8_mask, _mm512_cmplt_epi8_mask, _mm512_loadu_si512,
-            _mm512_movepi8_mask, _mm512_set1_epi8,
-        };
-        #[cfg(target_arch = "x86_64")]
-        use core::arch::x86_64::{
-            __m512i, _mm512_cmpeq_epi8_mask, _mm512_cmplt_epi8_mask, _mm512_loadu_si512,
-            _mm512_movepi8_mask, _mm512_set1_epi8,
-        };
-
-        const LANES: usize = 64;
-
-        /// Returns true when AVX-512BW is available at runtime.
-        #[cfg(feature = "std")]
-        #[must_use]
-        pub fn is_available() -> bool {
-            std::is_x86_feature_detected!("avx512bw")
-        }
-
-        /// Returns true when AVX-512BW is available at runtime.
-        #[cfg(not(feature = "std"))]
-        #[must_use]
-        pub const fn is_available() -> bool {
-            false
-        }
-
-        /// Counts coarse byte classes with AVX-512BW.
-        ///
-        /// # Safety
-        ///
-        /// The caller must ensure the current CPU supports AVX-512BW.
-        #[target_feature(enable = "avx512bw")]
-        #[must_use]
-        #[allow(clippy::cast_possible_wrap)]
-        pub unsafe fn classify(bytes: &[u8]) -> ByteClassCounts {
-            let mut counts = ByteClassCounts::default();
-            let mut index = 0;
-
-            let space = _mm512_set1_epi8(b' ' as i8);
-            let tab = _mm512_set1_epi8(b'\t' as i8);
-            let newline = _mm512_set1_epi8(b'\n' as i8);
-            let carriage_return = _mm512_set1_epi8(b'\r' as i8);
-            let delete = _mm512_set1_epi8(0x7f_i8);
-
-            while index + LANES <= bytes.len() {
-                // SAFETY: `index + 64 <= bytes.len()`; AVX-512BW enabled.
-                let chunk =
-                    unsafe { _mm512_loadu_si512(bytes.as_ptr().add(index).cast::<__m512i>()) };
-
-                // High bit: extract sign bits — equivalent to AVX2's
-                // `_mm256_movemask_epi8` but as a 64-bit mask.
-                let high_bit_mask = _mm512_movepi8_mask(chunk);
-                // `cmplt(space, chunk)` ⇒ `chunk < space` ⇒ low ASCII
-                // controls. Mask off bytes whose high bit is set so we
-                // only see 0x00..0x1f (the AVX2 path uses `cmpgt(space,
-                // chunk)`; both treat bytes as signed but high-bit bytes
-                // appear as negative, so they wrap into "less than" any
-                // small positive byte and are rejected via the AND).
-                let low_control_mask = _mm512_cmplt_epi8_mask(chunk, space) & !high_bit_mask;
-                let space_mask = _mm512_cmpeq_epi8_mask(chunk, space);
-                let whitespace_mask = space_mask
-                    | _mm512_cmpeq_epi8_mask(chunk, tab)
-                    | _mm512_cmpeq_epi8_mask(chunk, newline)
-                    | _mm512_cmpeq_epi8_mask(chunk, carriage_return);
-                let delete_mask = _mm512_cmpeq_epi8_mask(chunk, delete);
-                let control_mask = (low_control_mask | delete_mask) & !whitespace_mask;
-                let printable_mask = !(high_bit_mask | low_control_mask | delete_mask | space_mask);
-
-                counts.high_bit += u64::from(high_bit_mask.count_ones());
-                counts.whitespace += u64::from(whitespace_mask.count_ones());
-                counts.control += u64::from(control_mask.count_ones());
-                counts.printable_ascii += u64::from(printable_mask.count_ones());
-
-                index += LANES;
-            }
-
-            scalar::add(&bytes[index..], &mut counts);
-            counts
-        }
-
-        /// Validates UTF-8 with the AVX-512BW Keiser-Lemire 3-pshufb DFA.
-        ///
-        /// Returns the same triple as [`super::scalar::validate_utf8`] /
-        /// `core::str::from_utf8`. On detected error, falls back to scalar
-        /// diagnosis to recover precise `valid_up_to` and `error_len`.
-        ///
-        /// # Safety
-        ///
-        /// The caller must ensure the current CPU supports AVX-512BW.
-        #[target_feature(enable = "avx512bw")]
-        #[must_use]
-        pub unsafe fn validate_utf8(bytes: &[u8]) -> crate::byteclass::Utf8Validation {
-            // SAFETY: `target_feature(enable = "avx512bw")` propagates the
-            // AVX-512BW requirement to the inner module-level entry point.
-            unsafe { crate::byteclass::utf8_avx512::validate_utf8(bytes) }
-        }
-    }
+    #[cfg(all(
+        feature = "arch-pinned-kernels",
+        feature = "avx512",
+        any(target_arch = "x86", target_arch = "x86_64")
+    ))]
+    pub mod avx512;
+    #[cfg(all(
+        not(feature = "arch-pinned-kernels"),
+        feature = "avx512",
+        any(target_arch = "x86", target_arch = "x86_64")
+    ))]
+    #[allow(dead_code, unreachable_pub)]
+    pub(crate) mod avx512;
 
     /// Permutation-LUT byte classifier built on AVX-512 VBMI.
     ///
@@ -455,223 +238,19 @@ pub mod kernels {
     /// `0..16`. That makes it suitable for ad-hoc classifiers (URL-safe
     /// bytes, hex digits, base64 alphabets, JSON structural characters,
     /// etc.) without writing bespoke kernels for each.
-    #[cfg(all(feature = "avx512", any(target_arch = "x86", target_arch = "x86_64")))]
-    pub mod avx512_vbmi {
-        use crate::byteclass::ByteClassCounts;
-
-        #[cfg(target_arch = "x86")]
-        use core::arch::x86::{
-            __m512i, _mm512_cmpeq_epi8_mask, _mm512_loadu_si512, _mm512_mask_blend_epi8,
-            _mm512_movepi8_mask, _mm512_permutex2var_epi8, _mm512_set1_epi8,
-        };
-        #[cfg(target_arch = "x86_64")]
-        use core::arch::x86_64::{
-            __m512i, _mm512_cmpeq_epi8_mask, _mm512_loadu_si512, _mm512_mask_blend_epi8,
-            _mm512_movepi8_mask, _mm512_permutex2var_epi8, _mm512_set1_epi8,
-        };
-
-        const LANES: usize = 64;
-
-        /// Maximum number of distinct class IDs supported by the LUT
-        /// kernels. Class IDs in tables passed to [`classify_with_lut`]
-        /// must be in `0..MAX_CLASSES`.
-        pub const MAX_CLASSES: usize = 16;
-
-        /// Returns true when AVX-512 VBMI is available at runtime.
-        ///
-        /// VBMI is **not** implied by AVX-512BW. AMD Zen 4 has BW but not
-        /// VBMI; Intel Ice Lake and later do.
-        #[cfg(feature = "std")]
-        #[must_use]
-        pub fn is_available() -> bool {
-            // VBMI is the precondition for `_mm512_permutex2var_epi8`
-            // (`vpermi2b`); BW is required for the per-class compare-mask
-            // intrinsics; the F base is implied by both.
-            std::is_x86_feature_detected!("avx512vbmi") && std::is_x86_feature_detected!("avx512bw")
-        }
-
-        /// Returns true when AVX-512 VBMI is available at runtime.
-        #[cfg(not(feature = "std"))]
-        #[must_use]
-        pub const fn is_available() -> bool {
-            false
-        }
-
-        /// Loads a contiguous 64-byte slice into an `__m512i`.
-        ///
-        /// # Safety
-        ///
-        /// Requires AVX-512 VBMI (and implicitly BW + F). `src` must be
-        /// readable for at least 64 bytes.
-        #[target_feature(enable = "avx512vbmi,avx512bw")]
-        #[inline]
-        unsafe fn load_table_chunk(src: &[u8; 64]) -> __m512i {
-            // SAFETY: `src` is a 64-byte array, which is the exact input
-            // width of `_mm512_loadu_si512`.
-            unsafe { _mm512_loadu_si512(src.as_ptr().cast::<__m512i>()) }
-        }
-
-        /// Counts coarse byte classes against an arbitrary `[u8; 256]`
-        /// class-index table.
-        ///
-        /// `class_table[b]` is the class index assigned to byte value `b`.
-        /// Indices must be in `0..MAX_CLASSES`. The returned array is
-        /// indexed by class: `counts[c]` is the number of input bytes that
-        /// mapped to class `c`. Entries beyond the maximum class index
-        /// used by the table remain zero.
-        ///
-        /// # Algorithm
-        ///
-        /// 1. The 256-byte `class_table` is split into four 64-byte halves.
-        ///    The first two form the "low" pair (covering byte values
-        ///    `0x00..0x7F`); the last two form the "high" pair (covering
-        ///    `0x80..0xFF`).
-        /// 2. For each 64-byte input chunk:
-        ///    * `lo = vpermi2b(chunk, low_pair)` — looks up `chunk[i]` for
-        ///      bytes in `0x00..0x7F`. `vpermi2b` ignores the high bit of
-        ///      its index, so this also produces a (wrong) value for bytes
-        ///      `0x80..0xFF`.
-        ///    * `hi = vpermi2b(chunk, high_pair)` — same shape, with the
-        ///      high half of the table.
-        ///    * `mask = movepi8_mask(chunk)` — high-bit-of-each-lane.
-        ///    * `classes = mask_blend(mask, lo, hi)` — picks `hi` where
-        ///      the input byte's high bit is set, `lo` otherwise.
-        /// 3. For each class `c` in `0..MAX_CLASSES`:
-        ///    `counts[c] += popcnt(cmpeq_mask(classes, splat(c)))`.
-        ///
-        /// The trailing tail (`bytes.len() % 64`) is handled by a scalar
-        /// loop against the same table.
-        ///
-        /// # Safety
-        ///
-        /// The caller must ensure the current CPU supports AVX-512 VBMI
-        /// (see [`is_available`]). Entries of `class_table` that are
-        /// `>= MAX_CLASSES` are silently discarded (the per-class
-        /// `cmpeq` loop only matches indices `0..MAX_CLASSES`); the
-        /// returned counts therefore may not sum to `bytes.len()` if
-        /// out-of-range entries were used.
-        #[target_feature(enable = "avx512vbmi,avx512bw")]
-        #[must_use]
-        #[allow(clippy::cast_possible_wrap)]
-        pub unsafe fn classify_with_lut(
-            bytes: &[u8],
-            class_table: &[u8; 256],
-        ) -> [u64; MAX_CLASSES] {
-            let mut counts = [0_u64; MAX_CLASSES];
-
-            // Pre-load the four 64-byte table halves once. The four
-            // sub-slices each have length exactly 64; the `try_into`
-            // calls into `&[u8; 64]` cannot fail. We use
-            // `unwrap_unchecked` to avoid a panic branch that the
-            // compiler might otherwise leave around the inlined loads.
-            //
-            // SAFETY: each of `[0..64]`, `[64..128]`, `[128..192]`,
-            // `[192..256]` slices a length-256 array at length-64
-            // strides, so the conversion to `&[u8; 64]` always
-            // succeeds. `load_table_chunk` requires `avx512vbmi+bw`,
-            // which is asserted by this function's `target_feature`.
-            let t0_arr: &[u8; 64] = unsafe { (&class_table[0..64]).try_into().unwrap_unchecked() };
-            let t1_arr: &[u8; 64] =
-                unsafe { (&class_table[64..128]).try_into().unwrap_unchecked() };
-            let t2_arr: &[u8; 64] =
-                unsafe { (&class_table[128..192]).try_into().unwrap_unchecked() };
-            let t3_arr: &[u8; 64] =
-                unsafe { (&class_table[192..256]).try_into().unwrap_unchecked() };
-            // SAFETY: target_feature(enable = "avx512vbmi,avx512bw")
-            // propagates to the helper.
-            let (t0, t1, t2, t3) = unsafe {
-                (
-                    load_table_chunk(t0_arr),
-                    load_table_chunk(t1_arr),
-                    load_table_chunk(t2_arr),
-                    load_table_chunk(t3_arr),
-                )
-            };
-
-            // Splat constants for each candidate class index.
-            // `_mm512_set1_epi8` is a safe-to-call `pub fn` when the
-            // enclosing function has `target_feature(enable = "avx512bw")`,
-            // which `target_feature(enable = "avx512vbmi,avx512bw")` does.
-            let class_splats: [__m512i; MAX_CLASSES] =
-                core::array::from_fn(|i| _mm512_set1_epi8(i as i8));
-
-            let mut index = 0;
-            while index + LANES <= bytes.len() {
-                // SAFETY: `index + 64 <= bytes.len()`; the unaligned 64-byte
-                // load reads from `bytes` which the bounds check above
-                // proves is in range.
-                let chunk =
-                    unsafe { _mm512_loadu_si512(bytes.as_ptr().add(index).cast::<__m512i>()) };
-
-                // Two LUT halves; blend by high-bit of each input byte.
-                // All four intrinsics are safe to call under
-                // `target_feature(avx512vbmi,avx512bw)`.
-                let lo = _mm512_permutex2var_epi8(t0, chunk, t1);
-                let hi = _mm512_permutex2var_epi8(t2, chunk, t3);
-                let high_bit_mask = _mm512_movepi8_mask(chunk);
-                let classes = _mm512_mask_blend_epi8(high_bit_mask, lo, hi);
-
-                // Per-class popcount via cmpeq-mask.
-                for (c, splat_c) in class_splats.iter().enumerate() {
-                    let class_mask = _mm512_cmpeq_epi8_mask(classes, *splat_c);
-                    counts[c] += u64::from(class_mask.count_ones());
-                }
-
-                index += LANES;
-            }
-
-            // Scalar tail.
-            for &byte in &bytes[index..] {
-                let c = class_table[byte as usize] as usize;
-                if c < MAX_CLASSES {
-                    counts[c] += 1;
-                }
-            }
-
-            counts
-        }
-
-        /// Convenience wrapper that translates the LUT result back into
-        /// the legacy [`ByteClassCounts`] shape, given a `class_table`
-        /// built by [`super::super::printable_control_whitespace_high_bit_table`].
-        ///
-        /// # Safety
-        ///
-        /// Same precondition as [`classify_with_lut`].
-        #[target_feature(enable = "avx512vbmi,avx512bw")]
-        #[must_use]
-        pub unsafe fn classify(bytes: &[u8]) -> ByteClassCounts {
-            let table = super::super::printable_control_whitespace_high_bit_table();
-            // SAFETY: target_feature(enable = "avx512vbmi,avx512bw") is set.
-            let counts = unsafe { classify_with_lut(bytes, &table) };
-            ByteClassCounts {
-                printable_ascii: counts[super::super::CLASS_PRINTABLE as usize],
-                whitespace: counts[super::super::CLASS_WHITESPACE as usize],
-                control: counts[super::super::CLASS_CONTROL as usize],
-                high_bit: counts[super::super::CLASS_HIGH_BIT as usize],
-                other: 0,
-            }
-        }
-
-        /// Validates UTF-8 with the AVX-512 VBMI fused-table DFA.
-        ///
-        /// Same triple as [`super::scalar::validate_utf8`] /
-        /// `core::str::from_utf8`. Single 256-entry vpermi2b lookup
-        /// replaces the AVX-512BW path's two-shuffle pair.
-        ///
-        /// # Safety
-        ///
-        /// Caller must ensure both AVX-512BW and AVX-512 VBMI are
-        /// available on the current CPU.
-        #[target_feature(enable = "avx512bw,avx512vbmi")]
-        #[must_use]
-        pub unsafe fn validate_utf8(bytes: &[u8]) -> crate::byteclass::Utf8Validation {
-            // SAFETY: target_feature(enable = "avx512bw,avx512vbmi") on
-            // this function propagates both requirements to the inner
-            // module-level entry point.
-            unsafe { crate::byteclass::utf8_avx512::validate_utf8_vbmi(bytes) }
-        }
-    }
+    #[cfg(all(
+        feature = "arch-pinned-kernels",
+        feature = "avx512",
+        any(target_arch = "x86", target_arch = "x86_64")
+    ))]
+    pub mod avx512_vbmi;
+    #[cfg(all(
+        not(feature = "arch-pinned-kernels"),
+        feature = "avx512",
+        any(target_arch = "x86", target_arch = "x86_64")
+    ))]
+    #[allow(dead_code, unreachable_pub)]
+    pub(crate) mod avx512_vbmi;
 
     /// AArch64 NEON byte-class classifier.
     ///
@@ -679,165 +258,19 @@ pub mod kernels {
     /// counts are derived by ANDing each comparison mask with `0x01` and
     /// horizontally summing the resulting one-byte indicators across two
     /// `uint8x16_t` halves of the 32-byte window.
-    #[cfg(all(feature = "neon", target_arch = "aarch64"))]
-    pub mod neon {
-        use super::scalar;
-        use crate::byteclass::ByteClassCounts;
-
-        use core::arch::aarch64::{
-            uint8x16_t, vaddlvq_u8, vandq_u8, vceqq_u8, vcgeq_u8, vcltq_u8, vdupq_n_u8, vld1q_u8,
-            vmvnq_u8, vorrq_u8,
-        };
-
-        const LANES: usize = 32;
-
-        /// Returns true when NEON is available at runtime.
-        ///
-        /// On AArch64, NEON is mandatory (it's part of the base ABI), so
-        /// this is unconditionally true. The function exists for API
-        /// symmetry with [`super::avx2::is_available`].
-        #[must_use]
-        pub const fn is_available() -> bool {
-            true
-        }
-
-        /// Counts coarse byte classes with NEON.
-        ///
-        /// # Safety
-        ///
-        /// The caller must ensure the current CPU supports NEON. On AArch64
-        /// this is part of the base ABI; the precondition is always met for
-        /// `target_arch = "aarch64"` builds.
-        #[target_feature(enable = "neon")]
-        #[must_use]
-        pub unsafe fn classify(bytes: &[u8]) -> ByteClassCounts {
-            let mut counts = ByteClassCounts::default();
-            let mut index = 0;
-
-            let one = vdupq_n_u8(1);
-            let space = vdupq_n_u8(b' ');
-            let tab = vdupq_n_u8(b'\t');
-            let newline = vdupq_n_u8(b'\n');
-            let carriage_return = vdupq_n_u8(b'\r');
-            let delete = vdupq_n_u8(0x7f);
-            let high_bit_threshold = vdupq_n_u8(0x80);
-
-            while index + LANES <= bytes.len() {
-                // SAFETY: index + 32 <= bytes.len() bounds both 16-byte loads.
-                let v0 = unsafe { vld1q_u8(bytes.as_ptr().add(index)) };
-                let v1 = unsafe { vld1q_u8(bytes.as_ptr().add(index + 16)) };
-
-                // SAFETY: target_feature("neon") is enabled on this fn; the
-                // helper requires the same precondition.
-                unsafe {
-                    accumulate(
-                        v0,
-                        &mut counts,
-                        one,
-                        space,
-                        tab,
-                        newline,
-                        carriage_return,
-                        delete,
-                        high_bit_threshold,
-                    );
-                    accumulate(
-                        v1,
-                        &mut counts,
-                        one,
-                        space,
-                        tab,
-                        newline,
-                        carriage_return,
-                        delete,
-                        high_bit_threshold,
-                    );
-                }
-
-                index += LANES;
-            }
-
-            scalar::add(&bytes[index..], &mut counts);
-            counts
-        }
-
-        /// Folds one 16-byte vector into the running [`ByteClassCounts`].
-        ///
-        /// # Safety
-        ///
-        /// Must be called from a function tagged `target_feature = "neon"`.
-        #[target_feature(enable = "neon")]
-        #[inline]
-        #[allow(clippy::too_many_arguments)]
-        unsafe fn accumulate(
-            chunk: uint8x16_t,
-            counts: &mut ByteClassCounts,
-            one: uint8x16_t,
-            space: uint8x16_t,
-            tab: uint8x16_t,
-            newline: uint8x16_t,
-            carriage_return: uint8x16_t,
-            delete: uint8x16_t,
-            high_bit_threshold: uint8x16_t,
-        ) {
-            // High-bit (>= 0x80): one-byte indicator per lane, horizontally summed.
-            let high_bit = vcgeq_u8(chunk, high_bit_threshold);
-            let high_bit_count = vaddlvq_u8(vandq_u8(high_bit, one)) as u64;
-
-            // Whitespace = space | tab | newline | carriage_return.
-            let is_space = vceqq_u8(chunk, space);
-            let is_tab = vceqq_u8(chunk, tab);
-            let is_nl = vceqq_u8(chunk, newline);
-            let is_cr = vceqq_u8(chunk, carriage_return);
-            let whitespace = vorrq_u8(vorrq_u8(is_space, is_tab), vorrq_u8(is_nl, is_cr));
-            let whitespace_count = vaddlvq_u8(vandq_u8(whitespace, one)) as u64;
-
-            // Low control = byte < 0x20 AND high-bit == 0.
-            let is_low = vcltq_u8(chunk, space);
-            let low_control = vandq_u8(is_low, vmvnq_u8(high_bit));
-            // DEL (0x7f) is also classed as control; subtract it from whitespace overlap.
-            let is_delete = vceqq_u8(chunk, delete);
-            // Control = (low_control | delete) & !whitespace.
-            let control_raw = vorrq_u8(low_control, is_delete);
-            let control = vandq_u8(control_raw, vmvnq_u8(whitespace));
-            let control_count = vaddlvq_u8(vandq_u8(control, one)) as u64;
-
-            // Printable = !(high_bit | low_control | delete | whitespace).
-            // Equivalently: !high_bit & !low_control & !is_delete & !whitespace.
-            let not_high = vmvnq_u8(high_bit);
-            let not_low = vmvnq_u8(low_control);
-            let not_del = vmvnq_u8(is_delete);
-            let not_ws = vmvnq_u8(whitespace);
-            let printable = vandq_u8(vandq_u8(not_high, not_low), vandq_u8(not_del, not_ws));
-            let printable_count = vaddlvq_u8(vandq_u8(printable, one)) as u64;
-
-            counts.high_bit += high_bit_count;
-            counts.whitespace += whitespace_count;
-            counts.control += control_count;
-            counts.printable_ascii += printable_count;
-        }
-
-        /// Validates UTF-8 with the NEON Keiser-Lemire 3-pshufb DFA.
-        ///
-        /// Returns the same triple as [`super::scalar::validate_utf8`] /
-        /// `core::str::from_utf8`. Implementation lives in
-        /// [`crate::byteclass::utf8_neon`]; on detected error, falls back
-        /// to scalar diagnosis to recover precise `valid_up_to` and
-        /// `error_len`.
-        ///
-        /// # Safety
-        ///
-        /// The caller must ensure the current CPU supports NEON. On
-        /// AArch64 NEON is mandatory; the precondition is always met for
-        /// `target_arch = "aarch64"` builds.
-        #[target_feature(enable = "neon")]
-        #[must_use]
-        pub unsafe fn validate_utf8(bytes: &[u8]) -> crate::byteclass::Utf8Validation {
-            // SAFETY: target_feature("neon") propagates the requirement to
-            // the inner module-level entry point.
-            unsafe { crate::byteclass::utf8_neon::validate_utf8(bytes) }
-        }
-    }
+    #[cfg(all(
+        feature = "arch-pinned-kernels",
+        feature = "neon",
+        target_arch = "aarch64"
+    ))]
+    pub mod neon;
+    #[cfg(all(
+        not(feature = "arch-pinned-kernels"),
+        feature = "neon",
+        target_arch = "aarch64"
+    ))]
+    #[allow(dead_code, unreachable_pub)]
+    pub(crate) mod neon;
 
     /// AArch64 SVE2 byte-class classifier.
     ///
@@ -883,179 +316,19 @@ pub mod kernels {
     /// QEMU's default user-mode CPU (`max`) emulates 512-bit SVE, so
     /// cross-tests run wider lanes than the Cobalt-100 hardware will.
     /// Both must produce identical results — that is the parity test.
-    #[cfg(all(feature = "sve2", target_arch = "aarch64"))]
-    pub mod sve2 {
-        use crate::byteclass::ByteClassCounts;
-
-        use core::arch::aarch64::{
-            svand_b_z, svcmpeq_n_u8, svcmpge_n_u8, svcmplt_n_u8, svcntb, svcntp_b8, svld1_u8,
-            svnot_b_z, svorr_b_z, svptest_any, svptrue_b8, svwhilelt_b8_u64,
-        };
-
-        /// Returns true when SVE2 is available at runtime.
-        #[cfg(feature = "std")]
-        #[must_use]
-        pub fn is_available() -> bool {
-            std::arch::is_aarch64_feature_detected!("sve2")
-        }
-
-        /// Returns true when SVE2 is available at runtime.
-        #[cfg(not(feature = "std"))]
-        #[must_use]
-        pub const fn is_available() -> bool {
-            false
-        }
-
-        /// Counts coarse byte classes with SVE2.
-        ///
-        /// One vector-length-agnostic loop processes the whole input,
-        /// using `svwhilelt_b8` for the active-lane predicate and a
-        /// 4-way `svcntp_b8` (PCNT-of-mask) reduction per class.
-        ///
-        /// # Safety
-        ///
-        /// The caller must ensure the current CPU supports SVE2. SVE2 is
-        /// a strict superset of SVE, so this implies SVE availability as
-        /// well.
-        #[target_feature(enable = "sve2")]
-        #[must_use]
-        pub unsafe fn classify(bytes: &[u8]) -> ByteClassCounts {
-            let mut counts = ByteClassCounts::default();
-            let n = bytes.len() as u64;
-            let mut i: u64 = 0;
-            let ptr = bytes.as_ptr();
-            let all_lanes = svptrue_b8();
-            let step = svcntb();
-
-            // The classification predicates are derived once per input
-            // chunk via SVE's predicated `svcmp*_n_u8` family. The "_n_"
-            // suffix means the second operand is a scalar (broadcast),
-            // matching NEON's `vceqq_u8(_, vdupq_n_u8(c))` shape.
-            loop {
-                // Active-lane predicate: lane `j` active iff `i + j < n`.
-                let pg = svwhilelt_b8_u64(i, n);
-                // Exit when the predicate is empty (i.e. we've consumed
-                // the whole input). Equivalent to `i >= n` rounded up to
-                // the next vector boundary.
-                if !svptest_any(all_lanes, pg) {
-                    break;
-                }
-
-                // SAFETY: the predicate `pg` zeros lanes past `n - i`,
-                // so the vector load reads at most `step` bytes from
-                // `ptr.add(i)`; SVE guarantees inactive lanes don't
-                // fault the load past valid memory.
-                let v = unsafe { svld1_u8(pg, ptr.add(i as usize)) };
-
-                // High bit (>= 0x80).
-                let high_bit_mask = svcmpge_n_u8(pg, v, 0x80);
-
-                // Low ASCII control (< 0x20). High-bit and low-control
-                // are disjoint by construction (mutually exclusive value
-                // ranges), so we use the active-lane predicate `pg` for
-                // both compares without further masking.
-                let low_control_mask = svcmplt_n_u8(pg, v, 0x20);
-
-                // Whitespace = space | tab | newline | carriage-return.
-                let space_mask = svcmpeq_n_u8(pg, v, b' ');
-                let tab_mask = svcmpeq_n_u8(pg, v, b'\t');
-                let nl_mask = svcmpeq_n_u8(pg, v, b'\n');
-                let cr_mask = svcmpeq_n_u8(pg, v, b'\r');
-                let whitespace_mask = svorr_b_z(
-                    pg,
-                    svorr_b_z(pg, space_mask, tab_mask),
-                    svorr_b_z(pg, nl_mask, cr_mask),
-                );
-
-                // DEL (0x7f).
-                let delete_mask = svcmpeq_n_u8(pg, v, 0x7f);
-
-                // Control = (low_control | delete) & !whitespace.
-                let control_raw = svorr_b_z(pg, low_control_mask, delete_mask);
-                let not_ws = svnot_b_z(pg, whitespace_mask);
-                let control_mask = svand_b_z(pg, control_raw, not_ws);
-
-                // Printable = pg & !(high_bit | low_control | delete |
-                // whitespace). All four disjuncts are within `pg` so the
-                // outer AND with `pg` is implicit in the zeroing
-                // `svnot_b_z` (inactive lanes stay zero).
-                let high_or_low = svorr_b_z(pg, high_bit_mask, low_control_mask);
-                let del_or_ws = svorr_b_z(pg, delete_mask, whitespace_mask);
-                let nonprintable = svorr_b_z(pg, high_or_low, del_or_ws);
-                let printable_mask = svand_b_z(pg, pg, svnot_b_z(pg, nonprintable));
-
-                counts.high_bit += svcntp_b8(all_lanes, high_bit_mask);
-                counts.whitespace += svcntp_b8(all_lanes, whitespace_mask);
-                counts.control += svcntp_b8(all_lanes, control_mask);
-                counts.printable_ascii += svcntp_b8(all_lanes, printable_mask);
-
-                i += step;
-            }
-
-            counts
-        }
-
-        /// Validates UTF-8 with the SVE2 fast-path.
-        ///
-        /// # Strategy
-        ///
-        /// SVE2 doesn't bring a Keiser-Lemire shuffle DFA win over NEON
-        /// for the general UTF-8 problem (the table-driven shuffles are
-        /// the same instruction count), but the vector-length-agnostic
-        /// ASCII-fast-path is a clear win: one predicated comparison
-        /// over the whole input checks "any high-bit byte?" in roughly
-        /// `n / svcntb()` cycles. When the input is pure ASCII (the
-        /// common case for code, JSON, logs, etc.) we return immediately
-        /// without invoking the heavier scalar/NEON DFA.
-        ///
-        /// On non-ASCII input we fall through to the existing NEON DFA
-        /// in [`crate::byteclass::utf8_neon`], which is bit-exact with
-        /// the scalar reference.
-        ///
-        /// # Safety
-        ///
-        /// The caller must ensure the current CPU supports SVE2. NEON is
-        /// part of the AArch64 base ABI so it is implicitly available
-        /// on every host where SVE2 is reported.
-        #[target_feature(enable = "sve2,neon")]
-        #[must_use]
-        pub unsafe fn validate_utf8(bytes: &[u8]) -> crate::byteclass::Utf8Validation {
-            let n = bytes.len() as u64;
-            let mut i: u64 = 0;
-            let ptr = bytes.as_ptr();
-            let all_lanes = svptrue_b8();
-            let step = svcntb();
-
-            // ASCII pre-scan: walk the input checking for any byte with
-            // the high bit set. If we reach the end with none, the slice
-            // is valid ASCII (and therefore valid UTF-8 by construction).
-            loop {
-                let pg = svwhilelt_b8_u64(i, n);
-                if !svptest_any(all_lanes, pg) {
-                    return crate::byteclass::Utf8Validation {
-                        valid: true,
-                        valid_up_to: bytes.len(),
-                        error_len: 0,
-                    };
-                }
-                // SAFETY: `pg` zeros lanes past `n - i`; SVE guarantees
-                // inactive lanes do not fault past valid memory.
-                let v = unsafe { svld1_u8(pg, ptr.add(i as usize)) };
-                let high_bit_mask = svcmpge_n_u8(pg, v, 0x80);
-                if svptest_any(all_lanes, high_bit_mask) {
-                    break;
-                }
-                i += step;
-            }
-
-            // Non-ASCII detected; defer to the NEON DFA path. NEON is
-            // mandatory on AArch64 so this is always safe to call.
-            // SAFETY: target_feature("sve2") on this fn implies SVE2 is
-            // available, which on every shipping AArch64 CPU also
-            // implies NEON (the AArch64 base ABI).
-            unsafe { crate::byteclass::utf8_neon::validate_utf8(bytes) }
-        }
-    }
+    #[cfg(all(
+        feature = "arch-pinned-kernels",
+        feature = "sve2",
+        target_arch = "aarch64"
+    ))]
+    pub mod sve2;
+    #[cfg(all(
+        not(feature = "arch-pinned-kernels"),
+        feature = "sve2",
+        target_arch = "aarch64"
+    ))]
+    #[allow(dead_code, unreachable_pub)]
+    pub(crate) mod sve2;
 }
 
 /// Class index used by [`printable_control_whitespace_high_bit_table`]
