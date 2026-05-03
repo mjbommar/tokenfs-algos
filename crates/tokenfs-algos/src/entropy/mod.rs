@@ -50,6 +50,12 @@ pub mod kernels {
         }
 
         /// Computes dense exact conditional entropy `H(next | previous)`.
+        ///
+        /// Available only with `feature = "userspace"`. Kernel/FUSE
+        /// callers should use
+        /// [`entropy::conditional::h_next_given_prev_with_scratch`]
+        /// directly (audit-R9 #5).
+        #[cfg(feature = "userspace")]
         #[must_use]
         pub fn conditional_h_next_given_prev(bytes: &[u8]) -> f32 {
             entropy::conditional::h_next_given_prev(bytes)

@@ -85,6 +85,14 @@ pub struct BytePairScratch {
 
 impl BytePairHistogram {
     /// Creates an empty pair histogram.
+    ///
+    /// **Stack footprint**: returns `Self` (~256 KiB) by value.
+    /// Available only with `feature = "userspace"` (audit-R9 #5).
+    /// Kernel/FUSE callers should use
+    /// [`with_scratch`](Self::with_scratch) — paired with caller-owned
+    /// [`BytePairCountsScratch`] storage — to keep the dense table off
+    /// the call frame entirely.
+    #[cfg(feature = "userspace")]
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -95,11 +103,13 @@ impl BytePairHistogram {
 
     /// Builds a pair histogram from adjacent byte pairs in `bytes`.
     ///
-    /// **Stack footprint**: returns `Self` (~256 KiB) by value. On a
-    /// kernel/FUSE/shallow-stack path use
+    /// **Stack footprint**: returns `Self` (~256 KiB) by value.
+    /// Available only with `feature = "userspace"` (audit-R9 #5).
+    /// Kernel/FUSE callers should use
     /// [`with_scratch`](Self::with_scratch) instead, paired with
-    /// caller-owned [`BytePairCountsScratch`] storage; that path keeps the
-    /// dense counter table off the call frame entirely.
+    /// caller-owned [`BytePairCountsScratch`] storage; that path keeps
+    /// the dense counter table off the call frame entirely.
+    #[cfg(feature = "userspace")]
     #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Self {
         let mut histogram = Self::new();
@@ -206,6 +216,11 @@ impl BytePairHistogram {
     }
 }
 
+// `Default` delegates to `new`, which is gated on `userspace` (audit-R9 #5).
+// Trait impls cannot be cfg-conditional in a way that preserves bound code,
+// so the impl itself is feature-gated and kernel/FUSE callers must use
+// `BytePairHistogram::with_scratch` directly.
+#[cfg(feature = "userspace")]
 impl Default for BytePairHistogram {
     fn default() -> Self {
         Self::new()
@@ -464,6 +479,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "userspace")]
     #[test]
     fn counts_adjacent_pairs() {
         let histogram = BytePairHistogram::from_bytes(b"ababa");
@@ -473,6 +489,7 @@ mod tests {
         assert_eq!(histogram.count_pair(b'a', b'a'), 0);
     }
 
+    #[cfg(feature = "userspace")]
     #[test]
     fn clear_resets_pair_histogram() {
         let mut histogram = BytePairHistogram::from_bytes(b"abcdef");
@@ -503,6 +520,7 @@ mod tests {
     /// This guards audit-R8 #6a: the scratch path is the kernel-safe
     /// constructor and must not drift in semantics from the legacy
     /// by-value form.
+    #[cfg(feature = "userspace")]
     #[test]
     fn with_scratch_view_matches_from_bytes() {
         let bytes = b"abacabadabacaba_zz_yyyy";

@@ -9,6 +9,12 @@ use crate::{
 ///
 /// This uses a dense byte-pair histogram and a 256-bin predecessor histogram.
 /// It does not allocate.
+///
+/// **Stack footprint**: builds [`BytePairHistogram`] (~256 KiB) on the
+/// call frame. Available only with `feature = "userspace"` (audit-R9 #5
+/// kernel-stack hazard). Kernel-adjacent callers should use
+/// [`h_next_given_prev_with_scratch`] (lazy-clear scratch path).
+#[cfg(feature = "userspace")]
 #[must_use]
 pub fn h_next_given_prev(bytes: &[u8]) -> f32 {
     if bytes.len() < 2 {
@@ -64,23 +70,28 @@ pub fn h_next_given_prev_from_scratch(scratch: &BytePairScratch) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{h_next_given_prev, h_next_given_prev_with_scratch};
+    #[cfg(feature = "userspace")]
+    use super::h_next_given_prev;
+    use super::h_next_given_prev_with_scratch;
     use crate::histogram::BytePairScratch;
     // `Box` is not in the no-std prelude; alias it from `alloc` for
     // the alloc-only build (audit-R6 finding #164).
     #[cfg(all(feature = "alloc", not(feature = "std")))]
     use alloc::boxed::Box;
 
+    #[cfg(feature = "userspace")]
     #[test]
     fn deterministic_next_byte_has_zero_conditional_entropy() {
         assert_eq!(h_next_given_prev(b"abababab"), 0.0);
     }
 
+    #[cfg(feature = "userspace")]
     #[test]
     fn mixed_next_byte_has_positive_conditional_entropy() {
         assert!(h_next_given_prev(b"abacabad") > 0.0);
     }
 
+    #[cfg(feature = "userspace")]
     #[test]
     fn scratch_conditional_entropy_matches_dense_path() {
         let bytes = b"abacabadabacaba";
