@@ -1,6 +1,6 @@
 [package]
 name = "tokenfs-algos"
-version = "0.4.2"
+version = "0.4.3"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -10,10 +10,16 @@ readme = "../../README.md"
 publish = false
 
 [features]
-# Default targets the kernel/FUSE/forensics consumer (no panic-prone
-# entry points). Userspace consumers wanting the ergonomic panicking
-# wrappers add `features = ["userspace"]`. v0.4.0 changed the default
-# from including `panicking-shape-apis` to omitting it; see CHANGELOG.
+# Default features. `std` is kept in default for ergonomic test/bench
+# building (~50 test sites use std-only macros like `eprintln!`); the
+# audit-R9 #4 concern about userspace OS probing
+# (`std::thread::available_parallelism`, `/sys/devices/system/cpu/`
+# reads) is addressed at the call-site level — those probes are now
+# gated on the `userspace` feature, so kernel/FUSE consumers opting
+# out of `userspace` do not pay them even with `std` enabled.
+# Kernel/FUSE consumers should use
+# `default-features = false, features = ["alloc"]` for the full
+# kernel-safe surface (no panicking entry points, no OS probing).
 default = ["std", "avx2", "neon"]
 std = []
 alloc = []

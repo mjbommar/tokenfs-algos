@@ -4,6 +4,70 @@ All notable changes to this crate will be documented in this file. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.4.3] — 2026-05-03
+
+Audit-R9 closeout: 7 of 8 findings closed (the 8th, R9 #1
+verifiability, was already resolved in v0.4.2). Closes the
+"kernel-safe-by-default" gap that R8 left open by gating
+constructors, OS probing, process-global state, and remaining
+panicking entry points behind `userspace` / `bench-internals`.
+
+### Fixed (HIGH) — try_rank1_batch is now genuinely no-panic (R9 #3)
+
+- **`RankSelectDict::try_rank1_batch`** previously documented per-position
+  OOB as a panic ("pre-filter positions against `Self::len_bits` for a
+  fully no-panic batch query"). Now validates ALL positions upfront
+  before any kernel dispatch and returns the new
+  `RankSelectError::BatchPositionOutOfRange { position, index, n_bits }`
+  on first OOB. Caller's `out` buffer is never partially mutated on the
+  failure path (verified by sentinel test). +2 tests.
+- **`try_select1_batch`** verified structurally no-panic: `select1` returns
+  `Option<usize>`, so per-element OOB surfaces as `out[i] = None`. No
+  code change; docstring clarifies.
+
+### Fixed (HIGH) — kernel-safe-by-default for constructors (R9 #2)
+
+The R8 round gated panicking shape APIs but missed constructors that
+assert on caller params. Now gated on `userspace`:
+
+- `BloomFilter::new` + `BloomFilter::with_target` (try_new + try_with_target stay public)
+- `HyperLogLog::new` (try_new stays public)
+- `sketch_p2::Estimator::new` (try_new stays public)
+- `similarity::lsh::MinHashIndex::new` + `SimHashIndex::new` + `Default for SimHashIndex` (try_new stays public)
+- `hash::sha256::Hasher::update` (try_update stays public) — closes R9 #8
+- `dispatch::force_backend` + `clear_forced_backend` gated on `bench-internals` instead (per their documented "primarily for tests and benchmarks" scope) — closes R9 #7
+
+The `try_*` primitives no longer route through the panicking `new` —
+they construct state directly. This decouples the no-panic surface from
+the userspace-only one.
+
+### Fixed (MEDIUM) — userspace OS probing now actually opt-in (R9 #4)
+
+- `dispatch::detect_logical_cpus` (calls `std::thread::available_parallelism`) and `detect_linux_cache_profile` + helpers (`/sys/devices/system/cpu/cpu0/cache` reads) are now gated on `userspace` instead of `std`. Kernel/FUSE consumers using `default-features = false, features = ["alloc"]` (or even just default sans `userspace`) no longer pay these OS probes during dispatch.
+- `std` remains in the default feature set for ergonomic test/bench/example building (~50 test sites use std-only macros like `eprintln!`); the audit's underlying concern (kernel-adjacent code reaching the OS probes through default features) is addressed at the call site rather than via a default-flip that would require gating every test using `eprintln!`/`println!`.
+
+### Fixed (MEDIUM-LOW) — BytePairHistogram by-value entries gated (R9 #5)
+
+- `BytePairHistogram::new`, `from_bytes`, `Default` impl gated on `userspace`. The 256 KiB stack allocation is no longer reachable from default builds. Heap-free `with_scratch` + `BytePairCountsScratch` siblings stay public.
+- Cascading: `entropy::conditional::h_next_given_prev`, `entropy::kernels::scalar::conditional_h_next_given_prev`, `entropy::kernels::auto::conditional_h_next_given_prev` (which all build a `BytePairHistogram` inline) gated on `userspace`. The `_with_scratch` siblings stay public.
+
+### Fixed (MEDIUM-LOW) — TLSH single canonical pearson_table (R9 #6)
+
+- `pearson_table()` previously returned a Fisher-Yates-shuffled permutation under `std` and an identity table under `no_std`. Same input → different digest depending on which side of the kernel/userspace boundary computed it. Now: a single canonical `static [u8; 256]` produced by a `const fn` Fisher-Yates that runs at compile time. **Std users see no digest change** (verified byte-for-byte against the prior runtime-init); no_std/alloc-only users WILL see different digests than before (previously identity, now the canonical shuffle), which is the intended one-time correction. +2 tests pinning canonical entries.
+
+### Notes
+
+- Lib test counts: 975 with `--all-features` (was 971 at v0.4.2; +4),
+  779 default, 669 `--no-default-features --features alloc` (was 672;
+  -3 from the conditional/joint cascading gate).
+- All `cargo xtask check`, aarch64 cross-clippy, `cargo deny check`
+  green with zero advisory suppressions.
+- One remaining v0.5.0 candidate from R9: dropping `std` from default
+  outright (would require ~50 test sites to gate on `userspace`/`std`
+  explicitly). The current call-site gating addresses the audit
+  finding's underlying concern (kernel/FUSE consumers do not pay the
+  OS probes); the structural default-flip is queued as a separate PR.
+
 ## [0.4.2] — 2026-05-03
 
 Audit-R7 #17 + R8 #5 + R8 #6b closeout. Two architectural items

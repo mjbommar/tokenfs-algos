@@ -1031,8 +1031,14 @@ fn detect_backend() -> Backend {
 }
 
 fn detect_logical_cpus() -> Option<usize> {
+    // Gated on `userspace` so kernel/FUSE consumers (default features
+    // sans `userspace`) do not pay an OS-probing syscall during
+    // dispatch (audit-R9 #4). `std::thread::available_parallelism`
+    // ultimately reads `/proc/cpuinfo` or sched_getaffinity on Linux —
+    // not reachable from kernel space and unnecessary in
+    // kernel-adjacent contexts.
     cfg_if::cfg_if! {
-        if #[cfg(feature = "std")] {
+        if #[cfg(feature = "userspace")] {
             std::thread::available_parallelism()
                 .ok()
                 .map(core::num::NonZeroUsize::get)
@@ -1064,7 +1070,7 @@ pub fn detect_accelerators() -> AcceleratorProfile {
 
 fn detect_cache_profile() -> CacheProfile {
     cfg_if::cfg_if! {
-        if #[cfg(all(feature = "std", target_os = "linux"))] {
+        if #[cfg(all(feature = "userspace", target_os = "linux"))] {
             cached_linux_cache_profile()
         } else {
             CacheProfile::unknown()
@@ -1072,13 +1078,13 @@ fn detect_cache_profile() -> CacheProfile {
     }
 }
 
-#[cfg(all(feature = "std", target_os = "linux"))]
+#[cfg(all(feature = "userspace", target_os = "linux"))]
 fn cached_linux_cache_profile() -> CacheProfile {
     static CACHE_PROFILE: std::sync::OnceLock<CacheProfile> = std::sync::OnceLock::new();
     *CACHE_PROFILE.get_or_init(detect_linux_cache_profile)
 }
 
-#[cfg(all(feature = "std", target_os = "linux"))]
+#[cfg(all(feature = "userspace", target_os = "linux"))]
 fn detect_linux_cache_profile() -> CacheProfile {
     let root = std::path::Path::new("/sys/devices/system/cpu/cpu0/cache");
     let Ok(entries) = std::fs::read_dir(root) else {
@@ -1130,7 +1136,7 @@ fn detect_linux_cache_profile() -> CacheProfile {
     profile
 }
 
-#[cfg(all(feature = "std", target_os = "linux"))]
+#[cfg(all(feature = "userspace", target_os = "linux"))]
 fn read_sysfs_trimmed(path: std::path::PathBuf) -> Option<String> {
     std::fs::read_to_string(path)
         .ok()
@@ -1138,7 +1144,7 @@ fn read_sysfs_trimmed(path: std::path::PathBuf) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-#[cfg(all(feature = "std", target_os = "linux"))]
+#[cfg(all(feature = "userspace", target_os = "linux"))]
 fn parse_size_bytes(value: &str) -> Option<usize> {
     let split = value
         .find(|ch: char| !ch.is_ascii_digit())
@@ -1155,12 +1161,12 @@ fn parse_size_bytes(value: &str) -> Option<usize> {
     number.checked_mul(multiplier)
 }
 
-#[cfg(all(feature = "std", target_os = "linux"))]
+#[cfg(all(feature = "userspace", target_os = "linux"))]
 fn min_some(current: Option<usize>, candidate: usize) -> Option<usize> {
     Some(current.map_or(candidate, |value| value.min(candidate)))
 }
 
-#[cfg(all(feature = "std", target_os = "linux"))]
+#[cfg(all(feature = "userspace", target_os = "linux"))]
 fn max_some(current: Option<usize>, candidate: usize) -> Option<usize> {
     Some(current.map_or(candidate, |value| value.max(candidate)))
 }
@@ -1768,7 +1774,7 @@ mod tests {
         assert_eq!(scalar.hash_sha256, KernelAvailability::Native);
     }
 
-    #[cfg(all(feature = "std", target_os = "linux"))]
+    #[cfg(all(feature = "userspace", target_os = "linux"))]
     #[test]
     fn parses_linux_cache_sizes() {
         assert_eq!(super::parse_size_bytes("48K"), Some(48 * 1024));
