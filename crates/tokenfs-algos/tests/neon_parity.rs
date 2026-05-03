@@ -13,7 +13,7 @@
 
 #![allow(missing_docs)]
 #![allow(clippy::unwrap_used)] // Test code — panic on None/Err is the desired failure mode.
-#![cfg(all(feature = "neon", target_arch = "aarch64"))]
+#![cfg(all(feature = "neon", feature = "userspace", target_arch = "aarch64"))]
 
 use proptest::prelude::*;
 use tokenfs_algos::{

@@ -10,7 +10,11 @@
 #![allow(missing_docs)]
 #![allow(deprecated)]
 #![allow(clippy::unwrap_used)] // Test code — panic on None is the desired failure mode.
-#![cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+#![cfg(all(
+    feature = "avx2",
+    feature = "userspace",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
 
 use proptest::prelude::*;
 

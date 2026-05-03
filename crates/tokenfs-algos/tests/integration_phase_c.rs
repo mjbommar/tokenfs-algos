@@ -17,7 +17,7 @@
 //! moved behind that on-by-default feature.
 
 #![allow(missing_docs)]
-#![cfg(feature = "panicking-shape-apis")]
+#![cfg(feature = "userspace")]
 
 use tokenfs_algos::bitmap::{ArrayContainer, Container};
 use tokenfs_algos::bits::{

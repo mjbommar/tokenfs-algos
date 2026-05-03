@@ -10,7 +10,11 @@ readme = "../../README.md"
 publish = false
 
 [features]
-default = ["std", "avx2", "neon", "panicking-shape-apis"]
+# Default targets the kernel/FUSE/forensics consumer (no panic-prone
+# entry points). Userspace consumers wanting the ergonomic panicking
+# wrappers add `features = ["userspace"]`. v0.4.0 changed the default
+# from including `panicking-shape-apis` to omitting it; see CHANGELOG.
+default = ["std", "avx2", "neon"]
 std = []
 alloc = []
 nightly = []
@@ -19,16 +23,27 @@ calibration = ["std"]
 parallel = ["dep:rayon"]
 avx2 = []
 avx512 = ["nightly"]
+# Ergonomic userspace umbrella: opts back into the panicking shape APIs
+# that v0.3.x had on by default. Pulls in `std` since panicking is a
+# no_std-incompatible behavior anyway. Kernel/FUSE/forensics consumers
+# should NOT enable this — the default surface is already kernel-safe.
+userspace = ["std", "panicking-shape-apis"]
 # Panicking wrappers for shape/size/range/length-validating public APIs.
-# When enabled (the default for back-compat), the existing panicking
-# variants (e.g. `BitPacker::encode_u32_slice`, `streamvbyte_decode_u32`,
-# `dot_f32_one_to_many`, `RankSelectDict::build`, `sha256_batch_st`,
-# `signature_batch_simd`) are exposed alongside their `try_*` siblings.
-# Kernel/FUSE consumers should disable this feature so that only the
-# fallible `try_*` entry points are reachable, eliminating panicking
-# branches at the kernel boundary (audit-R5 finding #157). Disable via
-# `default-features = false, features = ["alloc"]`.
+# When enabled (opt-in via `userspace` or directly), the existing
+# panicking variants (e.g. `BitPacker::encode_u32_slice`,
+# `streamvbyte_decode_u32`, `dot_f32_one_to_many`,
+# `RankSelectDict::build`, `sha256_batch_st`, `signature_batch_simd`)
+# are exposed alongside their `try_*` siblings. Disabled by default so
+# kernel/FUSE consumers cannot accidentally compile panicking branches
+# at the kernel boundary (audit-R5 #157, audit-R7-followup #1/3/4/14).
 panicking-shape-apis = []
+# Exposes per-backend kernel modules (kernels::scalar, kernels::avx2,
+# kernels::avx512, kernels::neon) for benchmarks and consumers wanting
+# to pin a specific backend. Disabled by default so library callers
+# cannot accidentally violate CPU-feature/bounds preconditions; the
+# safe `kernels::auto` dispatcher is always public regardless of this
+# feature (audit-R7 #17).
+arch-pinned-kernels = []
 # AVX-512 sub-feature backends. All gate runtime detection (`is_x86_feature_
 # detected!`) on the corresponding feature; compile-time gating uses only the
 # umbrella `avx512` flag to keep the feature matrix small. The named features
@@ -96,6 +111,7 @@ required-features = ["bench-internals"]
 [[bench]]
 name = "similarity"
 harness = false
+required-features = ["userspace"]
 
 [[bench]]
 name = "planner"
@@ -104,6 +120,7 @@ harness = false
 [[bench]]
 name = "hash_batched"
 harness = false
+required-features = ["userspace"]
 
 [[bench]]
 name = "bits_popcount"
@@ -112,14 +129,17 @@ harness = false
 [[bench]]
 name = "bits_streamvbyte"
 harness = false
+required-features = ["userspace"]
 
 [[bench]]
 name = "bits_rank_select"
 harness = false
+required-features = ["userspace"]
 
 [[bench]]
 name = "hash_set_membership"
 harness = false
+required-features = ["userspace"]
 
 [[bench]]
 name = "bitmap_set_ops"
@@ -137,25 +157,30 @@ harness = false
 name = "approx_bloom"
 harness = false
 
+[[bench]]
+name = "bits_bit_pack"
+harness = false
+required-features = ["userspace"]
+
 # Examples that compose multiple primitives via the ergonomic panicking
 # entry points (audit-R5 #157 moved these behind `panicking-shape-apis`).
 # The kernel/FUSE deployment build (no-default-features + alloc) does not
 # need them, so gate them out there.
 [[example]]
 name = "build_pipeline"
-required-features = ["panicking-shape-apis"]
+required-features = ["userspace"]
 
 [[example]]
 name = "inverted_index"
-required-features = ["panicking-shape-apis"]
+required-features = ["userspace"]
 
 [[example]]
 name = "dispatch_explain"
-required-features = ["panicking-shape-apis"]
+required-features = ["userspace"]
 
 [[example]]
 name = "similarity_scan"
-required-features = ["panicking-shape-apis"]
+required-features = ["userspace"]
 
 [lints]
 workspace = true
