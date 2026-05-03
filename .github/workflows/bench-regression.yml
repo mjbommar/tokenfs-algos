@@ -1,0 +1,97 @@
+name: Bench regression
+
+# Runs the primitive benchmarks on every push, compares the JSONL output
+# against the most recent main-branch baseline (downloaded from the latest
+# successful run of this same workflow on main), and fails CI if any
+# primitive regresses by more than the configured threshold (audit-R10 T2.3).
+#
+# Threshold is intentionally generous (15%) to absorb runner noise on
+# GitHub-hosted runners; the per-host calibration workflow (T2.4) tightens
+# this on labeled hardware.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      threshold_pct:
+        description: "Max acceptable %-slowdown vs main baseline"
+        required: false
+        default: "15"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  THRESHOLD_PCT: ${{ inputs.threshold_pct || '15' }}
+
+jobs:
+  bench-regression:
+    name: Bench regression check
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup install stable --profile minimal
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bench-regression
+
+      - name: Run primitive benches (criterion JSON)
+        run: |
+          cargo bench -p tokenfs-algos \
+            --features bench-internals,arch-pinned-kernels,userspace \
+            --bench primitives -- --quick
+
+      - name: Snapshot current run
+        run: |
+          mkdir -p target/bench-current
+          cargo xtask bench-report > target/bench-current/run.jsonl || true
+          # bench-report writes to stdout when given no args; fall back to
+          # the criterion estimates path if needed.
+          test -s target/bench-current/run.jsonl || \
+            cargo xtask bench-report target/bench-current/run.jsonl
+
+      - name: Download main baseline (best-effort)
+        id: baseline
+        uses: dawidd6/action-download-artifact@v6
+        continue-on-error: true
+        with:
+          workflow: bench-regression.yml
+          branch: main
+          name: bench-baseline
+          path: target/bench-baseline
+
+      - name: Compare against baseline
+        if: steps.baseline.outcome == 'success'
+        run: |
+          if [ ! -s target/bench-baseline/run.jsonl ]; then
+            echo "::warning::baseline empty, skipping regression check"
+            exit 0
+          fi
+          cargo xtask bench-regression-check \
+            target/bench-baseline/run.jsonl \
+            target/bench-current/run.jsonl \
+            "${THRESHOLD_PCT}"
+
+      - name: Skip if no baseline yet (first main push)
+        if: steps.baseline.outcome != 'success'
+        run: |
+          echo "::warning::no main baseline available; this run will become the baseline"
+
+      - name: Upload run as next baseline (only on main)
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-baseline
+          path: target/bench-current/run.jsonl
+          if-no-files-found: error
+          retention-days: 90

@@ -1,0 +1,92 @@
+name: Calibration
+
+# Runs the F21 / F22 / Magic-BPE real-data calibration matrices on a
+# labeled self-hosted host and the throughput-gated tests under
+# `TOKENFS_ALGOS_RUN_THROUGHPUT_GATE=1`. These targets need a quiet
+# bare-metal host to produce stable wall-clock numbers — running them
+# on a busy GitHub-hosted runner produces ±50% noise that defeats the
+# point of a hard gate (audit-R10 T2.4).
+#
+# The job uses `runs-on: [self-hosted, perf-quiet]` so it only runs on
+# hosts the maintainer has explicitly labeled. Cron is once a week
+# (Sundays 11:00 UTC) plus `workflow_dispatch` for ad-hoc runs.
+#
+# To enable: register a self-hosted runner with both `self-hosted` and
+# `perf-quiet` labels per
+#   https://docs.github.com/en/actions/hosting-your-own-runners
+# On a host without those labels this workflow is a no-op (queues
+# forever then times out at 6h).
+
+on:
+  schedule:
+    - cron: "0 11 * * 0"  # Sundays 11:00 UTC
+  workflow_dispatch:
+    inputs:
+      f22_throughput_threshold_ns:
+        description: "Override TOKENFS_ALGOS_F22_BLOCK_NS_THRESHOLD"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  TOKENFS_ALGOS_RUN_THROUGHPUT_GATE: "1"
+
+jobs:
+  calibration:
+    name: F21/F22/Magic-BPE calibration on labeled host
+    runs-on: [self-hosted, perf-quiet]
+    timeout-minutes: 360
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup install stable --profile minimal
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: calibration
+
+      - name: Log host info
+        run: |
+          uname -a
+          lscpu || true
+          cat /proc/meminfo | head -5 || true
+          rustc --version
+
+      - name: F22 throughput gate
+        env:
+          TOKENFS_ALGOS_F22_BLOCK_NS_THRESHOLD: ${{ inputs.f22_throughput_threshold_ns || '' }}
+        run: |
+          # Test gates on TOKENFS_ALGOS_RUN_THROUGHPUT_GATE=1 set above.
+          cargo test -p tokenfs-algos --release --features userspace,calibration \
+            --test fingerprint_f22 -- --nocapture
+
+      - name: bench-real-f21 (calibration matrix)
+        run: cargo xtask bench-real-f21
+
+      - name: bench-real-f22 (calibration matrix)
+        run: cargo xtask bench-real-f22
+
+      - name: bench-real-magic-bpe (calibration matrix)
+        env:
+          TOKENFS_ALGOS_MAGIC_BPE_LIMIT: "100"
+        run: cargo xtask bench-real-magic-bpe || true
+
+      - name: Snapshot calibration outputs
+        run: cargo xtask bench-history --label calibration-${{ github.run_id }}
+
+      - name: Upload calibration artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: calibration-${{ github.run_id }}
+          path: |
+            benches/_history/calibration-${{ github.run_id }}/
+            target/criterion/
+          if-no-files-found: warn
+          retention-days: 90

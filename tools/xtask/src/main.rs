@@ -82,6 +82,7 @@ fn run() -> Result<()> {
         "bench-ngram-sketch-real" => bench_primitive_filter_real(&rest, "ngram sketch-dense"),
         "bench-selector" => bench_primitive_filter(&rest, "selector"),
         "bench-compare" => bench_compare(&rest),
+        "bench-regression-check" => bench_regression_check(&rest),
         "bench-report" => bench_report(&rest),
         "bench-log" => record_bench_history(None),
         "bench-history" => bench_history(&rest),
@@ -1118,6 +1119,99 @@ fn bench_primitive_filter_real(extra: &[OsString], filter: &str) -> Result<()> {
             ("TOKENFS_ALGOS_PRIMITIVE_REAL".into(), "1".into()),
         ],
     )
+}
+
+/// Compares two `bench-report` JSONL runs and fails CI when any
+/// benchmark regresses beyond the `<threshold_pct>` slowdown
+/// budget (audit-R10 T2.3). Used by the
+/// `.github/workflows/bench-regression.yml` workflow.
+///
+/// Args: `<baseline.jsonl> <current.jsonl> <threshold_pct>`
+///
+/// `threshold_pct` is the maximum acceptable percent slowdown, e.g.
+/// `5.0` means any benchmark that drops >5% in throughput vs the
+/// baseline triggers a failure.
+fn bench_regression_check(args: &[OsString]) -> Result<()> {
+    if args.len() != 3 {
+        return Err(
+            "usage: cargo xtask bench-regression-check <baseline.jsonl> <current.jsonl> <threshold_pct>"
+                .into(),
+        );
+    }
+    let baseline = PathBuf::from(args[0].clone());
+    let current = PathBuf::from(args[1].clone());
+    let threshold: f64 = args[2]
+        .to_string_lossy()
+        .parse()
+        .map_err(|error| format!("threshold_pct: {error}"))?;
+    if !(threshold.is_finite() && threshold >= 0.0) {
+        return Err(format!(
+            "threshold_pct must be a finite non-negative number, got {threshold}"
+        ));
+    }
+
+    let old_records = read_bench_report_records(&baseline)?;
+    let new_records = read_bench_report_records(&current)?;
+    let old_map: HashMap<&str, &BenchReportRecord> = old_records
+        .iter()
+        .map(|r| (r.full_id.as_str(), r))
+        .collect();
+    let new_map: HashMap<&str, &BenchReportRecord> = new_records
+        .iter()
+        .map(|r| (r.full_id.as_str(), r))
+        .collect();
+
+    let mut regressions: Vec<(String, f64, f64, f64)> = Vec::new(); // (id, old_gib, new_gib, slowdown_pct)
+    for (key, old_record) in &old_map {
+        let Some(new_record) = new_map.get(key) else {
+            continue; // benchmark removed; not a regression
+        };
+        if old_record.gib_per_s == 0.0 {
+            continue;
+        }
+        // Slowdown is positive when new throughput is LOWER than old.
+        let slowdown_pct =
+            (old_record.gib_per_s - new_record.gib_per_s) / old_record.gib_per_s * 100.0;
+        if slowdown_pct > threshold {
+            regressions.push((
+                (*key).to_owned(),
+                old_record.gib_per_s,
+                new_record.gib_per_s,
+                slowdown_pct,
+            ));
+        }
+    }
+
+    eprintln!(
+        "xtask: bench-regression-check: baseline={} new={} threshold={:.2}%",
+        baseline.display(),
+        current.display(),
+        threshold,
+    );
+    eprintln!(
+        "xtask: bench-regression-check: matched={} regressions={}",
+        old_map.keys().filter(|k| new_map.contains_key(*k)).count(),
+        regressions.len(),
+    );
+
+    if regressions.is_empty() {
+        eprintln!("xtask: bench-regression-check: pass");
+        return Ok(());
+    }
+
+    regressions.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(Ordering::Equal));
+    eprintln!("xtask: bench-regression-check: REGRESSIONS:");
+    for (id, old, new, slowdown) in &regressions {
+        eprintln!(
+            "  {} : {:.2} GiB/s → {:.2} GiB/s ({:+.1}%)",
+            id, old, new, -slowdown
+        );
+    }
+    Err(format!(
+        "bench-regression-check: {} benchmark(s) regressed > {:.2}%",
+        regressions.len(),
+        threshold,
+    ))
 }
 
 fn bench_compare(args: &[OsString]) -> Result<()> {
@@ -5583,6 +5677,9 @@ fn help() {
                     isolated selector-signal benchmarks\n\
            bench-compare <old.jsonl> <new.jsonl>\n\
                     compare two benchmark history JSONL runs\n\
+           bench-regression-check <baseline.jsonl> <current.jsonl> <threshold_pct>\n\
+                    fail (non-zero exit) if any benchmark regresses\n\
+                    > threshold_pct vs baseline (audit-R10 T2.3)\n\
            bench-report [run.jsonl]\n\
                     generate heatmap, histogram, and timing-table artifacts\n\
            bench-log\n\

@@ -1,0 +1,117 @@
+name: Fuzz (nightly)
+
+# Runs every fuzz target for ~10 minutes each, every night. The per-push
+# CI smoke (T1.4 / T1.5) only runs ~5 seconds per target — enough to catch
+# build breakage and obvious crashes, but not deep state-space bugs.
+# This workflow is the bitrot guard the audit honest-gap called out (#217).
+#
+# On crash (libFuzzer exit code 77) the workflow fails AND uploads the
+# reproducer corpus to artifacts so the bug can be replayed locally:
+#   `cargo +nightly fuzz run <target> reproducer.bin`.
+#
+# On timeout (exit code 124) the workflow stays green — that is the
+# expected "ran for max_total_time without finding a crash" outcome.
+
+on:
+  schedule:
+    - cron: "0 6 * * *"   # daily 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: "Per-target fuzz time budget"
+        required: false
+        default: "600"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fuzz:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - chunk_gear_no_panic
+          - chunk_fastcdc_no_panic
+          - ngram_windows_no_panic
+          - byteclass_utf8_dispatch_parity
+          - runlength_transitions_dispatch_parity
+          - bits_streamvbyte_round_trip
+          - bits_bit_pack_round_trip
+          - bits_rank_select_consistency
+          - bitmap_intersect_parity
+          - vector_distance_parity
+          - format_sniffer_no_panic
+          - search_packed_dfa_no_panic
+          - hash_sha256_round_trip
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install nightly
+        run: rustup install nightly --profile minimal
+
+      - name: Install cargo-fuzz
+        run: cargo +nightly install cargo-fuzz --locked
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: fuzz-${{ matrix.target }}
+
+      - name: Restore corpus (best-effort)
+        uses: actions/cache/restore@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.sha }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+
+      - name: Run ${{ matrix.target }}
+        env:
+          DURATION: ${{ inputs.duration_seconds || '600' }}
+        run: |
+          set -euo pipefail
+          mkdir -p fuzz/corpus/${{ matrix.target }}
+          set +e
+          cargo +nightly fuzz run ${{ matrix.target }} \
+            -- -max_total_time=${DURATION} -timeout=30
+          rc=$?
+          set -e
+          # 0 = clean exit (rare with -max_total_time)
+          # 77 = libFuzzer crash
+          # 124 = timeout (treat as clean — we asked it to stop after DURATION)
+          if [ $rc -eq 0 ] || [ $rc -eq 124 ]; then
+            echo "fuzz target ${{ matrix.target }}: clean ($rc)"
+            exit 0
+          fi
+          if [ $rc -eq 77 ]; then
+            echo "::error::fuzz target ${{ matrix.target }} CRASHED (exit 77)"
+          else
+            echo "::error::fuzz target ${{ matrix.target }} unexpected exit $rc"
+          fi
+          exit 1
+
+      - name: Save corpus on success (rolling cache for next run)
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.sha }}
+
+      - name: Upload reproducer on crash
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ matrix.target }}-reproducer
+          path: |
+            fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
+          retention-days: 14

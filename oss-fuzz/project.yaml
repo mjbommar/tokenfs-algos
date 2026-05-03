@@ -1,0 +1,16 @@
+homepage: "https://github.com/mjbommar/tokenfs-algos"
+language: rust
+primary_contact: "michael@bommaritollc.com"
+auto_ccs:
+  - "michael@bommaritollc.com"
+sanitizers:
+  - address
+  - memory  # MSan: catches uninitialized memory reads
+fuzzing_engines:
+  - libfuzzer
+main_repo: "https://github.com/mjbommar/tokenfs-algos"
+file_github_issue: true
+vendor_ccs:
+  - "michael@bommaritollc.com"
+# Optional: per-target run limits. Default OSS-Fuzz schedule is sufficient
+# for the 13 declared targets.

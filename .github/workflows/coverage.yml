@@ -1,0 +1,102 @@
+name: Coverage
+
+# Generates `cargo-llvm-cov` coverage for the kernel-safe surface and uploads
+# the cobertura/HTML report to artifacts. Tracked as audit-R10 #honest-gap +
+# T3.3 — without this we have no visibility into what % of `tokenfs-algos`
+# the test suite actually exercises.
+#
+# We use llvm-cov rather than tarpaulin because llvm-cov:
+#   * supports inline-assembly instrumentation (some bitmap kernels emit asm),
+#   * tracks branch coverage natively,
+#   * produces stable counts across rustc updates by relying on the
+#     llvm-source-coverage instrumentation built into rustc.
+#
+# Two profiles are reported:
+#   * `default`         — `cargo test --all-features` (the user-facing surface)
+#   * `kernel-safe`     — `cargo test --no-default-features --features alloc`
+#                          (so we can see how much of the kernel-claimed-safe
+#                           subset is tested)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  llvm-cov:
+    name: cargo-llvm-cov
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable + llvm-tools)
+        run: |
+          rustup install stable --profile minimal
+          rustup component add llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: coverage
+
+      - name: Coverage — all-features (user-facing surface)
+        run: |
+          cargo llvm-cov \
+            -p tokenfs-algos \
+            --all-features \
+            --lib \
+            --no-fail-fast \
+            --lcov --output-path target/coverage-all-features.lcov \
+            --summary-only
+
+      - name: Coverage — kernel-safe surface (--no-default-features --features alloc)
+        run: |
+          cargo llvm-cov \
+            -p tokenfs-algos \
+            --no-default-features \
+            --features alloc \
+            --lib \
+            --no-fail-fast \
+            --lcov --output-path target/coverage-kernel-safe.lcov \
+            --summary-only
+
+      - name: Generate HTML reports
+        run: |
+          cargo llvm-cov \
+            -p tokenfs-algos \
+            --all-features \
+            --lib \
+            --no-fail-fast \
+            --html --output-dir target/llvm-cov-html-all-features
+          cargo llvm-cov \
+            -p tokenfs-algos \
+            --no-default-features \
+            --features alloc \
+            --lib \
+            --no-fail-fast \
+            --html --output-dir target/llvm-cov-html-kernel-safe
+
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-reports
+          path: |
+            target/coverage-all-features.lcov
+            target/coverage-kernel-safe.lcov
+            target/llvm-cov-html-all-features/
+            target/llvm-cov-html-kernel-safe/
+          if-no-files-found: error
+          retention-days: 30

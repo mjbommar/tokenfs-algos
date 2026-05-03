@@ -1,0 +1,118 @@
+name: Sanitizers
+
+# Runs Miri (interpreted MIR / undefined-behaviour detection), AddressSanitizer
+# (memory safety), and UndefinedBehaviorSanitizer over the test suite. The
+# `tokenfs-algos` crate has substantial `unsafe` SIMD surface — these jobs catch
+# UB / dangling-pointer / out-of-bounds bugs that the regular test suite would
+# not surface (audit-R10 #9 / T3.2).
+#
+# Cost: ~5x slower than `cargo test`. Run on a separate workflow so we can use
+# nightly + special build flags without slowing the main per-push CI matrix.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "23 5 * * 0"  # Sunday early UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  miri:
+    name: Miri (UB detector)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install nightly + miri
+        run: |
+          rustup install nightly --profile minimal
+          rustup component add --toolchain nightly miri
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: miri
+
+      - name: Miri test (kernel-safe surface, scalar-only)
+        # Miri does not implement most SIMD intrinsics; we run with no
+        # SIMD features so the scalar reference paths are exercised
+        # under the strict aliasing / provenance / leak checker.
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance -Zmiri-symbolic-alignment-check
+        run: |
+          cargo +nightly miri test \
+            -p tokenfs-algos \
+            --no-default-features \
+            --features alloc \
+            --lib
+
+  asan:
+    name: AddressSanitizer
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install nightly + rust-src
+        run: |
+          rustup install nightly --profile minimal
+          rustup component add --toolchain nightly rust-src
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: asan
+
+      - name: ASan test (release for SIMD codegen, address sanitizer)
+        env:
+          RUSTFLAGS: -Zsanitizer=address -Copt-level=2
+          ASAN_OPTIONS: detect_leaks=1:check_initialization_order=1:strict_init_order=1
+        run: |
+          cargo +nightly test \
+            -Zbuild-std \
+            --target x86_64-unknown-linux-gnu \
+            -p tokenfs-algos \
+            --features userspace,arch-pinned-kernels \
+            --lib
+
+  ubsan:
+    name: UndefinedBehaviorSanitizer
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install nightly + rust-src
+        run: |
+          rustup install nightly --profile minimal
+          rustup component add --toolchain nightly rust-src
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ubsan
+
+      - name: UBSan test
+        env:
+          RUSTFLAGS: -Zsanitizer=memory -Zsanitizer-memory-track-origins -Copt-level=2
+          MSAN_OPTIONS: poison_in_dtor=1
+        run: |
+          cargo +nightly test \
+            -Zbuild-std \
+            --target x86_64-unknown-linux-gnu \
+            -p tokenfs-algos \
+            --features userspace,arch-pinned-kernels \
+            --lib

@@ -1,0 +1,95 @@
+name: Mutation Testing
+
+# `cargo mutants` rewrites individual functions to provoke mutated behaviour
+# (e.g. flips comparisons, replaces returns with `Default::default()`,
+# swaps `+` for `-`) and re-runs the test suite. A "missed" mutant means
+# the test suite passed even though the implementation was broken — it
+# is the failure mode line-coverage cannot detect (audit-R10 honest-gap
+# / #218).
+#
+# Cost: ~30x `cargo test`. Run weekly + on-demand only; the
+# minutes:catch ratio does not justify per-PR.
+#
+# We use `--minimum-test-timeout 120 --build-timeout 180` to absorb the
+# slower compile-and-rerun cycle on the SIMD-heavy codebase.
+
+on:
+  schedule:
+    - cron: "0 9 * * 1"  # Mondays 09:00 UTC
+  workflow_dispatch:
+    inputs:
+      shard:
+        description: "Optional shard filter (e.g. 'src/bits/')"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  mutants:
+    name: cargo-mutants
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup install stable --profile minimal
+
+      - name: Install cargo-mutants
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: mutants
+
+      - name: Run cargo-mutants
+        env:
+          SHARD: ${{ inputs.shard || '' }}
+        run: |
+          set -euo pipefail
+          ARGS=(
+            --package tokenfs-algos
+            --features userspace,arch-pinned-kernels,bench-internals
+            --no-shuffle
+            --minimum-test-timeout 120
+            --build-timeout 180
+            --output target/mutants
+            --in-place
+            # Skip per-backend SIMD intrinsic kernels: Miri / cross-arch parity
+            # tests already pin the bit-exact reference and the AVX/NEON
+            # bodies don't survive most mutations cleanly.
+            --exclude 'src/**/kernels/avx*.rs'
+            --exclude 'src/**/kernels/neon.rs'
+            --exclude 'src/**/kernels/sse41.rs'
+            --exclude 'src/**/kernels/ssse3.rs'
+            --exclude 'src/**/kernels/x86_shani.rs'
+            --exclude 'src/**/kernels/aarch64_sha2.rs'
+            # Bench / example / fuzz code is not part of the surface.
+            --exclude 'benches/**'
+            --exclude 'examples/**'
+            --exclude 'fuzz/**'
+          )
+          if [ -n "$SHARD" ]; then
+            ARGS+=(--file "$SHARD")
+          fi
+          cargo mutants "${ARGS[@]}"
+
+      - name: Upload mutants report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-report
+          path: |
+            target/mutants/
+          if-no-files-found: warn
+          retention-days: 30
