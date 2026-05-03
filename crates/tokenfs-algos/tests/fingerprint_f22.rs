@@ -219,11 +219,31 @@ fn calibration_selector_analysis_gate_when_available() {
 
 #[test]
 fn f22_fingerprint_throughput_gate_when_available() {
+    // Opt-in: this is a wall-clock perf gate (1800 ns/block release
+    // threshold). It runs only when TOKENFS_ALGOS_RUN_THROUGHPUT_GATE
+    // is set so shared / loaded hosts (laptops, CI default runners,
+    // QEMU emulated cross-test) do not false-fail on a noisy
+    // measurement (audit-R10 T0.3). Run on quiet perf-labeled hosts:
+    //
+    //     TOKENFS_ALGOS_RUN_THROUGHPUT_GATE=1 cargo test \
+    //         --release -p tokenfs-algos --test fingerprint_f22 \
+    //         --features arch-pinned-kernels \
+    //         f22_fingerprint_throughput_gate_when_available
+    //
+    // The TOKENFS_ALGOS_SKIP_THROUGHPUT_GATE escape hatch is retained
+    // for back-compat (still skips even if RUN is set).
+    if env::var_os("TOKENFS_ALGOS_RUN_THROUGHPUT_GATE").is_none() {
+        eprintln!(
+            "TOKENFS_ALGOS_RUN_THROUGHPUT_GATE not set; skipping the wall-clock \
+             perf gate (set the env var on a quiet perf-labeled host to opt in)"
+        );
+        return;
+    }
     if env::var_os("TOKENFS_ALGOS_SKIP_THROUGHPUT_GATE").is_some() {
         eprintln!(
-            "TOKENFS_ALGOS_SKIP_THROUGHPUT_GATE set; skipping (intended for \
-             QEMU/emulated cross-test runs where wall-clock timings are not \
-             representative of native execution)"
+            "TOKENFS_ALGOS_SKIP_THROUGHPUT_GATE set; skipping (overrides RUN; \
+             intended for QEMU/emulated cross-test runs where wall-clock \
+             timings are not representative of native execution)"
         );
         return;
     }
