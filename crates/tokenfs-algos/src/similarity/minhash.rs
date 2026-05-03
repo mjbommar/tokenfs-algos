@@ -690,6 +690,13 @@ impl<'a, const K: usize> IncrementalSignature<'a, K> {
 /// cheaper to build than [`classic_from_hashes`] — single hash per element
 /// instead of `K` — at the cost of accuracy on sparse inputs (slots may stay
 /// `u64::MAX`). Use [`densified_one_permutation`] to repair.
+///
+/// # Panics
+///
+/// Panics if `K == 0`. Available only with `feature = "userspace"` —
+/// kernel/FUSE callers must enforce `K > 0` upstream and use the
+/// const-generic guarantee at the type level (audit-R10 #1 / #216).
+#[cfg(feature = "userspace")]
 #[must_use]
 pub fn one_permutation_from_hashes<I, const K: usize>(elements: I, seed: u64) -> Signature<K>
 where
@@ -711,6 +718,10 @@ where
 }
 
 /// Builds a one-permutation MinHash signature from raw byte slices.
+///
+/// Available only with `feature = "userspace"` because the underlying
+/// [`one_permutation_from_hashes`] panics on `K == 0` (audit-R10 #1 / #216).
+#[cfg(feature = "userspace")]
 #[must_use]
 pub fn one_permutation_from_bytes<'a, I, const K: usize>(items: I, seed: u64) -> Signature<K>
 where
@@ -893,6 +904,7 @@ mod tests {
         assert!(est < 0.10, "disjoint est={est}");
     }
 
+    #[cfg(feature = "userspace")]
     #[test]
     fn one_permutation_with_densification_recovers_jaccard() {
         let a: Vec<u32> = (0..200).collect();

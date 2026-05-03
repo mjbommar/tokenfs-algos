@@ -345,6 +345,9 @@ impl<'a> RankSelectDict<'a> {
     /// should use [`Self::try_rank1`], which validates the position and
     /// returns [`RankSelectError::PositionOutOfRange`] instead of
     /// aborting.
+    ///
+    /// Available only with `feature = "userspace"` (audit-R10 #1 / #216).
+    #[cfg(feature = "userspace")]
     #[must_use]
     pub fn rank1(&self, i: usize) -> usize {
         assert!(
@@ -419,6 +422,9 @@ impl<'a> RankSelectDict<'a> {
     /// should use [`Self::try_rank0`], which validates the position and
     /// returns [`RankSelectError::PositionOutOfRange`] instead of
     /// aborting.
+    ///
+    /// Available only with `feature = "userspace"` (audit-R10 #1 / #216).
+    #[cfg(feature = "userspace")]
     #[must_use]
     pub fn rank0(&self, i: usize) -> usize {
         assert!(
@@ -1666,7 +1672,7 @@ mod tests {
         let bits = [0xff_u64, 0xff_u64, 0xff_u64, 0xff_u64]; // 32 ones.
         let dict = RankSelectDict::try_build(&bits, 256).expect("valid build");
         assert_eq!(dict.count_ones(), 32);
-        assert_eq!(dict.rank1(8), 8);
+        assert_eq!(dict.try_rank1(8).expect("8 in range"), 8);
         assert_eq!(dict.select1(0), Some(0));
         assert_eq!(dict.select1(7), Some(7));
         assert_eq!(dict.select1(31), Some(64 + 64 + 64 + 7));
@@ -1797,7 +1803,11 @@ mod tests {
         dict.try_rank1_batch(&positions, &mut out)
             .expect("happy path must succeed");
         for (i, &p) in positions.iter().enumerate() {
-            assert_eq!(out[i], dict.rank1(p), "out[{i}] != rank1({p})");
+            assert_eq!(
+                out[i],
+                dict.try_rank1(p).expect("p in range"),
+                "out[{i}] != rank1({p})"
+            );
         }
     }
 

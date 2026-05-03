@@ -38,7 +38,7 @@ crates/tokenfs-algos/src/bits/bit_pack/kernels/neon.rs:23:decode_u32_slice:asser
 crates/tokenfs-algos/src/bits/bit_pack/kernels/scalar.rs:9:encode_u32_slice:assert!
 crates/tokenfs-algos/src/bits/bit_pack/kernels/scalar.rs:100:decode_u32_slice:assert!
 crates/tokenfs-algos/src/bits/rank_select/kernels/scalar.rs:9:rank1_batch:assert!
-crates/tokenfs-algos/src/bits/rank_select/kernels/scalar.rs:26:select1_batch:assert!
+crates/tokenfs-algos/src/bits/rank_select/kernels/scalar.rs:28:select1_batch:assert!
 crates/tokenfs-algos/src/bits/streamvbyte/kernels/avx2.rs:36:decode_u32:assert!
 crates/tokenfs-algos/src/bits/streamvbyte/kernels/neon.rs:21:decode_u32:assert!
 crates/tokenfs-algos/src/bits/streamvbyte/kernels/scalar.rs:28:encode_u32:assert!
@@ -68,13 +68,11 @@ crates/tokenfs-algos/src/permutation/rcm.rs:70:rcm:assert_eq!
 
 # -----------------------------------------------------------------
 # Category C — top-level SIMD/dispatch panic entries the auditor did
-# not flag in audit-R10 #1 but the lint discovered. Real misses;
-# fix by gating on userspace and pointing callers to existing
-# `try_*` siblings.
-# -----------------------------------------------------------------
-
-crates/tokenfs-algos/src/approx.rs:740:contains_batch_simd:assert_eq!
-crates/tokenfs-algos/src/approx.rs:1366:merge_simd:assert_eq!
-crates/tokenfs-algos/src/bits/rank_select.rs:349:rank1:assert!
-crates/tokenfs-algos/src/bits/rank_select.rs:423:rank0:assert!
-crates/tokenfs-algos/src/similarity/minhash.rs:694:one_permutation_from_hashes:assert!
+# not flag in audit-R10 #1 but the lint discovered.
+#
+# CLEARED in v0.4.6:
+#   approx::contains_batch_simd, approx::merge_simd,
+#   bits::rank_select::{rank0, rank1},
+#   similarity::minhash::one_permutation_from_hashes
+# All five are now `#[cfg(feature = "userspace")]`-gated. The kernel-
+# safe surface routes through the existing `try_*` siblings.

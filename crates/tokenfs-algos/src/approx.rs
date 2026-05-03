@@ -737,6 +737,9 @@ mod bloom {
         /// [`Self::try_contains_batch_simd`] for a fallible variant
         /// returning [`super::BloomBatchError`] for either condition
         /// instead of panicking.
+        ///
+        /// Available only with `feature = "userspace"` (audit-R10 #1 / #216).
+        #[cfg(feature = "userspace")]
         pub fn contains_batch_simd(&self, keys: &[u64], out: &mut [bool]) {
             assert_eq!(
                 keys.len(),
@@ -779,7 +782,11 @@ mod bloom {
                     out_len: out.len(),
                 });
             }
-            self.contains_batch_simd(keys, out);
+            // Inline the batch loop here so try_* doesn't depend on the
+            // userspace-gated panicking sibling (audit-R10 #1 / #216).
+            for (key, slot) in keys.iter().zip(out.iter_mut()) {
+                *slot = self.contains_simd(*key);
+            }
             Ok(())
         }
     }
@@ -1363,6 +1370,9 @@ mod hll {
         /// Kernel/FUSE callers should use [`Self::try_merge_simd`]
         /// which returns [`HllMergeError::PrecisionMismatch`] on the
         /// same precondition without aborting the caller.
+        ///
+        /// Available only with `feature = "userspace"` (audit-R10 #1 / #216).
+        #[cfg(feature = "userspace")]
         pub fn merge_simd(&mut self, other: &Self) {
             assert_eq!(
                 self.precision, other.precision,
@@ -1806,7 +1816,8 @@ mod tests {
         // Mix of inserted and non-inserted keys.
         let probes: Vec<u64> = (0_u64..400).collect();
         let mut batch_out = vec![false; probes.len()];
-        bf.contains_batch_simd(&probes, &mut batch_out);
+        bf.try_contains_batch_simd(&probes, &mut batch_out)
+            .expect("contains_batch_simd: shape match");
         for (i, &probe) in probes.iter().enumerate() {
             let per_key = bf.contains_simd(probe);
             assert_eq!(
@@ -1827,7 +1838,8 @@ mod tests {
         }
         let probes: Vec<u64> = (0_u64..32).collect();
         let mut out = vec![false; probes.len()];
-        bf.contains_batch_simd(&probes, &mut out);
+        bf.try_contains_batch_simd(&probes, &mut out)
+            .expect("contains_batch_simd: shape match");
         assert!(out.iter().all(|&b| !b));
     }
 
@@ -1969,20 +1981,20 @@ mod tests {
 
     #[cfg(feature = "std")]
     #[test]
-    #[should_panic(expected = "out of range")]
-    fn bloom_simd_contains_batch_simd_still_panics_on_k_exceeds_simd_max() {
-        // The non-`try_*` sibling keeps its panic contract: callers
-        // that opt into the panicking surface must still see a clear
-        // panic (rather than UB / out-of-bounds memory access). The
-        // panic surfaces from `&mut buf[..self.k]` slice indexing
-        // inside `contains_simd`, which is the standard
-        // "range end index N out of range for slice of length M"
-        // panic.
+    fn bloom_simd_try_contains_batch_simd_returns_err_on_k_exceeds_simd_max() {
+        // Per audit-R10 #1 / #216: `contains_batch_simd` is now gated
+        // on `userspace` and the kernel-safe surface routes through
+        // `try_contains_batch_simd`, which surfaces the over-large
+        // `k` as `BloomBatchError::KExceedsSimdMax` instead of the old
+        // out-of-range slice-index panic.
         let bf =
             BloomFilter::try_new(4096, bloom_kernels::MAX_K + 1).expect("test args within bounds");
         let keys = [0_u64];
         let mut out = [false; 1];
-        bf.contains_batch_simd(&keys, &mut out);
+        assert!(matches!(
+            bf.try_contains_batch_simd(&keys, &mut out),
+            Err(BloomBatchError::KExceedsSimdMax { .. })
+        ));
     }
 
     #[cfg(feature = "std")]
@@ -2278,7 +2290,9 @@ mod tests {
                 let mut a_simd = a_scalar.clone();
 
                 a_scalar.try_merge(&b).expect("test args within bounds");
-                a_simd.merge_simd(&b);
+                a_simd
+                    .try_merge_simd(&b)
+                    .expect("merge_simd: precision match");
 
                 assert_eq!(
                     a_scalar.register_bytes(),
@@ -2294,7 +2308,8 @@ mod tests {
     fn hll_merge_simd_is_idempotent_for_self_merge() {
         let original = build_hll_with_inserts(12, 0xC0FFEE, 5_000);
         let mut copy = original.clone();
-        copy.merge_simd(&original);
+        copy.try_merge_simd(&original)
+            .expect("merge_simd: precision match");
         assert_eq!(
             copy.register_bytes(),
             original.register_bytes(),
@@ -2331,7 +2346,8 @@ mod tests {
         let mut scalar = a.clone();
         let mut simd = a.clone();
         scalar.try_merge(&b).expect("test args within bounds");
-        simd.merge_simd(&b);
+        simd.try_merge_simd(&b)
+            .expect("merge_simd: precision match");
         assert_eq!(
             scalar.register_bytes(),
             simd.register_bytes(),
@@ -2442,11 +2458,17 @@ mod tests {
 
     #[cfg(feature = "std")]
     #[test]
-    #[should_panic(expected = "HyperLogLog merge requires equal precision")]
-    fn hll_merge_simd_panics_on_precision_mismatch() {
+    fn hll_try_merge_simd_returns_err_on_precision_mismatch() {
+        // Per audit-R10 #1 / #216: `merge_simd` is now gated on
+        // `userspace`. The kernel-safe surface uses `try_merge_simd`
+        // which surfaces the precision mismatch as
+        // `HllMergeError::PrecisionMismatch` instead of panicking.
         let mut a = HyperLogLog::try_new(10).expect("test args within bounds");
         let b = HyperLogLog::try_new(12).expect("test args within bounds");
-        a.merge_simd(&b);
+        assert!(matches!(
+            a.try_merge_simd(&b),
+            Err(HllMergeError::PrecisionMismatch { .. })
+        ));
     }
 
     #[cfg(feature = "std")]

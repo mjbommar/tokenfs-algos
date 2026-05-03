@@ -14,7 +14,9 @@ pub fn rank1_batch(dict: &RankSelectDict<'_>, positions: &[usize], out: &mut [us
         positions.len()
     );
     for (slot, &p) in out.iter_mut().zip(positions.iter()) {
-        *slot = dict.rank1(p);
+        *slot = dict
+            .try_rank1(p)
+            .expect("rank1_batch: position validated by upstream dispatcher");
     }
 }
 
