@@ -38,6 +38,13 @@ pub mod kernels {
         }
 
         /// Computes dense exact adjacent-pair joint entropy.
+        ///
+        /// Available only with `feature = "userspace"`. Kernel/FUSE callers
+        /// should use [`entropy::joint::h2_pairs_with_scratch`] or
+        /// [`entropy::joint::h2_pairs_with_dense_scratch`] directly — both
+        /// keep the dense 256x256 counter table off the call frame
+        /// (audit-R8 #6b).
+        #[cfg(feature = "userspace")]
         #[must_use]
         pub fn joint_h2_pairs(bytes: &[u8]) -> f32 {
             entropy::joint::h2_pairs(bytes)
@@ -73,6 +80,13 @@ pub mod kernels {
         }
 
         /// Computes dense exact adjacent-pair joint entropy.
+        ///
+        /// Available only with `feature = "userspace"`. Kernel/FUSE callers
+        /// should use [`entropy::joint::h2_pairs_with_scratch`] or
+        /// [`entropy::joint::h2_pairs_with_dense_scratch`] directly — both
+        /// keep the dense 256x256 counter table off the call frame
+        /// (audit-R8 #6b).
+        #[cfg(feature = "userspace")]
         #[must_use]
         pub fn joint_h2_pairs(bytes: &[u8]) -> f32 {
             entropy::joint::h2_pairs(bytes)

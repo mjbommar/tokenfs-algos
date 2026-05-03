@@ -147,6 +147,12 @@ where
 /// State footprint: `K * 256 * 8` bytes — see
 /// [`kernels_gather`] for the L1/L2 trade-off discussion.
 ///
+/// Available only with `feature = "userspace"`. Kernel/FUSE callers
+/// should use [`build_byte_table_from_seeds_into`] (heap-free; caller-
+/// provided scratch) or [`build_byte_table_from_seeds_boxed`] (heap-
+/// allocated) instead. Audit-R8 #6b removes this by-value form from
+/// the kernel-default surface entirely.
+///
 /// **WARNING (kernel stack)**: returns the table *by value*. At
 /// `K = 64` that is 128 KiB on the call frame; at `K = 256` it is 512
 /// KiB. Neither is safe on a kernel-adjacent stack (typical 8-16 KiB
@@ -174,6 +180,7 @@ where
 /// signatures with the same seeds — one via the scalar table-based
 /// path, one via the gather kernels — produce **bit-identical**
 /// signatures.
+#[cfg(feature = "userspace")]
 #[must_use]
 pub fn build_byte_table_from_seeds<const K: usize>(
     seeds: &[u64; K],
@@ -299,11 +306,19 @@ pub fn update_bytes_table_8(
 /// slice and a precomputed gather table. Convenience wrapper over
 /// [`update_bytes_table_8`].
 ///
+/// Available only with `feature = "userspace"`. Kernel/FUSE callers
+/// should use [`classic_from_bytes_table_8_into`] (heap-free; caller-
+/// provided scratch) instead. Audit-R8 #6b removes this by-value form
+/// from the kernel-default surface for consistency with the K-generic
+/// `signature_simd` family even though the per-call stack cost is
+/// small (~80 bytes).
+///
 /// # Stack
 ///
 /// Returns `Signature<8>` (~80 bytes) by value; safe at K=8. The
 /// stack-cost concern grows with `K` — for the K-generic siblings see
 /// [`signature_simd`] / [`signature_simd_into`].
+#[cfg(feature = "userspace")]
 #[must_use]
 pub fn classic_from_bytes_table_8(
     bytes: &[u8],
@@ -372,6 +387,11 @@ pub fn update_bytes_table_kway<const K: usize>(
 /// gather table; pair with [`build_byte_table_from_seeds`] to
 /// pre-build the table from seeds.
 ///
+/// Available only with `feature = "userspace"`. Kernel/FUSE callers
+/// should use [`signature_simd_into`] (heap-free; caller-provided
+/// scratch) instead. Audit-R8 #6b removes this by-value form from the
+/// kernel-default surface entirely.
+///
 /// # Stack
 ///
 /// Returns `Signature<K>` by value: `K * 8` bytes for the slot array
@@ -390,6 +410,7 @@ pub fn update_bytes_table_kway<const K: usize>(
 /// budget; build it via [`build_byte_table_from_seeds_into`] /
 /// [`build_byte_table_from_seeds_boxed`] instead of
 /// [`build_byte_table_from_seeds`] so the table lives off-stack.
+#[cfg(feature = "userspace")]
 #[must_use]
 pub fn signature_simd<const K: usize>(
     bytes: &[u8],
@@ -456,7 +477,7 @@ pub fn signature_batch_simd<const K: usize>(
         out.len()
     );
     for (slot, bytes) in out.iter_mut().zip(byte_slices.iter()) {
-        *slot = signature_simd::<K>(bytes, table);
+        signature_simd_into::<K>(bytes, table, slot);
     }
 }
 
@@ -486,6 +507,12 @@ impl std::error::Error for BatchShapeError {}
 /// Fallible form of [`signature_batch_simd`]. Returns a
 /// [`BatchShapeError`] when `byte_slices.len() != out.len()`; otherwise
 /// computes the batch and returns `Ok(())`.
+///
+/// Internally dispatches to [`signature_simd_into`] (heap-free; writes
+/// each per-slice signature directly into the corresponding `out` slot)
+/// rather than the by-value [`signature_simd`] so this kernel-safe
+/// entry point compiles in builds that gate the by-value helpers
+/// behind `feature = "userspace"` (audit-R8 #6b).
 pub fn try_signature_batch_simd<const K: usize>(
     byte_slices: &[&[u8]],
     table: &[[u64; K]; kernels_gather::TABLE_ROWS],
@@ -498,7 +525,7 @@ pub fn try_signature_batch_simd<const K: usize>(
         });
     }
     for (slot, bytes) in out.iter_mut().zip(byte_slices.iter()) {
-        *slot = signature_simd::<K>(bytes, table);
+        signature_simd_into::<K>(bytes, table, slot);
     }
     Ok(())
 }
@@ -908,6 +935,7 @@ mod tests {
         assert_eq!(s_bytes, s_hashed);
     }
 
+    #[cfg(feature = "userspace")]
     #[test]
     fn table_based_8way_matches_per_byte_reference() {
         // Hand-compute the per-byte hash family directly and compare
@@ -943,6 +971,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "userspace")]
     #[test]
     fn empty_input_does_not_populate_table_signature() {
         let seeds: [u64; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
@@ -989,7 +1018,7 @@ mod tests {
     #[test]
     fn incremental_empty_signature_is_empty() {
         let seeds = make_test_seeds_8();
-        let table = build_byte_table_from_seeds::<8>(&seeds);
+        let table = build_byte_table_from_seeds_boxed::<8>(&seeds);
         let builder = IncrementalSignature::<8>::new(&table);
         let sig = builder.finalize();
         assert!(sig.is_empty());
@@ -998,7 +1027,7 @@ mod tests {
     #[test]
     fn incremental_update_byte_matches_one_shot() {
         let seeds = make_test_seeds_8();
-        let table = build_byte_table_from_seeds::<8>(&seeds);
+        let table = build_byte_table_from_seeds_boxed::<8>(&seeds);
 
         let payload = b"the quick brown fox jumps over the lazy dog";
 
@@ -1008,14 +1037,15 @@ mod tests {
         }
         let stream_sig = builder.finalize();
 
-        let one_shot = classic_from_bytes_table_8(payload, &table);
+        let mut one_shot = Signature::<8>::new();
+        classic_from_bytes_table_8_into(payload, &table, &mut one_shot);
         assert_eq!(stream_sig.slots(), one_shot.slots());
     }
 
     #[test]
     fn incremental_update_bytes_matches_one_shot() {
         let seeds = make_test_seeds_8();
-        let table = build_byte_table_from_seeds::<8>(&seeds);
+        let table = build_byte_table_from_seeds_boxed::<8>(&seeds);
 
         let payload = random_bytes(4096);
 
@@ -1023,7 +1053,8 @@ mod tests {
         builder.update_bytes(&payload);
         let stream_sig = builder.finalize();
 
-        let one_shot = classic_from_bytes_table_8(&payload, &table);
+        let mut one_shot = Signature::<8>::new();
+        classic_from_bytes_table_8_into(&payload, &table, &mut one_shot);
         assert_eq!(stream_sig.slots(), one_shot.slots());
     }
 
@@ -1031,10 +1062,11 @@ mod tests {
     #[test]
     fn stream_chunking_invariant() {
         let seeds = make_test_seeds_8();
-        let table = build_byte_table_from_seeds::<8>(&seeds);
+        let table = build_byte_table_from_seeds_boxed::<8>(&seeds);
 
         let payload = random_bytes(64 * 1024);
-        let one_shot = classic_from_bytes_table_8(&payload, &table);
+        let mut one_shot = Signature::<8>::new();
+        classic_from_bytes_table_8_into(&payload, &table, &mut one_shot);
 
         for &chunk in &[1_usize, 7, 17, 63, 64, 65, 1024, 4096] {
             let mut builder = IncrementalSignature::<8>::new(&table);
@@ -1054,7 +1086,7 @@ mod tests {
     #[test]
     fn incremental_k4_matches_scalar_reference() {
         let seeds = make_test_seeds_4();
-        let table = build_byte_table_from_seeds::<4>(&seeds);
+        let table = build_byte_table_from_seeds_boxed::<4>(&seeds);
 
         let payload = random_bytes(4096);
 
@@ -1079,7 +1111,7 @@ mod tests {
     #[test]
     fn snapshot_does_not_consume_builder() {
         let seeds = make_test_seeds_8();
-        let table = build_byte_table_from_seeds::<8>(&seeds);
+        let table = build_byte_table_from_seeds_boxed::<8>(&seeds);
 
         let mut builder = IncrementalSignature::<8>::new(&table);
         builder.update_bytes(b"first half");
@@ -1096,21 +1128,23 @@ mod tests {
         // After all updates, the builder's signature equals what we'd get
         // from a fresh one-shot pass over the concatenated input.
         let final_sig = builder.finalize();
-        let one_shot = classic_from_bytes_table_8(b"first half + second half", &table);
+        let mut one_shot = Signature::<8>::new();
+        classic_from_bytes_table_8_into(b"first half + second half", &table, &mut one_shot);
         assert_eq!(final_sig.slots(), one_shot.slots());
     }
 
     #[test]
     fn reset_clears_signature() {
         let seeds = make_test_seeds_8();
-        let table = build_byte_table_from_seeds::<8>(&seeds);
+        let table = build_byte_table_from_seeds_boxed::<8>(&seeds);
 
         let mut builder = IncrementalSignature::<8>::new(&table);
         builder.update_bytes(b"poison");
         builder.reset();
         builder.update_bytes(b"abcdef");
 
-        let one_shot = classic_from_bytes_table_8(b"abcdef", &table);
+        let mut one_shot = Signature::<8>::new();
+        classic_from_bytes_table_8_into(b"abcdef", &table, &mut one_shot);
         assert_eq!(builder.finalize().slots(), one_shot.slots());
     }
 
@@ -1119,18 +1153,21 @@ mod tests {
     #[test]
     fn merge_matches_concatenation() {
         let seeds = make_test_seeds_8();
-        let table = build_byte_table_from_seeds::<8>(&seeds);
+        let table = build_byte_table_from_seeds_boxed::<8>(&seeds);
 
         let payload = random_bytes(8192);
         let (left, right) = payload.split_at(payload.len() / 2);
 
-        let sig_left = classic_from_bytes_table_8(left, &table);
-        let sig_right = classic_from_bytes_table_8(right, &table);
+        let mut sig_left = Signature::<8>::new();
+        classic_from_bytes_table_8_into(left, &table, &mut sig_left);
+        let mut sig_right = Signature::<8>::new();
+        classic_from_bytes_table_8_into(right, &table, &mut sig_right);
 
         let mut merged = IncrementalSignature::<8>::from_signature(&table, sig_left);
         merged.merge(&sig_right);
 
-        let one_shot = classic_from_bytes_table_8(&payload, &table);
+        let mut one_shot = Signature::<8>::new();
+        classic_from_bytes_table_8_into(&payload, &table, &mut one_shot);
         assert_eq!(merged.finalize().slots(), one_shot.slots());
     }
 
@@ -1140,7 +1177,7 @@ mod tests {
     #[test]
     fn from_signature_resumes_correctly() {
         let seeds = make_test_seeds_8();
-        let table = build_byte_table_from_seeds::<8>(&seeds);
+        let table = build_byte_table_from_seeds_boxed::<8>(&seeds);
 
         let mut a = IncrementalSignature::<8>::new(&table);
         a.update_bytes(b"first half");
@@ -1149,7 +1186,8 @@ mod tests {
         let mut b = IncrementalSignature::<8>::from_signature(&table, snapshot);
         b.update_bytes(b" rest");
 
-        let one_shot = classic_from_bytes_table_8(b"first half rest", &table);
+        let mut one_shot = Signature::<8>::new();
+        classic_from_bytes_table_8_into(b"first half rest", &table, &mut one_shot);
         assert_eq!(b.finalize().slots(), one_shot.slots());
     }
 
@@ -1171,6 +1209,7 @@ mod tests {
         out
     }
 
+    #[cfg(feature = "userspace")]
     #[test]
     fn signature_simd_k8_matches_scalar_one_shot() {
         let seeds = make_test_seeds_8();
@@ -1187,6 +1226,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "userspace")]
     #[test]
     fn signature_simd_k16_matches_scalar_reference() {
         let seeds: [u64; 16] = core::array::from_fn(|i| 0xABCD_u64.wrapping_add(i as u64));
@@ -1198,6 +1238,7 @@ mod tests {
         assert_eq!(actual.slots(), &expected);
     }
 
+    #[cfg(feature = "userspace")]
     #[test]
     fn signature_simd_k32_matches_scalar_reference() {
         let seeds: [u64; 32] = core::array::from_fn(|i| 0x1234_5678_u64.wrapping_add(i as u64));
@@ -1209,6 +1250,7 @@ mod tests {
         assert_eq!(actual.slots(), &expected);
     }
 
+    #[cfg(feature = "userspace")]
     #[test]
     fn signature_simd_k64_matches_scalar_reference() {
         let seeds: [u64; 64] = core::array::from_fn(|i| 0xFACE_FEED_u64.wrapping_add(i as u64));
@@ -1222,6 +1264,7 @@ mod tests {
 
     /// Edge-case: the empty slice produces an empty signature (every
     /// slot stays `u64::MAX`, none populated).
+    #[cfg(feature = "userspace")]
     #[test]
     fn signature_simd_empty_input_is_empty() {
         let seeds: [u64; 16] = core::array::from_fn(|i| (i as u64) * 0xDEAD_BEEF);
@@ -1233,6 +1276,7 @@ mod tests {
         assert!(sig.is_empty());
     }
 
+    #[cfg(feature = "userspace")]
     #[test]
     fn signature_simd_single_byte_matches_table_row() {
         let seeds: [u64; 16] = core::array::from_fn(|i| (i as u64) * 0xCAFE_F00D);
@@ -1249,6 +1293,7 @@ mod tests {
 
     /// Inputs short enough that no full SIMD lane fires still match the
     /// scalar reference exactly.
+    #[cfg(feature = "userspace")]
     #[test]
     fn signature_simd_short_input_matches_scalar() {
         let seeds: [u64; 32] = core::array::from_fn(|i| 0xBABE_FACE_u64.wrapping_add(i as u64));
@@ -1264,6 +1309,7 @@ mod tests {
     }
 
     /// Very long inputs (multi-MB) still match scalar exactly.
+    #[cfg(feature = "userspace")]
     #[test]
     fn signature_simd_long_input_matches_scalar() {
         let seeds: [u64; 16] = core::array::from_fn(|i| 0x2222_3333_u64.wrapping_add(i as u64));
@@ -1274,7 +1320,7 @@ mod tests {
         assert_eq!(actual.slots(), &expected);
     }
 
-    #[cfg(feature = "panicking-shape-apis")]
+    #[cfg(feature = "userspace")]
     #[test]
     fn signature_batch_simd_matches_per_slice() {
         let seeds: [u64; 16] = core::array::from_fn(|i| 0x99AA_u64.wrapping_add(i as u64));
@@ -1291,7 +1337,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "panicking-shape-apis")]
+    #[cfg(feature = "userspace")]
     #[test]
     fn signature_batch_simd_empty_batch_is_noop() {
         let seeds: [u64; 8] = make_test_seeds_8();
@@ -1302,7 +1348,7 @@ mod tests {
         assert!(out.is_empty());
     }
 
-    #[cfg(feature = "panicking-shape-apis")]
+    #[cfg(feature = "userspace")]
     #[test]
     #[should_panic(expected = "must match")]
     fn signature_batch_simd_panics_on_shape_mismatch() {
@@ -1316,7 +1362,7 @@ mod tests {
     #[test]
     fn try_signature_batch_simd_rejects_shape_mismatch() {
         let seeds: [u64; 8] = make_test_seeds_8();
-        let table = build_byte_table_from_seeds::<8>(&seeds);
+        let table = build_byte_table_from_seeds_boxed::<8>(&seeds);
         let refs: Vec<&[u8]> = vec![b"alpha", b"beta", b"gamma"];
         let mut out = vec![Signature::<8>::new(); 2];
         let err = try_signature_batch_simd::<8>(&refs, &table, &mut out).unwrap_err();
@@ -1327,13 +1373,15 @@ mod tests {
     #[test]
     fn try_signature_batch_simd_succeeds_on_matching_shape() {
         let seeds: [u64; 8] = make_test_seeds_8();
-        let table = build_byte_table_from_seeds::<8>(&seeds);
+        let table = build_byte_table_from_seeds_boxed::<8>(&seeds);
         let refs: Vec<&[u8]> = vec![b"hello", b"world", b"!"];
         let mut out = vec![Signature::<8>::new(); 3];
         let res = try_signature_batch_simd::<8>(&refs, &table, &mut out);
         assert!(res.is_ok());
         for (i, payload) in refs.iter().enumerate() {
-            assert_eq!(out[i].slots(), signature_simd::<8>(payload, &table).slots());
+            let mut single = Signature::<8>::new();
+            signature_simd_into::<8>(payload, &table, &mut single);
+            assert_eq!(out[i].slots(), single.slots());
         }
     }
 
@@ -1345,7 +1393,7 @@ mod tests {
             ($k:literal) => {{
                 let seeds: [u64; $k] =
                     core::array::from_fn(|i| 0x9876_5432_u64.wrapping_add(i as u64));
-                let table = build_byte_table_from_seeds::<$k>(&seeds);
+                let table = build_byte_table_from_seeds_boxed::<$k>(&seeds);
                 let payload = random_bytes(2048);
 
                 let mut sig = Signature::<$k>::new();
@@ -1374,6 +1422,13 @@ mod tests {
     /// by-value [`build_byte_table_from_seeds`] at K = 128 / K = 256
     /// here would put 256 KiB / 512 KiB of table on the test stack —
     /// the very hazard the boxed wrapper exists to avoid.
+    ///
+    /// The K=8 sub-block compares the by-value form against `_boxed`
+    /// directly, so this test as a whole requires `userspace` (audit-R8
+    /// #6b). The K>=16 cross-checks use only `_boxed` against the
+    /// per-byte reference and stay covered for kernel-default builds via
+    /// `build_byte_table_from_seeds_into_matches_by_value` below.
+    #[cfg(feature = "userspace")]
     #[test]
     fn build_byte_table_from_seeds_boxed_matches_by_value() {
         // K = 8 (16 KiB table) is at the upper edge of the kernel
@@ -1420,6 +1475,7 @@ mod tests {
     /// and K = 256 — the widths the new bench exercises and that
     /// audit-R5 #156 flagged. The table never lives on the test
     /// stack.
+    #[cfg(feature = "userspace")]
     #[test]
     fn signature_simd_boxed_table_matches_reference_k128_k256() {
         macro_rules! check_k {
@@ -1450,6 +1506,12 @@ mod tests {
     /// the by-value [`signature_simd`] across the K family the bench
     /// exercises. This guards audit-R8 #6b: the kernel-safe `_into`
     /// path must not drift in semantics from the legacy by-value form.
+    ///
+    /// Gated on `userspace` because the reference side calls the
+    /// gated by-value [`signature_simd`] (audit-R8 #6b). Kernel-default
+    /// builds verify the `_into` path against the per-byte scalar
+    /// reference via `update_bytes_table_kway_matches_reference`.
+    #[cfg(feature = "userspace")]
     #[test]
     fn signature_simd_into_matches_by_value() {
         macro_rules! check_k {
@@ -1483,11 +1545,12 @@ mod tests {
     #[test]
     fn signature_simd_into_empty_input_resets_buffer() {
         let seeds: [u64; 16] = core::array::from_fn(|i| (i as u64) * 0xDEAD_BEEF);
-        let table = build_byte_table_from_seeds::<16>(&seeds);
+        let table = build_byte_table_from_seeds_boxed::<16>(&seeds);
 
         // Pre-poison the output buffer to verify the `_into` path
         // actually overwrites it.
-        let mut out = signature_simd::<16>(b"poison", &table);
+        let mut out = Signature::<16>::new();
+        signature_simd_into::<16>(b"poison", &table, &mut out);
         assert!(!out.is_empty());
 
         signature_simd_into::<16>(b"", &table, &mut out);
@@ -1503,7 +1566,7 @@ mod tests {
     #[test]
     fn signature_simd_into_reuses_buffer_across_calls() {
         let seeds: [u64; 32] = core::array::from_fn(|i| 0xCAFE_F00D_u64.wrapping_add(i as u64));
-        let table = build_byte_table_from_seeds::<32>(&seeds);
+        let table = build_byte_table_from_seeds_boxed::<32>(&seeds);
 
         let payload_a = random_bytes(1024);
         let payload_b = random_bytes(2048);
@@ -1516,19 +1579,25 @@ mod tests {
         signature_simd_into::<32>(&payload_b, &table, &mut buf);
         let snapshot_b = buf;
 
-        // The second call should equal a fresh by-value run on payload_b
+        // The second call should equal a fresh `_into` run on payload_b
         // — independent of payload_a — because `_into` clears `out` on
         // entry.
-        let independent_b = signature_simd::<32>(&payload_b, &table);
+        let mut independent_b = Signature::<32>::new();
+        signature_simd_into::<32>(&payload_b, &table, &mut independent_b);
         assert_eq!(snapshot_b.slots(), independent_b.slots());
 
         // Snapshots agree on payload_a too.
-        let independent_a = signature_simd::<32>(&payload_a, &table);
+        let mut independent_a = Signature::<32>::new();
+        signature_simd_into::<32>(&payload_a, &table, &mut independent_a);
         assert_eq!(snapshot_a.slots(), independent_a.slots());
     }
 
     /// `classic_from_bytes_table_8_into` is bit-exact with the
     /// by-value [`classic_from_bytes_table_8`].
+    ///
+    /// Gated on `userspace` because the reference side calls the
+    /// gated by-value [`classic_from_bytes_table_8`] (audit-R8 #6b).
+    #[cfg(feature = "userspace")]
     #[test]
     fn classic_from_bytes_table_8_into_matches_by_value() {
         let seeds = make_test_seeds_8();
@@ -1549,9 +1618,10 @@ mod tests {
     #[test]
     fn classic_from_bytes_table_8_into_empty_input_resets_buffer() {
         let seeds = make_test_seeds_8();
-        let table = build_byte_table_from_seeds::<8>(&seeds);
+        let table = build_byte_table_from_seeds_boxed::<8>(&seeds);
 
-        let mut out = classic_from_bytes_table_8(b"poison", &table);
+        let mut out = Signature::<8>::new();
+        classic_from_bytes_table_8_into(b"poison", &table, &mut out);
         assert!(!out.is_empty());
 
         classic_from_bytes_table_8_into(b"", &table, &mut out);
@@ -1561,32 +1631,37 @@ mod tests {
         assert!(out.is_empty());
     }
 
-    /// `build_byte_table_from_seeds_into<K>` produces a bit-exact
-    /// match with the by-value [`build_byte_table_from_seeds`] across
-    /// every documented `K` width. This is the parity guarantee for
-    /// audit-R8 #6b: the kernel-safe `_into` wrapper must not drift in
-    /// semantics from the legacy by-value form.
-    ///
-    /// At `K >= 16` the test uses heap-allocated buffers so the test
-    /// itself does not reproduce the audit hazard (a 32 KiB-512 KiB
-    /// table on the test stack). Two `_into` calls with the same seeds
-    /// must produce bit-exact results because the kernel is
-    /// deterministic.
+    /// `build_byte_table_from_seeds_into<K>` at `K = 8` produces a
+    /// bit-exact match with the by-value
+    /// [`build_byte_table_from_seeds`]. Gated on `userspace` because
+    /// the by-value reference is now `userspace`-only (audit-R8 #6b);
+    /// the K>=16 widths are independently covered by
+    /// `build_byte_table_from_seeds_into_matches_boxed_reference` below.
+    #[cfg(feature = "userspace")]
     #[test]
     fn build_byte_table_from_seeds_into_matches_by_value() {
         // Stack-safe width (table footprint ≤ 16 KiB): compare the
         // by-value path directly against the `_into` path.
-        {
-            const K: usize = 8;
-            let seeds: [u64; K] = core::array::from_fn(|i| 0x9E37_79B9_u64.wrapping_add(i as u64));
-            let by_value = build_byte_table_from_seeds::<K>(&seeds);
-            let mut into = [[0_u64; K]; kernels_gather::TABLE_ROWS];
-            build_byte_table_from_seeds_into::<K>(&seeds, &mut into);
-            assert_eq!(by_value, into, "K={K}");
-        }
+        const K: usize = 8;
+        let seeds: [u64; K] = core::array::from_fn(|i| 0x9E37_79B9_u64.wrapping_add(i as u64));
+        let by_value = build_byte_table_from_seeds::<K>(&seeds);
+        let mut into = [[0_u64; K]; kernels_gather::TABLE_ROWS];
+        build_byte_table_from_seeds_into::<K>(&seeds, &mut into);
+        assert_eq!(by_value, into, "K={K}");
+    }
 
-        // K >= 16: use only heap-allocated buffers so the test does
-        // not put a 32 KiB-512 KiB array on the test stack.
+    /// `build_byte_table_from_seeds_into<K>` at `K >= 16` produces a
+    /// bit-exact match with the heap-allocated
+    /// [`build_byte_table_from_seeds_boxed`] reference across every
+    /// documented K width. This is the kernel-safe parity guarantee
+    /// for audit-R8 #6b — every K is exercised through entry points
+    /// that compile in the kernel-default (no-`userspace`) build.
+    ///
+    /// Uses heap-allocated buffers throughout so the test itself does
+    /// not reproduce the audit hazard (a 32 KiB-512 KiB table on the
+    /// test stack).
+    #[test]
+    fn build_byte_table_from_seeds_into_matches_boxed_reference() {
         macro_rules! check_k_heap {
             ($k:literal) => {{
                 let seeds: [u64; $k] =

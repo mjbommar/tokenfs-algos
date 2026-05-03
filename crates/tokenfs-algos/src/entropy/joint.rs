@@ -63,6 +63,11 @@ impl PairEntropyShape {
 /// This uses a dense 65,536-bin byte-pair histogram and does not heap-
 /// allocate.
 ///
+/// Available only with `feature = "userspace"`. Kernel/FUSE callers
+/// should use [`h2_pairs_with_scratch`] (heap-free; caller-provided
+/// scratch) or [`h2_pairs_with_dense_scratch`] (heap-free; caller-
+/// provided dense counter table) instead.
+///
 /// # Stack
 ///
 /// Materialises a [`BytePairHistogram`] (~256 KiB) on the call frame —
@@ -71,7 +76,9 @@ impl PairEntropyShape {
 /// callers must instead use [`h2_pairs_with_scratch`] (lazy-clear scratch
 /// path) or [`h2_pairs_with_dense_scratch`] (caller-provided dense
 /// counter table) — both keep the dense counters off the stack
-/// (audit-R8 #6a).
+/// (audit-R8 #6a). Audit-R8 #6b removes this by-value form from the
+/// kernel-default surface entirely.
+#[cfg(feature = "userspace")]
 #[must_use]
 pub fn h2_pairs(bytes: &[u8]) -> f32 {
     let histogram = BytePairHistogram::from_bytes(bytes);
@@ -194,10 +201,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        PairEntropyShape, PairEntropyStrategy, h2_pairs, h2_pairs_with_dense_scratch,
-        h2_pairs_with_scratch, plan_pair_entropy,
+        PairEntropyShape, PairEntropyStrategy, h2_pairs_with_dense_scratch, plan_pair_entropy,
     };
-    use crate::histogram::{BytePairScratch, pair::BytePairCountsScratch};
+    #[cfg(feature = "userspace")]
+    use super::{h2_pairs, h2_pairs_with_scratch};
+    #[cfg(feature = "userspace")]
+    use crate::histogram::BytePairScratch;
+    use crate::histogram::pair::BytePairCountsScratch;
     // `Box` is not in the no-std prelude; alias it from `alloc` for
     // the alloc-only build (audit-R6 finding #164).
     #[cfg(all(feature = "alloc", not(feature = "std")))]
@@ -218,17 +228,20 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "userspace")]
     #[test]
     fn repeated_pair_joint_entropy_is_zero() {
         assert_eq!(h2_pairs(b"aaaaaaaa"), 0.0);
     }
 
+    #[cfg(feature = "userspace")]
     #[test]
     fn alternating_pairs_have_one_bit_joint_entropy() {
         let entropy = h2_pairs(b"abababa");
         assert!((entropy - 1.0).abs() < 1e-6, "h2_pairs={entropy}");
     }
 
+    #[cfg(feature = "userspace")]
     #[test]
     fn scratch_h2_matches_dense_h2() {
         let mut scratch = Box::new(BytePairScratch::new());
@@ -240,6 +253,12 @@ mod tests {
     /// by-value `h2_pairs` form across representative inputs. This is
     /// the parity guarantee for audit-R8 #6a: the kernel-safe
     /// dense-scratch path must not drift in semantics.
+    ///
+    /// Gated on `userspace` because `h2_pairs` itself is now gated
+    /// (audit-R8 #6b). The kernel-safe path covers the same inputs in
+    /// `dense_scratch_h2_handles_trivial_input` and
+    /// `dense_scratch_h2_reuses_buffer_across_calls`.
+    #[cfg(feature = "userspace")]
     #[test]
     fn dense_scratch_h2_matches_h2_pairs() {
         let mut scratch = alloc_zeroed_dense_scratch();
