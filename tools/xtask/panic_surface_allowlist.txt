@@ -1,0 +1,88 @@
+# panic-surface-lint allowlist (audit-R10 T1.6)
+#
+# Each non-comment line grandfathers one (`pub fn`, panic-macro) site
+# that the lint would otherwise reject under the kernel-safe-by-default
+# narrative (audit-R10 #1, T1.1, T1.6).
+#
+# Format: <path>:<decl_line>:<fn_name>:<macro!>
+#
+# Adding new entries requires explicit rationale. The whole list is a
+# tracked TODO — every entry is panic surface that should eventually be
+# resolved by either:
+#   (a) gating the function on `#[cfg(feature = "userspace")]`,
+#   (b) gating the parent module on `userspace` (covers a whole file),
+#   (c) extracting an `_unchecked` sibling and routing dispatcher
+#       callers through it after upfront validation.
+#
+# The followup cleanup is scheduled as a Tier 2 task — see #216 in the
+# task list (audit-R10 systematic gating sweep).
+#
+# Categories below mirror the cleanup batches.
+
+# -----------------------------------------------------------------
+# Category A — kernel backend panic sites (called transitively from
+# `kernels::auto::*` dispatchers gated on userspace).
+#
+# Fix pattern: add `pub fn <name>_unchecked` siblings to the backend,
+# have the auto dispatcher call `_unchecked` after pre-validation. The
+# panicking version stays as the user-facing reference but gated on
+# userspace.
+# -----------------------------------------------------------------
+
+crates/tokenfs-algos/src/approx/bloom_kernels/avx2.rs:80:positions:assert!
+crates/tokenfs-algos/src/approx/bloom_kernels/avx512.rs:46:positions:assert!
+crates/tokenfs-algos/src/approx/bloom_kernels/neon.rs:25:positions:assert!
+crates/tokenfs-algos/src/approx/bloom_kernels/scalar.rs:10:positions:assert!
+crates/tokenfs-algos/src/bits/bit_pack/kernels/avx2.rs:35:decode_u32_slice:assert!
+crates/tokenfs-algos/src/bits/bit_pack/kernels/neon.rs:23:decode_u32_slice:assert!
+crates/tokenfs-algos/src/bits/bit_pack/kernels/scalar.rs:9:encode_u32_slice:assert!
+crates/tokenfs-algos/src/bits/bit_pack/kernels/scalar.rs:100:decode_u32_slice:assert!
+crates/tokenfs-algos/src/bits/rank_select/kernels/scalar.rs:9:rank1_batch:assert!
+crates/tokenfs-algos/src/bits/rank_select/kernels/scalar.rs:26:select1_batch:assert!
+crates/tokenfs-algos/src/bits/streamvbyte/kernels/avx2.rs:36:decode_u32:assert!
+crates/tokenfs-algos/src/bits/streamvbyte/kernels/neon.rs:21:decode_u32:assert!
+crates/tokenfs-algos/src/bits/streamvbyte/kernels/scalar.rs:28:encode_u32:assert!
+crates/tokenfs-algos/src/bits/streamvbyte/kernels/scalar.rs:129:decode_u32:assert!
+crates/tokenfs-algos/src/bits/streamvbyte/kernels/ssse3.rs:37:decode_u32:assert!
+crates/tokenfs-algos/src/hash/set_membership/kernels/avx2.rs:109:contains_u32_batch:assert_eq!
+crates/tokenfs-algos/src/hash/set_membership/kernels/avx512.rs:62:contains_u32_batch:assert_eq!
+crates/tokenfs-algos/src/hash/set_membership/kernels/neon.rs:52:contains_u32_batch:assert_eq!
+crates/tokenfs-algos/src/hash/set_membership/kernels/scalar.rs:16:contains_u32_batch:assert_eq!
+crates/tokenfs-algos/src/hash/set_membership/kernels/sse41.rs:103:contains_u32_batch:assert_eq!
+crates/tokenfs-algos/src/permutation/rabbit/kernels/scalar.rs:31:modularity_gains_neighbor_batch:assert_eq!
+
+# -----------------------------------------------------------------
+# Category B — `permutation` module panic surface (already inside
+# `pub mod permutation` gated `#[cfg(any(feature = "alloc", feature = "std"))]`
+# at `lib.rs:81`, NOT on `userspace`).
+#
+# Fix pattern: switch the lib.rs gate to include userspace, OR gate
+# each panicking constructor/method on userspace individually. Each
+# already has a `try_*` sibling per audit-R4 #151 / R6 #161.
+# -----------------------------------------------------------------
+
+crates/tokenfs-algos/src/permutation/mod.rs:127:identity:assert!
+crates/tokenfs-algos/src/permutation/mod.rs:247:apply:assert_eq!
+crates/tokenfs-algos/src/permutation/mod.rs:302:apply_into:assert_eq!
+crates/tokenfs-algos/src/permutation/mod.rs:439:validate_no_alloc:assert!
+crates/tokenfs-algos/src/permutation/mod.rs:850:neighbors_of:assert!
+crates/tokenfs-algos/src/permutation/mod.rs:866:degree:assert!
+crates/tokenfs-algos/src/permutation/hilbert.rs:90:hilbert_2d:assert!
+crates/tokenfs-algos/src/permutation/hilbert.rs:165:hilbert_nd:assert!
+crates/tokenfs-algos/src/permutation/rabbit.rs:278:rabbit_order:assert_eq!
+crates/tokenfs-algos/src/permutation/rabbit.rs:644:rabbit_order_par:assert_eq!
+crates/tokenfs-algos/src/permutation/rabbit.rs:1185:modularity_gains_neighbor_batch:assert_eq!
+crates/tokenfs-algos/src/permutation/rcm.rs:69:rcm:assert_eq!
+
+# -----------------------------------------------------------------
+# Category C — top-level SIMD/dispatch panic entries the auditor did
+# not flag in audit-R10 #1 but the lint discovered. Real misses;
+# fix by gating on userspace and pointing callers to existing
+# `try_*` siblings.
+# -----------------------------------------------------------------
+
+crates/tokenfs-algos/src/approx.rs:740:contains_batch_simd:assert_eq!
+crates/tokenfs-algos/src/approx.rs:1366:merge_simd:assert_eq!
+crates/tokenfs-algos/src/bits/rank_select.rs:349:rank1:assert!
+crates/tokenfs-algos/src/bits/rank_select.rs:423:rank0:assert!
+crates/tokenfs-algos/src/similarity/minhash.rs:694:one_permutation_from_hashes:assert!

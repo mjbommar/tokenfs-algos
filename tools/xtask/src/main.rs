@@ -95,6 +95,7 @@ fn run() -> Result<()> {
         "profile-primitives-flamegraph" => profile_primitives_flamegraph(&rest),
         "profile-primitives-flamegraph-real" => profile_primitives_flamegraph_real(&rest),
         "security" => security(),
+        "panic-surface-lint" => panic_surface_lint(),
         "ci" => ci(),
         "help" | "-h" | "--help" => {
             help();
@@ -161,7 +162,392 @@ fn security() -> Result<()> {
         "--lib",
     ])?;
     ensure_minimal_no_std_dependency_tree()?;
+    panic_surface_lint()?;
     Ok(())
+}
+
+/// Static check for ungated panic-prone macros (`assert!`, `panic!`,
+/// `assert_eq!`, `assert_ne!`, `unreachable!`, `unimplemented!`,
+/// `todo!`) inside `pub fn` / `pub unsafe fn` bodies.
+///
+/// The kernel-safe-by-default narrative (audit-R10 #1, T1.1, T1.6)
+/// requires that every panicking public API in `tokenfs-algos` be
+/// either:
+///
+/// * gated behind `#[cfg(feature = "userspace")]` (or the legacy
+///   `#[cfg(feature = "panicking-shape-apis")]`) so kernel/FUSE/
+///   Postgres-extension consumers can disable the panicking surface,
+/// * or accompanied by a fallible `try_*` sibling that is reachable
+///   without that gate — ideally with the panicking version dropped to
+///   a thin `try_*(...).expect(...)` wrapper.
+///
+/// This lint scans every `.rs` file under `crates/tokenfs-algos/src/`
+/// (skipping `#[cfg(test)] mod tests` blocks and any path component
+/// named `tests` / `benches`), and walks each `pub fn` / `pub unsafe
+/// fn` declaration. For each one not directly gated by a userspace /
+/// panicking-shape-apis attribute, it scans the function body for the
+/// listed panic macros and reports a violation if any is found.
+///
+/// The lint is intentionally line-based and grep-shaped so it can run
+/// in CI without the syn / proc-macro toolchain. False positives can
+/// be suppressed by gating the function on `feature = "userspace"`.
+fn panic_surface_lint() -> Result<()> {
+    let cwd = env::current_dir().map_err(|error| format!("cwd: {error}"))?;
+    let src_root = cwd.join("crates").join("tokenfs-algos").join("src");
+    let allowlist_path = cwd
+        .join("tools")
+        .join("xtask")
+        .join("panic_surface_allowlist.txt");
+    let allowlist = load_allowlist(&allowlist_path)?;
+
+    let mut files: Vec<PathBuf> = Vec::new();
+    collect_rs_files(&src_root, &mut files)?;
+    files.sort();
+
+    let mut new_violations: Vec<PanicViolation> = Vec::new();
+    let mut matched_keys: BTreeSet<String> = BTreeSet::new();
+    for path in &files {
+        let rel = path.strip_prefix(&cwd).unwrap_or(path).to_path_buf();
+        let content = fs::read_to_string(path)
+            .map_err(|error| format!("read {}: {error}", path.display()))?;
+        let mut found: Vec<PanicViolation> = Vec::new();
+        scan_panic_sites_in_file(&rel, &content, &mut found);
+        for violation in found {
+            if allowlist.contains(&violation.key()) {
+                matched_keys.insert(violation.key());
+            } else {
+                new_violations.push(violation);
+            }
+        }
+    }
+
+    let stale_keys: Vec<&String> = allowlist
+        .iter()
+        .filter(|key| !matched_keys.contains(*key))
+        .collect();
+
+    if !stale_keys.is_empty() {
+        eprintln!(
+            "xtask: panic-surface-lint: WARNING: {} stale allowlist entries (resolved or moved):",
+            stale_keys.len(),
+        );
+        for key in &stale_keys {
+            eprintln!("  {key}");
+        }
+        eprintln!(
+            "  → remove these from {} once verified",
+            allowlist_path.display(),
+        );
+    }
+
+    if new_violations.is_empty() {
+        eprintln!(
+            "xtask: panic-surface-lint: pub fn surface within allowlist ({} entries snapshotted, audit-R10 T1.6)",
+            allowlist.len(),
+        );
+        Ok(())
+    } else {
+        for violation in &new_violations {
+            eprintln!(
+                "xtask: panic-surface-lint: {}:{}: ungated `{}` inside `pub fn {}` (decl {}:{}); \
+                 gate the function on `#[cfg(feature = \"userspace\")]` or extract a fallible \
+                 `try_*` sibling. To grandfather temporarily, append to {}:\n  {}",
+                violation.path.display(),
+                violation.panic_line,
+                violation.macro_name,
+                violation.fn_name,
+                violation.path.display(),
+                violation.decl_line,
+                allowlist_path.display(),
+                violation.key(),
+            );
+        }
+        Err(format!(
+            "panic-surface-lint: {} new ungated panic site(s) in pub fn surface (audit-R10 T1.6)",
+            new_violations.len(),
+        ))
+    }
+}
+
+/// Single panic-surface violation surfaced by the lint.
+struct PanicViolation {
+    path: PathBuf,
+    decl_line: usize,
+    panic_line: usize,
+    fn_name: String,
+    macro_name: &'static str,
+}
+
+impl PanicViolation {
+    /// Stable key matching the allowlist file format.
+    fn key(&self) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            self.path.display(),
+            self.decl_line,
+            self.fn_name,
+            self.macro_name,
+        )
+    }
+}
+
+/// Loads `tools/xtask/panic_surface_allowlist.txt` into a key set.
+///
+/// Each non-comment, non-blank line is a key in the format
+/// `<path>:<decl_line>:<fn_name>:<macro!>`. Comments use `#` and may
+/// appear on their own line or after `# ` on a key line. Missing file
+/// is treated as an empty allowlist.
+fn load_allowlist(path: &Path) -> Result<BTreeSet<String>> {
+    let mut out = BTreeSet::new();
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(error) => return Err(format!("read {}: {error}", path.display())),
+    };
+    for raw_line in content.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let key = match trimmed.split_once(" #") {
+            Some((k, _)) => k.trim(),
+            None => trimmed,
+        };
+        if !key.is_empty() {
+            out.insert(key.to_owned());
+        }
+    }
+    Ok(out)
+}
+
+fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    let entries =
+        fs::read_dir(dir).map_err(|error| format!("read_dir {}: {error}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("dir entry: {error}"))?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs_files(&path, out)?;
+        } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn scan_panic_sites_in_file(rel: &Path, content: &str, violations: &mut Vec<PanicViolation>) {
+    let lines: Vec<&str> = content.lines().collect();
+
+    // Single forward pass: track brace depth and a stack of "depths at
+    // which the enclosing scope was opened with a userspace / test
+    // gate". A `pub fn` whose enclosing stack is non-empty is exempt;
+    // otherwise we scan its body for panic macros.
+    let mut skip_stack: Vec<usize> = Vec::new();
+    let mut depth: usize = 0;
+    let mut pending_attrs = String::new();
+
+    let mut i = 0;
+    while i < lines.len() {
+        let raw = lines[i];
+        let trimmed = raw.trim_start();
+        let no_comment = strip_line_comment(raw);
+
+        // Doc comments and blank lines: don't disturb pending attrs.
+        if trimmed.is_empty() || trimmed.starts_with("//") {
+            i += 1;
+            continue;
+        }
+
+        // Attribute lines accumulate.
+        if trimmed.starts_with("#[") || trimmed.starts_with("#![") {
+            pending_attrs.push_str(trimmed);
+            pending_attrs.push(' ');
+            i += 1;
+            continue;
+        }
+
+        // `pub fn` / `pub unsafe fn` / `pub(crate) fn` / `pub(super) fn`
+        if is_pub_fn_decl(trimmed) {
+            let attr_skip = attrs_have_skip(&pending_attrs);
+            let scope_skip = !skip_stack.is_empty();
+            if !(attr_skip || scope_skip)
+                && let Some((open_line, close_line)) = find_fn_body(&lines, i)
+                && let Some((rel_idx, mac)) = scan_lines_for_panic(&lines[open_line..=close_line])
+            {
+                let abs_line = open_line + rel_idx + 1;
+                let fn_name = extract_fn_name(trimmed).unwrap_or("<unknown>").to_owned();
+                violations.push(PanicViolation {
+                    path: rel.to_path_buf(),
+                    decl_line: i + 1,
+                    panic_line: abs_line,
+                    fn_name,
+                    macro_name: mac,
+                });
+            }
+            pending_attrs.clear();
+            // Fall through to brace counting so the fn body's `{ ... }`
+            // updates `depth` and any nested test-mod gates are tracked.
+        }
+
+        // Item-opening tokens that may carry our pending attrs (mod / impl /
+        // trait / struct / enum). We only care about whether the new scope
+        // is gated; brace depth is updated by the generic counter below.
+        if (trimmed.starts_with("mod ")
+            || trimmed.starts_with("pub mod ")
+            || trimmed.starts_with("pub(crate) mod ")
+            || trimmed.starts_with("pub(super) mod ")
+            || trimmed.starts_with("impl ")
+            || trimmed.starts_with("impl<")
+            || trimmed.starts_with("unsafe impl "))
+            && no_comment.contains('{')
+            && attrs_have_skip(&pending_attrs)
+        {
+            // The new scope opens at current `depth`; record so we exit
+            // the skip when depth returns to <= this value.
+            skip_stack.push(depth);
+        }
+
+        // Any non-attr non-comment non-blank line consumes pending attrs.
+        if !trimmed.starts_with("#[") {
+            pending_attrs.clear();
+        }
+
+        // Update brace depth + pop stale skip frames.
+        let delta = count_brace_delta(no_comment);
+        let new_depth = ((depth as isize) + delta).max(0) as usize;
+        while let Some(&top) = skip_stack.last() {
+            if top >= new_depth {
+                skip_stack.pop();
+            } else {
+                break;
+            }
+        }
+        depth = new_depth;
+        i += 1;
+    }
+}
+
+fn strip_line_comment(s: &str) -> &str {
+    // Coarse: assumes `//` is not embedded in a string literal on the line.
+    // Acceptable for tokenfs-algos source style; over-stripping would only
+    // hide panic macros inside comments, which is the safe direction.
+    if let Some(idx) = s.find("//") {
+        &s[..idx]
+    } else {
+        s
+    }
+}
+
+fn count_brace_delta(s: &str) -> isize {
+    // Tracks `{` / `}` while skipping content inside double-quoted
+    // string literals (handles `\"` escapes). Char-literal syntax is
+    // intentionally ignored: distinguishing `'{'` (char literal) from
+    // `<'_>` (lifetime) without a real lexer is fragile, and lifetimes
+    // are far more common than char literals containing braces.
+    let bytes = s.as_bytes();
+    let mut depth: isize = 0;
+    let mut in_str = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        let nxt = if i + 1 < bytes.len() { bytes[i + 1] } else { 0 };
+        if in_str {
+            if b == b'\\' && nxt != 0 {
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_str = false;
+            }
+        } else if b == b'"' {
+            in_str = true;
+        } else if b == b'{' {
+            depth += 1;
+        } else if b == b'}' {
+            depth -= 1;
+        }
+        i += 1;
+    }
+    depth
+}
+
+fn attrs_have_skip(attrs: &str) -> bool {
+    attrs.contains("feature = \"userspace\"")
+        || attrs.contains("feature = \"panicking-shape-apis\"")
+        || attrs.contains("cfg(test)")
+}
+
+fn is_pub_fn_decl(line: &str) -> bool {
+    line.starts_with("pub fn ")
+        || line.starts_with("pub unsafe fn ")
+        || line.starts_with("pub(crate) fn ")
+        || line.starts_with("pub(crate) unsafe fn ")
+        || line.starts_with("pub(super) fn ")
+        || line.starts_with("pub(super) unsafe fn ")
+}
+
+fn extract_fn_name(line: &str) -> Option<&str> {
+    let after = line.split("fn ").nth(1)?;
+    let end = after.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))?;
+    Some(&after[..end])
+}
+
+fn find_fn_body(lines: &[&str], decl_line: usize) -> Option<(usize, usize)> {
+    let mut open_line = None;
+    for (offset, line) in lines.iter().enumerate().skip(decl_line) {
+        if strip_line_comment(line).contains('{') {
+            open_line = Some(decl_line + offset.saturating_sub(decl_line));
+            break;
+        }
+    }
+    let open_line = open_line?;
+    let mut depth: isize = 0;
+    let mut started = false;
+    for (offset, line) in lines.iter().enumerate().skip(open_line) {
+        depth += count_brace_delta(strip_line_comment(line));
+        if depth > 0 {
+            started = true;
+        }
+        if started && depth == 0 {
+            return Some((open_line, open_line + offset.saturating_sub(open_line)));
+        }
+    }
+    None
+}
+
+fn scan_lines_for_panic(lines: &[&str]) -> Option<(usize, &'static str)> {
+    static MACROS: &[&str] = &[
+        "panic!",
+        "assert!",
+        "assert_eq!",
+        "assert_ne!",
+        "unreachable!",
+        "unimplemented!",
+        "todo!",
+    ];
+    for (i, line) in lines.iter().enumerate() {
+        let no_comment = strip_line_comment(line);
+        for mac in MACROS {
+            // Find every occurrence of the macro name and require a
+            // word boundary before it so `debug_assert!` does not match
+            // `assert!`.
+            let mut start = 0;
+            while let Some(pos) = no_comment[start..].find(mac) {
+                let abs = start + pos;
+                let before = if abs == 0 {
+                    b' '
+                } else {
+                    no_comment.as_bytes()[abs - 1]
+                };
+                let is_word_char = before.is_ascii_alphanumeric() || before == b'_';
+                if !is_word_char {
+                    return Some((i, mac));
+                }
+                start = abs + mac.len();
+            }
+        }
+    }
+    None
 }
 
 fn ensure_minimal_no_std_dependency_tree() -> Result<()> {
@@ -5215,6 +5601,11 @@ fn help() {
                     primitive flamegraph SVG with real-file slices\n\
            security\n\
                     no_std/alloc/std core checks plus no_std dependency guard\n\
+                    + panic-surface-lint\n\
+           panic-surface-lint\n\
+                    fail on ungated panic macros (assert!, panic!, etc.)\n\
+                    inside `pub fn` bodies — gate on `userspace` or extract\n\
+                    a fallible `try_*` sibling (audit-R10 T1.6)\n\
            ci       local CI gate"
     );
 }

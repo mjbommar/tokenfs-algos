@@ -165,6 +165,13 @@ jobs:
         run: cargo clippy -p tokenfs-algos --tests --benches \
           --features bench-internals,tunes-json,userspace,arch-pinned-kernels -- -D warnings
 
+      - name: Panic-surface lint (audit-R10 T1.6)
+        # Fails on ungated `assert!` / `panic!` / etc. inside `pub fn`
+        # bodies that would surface a panic in non-userspace builds.
+        # Snapshot of known sites lives in
+        # tools/xtask/panic_surface_allowlist.txt.
+        run: cargo xtask panic-surface-lint
+
       - name: Run dispatch_explain (logs the runner's planner choices)
         # dispatch_explain example required-features = ["userspace"] (audit-R10 T0.1).
         run: cargo run -p tokenfs-algos --example dispatch_explain --release \
