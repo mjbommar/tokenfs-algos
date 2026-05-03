@@ -246,6 +246,10 @@ name = "public_histogram_api"
 required-features = ["arch-pinned-kernels"]
 
 [[test]]
+name = "histogram_kernels"
+required-features = ["bench-internals"]
+
+[[test]]
 name = "sve_parity"
 required-features = ["arch-pinned-kernels"]
 
