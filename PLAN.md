@@ -1,6 +1,6 @@
 # tokenfs-algos — Plan
 
-**Status:** living roadmap. Created 2026-04-30; last updated 2026-05-03 (post-v0.4.6 release). The workspace, core crate, and 0.4.x release train all exist; this document records both the founding intent and the gates that must stay true as implementation continues.
+**Status:** living roadmap. Created 2026-04-30; last updated 2026-05-03 (post-v0.5.0 release). The workspace, core crate, and 0.4.x → 0.5.0 release train all exist; this document records both the founding intent and the gates that must stay true as implementation continues.
 
 **Audience:** future readers (you, me, contributors) who want to understand why this crate exists separately from `binary-bpe`, `tokenfs_writer`, and `tokenfs_reader`, what it does, and how the API and modules fit together.
 
@@ -20,29 +20,30 @@
 | 0.4.4 | 2026-05-02 | Audit-R10 Tier 0 + Tier 1 |
 | 0.4.5 | 2026-05-03 | Audit-R10 Tier 2 + Tier 3 + honest-gap closure |
 | 0.4.6 | 2026-05-03 | Audit-R10 systematic gating sweep COMPLETE (allowlist 30 → 0) |
+| 0.5.0 | 2026-05-03 | Audit-R10 T3.4: iai-callgrind hardware-counter benches + 1% IR regression CI gate |
 
 See `CHANGELOG.md` for per-release diffs and audit lineage.
 
-### Current State (as of v0.4.6)
+### Current State (as of v0.5.0)
 
-- 979 lib tests pass with `--all-features`; 671 with `--no-default-features --features alloc` (the kernel-safe surface).
+- 978 lib tests pass with `--all-features`; 671 with `--no-default-features --features alloc` (the kernel-safe surface).
 - Every module in §4 below exists with at least a scalar reference; AVX2/AVX-512/NEON/SSE4.1/SHA-NI/FEAT_SHA2 backends exist for the modules where benchmarks justify them (popcount, bit_pack, streamvbyte, rank_select, set_membership, bloom_kernels, hll/kernels, sha256, byteclass, runlength, vector distance, similarity::minhash::kernels_gather, permutation::rabbit::kernels). `arch-pinned-kernels` controls per-backend `pub mod` visibility.
 - 13 cargo-fuzz targets compile and run nightly under `.github/workflows/fuzz-nightly.yml`. cargo-mutants weekly. Miri / ASan / MSan on push + Sundays.
-- 10 GitHub Actions workflows are in place; OSS-Fuzz integration files live in `oss-fuzz/` ready for upstream submission.
+- 11 GitHub Actions workflows in place — including `iai-bench.yml` for deterministic instruction-count regression detection at 1% sensitivity (audit-R10 T3.4). OSS-Fuzz integration files live in `oss-fuzz/` ready for upstream submission.
 - **Audit-R4 through R10 are closed.** The kernel-safe-by-default narrative is structurally enforced: `tools/xtask/panic_surface_allowlist.txt` contains zero entries, and `cargo xtask panic-surface-lint` blocks any new `pub fn` that introduces a panicking macro without a `#[cfg(feature = "userspace")]` gate.
 - Public primitive contracts are documented in `docs/PRIMITIVE_CONTRACTS.md`. Kernel-safety contract is documented in `docs/KERNEL_SAFETY.md` (covers the `try_*` / `_unchecked` / `_inner` conventions, the lint, and the allowlist policy).
 - F22 block fingerprint has scalar + x86 AVX2/SSE4.2 pinned paths. F22 extent fingerprint has a fused scalar/runtime-dispatched accumulator; pinned scalar is exact, public default samples large-extent H4 by design.
 - `no_std + alloc` is the kernel-safe surface; math goes through the crate-local `math` wrapper and `libm` outside `std`.
 
-### Next Acceptance Gates (v0.5.0)
+### Next Acceptance Gates (v0.6+)
 
-The remaining work for v0.5.0 is enhancement, not safety. Each item is a separate task in the project tracker:
+v0.5.0 closed the only audit-R10 item triaged as in-scope (T3.4). The remaining
+audit-R10 items were deferred per the v0.5.0 triage and are now scheduled later:
 
-- **T3.4 iai-callgrind** — deterministic hardware-counter benches, complementing the wall-clock criterion benches. Decide: required for v0.5.0, or push to v0.6?
-- **T3.5 bench-history publication** — gh-pages or bencher.dev. Decide: which target, what cadence.
-- **T3.6 std default-flip** — drop `std` from default features (audit-R9 #4 carry-over). Breaking change; decide: do this in v0.5.0 or queue for v1.0?
+- **T3.5 bench-history publication** — gh-pages or bencher.dev. Targeted v0.6+; decide format and cadence first.
+- **T3.6 std default-flip** — drop `std` from default features (audit-R9 #4 carry-over). Breaking; queued for v1.0.
 
-The rest of v0.5.0 is whatever the next audit round (R11) surfaces.
+The rest of v0.6+ is whatever the next audit round (R11) surfaces.
 
 ### Hardware Backend Status
 
@@ -547,15 +548,15 @@ The crate has its own GitHub repo at `mjbommar/tokenfs-algos`. The TokenFS paper
 
 ## 13. Active Next Steps
 
-As of v0.4.6, in priority order:
+As of v0.5.0, in priority order:
 
-1. **Triage v0.5.0 scope.** The remaining items are T3.4 (iai-callgrind), T3.5 (bench-history publication), T3.6 (drop `std` from default features). Decide which are in-scope for v0.5.0 vs deferred. T3.6 is breaking; either v0.5.0 absorbs the breaking change or it waits for v1.0.
-2. **Submit OSS-Fuzz integration.** The `oss-fuzz/` directory has the upstream files ready (`Dockerfile`, `build.sh`, `project.yaml`). Open a PR against `google/oss-fuzz`. Once merged, ClusterFuzz coverage tracking + automatic regression bisection come for free.
-3. **Bake the new CI workflows.** `.github/workflows/{sanitizers,coverage,fuzz-nightly,mutation-testing,bench-regression,calibration}.yml` are all new in v0.4.5. Watch the first few weeks of runs, tune thresholds, and adjust the bench-regression threshold (currently 15%) once we have a noise baseline from GitHub-hosted runners.
-4. **Set up the calibration host.** `.github/workflows/calibration.yml` requires a `[self-hosted, perf-quiet]` labeled runner. Until that exists, the workflow queues forever then times out. Either provision the host or rewrite the workflow to opt-in via `workflow_dispatch` only.
-5. **Profile before new SIMD.** Add AVX-512 / NEON / SVE kernels only after flamegraphs or timing tables identify the next bottleneck. iai-callgrind (T3.4) will help here.
+1. **Submit OSS-Fuzz integration.** The `oss-fuzz/` directory has the upstream files ready (`Dockerfile`, `build.sh`, `project.yaml`). Open a PR against `google/oss-fuzz`. Once merged, ClusterFuzz coverage tracking + automatic regression bisection come for free.
+2. **Bake the new CI workflows.** `.github/workflows/{sanitizers,coverage,fuzz-nightly,mutation-testing,bench-regression,calibration,iai-bench}.yml` are all relatively new (v0.4.5 + v0.5.0). Watch the first few weeks of runs, tune thresholds, and adjust the bench-regression threshold (currently 15%) once we have a noise baseline from GitHub-hosted runners. The iai-bench gate is set at 1.0% IR regression (T3.4) — tighten or loosen once a real regression flags.
+3. **Set up the calibration host.** `.github/workflows/calibration.yml` requires a `[self-hosted, perf-quiet]` labeled runner. Until that exists, the workflow queues forever then times out. Either provision the host or rewrite the workflow to opt-in via `workflow_dispatch` only.
+4. **Decide T3.5 publication target.** gh-pages vs bencher.dev for bench-history publication. Cadence: every main push, weekly digest, or both?
+5. **Profile before new SIMD.** Add AVX-512 / NEON / SVE kernels only after flamegraphs, criterion timing tables, or iai-callgrind counters identify the next bottleneck.
 6. **Downstream integration.** Wire `binary-bpe` and TokenFS consumers against `fingerprint`, `selector`, `chunk`, `distribution`, `permutation`, `similarity`, and `format` APIs. The kernel-safe-by-default surface is now stable enough for kernel-mode consumers to design against.
-7. **Audit-R11.** Schedule the next external audit pass once v0.5.0 ships. The previous audit cadence (R4 → R10) ran in parallel with implementation; R11 should focus on the consumer-facing API ergonomics and the no-panic surface from a fresh reviewer.
+7. **Audit-R11.** Schedule the next external audit pass. The previous audit cadence (R4 → R10) ran in parallel with implementation; R11 should focus on consumer-facing API ergonomics and a fresh look at the no-panic surface.
 
 ---
 

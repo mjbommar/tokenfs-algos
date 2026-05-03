@@ -942,7 +942,7 @@ dependencies = [
 
 [[package]]
 name = "tokenfs-algos"
-version = "0.4.6"
+version = "0.5.0"
 dependencies = [
  "blake3",
  "bytemuck",

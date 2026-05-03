@@ -4,6 +4,51 @@ All notable changes to this crate will be documented in this file. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] — 2026-05-03
+
+Audit-R10 fully closed for v0.5.0 scope: T3.4 (iai-callgrind hardware-counter
+benches) lands as a 1%-sensitive regression gate complementing the noisier
+15%-budget criterion benches. T3.5 (bench-history publication) and T3.6
+(drop `std` from default features) are explicitly deferred per the v0.5.0
+triage in `PLAN.md` — both are enhancement, not safety, and there is no
+audit finding gating either on this release.
+
+The library API surface is unchanged from v0.4.6. The bump to 0.5.0 marks
+the milestone, not breakage; non-`userspace` consumers continue to see the
+same kernel-safe surface that landed in v0.4.6.
+
+### Added — iai-callgrind hardware-counter benches (audit-R10 T3.4)
+
+  * `crates/tokenfs-algos/benches/iai_primitives.rs` — 7
+    `#[library_benchmark]` cases over 3 groups (bits, hash, vector)
+    on a focused subset of hot primitives: popcount (auto + scalar),
+    streamvbyte encode/decode, sha256, vector dot/l2. Deterministic
+    xorshift fixtures so instruction counts reproduce across runs.
+  * `iai-callgrind = "0.16"` added to `[dev-dependencies]` and registered
+    as a `[[bench]] required-features = ["arch-pinned-kernels"]` (the
+    popcount scalar parity case touches `bits::kernels::scalar` directly).
+  * `cargo xtask bench-iai` runs the suite locally; help entry updated.
+  * `.github/workflows/iai-bench.yml` installs valgrind + the matching
+    `iai-callgrind-runner`, downloads the most recent main-branch baseline
+    (`iai-baseline-main` artifact), runs with
+    `--baseline=main --regression="ir=1.0"` to fail PRs on >1%
+    instruction-count regression, and on `main` re-saves and re-uploads
+    the baseline (90-day retention).
+  * `docs/PROFILING.md` — new section explaining the threshold rationale
+    (1% iai vs 15% criterion), local invocation, and the CI baseline flow.
+
+### Notes
+
+  * Lib test counts unchanged from v0.4.6: 978 `--all-features`, 671
+    `--no-default-features --features alloc`. No library code changed —
+    this release adds bench infrastructure + CI gate only.
+  * Allowlist still at 0 entries; panic-surface lint still green.
+  * `cargo xtask check` green: fmt, clippy, doc, no-std-tree,
+    no-std-smoke build, panic-surface-lint at zero entries.
+  * Audit-R10 scoreboard: **all v0.5.0-targeted items closed.** Remaining
+    audit-R10 work (T3.5, T3.6) re-triaged into v0.6+ / v1.0. No HIGH or
+    MEDIUM findings open.
+
 ## [0.4.6] — 2026-05-03
 
 Audit-R10 systematic gating sweep COMPLETE — `tools/xtask/panic_surface_allowlist.txt`

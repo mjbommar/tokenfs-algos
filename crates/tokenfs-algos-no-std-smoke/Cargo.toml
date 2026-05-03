@@ -9,4 +9,4 @@ publish = false
 test = false           # this crate exists to verify no_std lib build, not to run tests
 
 [dependencies]
-tokenfs-algos = { path = "../tokenfs-algos", version = "0.4", default-features = false, features = ["alloc"] }
+tokenfs-algos = { path = "../tokenfs-algos", version = "0.5", default-features = false, features = ["alloc"] }
