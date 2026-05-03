@@ -29,10 +29,10 @@
 # userspace.
 # -----------------------------------------------------------------
 
-crates/tokenfs-algos/src/approx/bloom_kernels/avx2.rs:80:positions:assert!
-crates/tokenfs-algos/src/approx/bloom_kernels/avx512.rs:46:positions:assert!
-crates/tokenfs-algos/src/approx/bloom_kernels/neon.rs:25:positions:assert!
-crates/tokenfs-algos/src/approx/bloom_kernels/scalar.rs:10:positions:assert!
+# bloom_kernels/{scalar,avx2,avx512,neon}.rs::positions CLEARED in v0.4.6 —
+# split into `positions` (userspace-gated, asserts) + `positions_unchecked`
+# (no asserts; caller upholds preconditions). `auto::positions` routes
+# through `_unchecked` after the userspace-gated asserting wrapper.
 crates/tokenfs-algos/src/bits/bit_pack/kernels/avx2.rs:35:decode_u32_slice:assert!
 crates/tokenfs-algos/src/bits/bit_pack/kernels/neon.rs:23:decode_u32_slice:assert!
 crates/tokenfs-algos/src/bits/bit_pack/kernels/scalar.rs:9:encode_u32_slice:assert!

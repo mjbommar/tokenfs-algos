@@ -846,8 +846,9 @@ pub mod bloom_kernels {
             ))]
             {
                 if super::avx512::is_available() {
-                    // SAFETY: availability was checked immediately above.
-                    unsafe { super::avx512::positions(h1, h2, k, bits, out) };
+                    // SAFETY: availability checked above. Caller upholds
+                    // out.len() >= k and bits > 0 (audit-R10 #1 / #216).
+                    unsafe { super::avx512::positions_unchecked(h1, h2, k, bits, out) };
                     return;
                 }
             }
@@ -859,8 +860,9 @@ pub mod bloom_kernels {
             ))]
             {
                 if super::avx2::is_available() {
-                    // SAFETY: availability was checked immediately above.
-                    unsafe { super::avx2::positions(h1, h2, k, bits, out) };
+                    // SAFETY: availability checked above. Caller upholds
+                    // out.len() >= k and bits > 0 (audit-R10 #1 / #216).
+                    unsafe { super::avx2::positions_unchecked(h1, h2, k, bits, out) };
                     return;
                 }
             }
@@ -868,13 +870,16 @@ pub mod bloom_kernels {
             #[cfg(all(feature = "neon", target_arch = "aarch64"))]
             {
                 if super::neon::is_available() {
-                    // SAFETY: NEON is mandatory on AArch64.
-                    unsafe { super::neon::positions(h1, h2, k, bits, out) };
+                    // SAFETY: NEON is mandatory on AArch64; caller upholds
+                    // out.len() >= k and bits > 0 (audit-R10 #1 / #216).
+                    unsafe { super::neon::positions_unchecked(h1, h2, k, bits, out) };
                     return;
                 }
             }
 
-            super::scalar::positions(h1, h2, k, bits, out);
+            // SAFETY: caller upholds out.len() >= k and bits > 0
+            // (audit-R10 #1 / #216).
+            unsafe { super::scalar::positions_unchecked(h1, h2, k, bits, out) };
         }
     }
 
@@ -977,7 +982,7 @@ pub mod bloom_kernels {
                     let h1 = 0xDEAD_BEEF_F00D_CAFE_u64.wrapping_mul(bits as u64 + 1);
                     let h2 = 0x1234_5678_9ABC_DEF0_u64.wrapping_mul(k as u64 + 1) | 1;
                     let mut out = vec![0_u64; k];
-                    scalar::positions(h1, h2, k, bits, &mut out);
+                    unsafe { scalar::positions_unchecked(h1, h2, k, bits, &mut out) };
                     for (i, &got) in out.iter().enumerate() {
                         let expected = h1.wrapping_add((i as u64).wrapping_mul(h2)) % (bits as u64);
                         assert_eq!(got, expected, "scalar diverged at bits={bits} k={k} i={i}");
@@ -994,7 +999,7 @@ pub mod bloom_kernels {
                     let h2 = 0x9E37_79B9_7F4A_7C15_u64.wrapping_mul(k as u64 + 3) | 1;
                     let mut out_scalar = vec![0_u64; k];
                     let mut out_auto = vec![0_u64; k];
-                    scalar::positions(h1, h2, k, bits, &mut out_scalar);
+                    unsafe { scalar::positions_unchecked(h1, h2, k, bits, &mut out_scalar) };
                     auto::positions(h1, h2, k, bits, &mut out_auto);
                     assert_eq!(
                         out_scalar, out_auto,
@@ -1017,10 +1022,10 @@ pub mod bloom_kernels {
                     let h2 = 0x6E5E_2E5C_DEAD_BEEF_u64.wrapping_mul(k as u64 + 5) | 1;
                     let mut out_scalar = vec![0_u64; k];
                     let mut out_avx2 = vec![0_u64; k];
-                    scalar::positions(h1, h2, k, bits, &mut out_scalar);
+                    unsafe { scalar::positions_unchecked(h1, h2, k, bits, &mut out_scalar) };
                     // SAFETY: availability checked above.
                     unsafe {
-                        avx2::positions(h1, h2, k, bits, &mut out_avx2);
+                        avx2::positions_unchecked(h1, h2, k, bits, &mut out_avx2);
                     }
                     assert_eq!(
                         out_scalar, out_avx2,
@@ -1045,10 +1050,10 @@ pub mod bloom_kernels {
                     let h2 = 0x0123_4567_89AB_CDEF_u64.wrapping_mul(k as u64 + 7) | 1;
                     let mut out_scalar = vec![0_u64; k];
                     let mut out_avx512 = vec![0_u64; k];
-                    scalar::positions(h1, h2, k, bits, &mut out_scalar);
+                    unsafe { scalar::positions_unchecked(h1, h2, k, bits, &mut out_scalar) };
                     // SAFETY: availability checked above.
                     unsafe {
-                        avx512::positions(h1, h2, k, bits, &mut out_avx512);
+                        avx512::positions_unchecked(h1, h2, k, bits, &mut out_avx512);
                     }
                     assert_eq!(
                         out_scalar, out_avx512,
@@ -1067,10 +1072,10 @@ pub mod bloom_kernels {
                     let h2 = 0x9E37_79B9_7F4A_7C15_u64.wrapping_mul(k as u64 + 11) | 1;
                     let mut out_scalar = vec![0_u64; k];
                     let mut out_neon = vec![0_u64; k];
-                    scalar::positions(h1, h2, k, bits, &mut out_scalar);
+                    unsafe { scalar::positions_unchecked(h1, h2, k, bits, &mut out_scalar) };
                     // SAFETY: NEON is mandatory on AArch64.
                     unsafe {
-                        neon::positions(h1, h2, k, bits, &mut out_neon);
+                        unsafe { neon::positions_unchecked(h1, h2, k, bits, &mut out_neon) };
                     }
                     assert_eq!(
                         out_scalar, out_neon,

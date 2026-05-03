@@ -41,12 +41,25 @@ pub const fn is_available() -> bool {
 ///
 /// # Panics
 ///
-/// Panics if `out.len() < k` or `bits == 0`.
+/// Panics if `out.len() < k` or `bits == 0`. Available only with
+/// `feature = "userspace"` (audit-R10 #1 / #216).
+#[cfg(feature = "userspace")]
 #[target_feature(enable = "avx512f,avx512dq")]
 pub unsafe fn positions(h1: u64, h2: u64, k: usize, bits: usize, out: &mut [u64]) {
     assert!(bits > 0, "BloomFilter bits must be > 0");
     assert!(out.len() >= k, "out buffer too small: {} < {k}", out.len());
+    // SAFETY: precondition checked above; AVX-512 supplied by target_feature.
+    unsafe { positions_unchecked(h1, h2, k, bits, out) }
+}
 
+/// Unchecked variant of [`positions`].
+///
+/// # Safety
+///
+/// Caller must ensure AVX-512F + AVX-512DQ are available, `out.len() >= k`,
+/// and `bits > 0` (audit-R10 #1 / #216).
+#[target_feature(enable = "avx512f,avx512dq")]
+pub unsafe fn positions_unchecked(h1: u64, h2: u64, k: usize, bits: usize, out: &mut [u64]) {
     let h1_v = _mm512_set1_epi64(h1 as i64);
     let h2_v = _mm512_set1_epi64(h2 as i64);
 

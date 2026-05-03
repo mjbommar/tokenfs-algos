@@ -20,12 +20,25 @@ pub const fn is_available() -> bool {
 ///
 /// # Panics
 ///
-/// Panics if `out.len() < k` or `bits == 0`.
+/// Panics if `out.len() < k` or `bits == 0`. Available only with
+/// `feature = "userspace"` (audit-R10 #1 / #216).
+#[cfg(feature = "userspace")]
 #[target_feature(enable = "neon")]
 pub unsafe fn positions(h1: u64, h2: u64, k: usize, bits: usize, out: &mut [u64]) {
     assert!(bits > 0, "BloomFilter bits must be > 0");
     assert!(out.len() >= k, "out buffer too small: {} < {k}", out.len());
+    // SAFETY: precondition checked above.
+    unsafe { positions_unchecked(h1, h2, k, bits, out) }
+}
 
+/// Unchecked variant of [`positions`].
+///
+/// # Safety
+///
+/// Caller must ensure NEON is available, `out.len() >= k`, and
+/// `bits > 0` (audit-R10 #1 / #216).
+#[target_feature(enable = "neon")]
+pub unsafe fn positions_unchecked(h1: u64, h2: u64, k: usize, bits: usize, out: &mut [u64]) {
     let h1_v = vdupq_n_u64(h1);
 
     let mut i = 0_usize;

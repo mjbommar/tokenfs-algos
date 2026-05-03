@@ -75,12 +75,27 @@ unsafe fn mul_epi64_lo(a: __m256i, b: __m256i) -> __m256i {
 ///
 /// # Panics
 ///
-/// Panics if `out.len() < k` or `bits == 0`.
+/// Panics if `out.len() < k` or `bits == 0`. Available only with
+/// `feature = "userspace"` — kernel-safe callers should use
+/// [`positions_unchecked`] after pre-validating (audit-R10 #1 / #216).
+#[cfg(feature = "userspace")]
 #[target_feature(enable = "avx2")]
 pub unsafe fn positions(h1: u64, h2: u64, k: usize, bits: usize, out: &mut [u64]) {
     assert!(bits > 0, "BloomFilter bits must be > 0");
     assert!(out.len() >= k, "out buffer too small: {} < {k}", out.len());
+    // SAFETY: precondition checked above; AVX2 supplied by target_feature.
+    unsafe { positions_unchecked(h1, h2, k, bits, out) }
+}
 
+/// Unchecked variant of [`positions`].
+///
+/// # Safety
+///
+/// Caller must ensure AVX2 is available, `out.len() >= k`, and
+/// `bits > 0`. Used by `super::auto::positions` after upstream
+/// validation (audit-R10 #1 / #216).
+#[target_feature(enable = "avx2")]
+pub unsafe fn positions_unchecked(h1: u64, h2: u64, k: usize, bits: usize, out: &mut [u64]) {
     // Stage 1: vector-add `h1 + i*h2` into a stack buffer of
     // u64 lanes. Process LANES (4) i-values per iteration.
     let h1_v = _mm256_set1_epi64x(h1 as i64);
