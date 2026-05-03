@@ -4,6 +4,118 @@ All notable changes to this crate will be documented in this file. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] — 2026-05-02
+
+The kernel-safe-by-default cut. Default features no longer expose the
+ergonomic panicking shape APIs; userspace consumers wanting them opt in
+via the new `userspace` umbrella feature. Adds nine families of `try_*`
+fallible siblings closing every audit-R7 panic-path finding the previous
+release left out. Pre-release: no semver compatibility commitment.
+
+### Changed (BREAKING) — default feature surface flip
+
+- **`panicking-shape-apis` no longer in `default = [...]`** (audit-R7
+  followup #1, #3, #4, #14). The panic-prone entry points
+  (`BitPacker::encode_u32_slice`, `streamvbyte_decode_u32`,
+  `dot_f32_one_to_many`, `RankSelectDict::build`, `sha256_batch_st`,
+  `signature_batch_simd`, etc.) now require the new `userspace`
+  umbrella feature. The crate's primary consumer audience — kernel
+  modules, FUSE daemons, Postgres extensions, MinIO/CDN, forensics
+  tools — should not have panic-prone branches compile in by default.
+  - **For userspace consumers**: add `features = ["userspace"]` to
+    your `[dependencies]` entry. Equivalent to v0.3.x default behavior.
+  - **For kernel/FUSE/forensics**: do nothing. The default is now
+    panic-free.
+  - **For benches that exercise panicking APIs** (similarity,
+    hash_batched, bits_streamvbyte, bits_rank_select,
+    hash_set_membership, bits_bit_pack): now declare
+    `required-features = ["userspace"]` in `Cargo.toml`. CI is
+    updated to enable it.
+  - **For example programs** (build_pipeline, inverted_index,
+    dispatch_explain, similarity_scan): now declare
+    `required-features = ["userspace"]`.
+  - **For integration tests** (avx2_parity, neon_parity,
+    integration_phase_c): file-level `#![cfg(feature = "userspace")]`.
+
+### Added — `try_*` panic-free coverage (audit-R7 followups)
+
+For each module below the existing panicking entry points are unchanged
+(now gated behind `userspace` per above); the new `try_*` siblings
+return `Result<T, Error>` with informative diagnostic fields.
+
+- **`bits::rank_select`** (#5, #6): `try_rank1`, `try_rank0`,
+  `try_rank1_batch`, `try_select1_batch`. New error variants
+  `RankSelectError::PositionOutOfRange { pos, n_bits }` and
+  `RankSelectError::BatchOutputTooShort { needed, actual }`. Batch
+  variants validate `out.len()` upfront so the caller's buffer is
+  never partially mutated on the failure path. +12 tests.
+- **`permutation`** (#7, #9, #10, #11):
+  - `Permutation::try_apply`, `try_apply_into` (shape-checked, lighter
+    than the existing `try_apply_into_strict` which also proves
+    permutation validity).
+  - `Permutation::try_validate_no_alloc` (returns Err on undersized
+    scratch instead of panicking).
+  - `CsrGraph::try_neighbors_of`, `try_degree_of`, `try_validate`
+    with new `CsrGraphError` enum (OutOfRange, OffsetsNonMonotone,
+    NeighborsOutOfBounds, OffsetsLengthMismatch, NeighborsLengthMismatch,
+    NeighborOutOfRange).
+  - `try_rcm`, `try_rabbit_order`, `try_rabbit_order_par` with new
+    top-level `PermutationConstructionError` that wraps `CsrGraphError`
+    via `From`. Note: these still allocate internally (work buffers);
+    the `try_*` path is about not panicking on bad input, NOT about
+    being heap-free. +36 tests.
+- **`approx`** (#12, #13): `BloomFilter::try_with_target` (overflow-
+  safe), `try_insert_simd`, `try_contains_simd`. HLL `try_new` /
+  `try_merge` doc-completed (try paths already existed). New
+  `ApproxError::BitCountOverflow`, `KExceedsSimdMax` variants;
+  `ApproxError` now `#[non_exhaustive]`. +6 tests.
+- **`similarity::lsh`** (#16): `MinHashIndex::try_new`,
+  `SimHashIndex::try_new`. New `LshConstructionError` enum
+  (ZeroBands, ZeroRows, BandsTimesRowsMismatchSignatureLen,
+  BandsExceedSignatureLen). The `Default for SimHashIndex` impl
+  delegates to the panicking `new` (trait impls cannot be fallible);
+  kernel callers should call `try_new` directly. +14 tests.
+- Existing panicking siblings retained but now gated on `userspace`;
+  each gained a `# Panics` doc section pointing at its `try_*`
+  counterpart for kernel/FUSE callers.
+
+### Documentation (audit-R7 followups #8, #15)
+
+- **`Hasher::update`** docstring elevates `try_update` guidance to a
+  dedicated `# Kernel/FUSE callers` section, framing the panic as a
+  DoS hazard since untrusted callers can supply adversarial byte
+  streams approaching the 2 EiB FIPS cap across multiple syscalls.
+- **`Permutation::apply` / `apply_into`** continue to point at
+  `try_apply_into_strict` for kernel-boundary callers wanting
+  permutation-validity proof; the new lightweight `try_apply` /
+  `try_apply_into` siblings are referenced for shape-only validation.
+
+### Added (unwired) — `arch-pinned-kernels` feature
+
+New Cargo feature is declared but does not yet gate any modules. The
+follow-up file-split refactor (audit-R7 #17) will move the per-backend
+`pub mod {scalar,avx2,avx512,neon}` SIMD kernels behind it so external
+callers cannot violate CPU-feature/bounds preconditions. Currently
+those modules are still unconditionally `pub`. Tracked separately;
+deferred from v0.4.0 because Rust does not permit conditional
+visibility on inline `pub mod` without body duplication and the
+file-split is invasive enough to warrant its own PR.
+
+### Notes
+
+- Lib test counts under each config (was 861 / 768 / 600 at v0.3.0):
+  - `--all-features`: 933 (+72)
+  - `default` (kernel-safe): 763 (+5 vs v0.3.0 default sans userspace)
+  - `--features userspace`: 842
+  - `--no-default-features --features alloc`: 653 (+49)
+- All `cargo xtask check`, aarch64 cross-clippy, `cargo deny check`,
+  and `cargo miri test --no-default-features --features alloc` gates
+  green with zero advisory suppressions.
+- v0.3.x carry-over follow-ups (AVX2 modularity-gain parity,
+  rabbit_order_par colouring) remain open; both still match the
+  documented "wall-clock parity or modestly slower" posture.
+- No new external dependencies added.
+
 ## [0.3.0] — 2026-05-02
 
 Phase D Rabbit Order release: SIMD modularity inner loop (Sprint 50-52) +
