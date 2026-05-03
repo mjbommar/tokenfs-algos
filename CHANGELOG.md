@@ -4,6 +4,128 @@ All notable changes to this crate will be documented in this file. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.4.1] — 2026-05-02
+
+Audit-round-8 hardening pass: 7 findings addressed via 4 parallel
+worktree agents + foreground doc + Cargo.toml-comment fixes. All
+additive — no semver-relevant changes (already pre-release; no
+existing consumers).
+
+### Fixed (HIGH)
+
+- **#1 chunk::recursive: SplitPolicy untrusted offset** — the
+  caller-supplied `SplitPolicy::split_at` was documented as requiring
+  `0 < offset < bytes.len()` but the recursive driver trusted it
+  blindly. `Some(0)` or `Some(len)` would recurse forever; `Some(>len)`
+  panicked on slicing. Now guarded: contract violations are silently
+  treated as terminal (leaf) splits in both the sequential `walk` and
+  parallel `walk_par`. Driver returns `F::Acc` (no Result type
+  available without breaking every caller); contract documented in
+  the SplitPolicy rustdoc. +5 tests covering Some(0), Some(len),
+  Some(len+1), Some(far_greater), and parallel-zero.
+- **#2 chunk::ChunkConfig + FastCdcConfig public fields create
+  zero-progress iterators** — public fields let callers bypass
+  constructors and set `min/avg/max = 0`; iterators then never
+  advance (CPU/memory DoS). Now defended on three layers:
+  - new `ChunkConfigError` enum (`ZeroMin`, `ZeroAvg`, `ZeroMax`,
+    `MinExceedsAvg`, `AvgExceedsMax`) returned by new `try_new` /
+    `try_with_sizes` constructors;
+  - new `FastCdcConfig::try_new` / `try_with_sizes` mirroring the
+    same validation;
+  - iterator progress guard: if `produced_bytes == 0`, the iterator
+    returns None (terminates) instead of looping forever — defends
+    against bypassed-constructor zero-configs;
+  - field-level rustdoc warning that direct struct-literal
+    construction is unsafe and pointing kernel callers at
+    `try_with_sizes`.
+
+  Fields kept `pub` (not made private) because the worktree agent's
+  scope guardrail prevented updating cross-crate consumers
+  (`benches/`, `examples/`, `fuzz/`); the progress guard + fallible
+  constructors give the same defense without breaking the external
+  fuzz crate. +14 tests across both Config types.
+
+### Fixed (MEDIUM)
+
+- **#3 try_contains_batch_simd panics for k > MAX_K** — the path
+  slices a fixed `[u64; MAX_K]` stack buffer with `[..self.k]` which
+  panics on `k > 32`. The single-key sibling
+  `try_contains_simd` was added in this patch (returns
+  `ApproxError::KExceedsSimdMax`); the batch sibling now early-checks
+  `k > MAX_K` and returns the new
+  `BloomBatchError::KExceedsSimdMax { k: u32, max: u32 }` variant
+  before the slice access. +3 tests including a `#[should_panic]`
+  regression on the panicking sibling to keep its contract.
+- **#4 try_hamming_u64_one_to_many panics on stride > u32::MAX/64** —
+  the post-validation kernel uses a panicking `sum_u64` for that
+  stride regime. Documented at line 311 but never surfaced as Err.
+  Now guarded: new `BatchShapeError::StrideExceedsHammingLimit { stride,
+  limit }` variant returned before the kernel dispatch. The check
+  fires *before* shape validation so an Err can be exercised with
+  empty `query`/`db`/`out` slices instead of needing 67M-word
+  allocations. Audited the four other vector::batch try_* siblings
+  (`try_dot_f32`, `try_l2_squared_f32`, `try_cosine_similarity_f32`,
+  `try_jaccard_u64`) — no other hidden panicking preconditions. +1
+  test.
+
+### Fixed (MEDIUM-LOW)
+
+- **#5 honest Cargo.toml comment for `arch-pinned-kernels`** — the
+  feature comment claimed it gated the per-backend kernel modules,
+  but those modules are still unconditionally `pub` (the file-split
+  refactor for ~30 modules across 15+ files is tracked as #180).
+  Comment now acknowledges the feature is declared-but-unwired and
+  steers kernel-adjacent consumers at `kernels::auto::*` until #180
+  lands. Pure documentation honesty; no code change.
+- **#6a entropy/joint + histogram/pair: dense 256x256
+  BytePairHistogram on stack (256 KiB)** — kernel-stack hazard.
+  New surface eliminates the inline allocation for kernel callers:
+  - `histogram::pair::BytePairCountsScratch` (caller-owned 256 KiB
+    table) + `BytePairHistogramView<'a>` (read-only borrow)
+  - `BytePairHistogram::with_scratch(bytes, &mut scratch) -> View`
+  - `entropy::joint::h2_pairs_with_dense_scratch(bytes, &mut scratch)`
+  - `entropy::joint::h2_from_pair_view(&view)`
+
+  By-value entries kept; each gained a `# Stack` (or
+  `# Kernel callers`) section pointing at the new heap-free sibling.
+  Module-level kernel-stack hazard discussion added to
+  `histogram::pair`.
+- **#6b/c similarity::minhash + kernels_gather: large arrays returned
+  by value (up to K * 256 * 8 bytes = 512 KiB at K=256)** — same
+  hazard. New `_into` siblings:
+  - `similarity::minhash::signature_simd_into<K>(bytes, table, &mut out)`
+  - `similarity::minhash::classic_from_bytes_table_8_into(...)`
+  - `similarity::minhash::build_byte_table_from_seeds_into<K>(...)`
+
+  The `kernels_gather` `_into` helpers already existed from R5 #156;
+  this round added doc cross-references from the by-value entries.
+  +13 tests across the heap-free siblings.
+
+### Documentation (LOW)
+
+- **#7 stale feature docs in lib.rs + README** — both files still
+  said `panicking-shape-apis` was "on-by-default" but v0.4.0 dropped
+  it. Both updated to state explicitly that the default is
+  kernel-safe and that userspace consumers opt back in via
+  `features = ["userspace"]`. README also added a top-of-list
+  explanation of the `userspace` umbrella.
+- **#15 (R7-followup carryover)**: SHA-256 `Hasher::update` doc
+  promotes try_update to a dedicated `# Kernel/FUSE callers`
+  section (was buried in the length-limit paragraph).
+
+### Notes
+
+- Lib test counts: 969 with `--all-features` (was 933 at v0.4.0;
+  +36 from the four R8 fix agents).
+- All `cargo xtask check`, aarch64 cross-clippy, `cargo deny check`
+  green with zero advisory suppressions.
+- Two outstanding architectural items remain open as task #180:
+  the file-split refactor to wire `arch-pinned-kernels` (audit-R7
+  #17 + audit-R8 #5). Per-backend kernel modules continue to be
+  unconditionally `pub`; the feature is declared but does not yet
+  gate anything. Kernel-adjacent consumers should call
+  `kernels::auto::*` exclusively until that lands.
+
 ## [0.4.0] — 2026-05-02
 
 The kernel-safe-by-default cut. Default features no longer expose the
