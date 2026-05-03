@@ -17,16 +17,53 @@
 //! Cross-backend results differ within `1e-3` of `sum(|a_i*b_i|)` (the
 //! Higham bound). Same-backend results are bit-exact across runs.
 
+#[cfg(feature = "arch-pinned-kernels")]
 pub mod scalar;
+#[cfg(not(feature = "arch-pinned-kernels"))]
+#[allow(dead_code, unreachable_pub)]
+pub(crate) mod scalar;
 
-#[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(all(
+    feature = "arch-pinned-kernels",
+    feature = "avx2",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
 pub mod avx2;
+#[cfg(all(
+    not(feature = "arch-pinned-kernels"),
+    feature = "avx2",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
+#[allow(dead_code, unreachable_pub)]
+pub(crate) mod avx2;
 
-#[cfg(all(feature = "avx512", any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(all(
+    feature = "arch-pinned-kernels",
+    feature = "avx512",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
 pub mod avx512;
+#[cfg(all(
+    not(feature = "arch-pinned-kernels"),
+    feature = "avx512",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
+#[allow(dead_code, unreachable_pub)]
+pub(crate) mod avx512;
 
-#[cfg(all(feature = "neon", target_arch = "aarch64"))]
+#[cfg(all(
+    feature = "arch-pinned-kernels",
+    feature = "neon",
+    target_arch = "aarch64"
+))]
 pub mod neon;
+#[cfg(all(
+    not(feature = "arch-pinned-kernels"),
+    feature = "neon",
+    target_arch = "aarch64"
+))]
+#[allow(dead_code, unreachable_pub)]
+pub(crate) mod neon;
 
 /// Runtime-dispatched dense-distance kernels.
 pub mod auto {

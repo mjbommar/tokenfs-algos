@@ -649,26 +649,11 @@ pub mod bloom_kernels {
     }
 
     /// Portable scalar position-computation reference.
-    pub mod scalar {
-        /// Writes the K Kirsch-Mitzenmacher positions into `out`.
-        ///
-        /// `out[i] = (h1.wrapping_add((i as u64).wrapping_mul(h2))) %
-        /// bits` for `i in 0..k`. Acts as the parity oracle for every
-        /// SIMD backend in this module.
-        ///
-        /// # Panics
-        ///
-        /// Panics if `out.len() < k` or `bits == 0`.
-        pub fn positions(h1: u64, h2: u64, k: usize, bits: usize, out: &mut [u64]) {
-            assert!(bits > 0, "BloomFilter bits must be > 0");
-            assert!(out.len() >= k, "out buffer too small: {} < {k}", out.len());
-            let bits_u64 = bits as u64;
-            for (i, slot) in out.iter_mut().take(k).enumerate() {
-                let raw = h1.wrapping_add((i as u64).wrapping_mul(h2));
-                *slot = raw % bits_u64;
-            }
-        }
-    }
+    #[cfg(feature = "arch-pinned-kernels")]
+    pub mod scalar;
+    #[cfg(not(feature = "arch-pinned-kernels"))]
+    #[allow(dead_code, unreachable_pub)]
+    pub(crate) mod scalar;
 
     /// x86 AVX2 position-computation kernel.
     ///
@@ -682,226 +667,38 @@ pub mod bloom_kernels {
     /// `(h1 + i*h2)` across multiple K values in parallel: for K=7
     /// the scalar path issues 7 sequential adds; the AVX2 path issues
     /// 2 vector adds (1 vector + tail).
-    #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
-    pub mod avx2 {
-        #[cfg(target_arch = "x86")]
-        use core::arch::x86::{
-            __m256i, _mm256_add_epi64, _mm256_mul_epu32, _mm256_set1_epi64x, _mm256_setr_epi64x,
-            _mm256_slli_epi64, _mm256_srli_epi64, _mm256_storeu_si256,
-        };
-        #[cfg(target_arch = "x86_64")]
-        use core::arch::x86_64::{
-            __m256i, _mm256_add_epi64, _mm256_mul_epu32, _mm256_set1_epi64x, _mm256_setr_epi64x,
-            _mm256_slli_epi64, _mm256_srli_epi64, _mm256_storeu_si256,
-        };
-
-        /// 4 u64 lanes per AVX2 vector.
-        const LANES: usize = 4;
-
-        /// Returns true when AVX2 is available at runtime.
-        #[cfg(feature = "std")]
-        #[must_use]
-        pub fn is_available() -> bool {
-            std::is_x86_feature_detected!("avx2")
-        }
-
-        /// Returns true when AVX2 is available at runtime.
-        #[cfg(not(feature = "std"))]
-        #[must_use]
-        pub const fn is_available() -> bool {
-            false
-        }
-
-        /// 64-bit lane-wise multiply emulation for AVX2.
-        ///
-        /// AVX2 has `_mm256_mul_epu32` which multiplies the low 32
-        /// bits of each 64-bit lane (producing 64-bit products in
-        /// even-indexed lanes only) but no native 64-bit multiply.
-        /// We emulate `a * b` via three 32x32→64 multiplies and two
-        /// shifts — the standard schoolbook recipe:
-        ///
-        /// `a * b = (a.lo * b.lo) + ((a.hi * b.lo) << 32) + ((a.lo * b.hi) << 32)`
-        ///
-        /// (the `a.hi * b.hi` term is dropped because we only keep
-        /// the low 64 bits of the product, and that term contributes
-        /// only to bits 64+).
-        ///
-        /// # Safety
-        ///
-        /// AVX2 must be available; caller asserts via `target_feature`.
-        #[target_feature(enable = "avx2")]
-        #[inline]
-        unsafe fn mul_epi64_lo(a: __m256i, b: __m256i) -> __m256i {
-            let a_lo = a; // low 32 of each 64-bit lane (high 32 ignored by mul_epu32)
-            let b_lo = b;
-            let a_hi = _mm256_srli_epi64::<32>(a);
-            let b_hi = _mm256_srli_epi64::<32>(b);
-
-            let lo_lo = _mm256_mul_epu32(a_lo, b_lo);
-            let hi_lo = _mm256_mul_epu32(a_hi, b_lo);
-            let lo_hi = _mm256_mul_epu32(a_lo, b_hi);
-
-            // Shift cross terms into the high half of each 64-bit lane
-            // and add to the lo*lo product.
-            let cross = _mm256_add_epi64(hi_lo, lo_hi);
-            let cross_shifted = _mm256_slli_epi64::<32>(cross);
-            _mm256_add_epi64(lo_lo, cross_shifted)
-        }
-
-        /// AVX2 position-computation kernel.
-        ///
-        /// Computes K positions in parallel across 4-wide vectors,
-        /// stores to the caller-supplied buffer, then performs the
-        /// scalar `% bits` reduction. Bit-exact with
-        /// [`super::scalar::positions`].
-        ///
-        /// # Safety
-        ///
-        /// The caller must ensure the current CPU supports AVX2.
-        ///
-        /// # Panics
-        ///
-        /// Panics if `out.len() < k` or `bits == 0`.
-        #[target_feature(enable = "avx2")]
-        pub unsafe fn positions(h1: u64, h2: u64, k: usize, bits: usize, out: &mut [u64]) {
-            assert!(bits > 0, "BloomFilter bits must be > 0");
-            assert!(out.len() >= k, "out buffer too small: {} < {k}", out.len());
-
-            // Stage 1: vector-add `h1 + i*h2` into a stack buffer of
-            // u64 lanes. Process LANES (4) i-values per iteration.
-            let h1_v = _mm256_set1_epi64x(h1 as i64);
-            let h2_v = _mm256_set1_epi64x(h2 as i64);
-
-            let mut i = 0_usize;
-            while i + LANES <= k {
-                // i-vector for this block: {i+0, i+1, i+2, i+3}
-                let i_v =
-                    _mm256_setr_epi64x(i as i64, (i + 1) as i64, (i + 2) as i64, (i + 3) as i64);
-                // SAFETY: `mul_epi64_lo` requires AVX2; the enclosing
-                // target_feature supplies it.
-                let prod = unsafe { mul_epi64_lo(i_v, h2_v) };
-                let sum = _mm256_add_epi64(h1_v, prod);
-                // Store the 4 raw u64 positions to `out[i..i+4]`.
-                // SAFETY: `out.len() >= k >= i + LANES` holds by the
-                // loop condition; the cast to `__m256i*` is align(1)
-                // via the unaligned store intrinsic.
-                unsafe {
-                    _mm256_storeu_si256(out.as_mut_ptr().add(i).cast::<__m256i>(), sum);
-                }
-                i += LANES;
-            }
-
-            // Stage 1 tail: remaining 0..LANES positions, scalar.
-            let bits_u64 = bits as u64;
-            while i < k {
-                let raw = h1.wrapping_add((i as u64).wrapping_mul(h2));
-                out[i] = raw;
-                i += 1;
-            }
-
-            // Stage 2: scalar modular reduction. AVX2 has no vector
-            // u64 divide; the per-lane `% bits` reduction is cheap
-            // compared to the multiply-add chain anyway.
-            for slot in out.iter_mut().take(k) {
-                *slot %= bits_u64;
-            }
-        }
-    }
+    #[cfg(all(
+        feature = "arch-pinned-kernels",
+        feature = "avx2",
+        any(target_arch = "x86", target_arch = "x86_64")
+    ))]
+    pub mod avx2;
+    #[cfg(all(
+        not(feature = "arch-pinned-kernels"),
+        feature = "avx2",
+        any(target_arch = "x86", target_arch = "x86_64")
+    ))]
+    #[allow(dead_code, unreachable_pub)]
+    pub(crate) mod avx2;
 
     /// x86 AVX-512 position-computation kernel.
     ///
     /// Computes 8 u64 positions per `__m512i` vector via
     /// `_mm512_add_epi64` + `_mm512_mullo_epi64` (native 64-bit
     /// multiply, AVX-512DQ). The modular reduction is scalar.
-    #[cfg(all(feature = "avx512", any(target_arch = "x86", target_arch = "x86_64")))]
-    pub mod avx512 {
-        #[cfg(target_arch = "x86")]
-        use core::arch::x86::{
-            __m512i, _mm512_add_epi64, _mm512_mullo_epi64, _mm512_set1_epi64, _mm512_setr_epi64,
-            _mm512_storeu_si512,
-        };
-        #[cfg(target_arch = "x86_64")]
-        use core::arch::x86_64::{
-            __m512i, _mm512_add_epi64, _mm512_mullo_epi64, _mm512_set1_epi64, _mm512_setr_epi64,
-            _mm512_storeu_si512,
-        };
-
-        /// 8 u64 lanes per AVX-512 vector.
-        const LANES: usize = 8;
-
-        /// Returns true when AVX-512F + AVX-512DQ are available at
-        /// runtime.
-        ///
-        /// `_mm512_mullo_epi64` is part of AVX-512DQ. The base
-        /// AVX-512F flag is implied by DQ but checked independently
-        /// for clarity (and to match the dispatch convention used by
-        /// [`crate::bits::popcount::kernels::avx512::is_available`]).
-        #[cfg(feature = "std")]
-        #[must_use]
-        pub fn is_available() -> bool {
-            std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512dq")
-        }
-
-        /// Returns true when AVX-512F + AVX-512DQ are available.
-        #[cfg(not(feature = "std"))]
-        #[must_use]
-        pub const fn is_available() -> bool {
-            false
-        }
-
-        /// AVX-512 position-computation kernel.
-        ///
-        /// # Safety
-        ///
-        /// The caller must ensure the current CPU supports AVX-512F
-        /// and AVX-512DQ.
-        ///
-        /// # Panics
-        ///
-        /// Panics if `out.len() < k` or `bits == 0`.
-        #[target_feature(enable = "avx512f,avx512dq")]
-        pub unsafe fn positions(h1: u64, h2: u64, k: usize, bits: usize, out: &mut [u64]) {
-            assert!(bits > 0, "BloomFilter bits must be > 0");
-            assert!(out.len() >= k, "out buffer too small: {} < {k}", out.len());
-
-            let h1_v = _mm512_set1_epi64(h1 as i64);
-            let h2_v = _mm512_set1_epi64(h2 as i64);
-
-            let mut i = 0_usize;
-            while i + LANES <= k {
-                let i_v = _mm512_setr_epi64(
-                    i as i64,
-                    (i + 1) as i64,
-                    (i + 2) as i64,
-                    (i + 3) as i64,
-                    (i + 4) as i64,
-                    (i + 5) as i64,
-                    (i + 6) as i64,
-                    (i + 7) as i64,
-                );
-                let prod = _mm512_mullo_epi64(i_v, h2_v);
-                let sum = _mm512_add_epi64(h1_v, prod);
-                // SAFETY: `out.len() >= k >= i + LANES`; unaligned
-                // store is align(1) via the intrinsic.
-                unsafe {
-                    _mm512_storeu_si512(out.as_mut_ptr().add(i).cast::<__m512i>(), sum);
-                }
-                i += LANES;
-            }
-
-            // Tail: scalar.
-            while i < k {
-                let raw = h1.wrapping_add((i as u64).wrapping_mul(h2));
-                out[i] = raw;
-                i += 1;
-            }
-
-            let bits_u64 = bits as u64;
-            for slot in out.iter_mut().take(k) {
-                *slot %= bits_u64;
-            }
-        }
-    }
+    #[cfg(all(
+        feature = "arch-pinned-kernels",
+        feature = "avx512",
+        any(target_arch = "x86", target_arch = "x86_64")
+    ))]
+    pub mod avx512;
+    #[cfg(all(
+        not(feature = "arch-pinned-kernels"),
+        feature = "avx512",
+        any(target_arch = "x86", target_arch = "x86_64")
+    ))]
+    #[allow(dead_code, unreachable_pub)]
+    pub(crate) mod avx512;
 
     /// AArch64 NEON position-computation kernel.
     ///
@@ -919,74 +716,19 @@ pub mod bloom_kernels {
     /// is roughly 1.5x faster than pure scalar at K=8 and converges
     /// to ~2x at K=32. See `benches/approx_bloom.rs` for measured
     /// numbers per platform.
-    #[cfg(all(feature = "neon", target_arch = "aarch64"))]
-    pub mod neon {
-        use core::arch::aarch64::{uint64x2_t, vaddq_u64, vdupq_n_u64, vld1q_u64, vst1q_u64};
-
-        /// 2 u64 lanes per NEON vector.
-        const LANES: usize = 2;
-
-        /// Returns true when NEON is available at runtime.
-        ///
-        /// NEON is mandatory on AArch64; this exists for API symmetry
-        /// with the x86 `is_available` helpers.
-        #[must_use]
-        pub const fn is_available() -> bool {
-            true
-        }
-
-        /// NEON position-computation kernel.
-        ///
-        /// # Safety
-        ///
-        /// The caller must ensure the current CPU supports NEON.
-        ///
-        /// # Panics
-        ///
-        /// Panics if `out.len() < k` or `bits == 0`.
-        #[target_feature(enable = "neon")]
-        pub unsafe fn positions(h1: u64, h2: u64, k: usize, bits: usize, out: &mut [u64]) {
-            assert!(bits > 0, "BloomFilter bits must be > 0");
-            assert!(out.len() >= k, "out buffer too small: {} < {k}", out.len());
-
-            let h1_v = vdupq_n_u64(h1);
-
-            let mut i = 0_usize;
-            while i + LANES <= k {
-                // Compute `i*h2` and `(i+1)*h2` scalar (no NEON
-                // 64-bit multiply pre-SVE2), pack into a vector,
-                // vector-add `h1` and store the two raw u64
-                // positions.
-                let prod = [
-                    (i as u64).wrapping_mul(h2),
-                    ((i + 1) as u64).wrapping_mul(h2),
-                ];
-                // SAFETY: `prod` is on the stack with 8-byte alignment;
-                // `vld1q_u64` accepts unaligned loads.
-                let prod_v: uint64x2_t = unsafe { vld1q_u64(prod.as_ptr()) };
-                let sum = vaddq_u64(h1_v, prod_v);
-                // SAFETY: `out.len() >= k >= i + LANES` holds by the
-                // loop condition.
-                unsafe {
-                    vst1q_u64(out.as_mut_ptr().add(i), sum);
-                }
-                i += LANES;
-            }
-
-            // Tail (k odd).
-            while i < k {
-                let raw = h1.wrapping_add((i as u64).wrapping_mul(h2));
-                out[i] = raw;
-                i += 1;
-            }
-
-            // Stage 2: scalar modular reduction.
-            let bits_u64 = bits as u64;
-            for slot in out.iter_mut().take(k) {
-                *slot %= bits_u64;
-            }
-        }
-    }
+    #[cfg(all(
+        feature = "arch-pinned-kernels",
+        feature = "neon",
+        target_arch = "aarch64"
+    ))]
+    pub mod neon;
+    #[cfg(all(
+        not(feature = "arch-pinned-kernels"),
+        feature = "neon",
+        target_arch = "aarch64"
+    ))]
+    #[allow(dead_code, unreachable_pub)]
+    pub(crate) mod neon;
 
     #[cfg(test)]
     mod tests {
@@ -1557,432 +1299,59 @@ mod hll {
         }
 
         /// Portable scalar reference implementations.
-        pub mod scalar {
-            use super::POW2_NEG_LUT;
-
-            /// Per-bucket max merge: `dst[i] = max(dst[i], src[i])`.
-            ///
-            /// Reference for the SIMD parity tests; this is the same
-            /// loop the original [`super::super::HyperLogLog::merge`]
-            /// shipped with.
-            pub fn merge(dst: &mut [u8], src: &[u8]) {
-                debug_assert_eq!(
-                    dst.len(),
-                    src.len(),
-                    "HLL merge requires equal-length register arrays"
-                );
-                for (a, &b) in dst.iter_mut().zip(src) {
-                    if b > *a {
-                        *a = b;
-                    }
-                }
-            }
-
-            /// Reference harmonic-mean cardinality `alpha * m^2 / Z`.
-            ///
-            /// Uses the [`super::POW2_NEG_LUT`] lookup so the scalar
-            /// reference exercises the same numerical path as the SIMD
-            /// kernels, eliminating LUT-vs-`powi` rounding differences
-            /// from the parity tolerance budget.
-            #[must_use]
-            pub fn count_raw(registers: &[u8], alpha: f64) -> f64 {
-                let m = registers.len() as f64;
-                let mut sum = 0.0_f64;
-                for &r in registers {
-                    sum += POW2_NEG_LUT[r as usize];
-                }
-                alpha * m * m / sum
-            }
-        }
+        #[cfg(feature = "arch-pinned-kernels")]
+        pub mod scalar;
+        #[cfg(not(feature = "arch-pinned-kernels"))]
+        #[allow(dead_code, unreachable_pub)]
+        pub(crate) mod scalar;
 
         /// x86 AVX2 kernels: `_mm256_max_epu8` for merge and an 8x-unrolled
         /// f64 reduction with `_mm256_i32gather_pd` for the harmonic mean.
-        #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
-        pub mod avx2 {
-            use super::POW2_NEG_LUT;
-
-            #[cfg(target_arch = "x86")]
-            use core::arch::x86::{
-                __m128i, __m256d, __m256i, _mm_cvtepu8_epi32, _mm_set_epi64x, _mm_srli_si128,
-                _mm256_add_pd, _mm256_i32gather_pd, _mm256_loadu_si256, _mm256_max_epu8,
-                _mm256_setzero_pd, _mm256_storeu_si256,
-            };
-            #[cfg(target_arch = "x86_64")]
-            use core::arch::x86_64::{
-                __m128i, __m256d, __m256i, _mm_cvtepu8_epi32, _mm_set_epi64x, _mm_srli_si128,
-                _mm256_add_pd, _mm256_i32gather_pd, _mm256_loadu_si256, _mm256_max_epu8,
-                _mm256_setzero_pd, _mm256_storeu_si256,
-            };
-
-            /// 32 u8 registers per AVX2 vector.
-            const VEC_BYTES: usize = 32;
-
-            /// Returns true when AVX2 is available at runtime.
-            #[cfg(feature = "std")]
-            #[must_use]
-            pub fn is_available() -> bool {
-                std::is_x86_feature_detected!("avx2")
-            }
-
-            /// Returns true when AVX2 is available at runtime.
-            #[cfg(not(feature = "std"))]
-            #[must_use]
-            pub const fn is_available() -> bool {
-                false
-            }
-
-            /// AVX2 per-bucket max merge.
-            ///
-            /// # Safety
-            ///
-            /// The caller must ensure the current CPU supports AVX2 and
-            /// that `dst.len() == src.len()`.
-            #[target_feature(enable = "avx2")]
-            pub unsafe fn merge(dst: &mut [u8], src: &[u8]) {
-                debug_assert_eq!(dst.len(), src.len());
-                let len = dst.len();
-                let mut i = 0_usize;
-                while i + VEC_BYTES <= len {
-                    // SAFETY: `i + 32 <= len` and AVX2 enabled by the
-                    // enclosing target_feature.
-                    let a = unsafe { _mm256_loadu_si256(dst.as_ptr().add(i).cast::<__m256i>()) };
-                    let b = unsafe { _mm256_loadu_si256(src.as_ptr().add(i).cast::<__m256i>()) };
-                    let m = _mm256_max_epu8(a, b);
-                    // SAFETY: same range bound as load above.
-                    unsafe {
-                        _mm256_storeu_si256(dst.as_mut_ptr().add(i).cast::<__m256i>(), m);
-                    }
-                    i += VEC_BYTES;
-                }
-                // Scalar tail.
-                while i < len {
-                    let b = src[i];
-                    if b > dst[i] {
-                        dst[i] = b;
-                    }
-                    i += 1;
-                }
-            }
-
-            /// AVX2 harmonic-mean cardinality `alpha * m^2 / Z`.
-            ///
-            /// Loads 8 u8 registers per inner iteration, gathers their
-            /// `2^-r` f64 values from [`super::POW2_NEG_LUT`] in two
-            /// 4-wide AVX2 gathers, and accumulates into two parallel
-            /// `__m256d` accumulators (8 doubles total) to break the
-            /// dependency chain through `_mm256_add_pd`.
-            ///
-            /// # Safety
-            ///
-            /// The caller must ensure the current CPU supports AVX2.
-            #[target_feature(enable = "avx2")]
-            #[must_use]
-            pub unsafe fn count_raw(registers: &[u8], alpha: f64) -> f64 {
-                let m = registers.len() as f64;
-                let lut_ptr = POW2_NEG_LUT.as_ptr();
-                let mut acc0 = _mm256_setzero_pd();
-                let mut acc1 = _mm256_setzero_pd();
-                let mut i = 0_usize;
-                let n = registers.len();
-
-                // Inner loop: process 8 registers per iteration via
-                // two 4-wide AVX2 gathers from the f64 LUT. Each gather
-                // requires 4 i32 indices; we load the 8-byte group into
-                // the low qword of an xmm, do PMOVZXBD on bytes 0..4
-                // for the low gather, then byte-shift the xmm right by
-                // 4 bytes (PSRLDQ) to move bytes 4..8 down into bytes
-                // 0..4, and PMOVZXBD again for the high gather.
-                while i + 8 <= n {
-                    // Load 8 u8 register values into the low qword of
-                    // an xmm register. SAFETY: `i + 8 <= n`.
-                    let bytes_u64 = unsafe {
-                        core::ptr::read_unaligned(registers.as_ptr().add(i).cast::<i64>())
-                    };
-                    let packed_xmm: __m128i = _mm_set_epi64x(0, bytes_u64);
-
-                    // Low 4 bytes (registers i..i+4) → 4x i32 indices.
-                    let lo_indices = _mm_cvtepu8_epi32(packed_xmm);
-                    // High 4 bytes (registers i+4..i+8): byte-shift the
-                    // xmm right by 4 to expose bytes 4..8 in the low
-                    // 4-byte slot, then PMOVZXBD.
-                    let shifted = _mm_srli_si128::<4>(packed_xmm);
-                    let hi_indices = _mm_cvtepu8_epi32(shifted);
-
-                    // SAFETY: indices ∈ 0..=255, LUT length 256, so
-                    // gather offsets in bytes (= 8*index) are ≤ 2040.
-                    // Intrinsic signature: <SCALE>(base_ptr, vindex).
-                    let g0 = unsafe { _mm256_i32gather_pd::<8>(lut_ptr, lo_indices) };
-                    let g1 = unsafe { _mm256_i32gather_pd::<8>(lut_ptr, hi_indices) };
-                    acc0 = _mm256_add_pd(acc0, g0);
-                    acc1 = _mm256_add_pd(acc1, g1);
-                    i += 8;
-                }
-
-                // Horizontal sum the two parallel f64x4 accumulators.
-                // SAFETY: AVX2 enabled by the enclosing target_feature.
-                let mut sum = unsafe { horizontal_sum_pd(_mm256_add_pd(acc0, acc1)) };
-
-                // Scalar tail.
-                while i < n {
-                    sum += POW2_NEG_LUT[registers[i] as usize];
-                    i += 1;
-                }
-
-                alpha * m * m / sum
-            }
-
-            #[target_feature(enable = "avx2")]
-            #[inline]
-            unsafe fn horizontal_sum_pd(v: __m256d) -> f64 {
-                // Cast the __m256d into two __m128d halves via the
-                // integer-cast helpers, then sum lanes scalar-style.
-                // We use a memory store for portability across rustc
-                // versions where some hadd/permute intrinsics are not
-                // stable on AVX2 alone.
-                let mut tmp = [0.0_f64; 4];
-                // SAFETY: tmp is f64-aligned (Rust guarantees this for
-                // local arrays of f64); the store is 32-byte aligned
-                // enough for VMOVUPD.
-                unsafe {
-                    core::arch::asm!(
-                        "vmovupd [{ptr}], {vec}",
-                        ptr = in(reg) tmp.as_mut_ptr(),
-                        vec = in(ymm_reg) v,
-                        options(nostack, preserves_flags),
-                    );
-                }
-                tmp[0] + tmp[1] + tmp[2] + tmp[3]
-            }
-        }
+        #[cfg(all(
+            feature = "arch-pinned-kernels",
+            feature = "avx2",
+            any(target_arch = "x86", target_arch = "x86_64")
+        ))]
+        pub mod avx2;
+        #[cfg(all(
+            not(feature = "arch-pinned-kernels"),
+            feature = "avx2",
+            any(target_arch = "x86", target_arch = "x86_64")
+        ))]
+        #[allow(dead_code, unreachable_pub)]
+        pub(crate) mod avx2;
 
         /// x86 AVX-512 kernels: `_mm512_max_epu8` for merge and an
         /// `_mm512_i32gather_pd`-driven 8-wide reduction for harmonic mean.
-        #[cfg(all(feature = "avx512", any(target_arch = "x86", target_arch = "x86_64")))]
-        pub mod avx512 {
-            use super::POW2_NEG_LUT;
-
-            #[cfg(target_arch = "x86")]
-            use core::arch::x86::{
-                __m128i, __m256i, __m512i, _mm_loadu_si128, _mm256_loadu_si256, _mm512_add_pd,
-                _mm512_cvtepu8_epi32, _mm512_i32gather_pd, _mm512_loadu_si512, _mm512_max_epu8,
-                _mm512_reduce_add_pd, _mm512_setzero_pd, _mm512_storeu_si512,
-            };
-            #[cfg(target_arch = "x86_64")]
-            use core::arch::x86_64::{
-                __m128i, __m256i, __m512i, _mm_loadu_si128, _mm256_loadu_si256, _mm512_add_pd,
-                _mm512_cvtepu8_epi32, _mm512_i32gather_pd, _mm512_loadu_si512, _mm512_max_epu8,
-                _mm512_reduce_add_pd, _mm512_setzero_pd, _mm512_storeu_si512,
-            };
-
-            /// 64 u8 registers per AVX-512 vector.
-            const VEC_BYTES: usize = 64;
-
-            /// Returns true when AVX-512BW (for VPMAXUB) is available
-            /// at runtime. AVX-512BW is the byte-and-word AVX-512
-            /// extension (Skylake-X, Ice Lake, Zen 4); without it the
-            /// 64-byte VPMAXUB on `__m512i` is unavailable.
-            #[cfg(feature = "std")]
-            #[must_use]
-            pub fn is_available() -> bool {
-                std::is_x86_feature_detected!("avx512f")
-                    && std::is_x86_feature_detected!("avx512bw")
-            }
-
-            /// Returns true when AVX-512F + AVX-512BW are available.
-            #[cfg(not(feature = "std"))]
-            #[must_use]
-            pub const fn is_available() -> bool {
-                false
-            }
-
-            /// AVX-512 per-bucket max merge.
-            ///
-            /// # Safety
-            ///
-            /// The caller must ensure the current CPU supports AVX-512F
-            /// and AVX-512BW and that `dst.len() == src.len()`.
-            #[target_feature(enable = "avx512f,avx512bw")]
-            pub unsafe fn merge(dst: &mut [u8], src: &[u8]) {
-                debug_assert_eq!(dst.len(), src.len());
-                let len = dst.len();
-                let mut i = 0_usize;
-                while i + VEC_BYTES <= len {
-                    // SAFETY: `i + 64 <= len`; AVX-512F+BW enabled by
-                    // the enclosing target_feature.
-                    let a = unsafe { _mm512_loadu_si512(dst.as_ptr().add(i).cast::<__m512i>()) };
-                    let b = unsafe { _mm512_loadu_si512(src.as_ptr().add(i).cast::<__m512i>()) };
-                    let m = _mm512_max_epu8(a, b);
-                    // SAFETY: same range bound as load above.
-                    unsafe {
-                        _mm512_storeu_si512(dst.as_mut_ptr().add(i).cast::<__m512i>(), m);
-                    }
-                    i += VEC_BYTES;
-                }
-                // Scalar tail (≤ 63 bytes). For valid HLL precisions
-                // (4..=16) the register count is `2^p` ∈ {16..=65_536},
-                // which is always a multiple of 16; the only sub-vector
-                // tail occurs at `p ∈ {4, 5}` (16 / 32 registers).
-                while i < len {
-                    let b = src[i];
-                    if b > dst[i] {
-                        dst[i] = b;
-                    }
-                    i += 1;
-                }
-            }
-
-            /// AVX-512 harmonic-mean cardinality `alpha * m^2 / Z`.
-            ///
-            /// Loads 16 u8 registers per inner iteration, zero-extends
-            /// to 16x i32 with VPMOVZXBD, gathers via two
-            /// `_mm512_i32gather_pd` calls (each 8-wide), and
-            /// accumulates into two `__m512d` accumulators.
-            ///
-            /// # Safety
-            ///
-            /// The caller must ensure the current CPU supports AVX-512F.
-            #[target_feature(enable = "avx512f,avx512bw")]
-            #[must_use]
-            pub unsafe fn count_raw(registers: &[u8], alpha: f64) -> f64 {
-                let m = registers.len() as f64;
-                let lut_ptr = POW2_NEG_LUT.as_ptr();
-                let mut acc0 = _mm512_setzero_pd();
-                let mut acc1 = _mm512_setzero_pd();
-                let mut i = 0_usize;
-                let n = registers.len();
-
-                while i + 16 <= n {
-                    // Load 16 u8 register bytes into the low half of a
-                    // 32-byte zmm register, then zero-extend to 16x i32.
-                    // SAFETY: `i + 16 <= n` bounds the 16-byte read.
-                    let xmm =
-                        unsafe { _mm_loadu_si128(registers.as_ptr().add(i).cast::<__m128i>()) };
-                    // SAFETY: VPMOVZXBD widens 16x u8 → 16x i32; AVX-512F
-                    // enabled by the enclosing target_feature.
-                    let indices_512: __m512i = _mm512_cvtepu8_epi32(xmm);
-
-                    // Split the 16x i32 indices into two 8x i32 halves
-                    // for the two 8-wide gathers.
-                    let mut tmp_idx = [0_i32; 16];
-                    // SAFETY: tmp_idx is i32-aligned and 64 bytes long.
-                    unsafe {
-                        _mm512_storeu_si512(tmp_idx.as_mut_ptr().cast::<__m512i>(), indices_512);
-                    }
-                    let lo_idx_256 =
-                        unsafe { _mm256_loadu_si256(tmp_idx.as_ptr().cast::<__m256i>()) };
-                    let hi_idx_256 =
-                        unsafe { _mm256_loadu_si256(tmp_idx.as_ptr().add(8).cast::<__m256i>()) };
-
-                    // SAFETY: indices ∈ 0..=255; gather offsets ≤ 2040.
-                    // Intrinsic signature for AVX-512:
-                    // <SCALE>(offsets: __m256i, base: *const f64).
-                    let g0 = unsafe { _mm512_i32gather_pd::<8>(lo_idx_256, lut_ptr) };
-                    let g1 = unsafe { _mm512_i32gather_pd::<8>(hi_idx_256, lut_ptr) };
-                    acc0 = _mm512_add_pd(acc0, g0);
-                    acc1 = _mm512_add_pd(acc1, g1);
-                    i += 16;
-                }
-
-                let mut sum = _mm512_reduce_add_pd(_mm512_add_pd(acc0, acc1));
-
-                // Scalar tail.
-                while i < n {
-                    sum += POW2_NEG_LUT[registers[i] as usize];
-                    i += 1;
-                }
-
-                alpha * m * m / sum
-            }
-        }
+        #[cfg(all(
+            feature = "arch-pinned-kernels",
+            feature = "avx512",
+            any(target_arch = "x86", target_arch = "x86_64")
+        ))]
+        pub mod avx512;
+        #[cfg(all(
+            not(feature = "arch-pinned-kernels"),
+            feature = "avx512",
+            any(target_arch = "x86", target_arch = "x86_64")
+        ))]
+        #[allow(dead_code, unreachable_pub)]
+        pub(crate) mod avx512;
 
         /// AArch64 NEON kernels: `vmaxq_u8` for merge and a parallel-f64
         /// LUT-driven reduction for harmonic mean.
-        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
-        pub mod neon {
-            use super::POW2_NEG_LUT;
-
-            use core::arch::aarch64::{vld1q_u8, vmaxq_u8, vst1q_u8};
-
-            /// 16 u8 registers per NEON vector.
-            const VEC_BYTES: usize = 16;
-
-            /// Returns true when NEON is available at runtime.
-            ///
-            /// NEON is mandatory in the AArch64 ABI; this helper exists
-            /// for API symmetry with the x86 kernels.
-            #[must_use]
-            pub const fn is_available() -> bool {
-                true
-            }
-
-            /// NEON per-bucket max merge.
-            ///
-            /// # Safety
-            ///
-            /// The caller must ensure the current CPU supports NEON and
-            /// that `dst.len() == src.len()`.
-            #[target_feature(enable = "neon")]
-            pub unsafe fn merge(dst: &mut [u8], src: &[u8]) {
-                debug_assert_eq!(dst.len(), src.len());
-                let len = dst.len();
-                let mut i = 0_usize;
-                while i + VEC_BYTES <= len {
-                    // SAFETY: `i + 16 <= len`; NEON enabled by the
-                    // enclosing target_feature.
-                    let a = unsafe { vld1q_u8(dst.as_ptr().add(i)) };
-                    let b = unsafe { vld1q_u8(src.as_ptr().add(i)) };
-                    let m = vmaxq_u8(a, b);
-                    // SAFETY: same range bound as the load above.
-                    unsafe { vst1q_u8(dst.as_mut_ptr().add(i), m) };
-                    i += VEC_BYTES;
-                }
-                // Scalar tail.
-                while i < len {
-                    let b = src[i];
-                    if b > dst[i] {
-                        dst[i] = b;
-                    }
-                    i += 1;
-                }
-            }
-
-            /// NEON harmonic-mean cardinality `alpha * m^2 / Z`.
-            ///
-            /// AArch64 NEON has no efficient gather instruction, so the
-            /// inner loop runs four parallel scalar f64 accumulators
-            /// (driving four LUT lookups per iteration). The pipelined
-            /// AArch64 backends (Apple M-series, Graviton, Snapdragon)
-            /// extract enough ILP from this to clear the same throughput
-            /// the gather-based x86 backends hit.
-            ///
-            /// # Safety
-            ///
-            /// The caller must ensure the current CPU supports NEON.
-            #[target_feature(enable = "neon")]
-            #[must_use]
-            pub unsafe fn count_raw(registers: &[u8], alpha: f64) -> f64 {
-                let m = registers.len() as f64;
-                let mut a0 = 0.0_f64;
-                let mut a1 = 0.0_f64;
-                let mut a2 = 0.0_f64;
-                let mut a3 = 0.0_f64;
-                let mut i = 0_usize;
-                let n = registers.len();
-                while i + 4 <= n {
-                    a0 += POW2_NEG_LUT[registers[i] as usize];
-                    a1 += POW2_NEG_LUT[registers[i + 1] as usize];
-                    a2 += POW2_NEG_LUT[registers[i + 2] as usize];
-                    a3 += POW2_NEG_LUT[registers[i + 3] as usize];
-                    i += 4;
-                }
-                let mut sum = (a0 + a1) + (a2 + a3);
-                while i < n {
-                    sum += POW2_NEG_LUT[registers[i] as usize];
-                    i += 1;
-                }
-                alpha * m * m / sum
-            }
-        }
+        #[cfg(all(
+            feature = "arch-pinned-kernels",
+            feature = "neon",
+            target_arch = "aarch64"
+        ))]
+        pub mod neon;
+        #[cfg(all(
+            not(feature = "arch-pinned-kernels"),
+            feature = "neon",
+            target_arch = "aarch64"
+        ))]
+        #[allow(dead_code, unreachable_pub)]
+        pub(crate) mod neon;
     }
 }
 

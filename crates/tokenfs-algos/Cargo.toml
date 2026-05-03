@@ -42,6 +42,23 @@ avx512_vpclmulqdq = ["avx512"]
 neon = []
 sve = ["nightly"]
 sve2 = ["nightly"]
+# Expose per-backend pinned SIMD kernel modules (`kernels::scalar`,
+# `kernels::avx2`, `kernels::avx512`, `kernels::neon`, plus AVX-512
+# sub-variants and SSE4.2 / AVX2-shape pinned kernels) as part of the
+# crate's external API. These modules contain `unsafe` entry points that
+# require the caller to uphold CPU-feature detection and bounds /
+# alignment preconditions; the safe `kernels::auto` dispatcher (and any
+# non-per-backend module) remains public unconditionally.
+#
+# Without this feature, per-backend modules are crate-private (`mod`,
+# not `pub mod`) so external callers cannot bypass dispatch and trigger
+# UB by invoking a kernel on a CPU lacking the required ISA. Internal
+# callers (the dispatcher, sibling modules in this crate) continue to
+# see them under both cfgs. Benches that target a specific pinned
+# backend declare `required-features = ["arch-pinned-kernels"]`.
+#
+# Closes audit-R7 #17 / audit-R8 #5.
+arch-pinned-kernels = []
 # JSON loading for planner Tunes (see dispatch::planner::tunes::Tunes::from_json).
 tunes-json = ["std", "dep:serde_json"]
 # BLAKE3 content-addressable hash backend. Wraps the `blake3` crate
@@ -88,14 +105,21 @@ name = "histogram"
 harness = false
 required-features = ["bench-internals"]
 
+# `primitives` reaches into per-backend modules
+# (`sketch::kernels::sse42`, `byteclass::kernels::avx2`,
+# `fingerprint::kernels::avx2`); keep it gated on `arch-pinned-kernels`
+# alongside `bench-internals`.
 [[bench]]
 name = "primitives"
 harness = false
-required-features = ["bench-internals"]
+required-features = ["bench-internals", "arch-pinned-kernels"]
 
+# `similarity` exercises the deprecated `similarity::kernels::scalar`
+# parity wrappers directly.
 [[bench]]
 name = "similarity"
 harness = false
+required-features = ["arch-pinned-kernels"]
 
 [[bench]]
 name = "planner"
@@ -105,37 +129,109 @@ harness = false
 name = "hash_batched"
 harness = false
 
+# `bits_popcount` benchmarks the pinned `bits::popcount::kernels::*`
+# backends head-to-head.
 [[bench]]
 name = "bits_popcount"
 harness = false
+required-features = ["arch-pinned-kernels"]
 
+# `bits_bit_pack` declared explicitly so `required-features` can pin
+# the per-backend kernel imports it uses.
+[[bench]]
+name = "bits_bit_pack"
+harness = false
+required-features = ["arch-pinned-kernels"]
+
+# `bits_streamvbyte` exercises the pinned `streamvbyte::kernels::*`
+# backends head-to-head.
 [[bench]]
 name = "bits_streamvbyte"
 harness = false
+required-features = ["arch-pinned-kernels"]
 
 [[bench]]
 name = "bits_rank_select"
 harness = false
 
+# `hash_set_membership` exercises the pinned
+# `set_membership::kernels::*` backends head-to-head.
 [[bench]]
 name = "hash_set_membership"
 harness = false
+required-features = ["arch-pinned-kernels"]
 
+# `bitmap_set_ops` exercises the pinned `bitmap::kernels::*` backends
+# head-to-head.
 [[bench]]
 name = "bitmap_set_ops"
 harness = false
+required-features = ["arch-pinned-kernels"]
 
+# `permutation_rcm` exercises pinned scalar permutation kernels.
 [[bench]]
 name = "permutation_rcm"
 harness = false
+required-features = ["arch-pinned-kernels"]
 
+# `approx_hll` exercises the pinned `approx::hll_kernels::*` backends.
 [[bench]]
 name = "approx_hll"
 harness = false
+required-features = ["arch-pinned-kernels"]
 
+# `approx_bloom` exercises the pinned `approx::bloom_kernels::*` backends.
 [[bench]]
 name = "approx_bloom"
 harness = false
+required-features = ["arch-pinned-kernels"]
+
+# Examples that reach into per-backend pinned kernels for head-to-head
+# benchmark / parity demos. Without `arch-pinned-kernels` those modules
+# are crate-private, so the examples are gated to match.
+[[example]]
+name = "bench_compare"
+required-features = ["arch-pinned-kernels"]
+
+[[example]]
+name = "profile_primitives"
+required-features = ["arch-pinned-kernels"]
+
+[[example]]
+name = "similarity_scan"
+required-features = ["arch-pinned-kernels"]
+
+# Integration tests that pin specific backends to assert SIMD parity
+# with the scalar oracle. They need `arch-pinned-kernels` to reach the
+# per-backend modules; the dispatched APIs are exercised by the
+# unit-test suite under `--lib`.
+[[test]]
+name = "avx2_parity"
+required-features = ["arch-pinned-kernels"]
+
+[[test]]
+name = "fingerprint_f22"
+required-features = ["arch-pinned-kernels"]
+
+[[test]]
+name = "integration_phase_c"
+required-features = ["arch-pinned-kernels"]
+
+[[test]]
+name = "neon_parity"
+required-features = ["arch-pinned-kernels"]
+
+[[test]]
+name = "parity"
+required-features = ["arch-pinned-kernels"]
+
+[[test]]
+name = "public_histogram_api"
+required-features = ["arch-pinned-kernels"]
+
+[[test]]
+name = "sve_parity"
+required-features = ["arch-pinned-kernels"]
 
 [lints]
 workspace = true

@@ -228,29 +228,11 @@ pub mod kernels {
     }
 
     /// Portable scalar set-membership.
-    pub mod scalar {
-        /// Linear scan delegating to `slice::contains`.
-        ///
-        /// Acts as the reference oracle for every SIMD backend in this
-        /// module. Equivalent to `haystack.iter().any(|x| *x == needle)`
-        /// without the manual-iter clippy lint.
-        #[must_use]
-        pub fn contains_u32(haystack: &[u32], needle: u32) -> bool {
-            haystack.contains(&needle)
-        }
-
-        /// Per-needle scalar batch.
-        ///
-        /// # Panics
-        ///
-        /// Panics if `needles.len() != out.len()`.
-        pub fn contains_u32_batch(haystack: &[u32], needles: &[u32], out: &mut [bool]) {
-            assert_eq!(needles.len(), out.len());
-            for (needle, slot) in needles.iter().zip(out.iter_mut()) {
-                *slot = contains_u32(haystack, *needle);
-            }
-        }
-    }
+    #[cfg(feature = "arch-pinned-kernels")]
+    pub mod scalar;
+    #[cfg(not(feature = "arch-pinned-kernels"))]
+    #[allow(dead_code, unreachable_pub)]
+    pub(crate) mod scalar;
 
     /// x86 SSE4.1 set-membership via PCMPEQD + PTEST.
     ///
@@ -377,128 +359,19 @@ pub mod kernels {
     /// Processes 8-lane u32 chunks (one `__m256i` = 32 bytes). Each chunk
     /// is broadcast-compared with `_mm256_cmpeq_epi32` and the all-zeros
     /// predicate is checked with `_mm256_testz_si256` (AVX `VPTEST`-like).
-    #[cfg(all(feature = "avx2", any(target_arch = "x86", target_arch = "x86_64")))]
-    pub mod avx2 {
-        use super::scalar;
-
-        #[cfg(target_arch = "x86")]
-        use core::arch::x86::{
-            __m256i, _mm256_cmpeq_epi32, _mm256_loadu_si256, _mm256_set1_epi32, _mm256_testz_si256,
-        };
-        #[cfg(target_arch = "x86_64")]
-        use core::arch::x86_64::{
-            __m256i, _mm256_cmpeq_epi32, _mm256_loadu_si256, _mm256_set1_epi32, _mm256_testz_si256,
-        };
-
-        /// 8 lanes (32 bytes) per AVX2 vector.
-        const LANES: usize = 8;
-
-        /// 4x unrolled = 32 lanes (128 B) per outer iteration. The OR of
-        /// four independent compares short-circuits the early-exit cost
-        /// for haystacks that miss; for haystacks that hit, the early
-        /// exit triggers within the 32-lane window so the unroll cost is
-        /// at most one extra compare.
-        const UNROLL_VECTORS: usize = 4;
-
-        /// Returns true when AVX2 is available at runtime.
-        #[cfg(feature = "std")]
-        #[must_use]
-        pub fn is_available() -> bool {
-            std::is_x86_feature_detected!("avx2")
-        }
-
-        /// Returns true when AVX2 is available at runtime.
-        #[cfg(not(feature = "std"))]
-        #[must_use]
-        pub const fn is_available() -> bool {
-            false
-        }
-
-        /// AVX2 single-needle membership.
-        ///
-        /// # Safety
-        ///
-        /// The caller must ensure the current CPU supports AVX2.
-        #[target_feature(enable = "avx2")]
-        #[must_use]
-        pub unsafe fn contains_u32(haystack: &[u32], needle: u32) -> bool {
-            let broadcast = _mm256_set1_epi32(needle as i32);
-            let mut index = 0_usize;
-            let unroll_lanes = LANES * UNROLL_VECTORS;
-
-            // Outer loop: process UNROLL_VECTORS vectors per iteration; OR
-            // their compare results together so the testz amortises across
-            // the unrolled block. Hits inside the block still branch out
-            // on the next iteration's testz.
-            while index + unroll_lanes <= haystack.len() {
-                // SAFETY: each load reads 32 bytes (8 u32s) and `index +
-                // UNROLL_VECTORS * LANES <= haystack.len()` is enforced by
-                // the loop condition. AVX2 is enabled by the enclosing
-                // target_feature.
-                let v0 =
-                    unsafe { _mm256_loadu_si256(haystack.as_ptr().add(index).cast::<__m256i>()) };
-                let v1 = unsafe {
-                    _mm256_loadu_si256(haystack.as_ptr().add(index + LANES).cast::<__m256i>())
-                };
-                let v2 = unsafe {
-                    _mm256_loadu_si256(haystack.as_ptr().add(index + 2 * LANES).cast::<__m256i>())
-                };
-                let v3 = unsafe {
-                    _mm256_loadu_si256(haystack.as_ptr().add(index + 3 * LANES).cast::<__m256i>())
-                };
-                let c0 = _mm256_cmpeq_epi32(v0, broadcast);
-                let c1 = _mm256_cmpeq_epi32(v1, broadcast);
-                let c2 = _mm256_cmpeq_epi32(v2, broadcast);
-                let c3 = _mm256_cmpeq_epi32(v3, broadcast);
-                // _mm256_or_si256 isn't strictly needed: testz accepts two
-                // operands and returns nonzero iff their AND is zero. We
-                // can fold pairs without an extra OR by passing distinct
-                // operands, but readability is better with explicit OR.
-                use core::arch::x86_64::_mm256_or_si256;
-                let or01 = _mm256_or_si256(c0, c1);
-                let or23 = _mm256_or_si256(c2, c3);
-                let any = _mm256_or_si256(or01, or23);
-                if _mm256_testz_si256(any, any) == 0 {
-                    return true;
-                }
-                index += unroll_lanes;
-            }
-
-            // Single-vector loop for the leftover lanes after the
-            // unrolled block.
-            while index + LANES <= haystack.len() {
-                // SAFETY: index + LANES <= haystack.len() bounds the load.
-                let v =
-                    unsafe { _mm256_loadu_si256(haystack.as_ptr().add(index).cast::<__m256i>()) };
-                let cmp = _mm256_cmpeq_epi32(v, broadcast);
-                if _mm256_testz_si256(cmp, cmp) == 0 {
-                    return true;
-                }
-                index += LANES;
-            }
-
-            scalar::contains_u32(&haystack[index..], needle)
-        }
-
-        /// AVX2 batched membership.
-        ///
-        /// # Safety
-        ///
-        /// The caller must ensure the current CPU supports AVX2.
-        ///
-        /// # Panics
-        ///
-        /// Panics if `needles.len() != out.len()`.
-        #[target_feature(enable = "avx2")]
-        pub unsafe fn contains_u32_batch(haystack: &[u32], needles: &[u32], out: &mut [bool]) {
-            assert_eq!(needles.len(), out.len());
-            for (needle, slot) in needles.iter().zip(out.iter_mut()) {
-                // SAFETY: target_feature(enable = "avx2") on this fn
-                // forwards the AVX2 precondition to the inner kernel.
-                *slot = unsafe { contains_u32(haystack, *needle) };
-            }
-        }
-    }
+    #[cfg(all(
+        feature = "arch-pinned-kernels",
+        feature = "avx2",
+        any(target_arch = "x86", target_arch = "x86_64")
+    ))]
+    pub mod avx2;
+    #[cfg(all(
+        not(feature = "arch-pinned-kernels"),
+        feature = "avx2",
+        any(target_arch = "x86", target_arch = "x86_64")
+    ))]
+    #[allow(dead_code, unreachable_pub)]
+    pub(crate) mod avx2;
 
     /// x86 AVX-512 set-membership via VPCMPEQD-mask + KORTESTW.
     ///
@@ -506,151 +379,38 @@ pub mod kernels {
     /// `_mm512_cmpeq_epi32_mask` returns a `__mmask16` directly; testing
     /// against zero is a single instruction and avoids the movemask round
     /// trip.
-    #[cfg(all(feature = "avx512", any(target_arch = "x86", target_arch = "x86_64")))]
-    pub mod avx512 {
-        use super::scalar;
-
-        #[cfg(target_arch = "x86")]
-        use core::arch::x86::{
-            __m512i, _mm512_cmpeq_epi32_mask, _mm512_loadu_si512, _mm512_set1_epi32,
-        };
-        #[cfg(target_arch = "x86_64")]
-        use core::arch::x86_64::{
-            __m512i, _mm512_cmpeq_epi32_mask, _mm512_loadu_si512, _mm512_set1_epi32,
-        };
-
-        /// 16 lanes (64 bytes) per AVX-512 vector.
-        const LANES: usize = 16;
-
-        /// Returns true when AVX-512F is available at runtime.
-        ///
-        /// `_mm512_cmpeq_epi32_mask` is part of AVX-512F.
-        #[cfg(feature = "std")]
-        #[must_use]
-        pub fn is_available() -> bool {
-            std::is_x86_feature_detected!("avx512f")
-        }
-
-        /// Returns true when AVX-512F is available at runtime.
-        #[cfg(not(feature = "std"))]
-        #[must_use]
-        pub const fn is_available() -> bool {
-            false
-        }
-
-        /// AVX-512 single-needle membership.
-        ///
-        /// # Safety
-        ///
-        /// The caller must ensure the current CPU supports AVX-512F.
-        #[target_feature(enable = "avx512f")]
-        #[must_use]
-        pub unsafe fn contains_u32(haystack: &[u32], needle: u32) -> bool {
-            let broadcast = _mm512_set1_epi32(needle as i32);
-            let mut index = 0_usize;
-
-            while index + LANES <= haystack.len() {
-                // SAFETY: index + LANES <= haystack.len() bounds the load
-                // and the enclosing target_feature supplies AVX-512F.
-                let v =
-                    unsafe { _mm512_loadu_si512(haystack.as_ptr().add(index).cast::<__m512i>()) };
-                let mask = _mm512_cmpeq_epi32_mask(v, broadcast);
-                if mask != 0 {
-                    return true;
-                }
-                index += LANES;
-            }
-
-            scalar::contains_u32(&haystack[index..], needle)
-        }
-
-        /// AVX-512 batched membership.
-        ///
-        /// # Safety
-        ///
-        /// The caller must ensure the current CPU supports AVX-512F.
-        ///
-        /// # Panics
-        ///
-        /// Panics if `needles.len() != out.len()`.
-        #[target_feature(enable = "avx512f")]
-        pub unsafe fn contains_u32_batch(haystack: &[u32], needles: &[u32], out: &mut [bool]) {
-            assert_eq!(needles.len(), out.len());
-            for (needle, slot) in needles.iter().zip(out.iter_mut()) {
-                // SAFETY: target_feature(enable = "avx512f") on this fn
-                // forwards the AVX-512F precondition to the inner kernel.
-                *slot = unsafe { contains_u32(haystack, *needle) };
-            }
-        }
-    }
+    #[cfg(all(
+        feature = "arch-pinned-kernels",
+        feature = "avx512",
+        any(target_arch = "x86", target_arch = "x86_64")
+    ))]
+    pub mod avx512;
+    #[cfg(all(
+        not(feature = "arch-pinned-kernels"),
+        feature = "avx512",
+        any(target_arch = "x86", target_arch = "x86_64")
+    ))]
+    #[allow(dead_code, unreachable_pub)]
+    pub(crate) mod avx512;
 
     /// AArch64 NEON set-membership via VCEQQ + horizontal max.
     ///
     /// Processes 4-lane u32 chunks (one `uint32x4_t` = 16 bytes). NEON
     /// has no movemask, so the per-lane equality vector is reduced via
     /// `vmaxvq_u32` — non-zero iff any lane matched.
-    #[cfg(all(feature = "neon", target_arch = "aarch64"))]
-    pub mod neon {
-        use super::scalar;
-
-        use core::arch::aarch64::{vceqq_u32, vdupq_n_u32, vld1q_u32, vmaxvq_u32};
-
-        /// 4 lanes (16 bytes) per NEON vector.
-        const LANES: usize = 4;
-
-        /// Returns true when NEON is available at runtime.
-        ///
-        /// NEON is mandatory on AArch64; this exists for API symmetry
-        /// with the x86 `is_available` helpers.
-        #[must_use]
-        pub const fn is_available() -> bool {
-            true
-        }
-
-        /// NEON single-needle membership.
-        ///
-        /// # Safety
-        ///
-        /// The caller must ensure the current CPU supports NEON.
-        #[target_feature(enable = "neon")]
-        #[must_use]
-        pub unsafe fn contains_u32(haystack: &[u32], needle: u32) -> bool {
-            let broadcast = vdupq_n_u32(needle);
-            let mut index = 0_usize;
-
-            while index + LANES <= haystack.len() {
-                // SAFETY: index + LANES <= haystack.len() bounds the load
-                // and the enclosing target_feature supplies NEON.
-                let v = unsafe { vld1q_u32(haystack.as_ptr().add(index)) };
-                let cmp = vceqq_u32(v, broadcast);
-                if vmaxvq_u32(cmp) != 0 {
-                    return true;
-                }
-                index += LANES;
-            }
-
-            scalar::contains_u32(&haystack[index..], needle)
-        }
-
-        /// NEON batched membership.
-        ///
-        /// # Safety
-        ///
-        /// The caller must ensure the current CPU supports NEON.
-        ///
-        /// # Panics
-        ///
-        /// Panics if `needles.len() != out.len()`.
-        #[target_feature(enable = "neon")]
-        pub unsafe fn contains_u32_batch(haystack: &[u32], needles: &[u32], out: &mut [bool]) {
-            assert_eq!(needles.len(), out.len());
-            for (needle, slot) in needles.iter().zip(out.iter_mut()) {
-                // SAFETY: target_feature(enable = "neon") on this fn
-                // forwards the NEON precondition to the inner kernel.
-                *slot = unsafe { contains_u32(haystack, *needle) };
-            }
-        }
-    }
+    #[cfg(all(
+        feature = "arch-pinned-kernels",
+        feature = "neon",
+        target_arch = "aarch64"
+    ))]
+    pub mod neon;
+    #[cfg(all(
+        not(feature = "arch-pinned-kernels"),
+        feature = "neon",
+        target_arch = "aarch64"
+    ))]
+    #[allow(dead_code, unreachable_pub)]
+    pub(crate) mod neon;
 }
 
 #[cfg(test)]
