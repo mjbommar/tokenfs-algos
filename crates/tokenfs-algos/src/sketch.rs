@@ -136,14 +136,17 @@ impl<const K: usize> MisraGries<K> {
 
     /// Observes one item.
     pub fn update(&mut self, item: u32) {
-        self.observations += 1;
+        // Saturating: defends against silent wrap on long-running streams
+        // (audit-R10 #5). `observations` u64 saturates at 2^64; `count`
+        // u32 saturates at u32::MAX.
+        self.observations = self.observations.saturating_add(1);
         if K == 0 {
             return;
         }
 
         for (candidate, count) in &mut self.counters {
             if *count != 0 && *candidate == item {
-                *count += 1;
+                *count = count.saturating_add(1);
                 return;
             }
         }
@@ -661,7 +664,9 @@ fn crc32_hash_ngram_bins_with<const N: usize, const BINS: usize>(
         } else {
             hash % BINS
         };
-        bins[bin] += 1;
+        // Saturating: long byte streams could otherwise wrap a single
+        // dominant n-gram bin past u32::MAX (audit-R10 #5).
+        bins[bin] = bins[bin].saturating_add(1);
     }
 }
 

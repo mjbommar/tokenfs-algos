@@ -150,8 +150,12 @@ impl BytePairHistogram {
         let mut observations = 0_u64;
         for pair in bytes.windows(2) {
             let index = pair_index(pair[0], pair[1]);
-            scratch.counts[index] += 1;
-            observations += 1;
+            // Saturating: a single dominant pair appearing > u32::MAX
+            // times in one >4 GiB input would otherwise wrap silently
+            // in release / panic in overflow-checking builds (audit-R10
+            // #5). Saturation gives a defined ceiling.
+            scratch.counts[index] = scratch.counts[index].saturating_add(1);
+            observations = observations.saturating_add(1);
         }
         BytePairHistogramView {
             counts: &scratch.counts,
@@ -174,8 +178,11 @@ impl BytePairHistogram {
 
     /// Adds one byte pair.
     pub fn add_pair(&mut self, first: u8, second: u8) {
-        self.counts[pair_index(first, second)] += 1;
-        self.observations += 1;
+        // Saturating: a single dominant pair appearing > u32::MAX times
+        // would otherwise wrap (audit-R10 #5).
+        let index = pair_index(first, second);
+        self.counts[index] = self.counts[index].saturating_add(1);
+        self.observations = self.observations.saturating_add(1);
     }
 
     /// Returns the count for one byte pair.
@@ -347,7 +354,9 @@ impl BytePairScratch {
             self.active_pairs[self.active_pair_len] = index as u16;
             self.active_pair_len += 1;
         }
-        self.counts[index] += 1;
+        // Saturating: prevents silent wrap when a single dominant pair
+        // appears more than u32::MAX times in one corpus (audit-R10 #5).
+        self.counts[index] = self.counts[index].saturating_add(1);
 
         let predecessor = first as usize;
         if self.predecessor_stamps[predecessor] != self.generation {
@@ -356,8 +365,9 @@ impl BytePairScratch {
             self.active_predecessors[self.active_predecessor_len] = first;
             self.active_predecessor_len += 1;
         }
-        self.predecessor_counts[predecessor] += 1;
-        self.observations += 1;
+        self.predecessor_counts[predecessor] =
+            self.predecessor_counts[predecessor].saturating_add(1);
+        self.observations = self.observations.saturating_add(1);
     }
 
     /// Returns the count for one byte pair in the current generation.
