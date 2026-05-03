@@ -33,6 +33,71 @@ use std::hash::Hash;
 use super::minhash::Signature as MinHashSignature;
 use super::simhash::Signature64;
 
+/// Failure modes for the fallible LSH index constructors
+/// ([`MinHashIndex::try_new`], [`SimHashIndex::try_new`]).
+///
+/// Returned instead of panicking when the caller-supplied band shape is
+/// inconsistent with the signature width. Surfacing these as a typed
+/// error (rather than `assert!`) lets kernel/FUSE/Postgres-extension
+/// callers refuse a malformed configuration without aborting the host
+/// process (audit-R7-followup #16).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LshConstructionError {
+    /// `bands == 0`. Banded LSH requires at least one band.
+    ZeroBands,
+    /// `rows_per_band == 0` for a [`MinHashIndex`]. Each band must hold
+    /// at least one signature row.
+    ZeroRows,
+    /// `bands * rows_per_band != K` for a [`MinHashIndex<_, K>`]. The
+    /// band shape must exactly partition the `K`-slot signature.
+    BandsTimesRowsMismatchSignatureLen {
+        /// Caller-supplied band count.
+        bands: usize,
+        /// Caller-supplied rows-per-band.
+        rows_per_band: usize,
+        /// Compile-time signature width `K`.
+        signature_len: usize,
+    },
+    /// `BANDS > 64` for a [`SimHashIndex`]. The 64-bit SimHash signature
+    /// cannot be partitioned into more than 64 bands without zero-width
+    /// bands.
+    BandsExceedSignatureLen {
+        /// Caller-supplied band count.
+        bands: usize,
+        /// Width of the SimHash signature in bits (always 64).
+        signature_bits: usize,
+    },
+}
+
+impl core::fmt::Display for LshConstructionError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::ZeroBands => f.write_str("LSH index requires bands > 0"),
+            Self::ZeroRows => f.write_str("MinHash LSH index requires rows_per_band > 0"),
+            Self::BandsTimesRowsMismatchSignatureLen {
+                bands,
+                rows_per_band,
+                signature_len,
+            } => write!(
+                f,
+                "MinHash LSH band shape mismatch: bands ({bands}) * rows_per_band \
+                 ({rows_per_band}) = {} must equal signature width K = {signature_len}",
+                bands.saturating_mul(*rows_per_band)
+            ),
+            Self::BandsExceedSignatureLen {
+                bands,
+                signature_bits,
+            } => write!(
+                f,
+                "SimHash LSH index requires bands ({bands}) <= signature width \
+                 ({signature_bits} bits)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LshConstructionError {}
+
 /// Per-query report.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
 pub struct QueryStats {
@@ -84,7 +149,11 @@ impl<Id: Clone + Eq + Hash, const K: usize> MinHashIndex<Id, K> {
     ///
     /// # Panics
     ///
-    /// Panics if `bands == 0` or `bands * rows_per_band != K`.
+    /// Panics if `bands == 0`, `rows_per_band == 0`, or
+    /// `bands * rows_per_band != K`. Kernel-, FUSE-, and Postgres-
+    /// extension consumers should call [`Self::try_new`] instead so a
+    /// malformed band shape returns a typed [`LshConstructionError`]
+    /// rather than aborting the host process (audit-R7-followup #16).
     #[must_use]
     pub fn new(bands: usize, rows_per_band: usize) -> Self {
         assert!(bands > 0, "bands must be > 0");
@@ -100,6 +169,39 @@ impl<Id: Clone + Eq + Hash, const K: usize> MinHashIndex<Id, K> {
             rows_per_band,
             corpus_size: 0,
         }
+    }
+
+    /// Fallible variant of [`Self::new`].
+    ///
+    /// Validates the band shape up front and returns
+    /// [`LshConstructionError`] instead of panicking when the caller
+    /// supplies `bands == 0`, `rows_per_band == 0`, or a product that
+    /// does not match the compile-time signature width `K`.
+    ///
+    /// This is the recommended constructor for kernel/FUSE/Postgres-
+    /// extension callers: a panic in a softirq or in `pg_init` is
+    /// fatal, but an `Err` can be propagated upward and rejected as a
+    /// configuration error (audit-R7-followup #16).
+    pub fn try_new(bands: usize, rows_per_band: usize) -> Result<Self, LshConstructionError> {
+        if bands == 0 {
+            return Err(LshConstructionError::ZeroBands);
+        }
+        if rows_per_band == 0 {
+            return Err(LshConstructionError::ZeroRows);
+        }
+        if bands.checked_mul(rows_per_band) != Some(K) {
+            return Err(LshConstructionError::BandsTimesRowsMismatchSignatureLen {
+                bands,
+                rows_per_band,
+                signature_len: K,
+            });
+        }
+        let bands_vec = (0..bands).map(|_| HashMap::new()).collect();
+        Ok(Self {
+            bands: bands_vec,
+            rows_per_band,
+            corpus_size: 0,
+        })
     }
 
     /// Number of items inserted.
@@ -184,7 +286,11 @@ impl<Id: Clone + Eq + Hash, const BANDS: usize> SimHashIndex<Id, BANDS> {
     /// # Panics
     ///
     /// Panics if `BANDS == 0` or `BANDS > 64`. Recommended: 4, 8, or 16
-    /// (corresponding to 16-, 8-, and 4-bit band widths).
+    /// (corresponding to 16-, 8-, and 4-bit band widths). Kernel-, FUSE-,
+    /// and Postgres-extension consumers should call [`Self::try_new`]
+    /// instead so a malformed `BANDS` returns a typed
+    /// [`LshConstructionError`] rather than aborting the host process
+    /// (audit-R7-followup #16).
     #[must_use]
     pub fn new() -> Self {
         assert!(BANDS > 0, "BANDS must be > 0");
@@ -198,6 +304,35 @@ impl<Id: Clone + Eq + Hash, const BANDS: usize> SimHashIndex<Id, BANDS> {
             band_width_bits,
             corpus_size: 0,
         }
+    }
+
+    /// Fallible variant of [`Self::new`].
+    ///
+    /// Validates the compile-time `BANDS` parameter up front and returns
+    /// [`LshConstructionError`] instead of panicking when `BANDS == 0`
+    /// or `BANDS > 64`.
+    ///
+    /// Recommended for kernel/FUSE/Postgres-extension callers: a panic
+    /// in a softirq or `pg_init` is fatal, but an `Err` can be
+    /// propagated upward and rejected as a configuration error
+    /// (audit-R7-followup #16).
+    pub fn try_new() -> Result<Self, LshConstructionError> {
+        if BANDS == 0 {
+            return Err(LshConstructionError::ZeroBands);
+        }
+        if BANDS > 64 {
+            return Err(LshConstructionError::BandsExceedSignatureLen {
+                bands: BANDS,
+                signature_bits: 64,
+            });
+        }
+        let band_width_bits = 64 / BANDS;
+        let bands = std::array::from_fn(|_| HashMap::new());
+        Ok(Self {
+            bands,
+            band_width_bits,
+            corpus_size: 0,
+        })
     }
 
     /// Number of items inserted.
@@ -408,5 +543,181 @@ mod tests {
             candidates: 0,
         };
         assert_eq!(zero.candidate_reduction(), 0.0);
+    }
+
+    // -----------------------------------------------------------------
+    // try_new constructor tests (audit-R7-followup #16).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn minhash_index_try_new_succeeds_on_valid_band_split() {
+        // 16 * 8 = 128 == K → must succeed.
+        const K: usize = 128;
+        let idx = MinHashIndex::<&'static str, K>::try_new(16, 8).expect("valid band split");
+        assert_eq!(idx.len(), 0);
+        assert!(idx.is_empty());
+    }
+
+    #[test]
+    fn minhash_index_try_new_rejects_zero_bands() {
+        const K: usize = 16;
+        match MinHashIndex::<&'static str, K>::try_new(0, 4) {
+            Err(LshConstructionError::ZeroBands) => {}
+            Err(other) => panic!("unexpected variant: {other:?}"),
+            Ok(_) => panic!("expected ZeroBands error"),
+        }
+    }
+
+    #[test]
+    fn minhash_index_try_new_rejects_zero_rows_per_band() {
+        const K: usize = 16;
+        match MinHashIndex::<&'static str, K>::try_new(4, 0) {
+            Err(LshConstructionError::ZeroRows) => {}
+            Err(other) => panic!("unexpected variant: {other:?}"),
+            Ok(_) => panic!("expected ZeroRows error"),
+        }
+    }
+
+    #[test]
+    fn minhash_index_try_new_rejects_band_shape_mismatch() {
+        // 3 * 5 = 15 != K=16 — must surface BandsTimesRowsMismatchSignatureLen
+        // with the offending fields, not panic.
+        const K: usize = 16;
+        match MinHashIndex::<&'static str, K>::try_new(3, 5) {
+            Err(LshConstructionError::BandsTimesRowsMismatchSignatureLen {
+                bands: 3,
+                rows_per_band: 5,
+                signature_len: 16,
+            }) => {}
+            Err(other) => panic!("unexpected variant: {other:?}"),
+            Ok(_) => panic!("expected mismatch error"),
+        }
+    }
+
+    #[test]
+    fn minhash_index_try_new_handles_overflow_in_bands_times_rows() {
+        // bands * rows_per_band overflows usize — checked_mul guards this
+        // and we must surface the mismatch error rather than panic on the
+        // overflow.
+        const K: usize = 16;
+        match MinHashIndex::<&'static str, K>::try_new(usize::MAX, 2) {
+            Err(LshConstructionError::BandsTimesRowsMismatchSignatureLen {
+                bands,
+                rows_per_band,
+                signature_len,
+            }) => {
+                assert_eq!(bands, usize::MAX);
+                assert_eq!(rows_per_band, 2);
+                assert_eq!(signature_len, K);
+            }
+            Err(other) => panic!("unexpected variant: {other:?}"),
+            Ok(_) => panic!("expected mismatch error on overflow input"),
+        }
+    }
+
+    #[test]
+    fn minhash_index_try_new_boundary_single_band_single_row() {
+        // K = 1, 1 band of 1 row — minimal valid configuration.
+        const K: usize = 1;
+        let idx = MinHashIndex::<&'static str, K>::try_new(1, 1).expect("minimal valid shape");
+        assert_eq!(idx.len(), 0);
+    }
+
+    #[test]
+    fn simhash_index_try_new_succeeds_on_valid_bands() {
+        let idx = SimHashIndex::<&'static str, 8>::try_new().expect("BANDS=8 valid");
+        assert_eq!(idx.len(), 0);
+        assert!(idx.is_empty());
+    }
+
+    #[test]
+    fn simhash_index_try_new_rejects_zero_bands() {
+        match SimHashIndex::<&'static str, 0>::try_new() {
+            Err(LshConstructionError::ZeroBands) => {}
+            Err(other) => panic!("unexpected variant: {other:?}"),
+            Ok(_) => panic!("expected ZeroBands error"),
+        }
+    }
+
+    #[test]
+    fn simhash_index_try_new_rejects_too_many_bands() {
+        // BANDS = 65 > 64 (signature width) — must return
+        // BandsExceedSignatureLen with the offending fields.
+        match SimHashIndex::<&'static str, 65>::try_new() {
+            Err(LshConstructionError::BandsExceedSignatureLen {
+                bands: 65,
+                signature_bits: 64,
+            }) => {}
+            Err(other) => panic!("unexpected variant: {other:?}"),
+            Ok(_) => panic!("expected BandsExceedSignatureLen error"),
+        }
+    }
+
+    #[test]
+    fn simhash_index_try_new_boundary_max_bands() {
+        // BANDS = 64 — maximum allowed, each band is 1 bit wide.
+        let idx = SimHashIndex::<&'static str, 64>::try_new().expect("BANDS=64 valid");
+        assert_eq!(idx.len(), 0);
+    }
+
+    #[test]
+    fn lsh_construction_error_display_is_informative() {
+        // Spot-check Display so error logs are useful for operators.
+        let zero = format!("{}", LshConstructionError::ZeroBands);
+        assert!(zero.contains("bands > 0"), "got: {zero}");
+
+        let mismatch = format!(
+            "{}",
+            LshConstructionError::BandsTimesRowsMismatchSignatureLen {
+                bands: 3,
+                rows_per_band: 5,
+                signature_len: 16,
+            }
+        );
+        assert!(mismatch.contains('3'), "got: {mismatch}");
+        assert!(mismatch.contains('5'), "got: {mismatch}");
+        assert!(mismatch.contains("16"), "got: {mismatch}");
+
+        let exceed = format!(
+            "{}",
+            LshConstructionError::BandsExceedSignatureLen {
+                bands: 128,
+                signature_bits: 64,
+            }
+        );
+        assert!(exceed.contains("128"), "got: {exceed}");
+        assert!(exceed.contains("64"), "got: {exceed}");
+    }
+
+    #[test]
+    fn lsh_construction_error_implements_std_error() {
+        // Compile-time witness that the error participates in the std
+        // error trait machinery callers expect.
+        fn assert_error<E: std::error::Error>(_: &E) {}
+        assert_error(&LshConstructionError::ZeroBands);
+    }
+
+    #[test]
+    fn minhash_index_try_new_round_trips_with_panicking_constructor() {
+        // try_new and new must produce indexes with identical empty
+        // shape so callers can swap one for the other without behavior
+        // drift.
+        const K: usize = 32;
+        let try_idx = MinHashIndex::<usize, K>::try_new(8, 4).expect("valid shape");
+        let panic_idx = MinHashIndex::<usize, K>::new(8, 4);
+        assert_eq!(try_idx.len(), panic_idx.len());
+        assert_eq!(try_idx.is_empty(), panic_idx.is_empty());
+        assert_eq!(try_idx.rows_per_band, panic_idx.rows_per_band);
+        assert_eq!(try_idx.bands.len(), panic_idx.bands.len());
+    }
+
+    #[test]
+    fn simhash_index_try_new_round_trips_with_panicking_constructor() {
+        let try_idx = SimHashIndex::<usize, 8>::try_new().expect("valid BANDS");
+        let panic_idx = SimHashIndex::<usize, 8>::new();
+        assert_eq!(try_idx.len(), panic_idx.len());
+        assert_eq!(try_idx.is_empty(), panic_idx.is_empty());
+        assert_eq!(try_idx.band_width_bits, panic_idx.band_width_bits);
+        assert_eq!(try_idx.bands.len(), panic_idx.bands.len());
     }
 }
