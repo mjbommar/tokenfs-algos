@@ -97,10 +97,10 @@ pub mod rcm;
 
 #[cfg(feature = "permutation_hilbert")]
 pub use hilbert::{hilbert_2d, hilbert_nd};
-pub use rabbit::rabbit_order;
+pub use rabbit::{rabbit_order, try_rabbit_order};
 #[cfg(feature = "parallel")]
-pub use rabbit::rabbit_order_par;
-pub use rcm::rcm;
+pub use rabbit::{rabbit_order_par, try_rabbit_order_par};
+pub use rcm::{rcm, try_rcm};
 
 /// A permutation array.
 ///
@@ -218,6 +218,11 @@ impl Permutation {
     /// For zero-length inputs, the empty `Vec` is returned without
     /// inspecting `src`.
     ///
+    /// Kernel/FUSE callers that need a non-panicking shape check should
+    /// prefer [`Permutation::try_apply`]. Callers that additionally want
+    /// proof of permutation validity should prefer
+    /// [`Permutation::try_apply_into_strict`].
+    ///
     /// # Safety contract
     ///
     /// If `self` is a valid bijection on `0..n` (constructed via
@@ -271,6 +276,11 @@ impl Permutation {
     ///
     /// Panics if `src.len() != self.len()` or `dst.len() < self.len()`.
     ///
+    /// Kernel/FUSE callers that need a non-panicking shape check should
+    /// prefer [`Permutation::try_apply_into`]. Callers that additionally
+    /// want proof of permutation validity should prefer
+    /// [`Permutation::try_apply_into_strict`].
+    ///
     /// # Safety contract
     ///
     /// If `self` is a valid bijection on `0..n` (constructed via
@@ -306,6 +316,102 @@ impl Permutation {
         for (i, &new_id) in self.0.iter().enumerate() {
             dst[new_id as usize] = src[i];
         }
+    }
+
+    /// Like [`Permutation::apply`] but returns an error on
+    /// shape-mismatch instead of panicking.
+    ///
+    /// Validates `src.len() == self.len()` upfront; on mismatch returns
+    /// [`PermutationApplyError::SrcLenMismatch`] without inspecting
+    /// `src` further. On success the body is identical to
+    /// [`Permutation::apply`] — `dst[perm[i]] = src[i]` is written into
+    /// a freshly allocated `Vec<T>` of length `self.len()`.
+    ///
+    /// This variant only checks the shape contract; it does NOT verify
+    /// that the [`Permutation`] is a valid bijection. If `self` was
+    /// constructed via [`Permutation::from_vec_unchecked`] from
+    /// untrusted on-disk data, prefer
+    /// [`Permutation::try_apply_into_strict`], which additionally
+    /// detects out-of-range and duplicate destination indices via a
+    /// caller-provided scratch bitset.
+    ///
+    /// For zero-length permutations, the empty `Vec` is returned
+    /// without inspecting `src` (provided the length matches).
+    ///
+    /// # Errors
+    ///
+    /// * [`PermutationApplyError::SrcLenMismatch`] when
+    ///   `src.len() != self.len()`.
+    pub fn try_apply<T: Copy>(&self, src: &[T]) -> Result<Vec<T>, PermutationApplyError> {
+        let n = self.0.len();
+        if src.len() != n {
+            return Err(PermutationApplyError::SrcLenMismatch {
+                expected: n,
+                actual: src.len(),
+            });
+        }
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        // Initialise dst with a clone of `src[0]` to satisfy the `Vec`
+        // invariant; every slot is overwritten by `apply_into`. The
+        // bound `T: Copy` makes the clone a no-op.
+        let mut dst = vec![src[0]; n];
+        // SAFETY-LIKE: `apply_into`'s shape contract is satisfied
+        // because we just verified `src.len() == n` and built `dst` of
+        // length `n`. The unchecked-panic-on-shape path inside
+        // `apply_into` cannot trigger.
+        self.apply_into(src, &mut dst);
+        Ok(dst)
+    }
+
+    /// Like [`Permutation::apply_into`] but returns an error on
+    /// shape-mismatch instead of panicking.
+    ///
+    /// Validates `src.len() == self.len()` and `dst.len() >= self.len()`
+    /// upfront; on either mismatch returns the corresponding
+    /// [`PermutationApplyError`] variant without writing to `dst`.
+    ///
+    /// This variant only checks the shape contract; it does NOT verify
+    /// that the [`Permutation`] is a valid bijection. If `self` was
+    /// constructed via [`Permutation::from_vec_unchecked`] from
+    /// untrusted on-disk data, prefer
+    /// [`Permutation::try_apply_into_strict`], which additionally
+    /// detects out-of-range and duplicate destination indices via a
+    /// caller-provided scratch bitset.
+    ///
+    /// On success the body is identical to
+    /// [`Permutation::apply_into`]: `dst[perm[i]] = src[i]` for every
+    /// `i in 0..self.len()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`PermutationApplyError::SrcLenMismatch`] when
+    ///   `src.len() != self.len()`.
+    /// * [`PermutationApplyError::DstTooSmall`] when
+    ///   `dst.len() < self.len()`.
+    pub fn try_apply_into<T: Copy>(
+        &self,
+        src: &[T],
+        dst: &mut [T],
+    ) -> Result<(), PermutationApplyError> {
+        let n = self.0.len();
+        if src.len() != n {
+            return Err(PermutationApplyError::SrcLenMismatch {
+                expected: n,
+                actual: src.len(),
+            });
+        }
+        if dst.len() < n {
+            return Err(PermutationApplyError::DstTooSmall {
+                needed: n,
+                actual: dst.len(),
+            });
+        }
+        for (i, &new_id) in self.0.iter().enumerate() {
+            dst[new_id as usize] = src[i];
+        }
+        Ok(())
     }
 
     /// Validates that this [`Permutation`] is a valid bijection on
@@ -365,6 +471,77 @@ impl Permutation {
             *cell |= bit;
         }
         true
+    }
+
+    /// Like [`Permutation::validate_no_alloc`] but returns a structured
+    /// error on failure instead of panicking on undersized scratch.
+    ///
+    /// `scratch` must have at least `self.len().div_ceil(64)` u64
+    /// words. The first `len().div_ceil(64)` words of `scratch` are
+    /// zeroed on entry. On a successful traversal, returns `Ok(())` —
+    /// the [`Permutation`] is a valid bijection on `0..self.len()`.
+    ///
+    /// This is the kernel-safe sibling of
+    /// [`Permutation::validate_no_alloc`]: it covers exactly the same
+    /// failure modes (length overflow, undersized scratch, out-of-range
+    /// index, duplicate index) but reports each via a non-panicking
+    /// [`PermutationValidationError`] variant. Use it when validating a
+    /// [`Permutation`] freshly loaded from untrusted on-disk data
+    /// without committing to the apply step `try_apply_into_strict`
+    /// performs.
+    ///
+    /// # Errors
+    ///
+    /// * [`PermutationValidationError::LengthOverflow`] when
+    ///   `self.len() > u32::MAX as usize` (vertex IDs are u32 by
+    ///   construction; should never trigger via the public
+    ///   constructors but defends against `from_vec_unchecked` abuse).
+    /// * [`PermutationValidationError::ScratchTooSmall`] when
+    ///   `scratch.len() < self.len().div_ceil(64)`.
+    /// * [`PermutationValidationError::OutOfRangeIndex`] when an entry
+    ///   of the permutation is `>= self.len()`.
+    /// * [`PermutationValidationError::DuplicateIndex`] when two
+    ///   entries of the permutation map to the same destination slot.
+    pub fn try_validate_no_alloc(
+        &self,
+        scratch: &mut [u64],
+    ) -> Result<(), PermutationValidationError> {
+        let n = self.0.len();
+        if n > u32::MAX as usize {
+            return Err(PermutationValidationError::LengthOverflow { len: n });
+        }
+        let words_needed = n.div_ceil(64);
+        if scratch.len() < words_needed {
+            return Err(PermutationValidationError::ScratchTooSmall {
+                needed_words: words_needed,
+                actual_words: scratch.len(),
+            });
+        }
+        // Zero only the prefix we will use; leave any tail untouched
+        // so callers can re-use a larger scratch buffer cheaply.
+        for slot in scratch.iter_mut().take(words_needed) {
+            *slot = 0;
+        }
+        for (i, &id_u32) in self.0.iter().enumerate() {
+            let id = id_u32 as usize;
+            if id >= n {
+                return Err(PermutationValidationError::OutOfRangeIndex {
+                    src_index: i,
+                    value: id_u32,
+                });
+            }
+            let word = id >> 6;
+            let bit = 1_u64 << (id & 63);
+            let cell = &mut scratch[word];
+            if *cell & bit != 0 {
+                return Err(PermutationValidationError::DuplicateIndex {
+                    src_index: i,
+                    value: id_u32,
+                });
+            }
+            *cell |= bit;
+        }
+        Ok(())
     }
 
     /// Like [`Permutation::apply_into`] but verifies during apply that
@@ -568,6 +745,76 @@ impl core::fmt::Display for PermutationApplyError {
 #[cfg(feature = "std")]
 impl std::error::Error for PermutationApplyError {}
 
+/// Failure modes returned by [`Permutation::try_validate_no_alloc`].
+///
+/// All variants are non-allocating and `Copy` so they can be propagated
+/// from kernel-mode call sites without touching the heap. They surface
+/// the offending source index and value when applicable so a caller can
+/// log or telemetry-tag corrupted on-disk permutations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PermutationValidationError {
+    /// Permutation length exceeds `u32::MAX as usize`. Vertex IDs are
+    /// `u32` by construction so this should be unreachable through
+    /// public constructors; the variant exists to defend against
+    /// misuse of [`Permutation::from_vec_unchecked`].
+    LengthOverflow {
+        /// The over-large permutation length.
+        len: usize,
+    },
+    /// `scratch.len() < self.len().div_ceil(64)`. Bitset scratch is
+    /// too small to track destination occupancy.
+    ScratchTooSmall {
+        /// Required number of u64 words.
+        needed_words: usize,
+        /// Caller-supplied number of u64 words.
+        actual_words: usize,
+    },
+    /// Out-of-range index — perm contains an entry `>= self.len()`.
+    OutOfRangeIndex {
+        /// Source index whose value is out of range.
+        src_index: usize,
+        /// The offending out-of-range value.
+        value: u32,
+    },
+    /// Duplicate index detected — perm is not a valid bijection. The
+    /// destination slot was already claimed by an earlier source index.
+    DuplicateIndex {
+        /// Source index whose mapping triggered the collision.
+        src_index: usize,
+        /// The duplicated value.
+        value: u32,
+    },
+}
+
+impl core::fmt::Display for PermutationValidationError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::LengthOverflow { len } => write!(
+                f,
+                "Permutation::try_validate_no_alloc: permutation length ({len}) exceeds u32::MAX"
+            ),
+            Self::ScratchTooSmall {
+                needed_words,
+                actual_words,
+            } => write!(
+                f,
+                "Permutation::try_validate_no_alloc: scratch words ({actual_words}) < needed ({needed_words})"
+            ),
+            Self::OutOfRangeIndex { src_index, value } => write!(
+                f,
+                "Permutation::try_validate_no_alloc: out-of-range value {value} at src index {src_index}"
+            ),
+            Self::DuplicateIndex { src_index, value } => write!(
+                f,
+                "Permutation::try_validate_no_alloc: duplicate value {value} at src index {src_index}"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for PermutationValidationError {}
+
 /// A borrowed compressed sparse row (CSR) adjacency input for graph
 /// permutations.
 ///
@@ -595,7 +842,10 @@ impl<'a> CsrGraph<'a> {
     /// # Panics
     ///
     /// Panics if `v >= self.n` or if the offsets/neighbors arrays are
-    /// inconsistent (e.g. `offsets[v + 1] < offsets[v]`).
+    /// inconsistent (e.g. `offsets[v + 1] < offsets[v]`,
+    /// `offsets.len() < v + 2`, or `offsets[v + 1] > neighbors.len()`).
+    /// Kernel/FUSE callers that need a non-panicking variant should
+    /// prefer [`CsrGraph::try_neighbors_of`].
     #[must_use]
     pub fn neighbors_of(&self, v: u32) -> &'a [u32] {
         assert!(v < self.n, "vertex {v} out of range [0, {})", self.n);
@@ -610,10 +860,349 @@ impl<'a> CsrGraph<'a> {
     /// # Panics
     ///
     /// Panics under the same conditions as [`Self::neighbors_of`].
+    /// Kernel/FUSE callers that need a non-panicking variant should
+    /// prefer [`CsrGraph::try_degree_of`].
     #[must_use]
     pub fn degree(&self, v: u32) -> u32 {
         assert!(v < self.n, "vertex {v} out of range [0, {})", self.n);
         self.offsets[v as usize + 1] - self.offsets[v as usize]
+    }
+
+    /// Like [`CsrGraph::neighbors_of`] but returns an error on
+    /// invalid input instead of panicking.
+    ///
+    /// Validates that `v < self.n`, that the offsets array is long
+    /// enough to read both `offsets[v]` and `offsets[v + 1]`, that the
+    /// offset pair is monotone (`offsets[v] <= offsets[v + 1]`), and
+    /// that the slice bounds fit inside `self.neighbors`. On success
+    /// returns the borrowed neighbour slice; on failure returns the
+    /// matching [`CsrGraphError`] variant without touching memory
+    /// outside the bounds the validator already checked.
+    ///
+    /// Use this from kernel-mode consumers that loaded a [`CsrGraph`]
+    /// from an untrusted on-disk image and need to traverse
+    /// adjacency lists without exposing a DoS hazard at the kernel
+    /// boundary.
+    ///
+    /// # Errors
+    ///
+    /// * [`CsrGraphError::OutOfRange`] when `v >= self.n` or when
+    ///   `self.offsets.len() < (v as usize) + 2`.
+    /// * [`CsrGraphError::OffsetsNonMonotone`] when
+    ///   `self.offsets[v] > self.offsets[v + 1]`.
+    /// * [`CsrGraphError::NeighborsOutOfBounds`] when
+    ///   `self.offsets[v + 1] as usize > self.neighbors.len()`.
+    pub fn try_neighbors_of(&self, v: u32) -> Result<&'a [u32], CsrGraphError> {
+        if v >= self.n {
+            return Err(CsrGraphError::OutOfRange { v, n: self.n });
+        }
+        let v_idx = v as usize;
+        // The offsets array must be long enough to address `v + 1`.
+        // Treat that as another "out of range" failure mode — the
+        // caller's CsrGraph header is internally inconsistent.
+        if self.offsets.len() <= v_idx + 1 {
+            return Err(CsrGraphError::OutOfRange { v, n: self.n });
+        }
+        let lo = self.offsets[v_idx];
+        let hi = self.offsets[v_idx + 1];
+        if lo > hi {
+            return Err(CsrGraphError::OffsetsNonMonotone { i: v, lo, hi });
+        }
+        let hi_idx = hi as usize;
+        if hi_idx > self.neighbors.len() {
+            return Err(CsrGraphError::NeighborsOutOfBounds {
+                offset: hi,
+                neighbors_len: self.neighbors.len(),
+            });
+        }
+        let lo_idx = lo as usize;
+        // SAFETY-LIKE: lo <= hi (monotone check) and hi_idx <= len
+        // (bounds check) together imply lo_idx <= hi_idx <= len, so
+        // the slice index is in bounds.
+        Ok(&self.neighbors[lo_idx..hi_idx])
+    }
+
+    /// Like [`CsrGraph::degree`] but returns an error on invalid
+    /// input instead of panicking.
+    ///
+    /// Validates that `v < self.n`, that the offsets array is long
+    /// enough to read both `offsets[v]` and `offsets[v + 1]`, and
+    /// that the offset pair is monotone. On success returns
+    /// `offsets[v + 1] - offsets[v]`. The neighbours array length is
+    /// not consulted — degree is purely a property of the offsets
+    /// array — so [`CsrGraphError::NeighborsOutOfBounds`] is never
+    /// returned.
+    ///
+    /// # Errors
+    ///
+    /// * [`CsrGraphError::OutOfRange`] when `v >= self.n` or when
+    ///   `self.offsets.len() < (v as usize) + 2`.
+    /// * [`CsrGraphError::OffsetsNonMonotone`] when
+    ///   `self.offsets[v] > self.offsets[v + 1]`.
+    pub fn try_degree_of(&self, v: u32) -> Result<u32, CsrGraphError> {
+        if v >= self.n {
+            return Err(CsrGraphError::OutOfRange { v, n: self.n });
+        }
+        let v_idx = v as usize;
+        if self.offsets.len() <= v_idx + 1 {
+            return Err(CsrGraphError::OutOfRange { v, n: self.n });
+        }
+        let lo = self.offsets[v_idx];
+        let hi = self.offsets[v_idx + 1];
+        if lo > hi {
+            return Err(CsrGraphError::OffsetsNonMonotone { i: v, lo, hi });
+        }
+        Ok(hi - lo)
+    }
+
+    /// Validates the entire CSR header in O(|V| + |E|) time, returning
+    /// `Ok(())` only when every per-vertex offset pair is monotone and
+    /// in-bounds against the neighbours array, and every neighbour ID
+    /// is in range `0..self.n`.
+    ///
+    /// This is the upfront-validation routine the fallible permutation
+    /// builders ([`try_rcm`], [`rabbit::try_rabbit_order`],
+    /// [`rabbit::try_rabbit_order_par`] when the `parallel` feature is
+    /// enabled) call before they touch any of the existing internal
+    /// pipelines. It is cheap relative to the agglomeration / BFS
+    /// passes themselves and runs entirely on borrowed slices —
+    /// suitable for kernel/FUSE callers that need to gate untrusted
+    /// on-disk CSR images before invoking the heavyweight builder.
+    ///
+    /// Note: the per-vertex `try_neighbors_of` / `try_degree_of`
+    /// helpers do NOT call this. They validate only the offsets pair
+    /// they read; this routine adds the global `offsets.len() == n + 1`
+    /// and `offsets[n] == neighbors.len()` checks plus a full sweep
+    /// over `neighbors` for in-range vertex IDs.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first failure mode encountered:
+    ///
+    /// * [`CsrGraphError::OffsetsLengthMismatch`] when
+    ///   `self.offsets.len() != self.n as usize + 1`.
+    /// * [`CsrGraphError::OffsetsNonMonotone`] when any consecutive
+    ///   pair of offsets is inverted.
+    /// * [`CsrGraphError::NeighborsLengthMismatch`] when
+    ///   `self.offsets[n] as usize != self.neighbors.len()`.
+    /// * [`CsrGraphError::NeighborOutOfRange`] when any entry of
+    ///   `self.neighbors` is `>= self.n`.
+    pub fn try_validate(&self) -> Result<(), CsrGraphError> {
+        let n_usize = self.n as usize;
+        if self.offsets.len() != n_usize + 1 {
+            return Err(CsrGraphError::OffsetsLengthMismatch {
+                actual_len: self.offsets.len(),
+                expected_len: n_usize + 1,
+            });
+        }
+        // n == 0: offsets is `[0]`, neighbors is empty. Validate that.
+        if self.n == 0 {
+            if self.neighbors.is_empty() {
+                return Ok(());
+            }
+            return Err(CsrGraphError::NeighborsLengthMismatch {
+                offsets_tail: self.offsets[0],
+                neighbors_len: self.neighbors.len(),
+            });
+        }
+        // Monotone offsets check.
+        for i in 0..n_usize {
+            let lo = self.offsets[i];
+            let hi = self.offsets[i + 1];
+            if lo > hi {
+                // SAFETY-LIKE: i < n <= u32::MAX as usize so the cast
+                // cannot overflow.
+                #[allow(clippy::cast_possible_truncation)]
+                return Err(CsrGraphError::OffsetsNonMonotone {
+                    i: i as u32,
+                    lo,
+                    hi,
+                });
+            }
+        }
+        // Tail consistency: offsets[n] must equal neighbors.len().
+        let tail = self.offsets[n_usize];
+        if tail as usize != self.neighbors.len() {
+            return Err(CsrGraphError::NeighborsLengthMismatch {
+                offsets_tail: tail,
+                neighbors_len: self.neighbors.len(),
+            });
+        }
+        // In-range neighbour IDs.
+        for (k, &u) in self.neighbors.iter().enumerate() {
+            if u >= self.n {
+                return Err(CsrGraphError::NeighborOutOfRange {
+                    neighbor: u,
+                    n: self.n,
+                    at_index: k,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Failure modes returned by the fallible [`CsrGraph`] accessors
+/// ([`CsrGraph::try_neighbors_of`], [`CsrGraph::try_degree_of`]) and by
+/// the fallible permutation builders' upfront CSR validation
+/// (`try_rcm`, `try_rabbit_order`, `try_rabbit_order_par` — added in
+/// audit-R7-followup #11).
+///
+/// All variants are non-allocating and `Copy` so they propagate from
+/// kernel-mode call sites without touching the heap. They surface
+/// the offending vertex / offset values so a caller can log or
+/// telemetry-tag corrupted on-disk CSR images.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CsrGraphError {
+    /// Vertex `v` is out of range for the graph: `v >= n`, or the
+    /// `offsets` array does not cover index `v + 1` (header
+    /// inconsistency).
+    OutOfRange {
+        /// The offending vertex ID.
+        v: u32,
+        /// The graph's declared vertex count `self.n`.
+        n: u32,
+    },
+    /// `offsets[i] > offsets[i + 1]` — the CSR offsets array is not
+    /// monotonically non-decreasing.
+    OffsetsNonMonotone {
+        /// Index `i` whose offset pair is inverted.
+        i: u32,
+        /// `offsets[i]`.
+        lo: u32,
+        /// `offsets[i + 1]`.
+        hi: u32,
+    },
+    /// `offsets[v + 1] as usize > neighbors.len()` — the offset
+    /// claims to address past the end of the neighbours array.
+    NeighborsOutOfBounds {
+        /// The offending offset value.
+        offset: u32,
+        /// The actual length of `neighbors`.
+        neighbors_len: usize,
+    },
+    /// `offsets.len() != (n as usize) + 1` — the offsets array does
+    /// not have the required CSR length.
+    OffsetsLengthMismatch {
+        /// The actual `offsets.len()`.
+        actual_len: usize,
+        /// The required length `n + 1`.
+        expected_len: usize,
+    },
+    /// `offsets[n] as usize != neighbors.len()` — the offsets tail
+    /// does not match the neighbour array length.
+    NeighborsLengthMismatch {
+        /// The value of `offsets[n]`.
+        offsets_tail: u32,
+        /// The actual length of `neighbors`.
+        neighbors_len: usize,
+    },
+    /// A neighbour ID is out of range: `neighbors[k] >= n` for some
+    /// `k`. Reported by the permutation builders' upfront CSR
+    /// validation; not produced by the per-vertex try_* accessors
+    /// (which never read `neighbors[k]`'s value).
+    NeighborOutOfRange {
+        /// The offending neighbour ID.
+        neighbor: u32,
+        /// The graph's declared vertex count `self.n`.
+        n: u32,
+        /// Index in the `neighbors` array where the offending value
+        /// lives, for diagnostics.
+        at_index: usize,
+    },
+}
+
+impl core::fmt::Display for CsrGraphError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::OutOfRange { v, n } => {
+                write!(f, "CsrGraph: vertex {v} out of range [0, {n})")
+            }
+            Self::OffsetsNonMonotone { i, lo, hi } => write!(
+                f,
+                "CsrGraph: offsets non-monotone at index {i}: offsets[{i}]={lo} > offsets[{}]={hi}",
+                i + 1
+            ),
+            Self::NeighborsOutOfBounds {
+                offset,
+                neighbors_len,
+            } => write!(
+                f,
+                "CsrGraph: offset {offset} addresses past neighbors.len() ({neighbors_len})"
+            ),
+            Self::OffsetsLengthMismatch {
+                actual_len,
+                expected_len,
+            } => write!(
+                f,
+                "CsrGraph: offsets.len() ({actual_len}) != n + 1 ({expected_len})"
+            ),
+            Self::NeighborsLengthMismatch {
+                offsets_tail,
+                neighbors_len,
+            } => write!(
+                f,
+                "CsrGraph: offsets[n] ({offsets_tail}) != neighbors.len() ({neighbors_len})"
+            ),
+            Self::NeighborOutOfRange {
+                neighbor,
+                n,
+                at_index,
+            } => write!(
+                f,
+                "CsrGraph: neighbor {neighbor} at neighbors[{at_index}] out of range [0, {n})"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for CsrGraphError {}
+
+/// Failure modes returned by the fallible permutation builders
+/// ([`try_rcm`], [`rabbit::try_rabbit_order`], and
+/// [`rabbit::try_rabbit_order_par`] when the `parallel` Cargo feature
+/// is enabled).
+///
+/// The builders validate the input CSR upfront via
+/// [`CsrGraph::try_validate`]; any header / offset / neighbour-bounds
+/// failure is reported via the [`Self::InvalidCsr`] variant. The
+/// existing internal builder pipelines panic only on conditions the
+/// upfront validation already covers, so the try_* path produces
+/// every failure mode through this top-level enum without unwinding
+/// the kernel boundary.
+///
+/// All variants are non-allocating and `Copy` so they propagate from
+/// kernel-mode call sites without touching the heap.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PermutationConstructionError {
+    /// The input [`CsrGraph`] is internally inconsistent. See the
+    /// nested [`CsrGraphError`] for the precise failure mode.
+    InvalidCsr(CsrGraphError),
+}
+
+impl From<CsrGraphError> for PermutationConstructionError {
+    fn from(err: CsrGraphError) -> Self {
+        Self::InvalidCsr(err)
+    }
+}
+
+impl core::fmt::Display for PermutationConstructionError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InvalidCsr(err) => {
+                write!(f, "permutation construction failed: invalid CSR: {err}")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for PermutationConstructionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidCsr(err) => Some(err),
+        }
     }
 }
 
@@ -984,5 +1573,499 @@ mod tests {
             let s = format!("{c}");
             assert!(s.starts_with("Permutation::try_apply_into_strict"));
         }
+    }
+
+    // ----- audit-R7-followup #7 — shape-safe try_apply / try_apply_into -----
+
+    #[test]
+    fn try_apply_matches_apply_on_valid_perm() {
+        // Happy path: identical output to the panicking sibling on a
+        // shape-correct call.
+        let perm = Permutation::try_from_vec(vec![2, 0, 3, 1]).expect("valid");
+        let src: Vec<i32> = vec![10, 20, 30, 40];
+        let expected = perm.apply(&src);
+        let actual = perm.try_apply(&src).expect("shape matches");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn try_apply_returns_src_len_mismatch_without_panicking() {
+        let perm = Permutation::identity(4);
+        let src: Vec<i32> = vec![10, 20, 30]; // wrong length
+        let err = perm.try_apply(&src).expect_err("length mismatch");
+        assert_eq!(
+            err,
+            PermutationApplyError::SrcLenMismatch {
+                expected: 4,
+                actual: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn try_apply_handles_empty_perm_without_inspecting_src() {
+        // Boundary: zero-length perm with zero-length src returns
+        // empty Vec without touching `src`.
+        let perm = Permutation::identity(0);
+        let src: Vec<u8> = Vec::new();
+        let out = perm.try_apply(&src).expect("empty matches empty");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn try_apply_into_matches_apply_into_on_valid_perm() {
+        // Happy path: identical output to the panicking sibling.
+        let perm = Permutation::try_from_vec(vec![1, 0, 2]).expect("valid perm");
+        let src: Vec<u8> = vec![7, 8, 9];
+        let mut dst_panic = [0_u8; 3];
+        let mut dst_try = [0_u8; 3];
+        perm.apply_into(&src, &mut dst_panic);
+        perm.try_apply_into(&src, &mut dst_try)
+            .expect("shape matches");
+        assert_eq!(dst_try, dst_panic);
+    }
+
+    #[test]
+    fn try_apply_into_rejects_src_len_mismatch() {
+        let perm = Permutation::identity(3);
+        let src = [10_u8, 20]; // wrong length
+        let mut dst = [0_u8; 3];
+        let err = perm
+            .try_apply_into(&src, &mut dst)
+            .expect_err("src length mismatch must error");
+        assert_eq!(
+            err,
+            PermutationApplyError::SrcLenMismatch {
+                expected: 3,
+                actual: 2,
+            }
+        );
+        // dst must not have been touched.
+        assert_eq!(dst, [0_u8; 3]);
+    }
+
+    #[test]
+    fn try_apply_into_rejects_dst_too_small() {
+        let perm = Permutation::identity(3);
+        let src = [10_u8, 20, 30];
+        let mut dst = [0_u8; 2]; // too small
+        let err = perm
+            .try_apply_into(&src, &mut dst)
+            .expect_err("dst too small must error");
+        assert_eq!(
+            err,
+            PermutationApplyError::DstTooSmall {
+                needed: 3,
+                actual: 2,
+            }
+        );
+        // dst must not have been touched.
+        assert_eq!(dst, [0_u8; 2]);
+    }
+
+    // ----- audit-R7-followup #9 — try_validate_no_alloc -----
+
+    #[test]
+    fn try_validate_no_alloc_accepts_valid_perms() {
+        // Happy path matches `validate_no_alloc(...)` -> true on every
+        // valid permutation we previously verified that way.
+        for n in [0_usize, 1, 2, 5, 17, 64, 65, 128, 129, 256] {
+            let perm = Permutation::identity(n);
+            let mut scratch = vec![0_u64; n.div_ceil(64).max(1)];
+            perm.try_validate_no_alloc(&mut scratch)
+                .expect("identity must validate");
+        }
+        // Cross-word valid permutation.
+        let mut v: Vec<u32> = (0..70_u32).rev().collect();
+        v.swap(3, 65);
+        let perm = Permutation::try_from_vec(v).expect("valid");
+        let mut scratch = [0_u64; 2];
+        perm.try_validate_no_alloc(&mut scratch)
+            .expect("reverse-with-swap must validate");
+    }
+
+    #[test]
+    fn try_validate_no_alloc_rejects_undersized_scratch() {
+        // n=65 needs 2 u64 words; pass 1.
+        let perm = Permutation::identity(65);
+        let mut scratch = [0_u64; 1];
+        let err = perm
+            .try_validate_no_alloc(&mut scratch)
+            .expect_err("undersized scratch must error, not panic");
+        assert_eq!(
+            err,
+            PermutationValidationError::ScratchTooSmall {
+                needed_words: 2,
+                actual_words: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn try_validate_no_alloc_rejects_duplicates() {
+        // SAFETY: deliberately invalid — used only to exercise the validator.
+        let perm = unsafe { Permutation::from_vec_unchecked(vec![0_u32, 1, 1]) };
+        let mut scratch = [0_u64; 1];
+        let err = perm
+            .try_validate_no_alloc(&mut scratch)
+            .expect_err("duplicate must error");
+        assert_eq!(
+            err,
+            PermutationValidationError::DuplicateIndex {
+                src_index: 2,
+                value: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn try_validate_no_alloc_rejects_out_of_range() {
+        // SAFETY: deliberately invalid — used only to exercise the validator.
+        let perm = unsafe { Permutation::from_vec_unchecked(vec![0_u32, 1, 5]) };
+        let mut scratch = [0_u64; 1];
+        let err = perm
+            .try_validate_no_alloc(&mut scratch)
+            .expect_err("out-of-range must error");
+        assert_eq!(
+            err,
+            PermutationValidationError::OutOfRangeIndex {
+                src_index: 2,
+                value: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn permutation_validation_error_display_renders_all_variants() {
+        // Cover the Display impl so all arms are exercised.
+        let cases = [
+            PermutationValidationError::LengthOverflow { len: 1 << 33 },
+            PermutationValidationError::ScratchTooSmall {
+                needed_words: 2,
+                actual_words: 1,
+            },
+            PermutationValidationError::OutOfRangeIndex {
+                src_index: 1,
+                value: 9,
+            },
+            PermutationValidationError::DuplicateIndex {
+                src_index: 2,
+                value: 1,
+            },
+        ];
+        for c in cases {
+            let s = format!("{c}");
+            assert!(s.starts_with("Permutation::try_validate_no_alloc"));
+        }
+    }
+
+    // ----- audit-R7-followup #10 — CsrGraph::try_neighbors_of / try_degree_of -----
+
+    #[test]
+    fn try_neighbors_of_matches_neighbors_of_on_well_formed_csr() {
+        // Path: 0-1-2-3, undirected.
+        let offsets = [0_u32, 1, 3, 5, 6];
+        let neighbors = [1_u32, 0, 2, 1, 3, 2];
+        let g = CsrGraph {
+            n: 4,
+            offsets: &offsets,
+            neighbors: &neighbors,
+        };
+        for v in 0_u32..4 {
+            let panic_path = g.neighbors_of(v);
+            let try_path = g
+                .try_neighbors_of(v)
+                .expect("well-formed CSR must succeed");
+            assert_eq!(panic_path, try_path);
+        }
+    }
+
+    #[test]
+    fn try_degree_of_matches_degree_on_well_formed_csr() {
+        let offsets = [0_u32, 1, 3, 5, 6];
+        let neighbors = [1_u32, 0, 2, 1, 3, 2];
+        let g = CsrGraph {
+            n: 4,
+            offsets: &offsets,
+            neighbors: &neighbors,
+        };
+        for v in 0_u32..4 {
+            let panic_path = g.degree(v);
+            let try_path = g.try_degree_of(v).expect("well-formed CSR must succeed");
+            assert_eq!(panic_path, try_path);
+        }
+    }
+
+    #[test]
+    fn try_neighbors_of_rejects_v_out_of_range() {
+        let offsets = [0_u32, 1, 3];
+        let neighbors = [1_u32, 0, 2];
+        let g = CsrGraph {
+            n: 2,
+            offsets: &offsets,
+            neighbors: &neighbors,
+        };
+        let err = g
+            .try_neighbors_of(2)
+            .expect_err("v == n must error, not panic");
+        assert_eq!(err, CsrGraphError::OutOfRange { v: 2, n: 2 });
+        let err = g.try_neighbors_of(99).expect_err("v >> n must error");
+        assert_eq!(err, CsrGraphError::OutOfRange { v: 99, n: 2 });
+    }
+
+    #[test]
+    fn try_neighbors_of_rejects_offsets_non_monotone() {
+        // Inverted offset pair at index 1: offsets[1]=5 > offsets[2]=2.
+        // (Both are within neighbors.len() so the bounds check
+        // succeeds; the failure mode under test is the monotone
+        // check.)
+        let offsets = [0_u32, 5, 2, 6];
+        let neighbors = [1_u32, 2, 3, 4, 5, 6];
+        let g = CsrGraph {
+            n: 3,
+            offsets: &offsets,
+            neighbors: &neighbors,
+        };
+        let err = g
+            .try_neighbors_of(1)
+            .expect_err("non-monotone offsets must error");
+        assert_eq!(
+            err,
+            CsrGraphError::OffsetsNonMonotone {
+                i: 1,
+                lo: 5,
+                hi: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn try_neighbors_of_rejects_neighbors_out_of_bounds() {
+        // offsets[1] = 99 addresses past the end of neighbors.
+        let offsets = [0_u32, 99];
+        let neighbors = [1_u32, 0];
+        let g = CsrGraph {
+            n: 1,
+            offsets: &offsets,
+            neighbors: &neighbors,
+        };
+        let err = g
+            .try_neighbors_of(0)
+            .expect_err("offset > neighbors.len() must error");
+        assert_eq!(
+            err,
+            CsrGraphError::NeighborsOutOfBounds {
+                offset: 99,
+                neighbors_len: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn try_degree_of_rejects_v_out_of_range_and_non_monotone() {
+        let offsets = [0_u32, 5, 2];
+        let neighbors = [1_u32, 2, 3, 4, 5, 6];
+        let g = CsrGraph {
+            n: 2,
+            offsets: &offsets,
+            neighbors: &neighbors,
+        };
+        let err = g.try_degree_of(7).expect_err("v >> n must error");
+        assert_eq!(err, CsrGraphError::OutOfRange { v: 7, n: 2 });
+        let err = g
+            .try_degree_of(1)
+            .expect_err("non-monotone offsets must error");
+        assert_eq!(
+            err,
+            CsrGraphError::OffsetsNonMonotone {
+                i: 1,
+                lo: 5,
+                hi: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn try_neighbors_of_rejects_truncated_offsets_array() {
+        // offsets array has only one entry but n=1 — there is no
+        // offsets[1] to read.
+        let offsets = [0_u32];
+        let neighbors: [u32; 0] = [];
+        let g = CsrGraph {
+            n: 1,
+            offsets: &offsets,
+            neighbors: &neighbors,
+        };
+        let err = g
+            .try_neighbors_of(0)
+            .expect_err("truncated offsets must error");
+        assert_eq!(err, CsrGraphError::OutOfRange { v: 0, n: 1 });
+    }
+
+    #[test]
+    fn csr_graph_error_display_renders_all_variants() {
+        // Cover every Display arm.
+        let cases = [
+            CsrGraphError::OutOfRange { v: 5, n: 3 },
+            CsrGraphError::OffsetsNonMonotone {
+                i: 1,
+                lo: 5,
+                hi: 2,
+            },
+            CsrGraphError::NeighborsOutOfBounds {
+                offset: 99,
+                neighbors_len: 5,
+            },
+            CsrGraphError::OffsetsLengthMismatch {
+                actual_len: 3,
+                expected_len: 5,
+            },
+            CsrGraphError::NeighborsLengthMismatch {
+                offsets_tail: 7,
+                neighbors_len: 6,
+            },
+            CsrGraphError::NeighborOutOfRange {
+                neighbor: 9,
+                n: 4,
+                at_index: 2,
+            },
+        ];
+        for c in cases {
+            let s = format!("{c}");
+            assert!(s.starts_with("CsrGraph"));
+        }
+    }
+
+    // ----- audit-R7-followup #11 — CsrGraph::try_validate + PermutationConstructionError -----
+
+    #[test]
+    fn try_validate_accepts_well_formed_csr() {
+        // Path: 0-1-2-3, undirected.
+        let offsets = [0_u32, 1, 3, 5, 6];
+        let neighbors = [1_u32, 0, 2, 1, 3, 2];
+        let g = CsrGraph {
+            n: 4,
+            offsets: &offsets,
+            neighbors: &neighbors,
+        };
+        g.try_validate().expect("well-formed CSR must validate");
+    }
+
+    #[test]
+    fn try_validate_accepts_empty_graph() {
+        let offsets = [0_u32];
+        let neighbors: [u32; 0] = [];
+        let g = CsrGraph {
+            n: 0,
+            offsets: &offsets,
+            neighbors: &neighbors,
+        };
+        g.try_validate().expect("empty graph must validate");
+    }
+
+    #[test]
+    fn try_validate_rejects_offsets_length_mismatch() {
+        let offsets = [0_u32, 1];
+        let neighbors = [1_u32, 0];
+        let g = CsrGraph {
+            n: 3, // expects 4 offsets
+            offsets: &offsets,
+            neighbors: &neighbors,
+        };
+        let err = g.try_validate().expect_err("length mismatch must error");
+        assert_eq!(
+            err,
+            CsrGraphError::OffsetsLengthMismatch {
+                actual_len: 2,
+                expected_len: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn try_validate_rejects_non_monotone_offsets() {
+        let offsets = [0_u32, 5, 2, 6];
+        let neighbors = [1_u32, 2, 3, 4, 5, 6];
+        let g = CsrGraph {
+            n: 3,
+            offsets: &offsets,
+            neighbors: &neighbors,
+        };
+        let err = g
+            .try_validate()
+            .expect_err("non-monotone offsets must error");
+        assert_eq!(
+            err,
+            CsrGraphError::OffsetsNonMonotone {
+                i: 1,
+                lo: 5,
+                hi: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn try_validate_rejects_neighbors_length_mismatch() {
+        // offsets[n]=2 but neighbors only has 1 element.
+        let offsets = [0_u32, 2];
+        let neighbors = [0_u32];
+        let g = CsrGraph {
+            n: 1,
+            offsets: &offsets,
+            neighbors: &neighbors,
+        };
+        let err = g.try_validate().expect_err("tail mismatch must error");
+        assert_eq!(
+            err,
+            CsrGraphError::NeighborsLengthMismatch {
+                offsets_tail: 2,
+                neighbors_len: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn try_validate_rejects_neighbor_out_of_range() {
+        // Single neighbour with id 99 but n=2.
+        let offsets = [0_u32, 1, 1];
+        let neighbors = [99_u32];
+        let g = CsrGraph {
+            n: 2,
+            offsets: &offsets,
+            neighbors: &neighbors,
+        };
+        let err = g
+            .try_validate()
+            .expect_err("out-of-range neighbour must error");
+        assert_eq!(
+            err,
+            CsrGraphError::NeighborOutOfRange {
+                neighbor: 99,
+                n: 2,
+                at_index: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn permutation_construction_error_display_renders() {
+        let err = PermutationConstructionError::InvalidCsr(CsrGraphError::OutOfRange {
+            v: 5,
+            n: 3,
+        });
+        let s = format!("{err}");
+        assert!(s.starts_with("permutation construction failed"));
+        assert!(s.contains("CsrGraph"));
+    }
+
+    #[test]
+    fn permutation_construction_error_from_csr_graph_error() {
+        // Verify the From impl that the try_* builders rely on.
+        let csr_err = CsrGraphError::OffsetsLengthMismatch {
+            actual_len: 2,
+            expected_len: 5,
+        };
+        let wrapped: PermutationConstructionError = csr_err.into();
+        assert_eq!(wrapped, PermutationConstructionError::InvalidCsr(csr_err));
     }
 }
