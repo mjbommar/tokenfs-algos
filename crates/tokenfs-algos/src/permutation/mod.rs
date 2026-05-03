@@ -74,10 +74,10 @@ pub mod rcm;
 
 #[cfg(feature = "permutation_hilbert")]
 pub use hilbert::{hilbert_2d, hilbert_nd};
-pub use rabbit::rabbit_order;
+pub use rabbit::{rabbit_order, try_rabbit_order};
 #[cfg(feature = "parallel")]
-pub use rabbit::rabbit_order_par;
-pub use rcm::rcm;
+pub use rabbit::{rabbit_order_par, try_rabbit_order_par};
+pub use rcm::{rcm, try_rcm};
 
 /// A permutation array.
 ///
@@ -931,6 +931,92 @@ impl<'a> CsrGraph<'a> {
         }
         Ok(hi - lo)
     }
+
+    /// Validates the entire CSR header in O(|V| + |E|) time, returning
+    /// `Ok(())` only when every per-vertex offset pair is monotone and
+    /// in-bounds against the neighbours array, and every neighbour ID
+    /// is in range `0..self.n`.
+    ///
+    /// This is the upfront-validation routine the fallible permutation
+    /// builders ([`try_rcm`], [`rabbit::try_rabbit_order`],
+    /// [`rabbit::try_rabbit_order_par`] when the `parallel` feature is
+    /// enabled) call before they touch any of the existing internal
+    /// pipelines. It is cheap relative to the agglomeration / BFS
+    /// passes themselves and runs entirely on borrowed slices —
+    /// suitable for kernel/FUSE callers that need to gate untrusted
+    /// on-disk CSR images before invoking the heavyweight builder.
+    ///
+    /// Note: the per-vertex `try_neighbors_of` / `try_degree_of`
+    /// helpers do NOT call this. They validate only the offsets pair
+    /// they read; this routine adds the global `offsets.len() == n + 1`
+    /// and `offsets[n] == neighbors.len()` checks plus a full sweep
+    /// over `neighbors` for in-range vertex IDs.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first failure mode encountered:
+    ///
+    /// * [`CsrGraphError::OffsetsLengthMismatch`] when
+    ///   `self.offsets.len() != self.n as usize + 1`.
+    /// * [`CsrGraphError::OffsetsNonMonotone`] when any consecutive
+    ///   pair of offsets is inverted.
+    /// * [`CsrGraphError::NeighborsLengthMismatch`] when
+    ///   `self.offsets[n] as usize != self.neighbors.len()`.
+    /// * [`CsrGraphError::NeighborOutOfRange`] when any entry of
+    ///   `self.neighbors` is `>= self.n`.
+    pub fn try_validate(&self) -> Result<(), CsrGraphError> {
+        let n_usize = self.n as usize;
+        if self.offsets.len() != n_usize + 1 {
+            return Err(CsrGraphError::OffsetsLengthMismatch {
+                actual_len: self.offsets.len(),
+                expected_len: n_usize + 1,
+            });
+        }
+        // n == 0: offsets is `[0]`, neighbors is empty. Validate that.
+        if self.n == 0 {
+            if self.neighbors.is_empty() {
+                return Ok(());
+            }
+            return Err(CsrGraphError::NeighborsLengthMismatch {
+                offsets_tail: self.offsets[0],
+                neighbors_len: self.neighbors.len(),
+            });
+        }
+        // Monotone offsets check.
+        for i in 0..n_usize {
+            let lo = self.offsets[i];
+            let hi = self.offsets[i + 1];
+            if lo > hi {
+                // SAFETY-LIKE: i < n <= u32::MAX as usize so the cast
+                // cannot overflow.
+                #[allow(clippy::cast_possible_truncation)]
+                return Err(CsrGraphError::OffsetsNonMonotone {
+                    i: i as u32,
+                    lo,
+                    hi,
+                });
+            }
+        }
+        // Tail consistency: offsets[n] must equal neighbors.len().
+        let tail = self.offsets[n_usize];
+        if tail as usize != self.neighbors.len() {
+            return Err(CsrGraphError::NeighborsLengthMismatch {
+                offsets_tail: tail,
+                neighbors_len: self.neighbors.len(),
+            });
+        }
+        // In-range neighbour IDs.
+        for (k, &u) in self.neighbors.iter().enumerate() {
+            if u >= self.n {
+                return Err(CsrGraphError::NeighborOutOfRange {
+                    neighbor: u,
+                    n: self.n,
+                    at_index: k,
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Failure modes returned by the fallible [`CsrGraph`] accessors
@@ -1049,6 +1135,53 @@ impl core::fmt::Display for CsrGraphError {
 
 #[cfg(feature = "std")]
 impl std::error::Error for CsrGraphError {}
+
+/// Failure modes returned by the fallible permutation builders
+/// ([`try_rcm`], [`rabbit::try_rabbit_order`], and
+/// [`rabbit::try_rabbit_order_par`] when the `parallel` Cargo feature
+/// is enabled).
+///
+/// The builders validate the input CSR upfront via
+/// [`CsrGraph::try_validate`]; any header / offset / neighbour-bounds
+/// failure is reported via the [`Self::InvalidCsr`] variant. The
+/// existing internal builder pipelines panic only on conditions the
+/// upfront validation already covers, so the try_* path produces
+/// every failure mode through this top-level enum without unwinding
+/// the kernel boundary.
+///
+/// All variants are non-allocating and `Copy` so they propagate from
+/// kernel-mode call sites without touching the heap.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PermutationConstructionError {
+    /// The input [`CsrGraph`] is internally inconsistent. See the
+    /// nested [`CsrGraphError`] for the precise failure mode.
+    InvalidCsr(CsrGraphError),
+}
+
+impl From<CsrGraphError> for PermutationConstructionError {
+    fn from(err: CsrGraphError) -> Self {
+        Self::InvalidCsr(err)
+    }
+}
+
+impl core::fmt::Display for PermutationConstructionError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InvalidCsr(err) => {
+                write!(f, "permutation construction failed: invalid CSR: {err}")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for PermutationConstructionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidCsr(err) => Some(err),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1774,5 +1907,138 @@ mod tests {
             let s = format!("{c}");
             assert!(s.starts_with("CsrGraph"));
         }
+    }
+
+    // ----- audit-R7-followup #11 — CsrGraph::try_validate + PermutationConstructionError -----
+
+    #[test]
+    fn try_validate_accepts_well_formed_csr() {
+        // Path: 0-1-2-3, undirected.
+        let offsets = [0_u32, 1, 3, 5, 6];
+        let neighbors = [1_u32, 0, 2, 1, 3, 2];
+        let g = CsrGraph {
+            n: 4,
+            offsets: &offsets,
+            neighbors: &neighbors,
+        };
+        g.try_validate().expect("well-formed CSR must validate");
+    }
+
+    #[test]
+    fn try_validate_accepts_empty_graph() {
+        let offsets = [0_u32];
+        let neighbors: [u32; 0] = [];
+        let g = CsrGraph {
+            n: 0,
+            offsets: &offsets,
+            neighbors: &neighbors,
+        };
+        g.try_validate().expect("empty graph must validate");
+    }
+
+    #[test]
+    fn try_validate_rejects_offsets_length_mismatch() {
+        let offsets = [0_u32, 1];
+        let neighbors = [1_u32, 0];
+        let g = CsrGraph {
+            n: 3, // expects 4 offsets
+            offsets: &offsets,
+            neighbors: &neighbors,
+        };
+        let err = g.try_validate().expect_err("length mismatch must error");
+        assert_eq!(
+            err,
+            CsrGraphError::OffsetsLengthMismatch {
+                actual_len: 2,
+                expected_len: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn try_validate_rejects_non_monotone_offsets() {
+        let offsets = [0_u32, 5, 2, 6];
+        let neighbors = [1_u32, 2, 3, 4, 5, 6];
+        let g = CsrGraph {
+            n: 3,
+            offsets: &offsets,
+            neighbors: &neighbors,
+        };
+        let err = g
+            .try_validate()
+            .expect_err("non-monotone offsets must error");
+        assert_eq!(
+            err,
+            CsrGraphError::OffsetsNonMonotone {
+                i: 1,
+                lo: 5,
+                hi: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn try_validate_rejects_neighbors_length_mismatch() {
+        // offsets[n]=2 but neighbors only has 1 element.
+        let offsets = [0_u32, 2];
+        let neighbors = [0_u32];
+        let g = CsrGraph {
+            n: 1,
+            offsets: &offsets,
+            neighbors: &neighbors,
+        };
+        let err = g.try_validate().expect_err("tail mismatch must error");
+        assert_eq!(
+            err,
+            CsrGraphError::NeighborsLengthMismatch {
+                offsets_tail: 2,
+                neighbors_len: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn try_validate_rejects_neighbor_out_of_range() {
+        // Single neighbour with id 99 but n=2.
+        let offsets = [0_u32, 1, 1];
+        let neighbors = [99_u32];
+        let g = CsrGraph {
+            n: 2,
+            offsets: &offsets,
+            neighbors: &neighbors,
+        };
+        let err = g
+            .try_validate()
+            .expect_err("out-of-range neighbour must error");
+        assert_eq!(
+            err,
+            CsrGraphError::NeighborOutOfRange {
+                neighbor: 99,
+                n: 2,
+                at_index: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn permutation_construction_error_display_renders() {
+        let err = PermutationConstructionError::InvalidCsr(CsrGraphError::OutOfRange {
+            v: 5,
+            n: 3,
+        });
+        let s = format!("{err}");
+        assert!(s.starts_with("permutation construction failed"));
+        assert!(s.contains("CsrGraph"));
+    }
+
+    #[test]
+    fn permutation_construction_error_from_csr_graph_error() {
+        // Verify the From impl that the try_* builders rely on.
+        let csr_err = CsrGraphError::OffsetsLengthMismatch {
+            actual_len: 2,
+            expected_len: 5,
+        };
+        let wrapped: PermutationConstructionError = csr_err.into();
+        assert_eq!(wrapped, PermutationConstructionError::InvalidCsr(csr_err));
     }
 }

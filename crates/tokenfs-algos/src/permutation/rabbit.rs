@@ -83,7 +83,7 @@ use core::cmp::Reverse;
 #[cfg(feature = "std")]
 use std::collections::BinaryHeap;
 
-use super::{CsrGraph, Permutation};
+use super::{CsrGraph, Permutation, PermutationConstructionError};
 
 /// Per-community weighted adjacency list.
 ///
@@ -138,7 +138,8 @@ struct Merge {
 ///
 /// Panics if `graph.offsets.len() != graph.n + 1`, if the CSR offsets
 /// are non-monotone, if `offsets[n]` does not equal `neighbors.len()`,
-/// or if any neighbour ID is out of range.
+/// or if any neighbour ID is out of range. Kernel/FUSE callers that
+/// need a non-panicking variant should prefer [`try_rabbit_order`].
 #[must_use]
 pub fn rabbit_order(graph: CsrGraph<'_>) -> Permutation {
     let n = graph.n as usize;
@@ -290,6 +291,41 @@ pub fn rabbit_order(graph: CsrGraph<'_>) -> Permutation {
     dfs_visit_order(n, &merges)
 }
 
+/// Like [`rabbit_order`] but returns an error on malformed CSR input
+/// instead of panicking.
+///
+/// Validates the entire CSR header upfront via
+/// [`CsrGraph::try_validate`] (offsets length, monotonicity,
+/// neighbours-tail consistency, in-range neighbour IDs) before
+/// invoking the existing internal pipeline. On a successful validation
+/// dispatches to [`rabbit_order`] — the success path is bit-identical
+/// to the panicking sibling, so the determinism guarantees and the
+/// degenerate-input behaviour documented for [`rabbit_order`] carry
+/// over verbatim.
+///
+/// **Allocation note:** the try_* path is about not panicking on bad
+/// input. It is NOT heap-free. Internally the per-vertex consolidated
+/// adjacency, weighted-degree cache, dendrogram, scratch buffers, and
+/// min-heap are all allocated on the heap. Rabbit Order is a
+/// build-time primitive (image-build phase, see
+/// `02b_DEPLOYMENT_MATRIX.md`); kernel-mode consumers load the
+/// resulting [`Permutation`] from the sealed image and apply it via
+/// the kernel-safe [`Permutation::try_apply_into`] /
+/// [`Permutation::try_apply_into_strict`].
+///
+/// # Errors
+///
+/// Returns [`PermutationConstructionError::InvalidCsr`] wrapping the
+/// first [`super::CsrGraphError`] encountered during upfront
+/// validation. See [`CsrGraph::try_validate`] for the full failure
+/// list.
+pub fn try_rabbit_order(
+    graph: CsrGraph<'_>,
+) -> Result<Permutation, PermutationConstructionError> {
+    graph.try_validate()?;
+    Ok(rabbit_order(graph))
+}
+
 /// Edge-count threshold below which [`rabbit_order_par`] falls back to
 /// the sequential [`rabbit_order`] path.
 ///
@@ -410,7 +446,9 @@ pub const RABBIT_PARALLEL_EDGE_THRESHOLD: usize = 200_000;
 ///
 /// # Panics
 ///
-/// Same panic conditions as [`rabbit_order`].
+/// Same panic conditions as [`rabbit_order`]. Kernel/FUSE callers
+/// that need a non-panicking variant should prefer
+/// [`try_rabbit_order_par`].
 #[cfg(feature = "parallel")]
 #[must_use]
 pub fn rabbit_order_par(graph: CsrGraph<'_>) -> Permutation {
@@ -617,6 +655,41 @@ pub fn rabbit_order_par(graph: CsrGraph<'_>) -> Permutation {
     }
 
     dfs_visit_order(n, &merges)
+}
+
+/// Like [`rabbit_order_par`] but returns an error on malformed CSR
+/// input instead of panicking.
+///
+/// Validates the entire CSR header upfront via
+/// [`CsrGraph::try_validate`] (offsets length, monotonicity,
+/// neighbours-tail consistency, in-range neighbour IDs) before
+/// invoking the existing internal parallel pipeline. On a successful
+/// validation dispatches to [`rabbit_order_par`] — the success path
+/// is bit-identical to the panicking sibling, including the
+/// `RABBIT_PARALLEL_EDGE_THRESHOLD` small-graph fallback that
+/// delegates to [`rabbit_order`] underneath.
+///
+/// **Allocation note:** the try_* path is about not panicking on bad
+/// input. It is NOT heap-free, and (because the parallel path may
+/// dispatch to rayon) it does not attempt any kernel-mode safety
+/// guarantees. Rabbit Order is a build-time primitive (image-build
+/// phase, see `02b_DEPLOYMENT_MATRIX.md`); kernel-mode consumers load
+/// the resulting [`Permutation`] from the sealed image and apply it
+/// via the kernel-safe [`Permutation::try_apply_into`] /
+/// [`Permutation::try_apply_into_strict`].
+///
+/// # Errors
+///
+/// Returns [`PermutationConstructionError::InvalidCsr`] wrapping the
+/// first [`super::CsrGraphError`] encountered during upfront
+/// validation. See [`CsrGraph::try_validate`] for the full failure
+/// list.
+#[cfg(feature = "parallel")]
+pub fn try_rabbit_order_par(
+    graph: CsrGraph<'_>,
+) -> Result<Permutation, PermutationConstructionError> {
+    graph.try_validate()?;
+    Ok(rabbit_order_par(graph))
 }
 
 /// Pure variant of [`consolidate_neighbours`] that returns the per-
@@ -2461,6 +2534,70 @@ mod tests {
         }
     }
 
+    // ----- audit-R7-followup #11 — try_rabbit_order fallible builder -----
+
+    #[test]
+    fn try_rabbit_order_matches_rabbit_order_on_well_formed_input() {
+        // Happy path: bit-identical to the panicking sibling on a
+        // shape-correct CSR.
+        let n = 6_u32;
+        let edges = vec![(0_u32, 1), (1, 2), (2, 0), (3, 4), (4, 5), (5, 3)];
+        let (offsets, neighbors) = csr_from_edges(n, &edges);
+        let g = CsrGraph {
+            n,
+            offsets: &offsets,
+            neighbors: &neighbors,
+        };
+        let panic_path = rabbit_order(g);
+        let try_path = try_rabbit_order(g).expect("well-formed CSR must succeed");
+        assert_eq!(panic_path, try_path);
+    }
+
+    #[test]
+    fn try_rabbit_order_rejects_non_monotone_offsets_without_panicking() {
+        // offsets[1]=5 > offsets[2]=2; both within neighbors length.
+        let offsets = [0_u32, 5, 2, 6];
+        let neighbors = [1_u32, 2, 0, 1, 0, 2];
+        let g = CsrGraph {
+            n: 3,
+            offsets: &offsets,
+            neighbors: &neighbors,
+        };
+        let err = try_rabbit_order(g).expect_err("non-monotone offsets must error");
+        match err {
+            PermutationConstructionError::InvalidCsr(super::super::CsrGraphError::OffsetsNonMonotone {
+                i,
+                lo,
+                hi,
+            }) => {
+                assert_eq!(i, 1);
+                assert_eq!(lo, 5);
+                assert_eq!(hi, 2);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_rabbit_order_rejects_neighbors_length_mismatch_without_panicking() {
+        // offsets[n] = 2 but neighbors only has 1 element.
+        let offsets = [0_u32, 2];
+        let neighbors = [1_u32];
+        let g = CsrGraph {
+            n: 1,
+            offsets: &offsets,
+            neighbors: &neighbors,
+        };
+        let err = try_rabbit_order(g).expect_err("tail-length mismatch must error");
+        assert_eq!(
+            err,
+            PermutationConstructionError::InvalidCsr(super::super::CsrGraphError::NeighborsLengthMismatch {
+                offsets_tail: 2,
+                neighbors_len: 1,
+            })
+        );
+    }
+
     // ---------------------------------------------------------------------
     // Sprint 53-55: round-based concurrent merging tests.
     //
@@ -2795,6 +2932,69 @@ mod tests {
             assert!(
                 tight * 5 >= total * 4,
                 "expected >=80% tight cliques, got tight={tight} slack={slack} total_inspected={total}"
+            );
+        }
+
+        // ----- audit-R7-followup #11 — try_rabbit_order_par fallible builder -----
+
+        #[test]
+        fn try_rabbit_order_par_matches_par_on_well_formed_input() {
+            // Happy path: bit-identical to the panicking sibling on a
+            // well-formed CSR. Use a small input that takes the
+            // sequential fallback under the hood.
+            let n = 6_u32;
+            let edges = vec![(0_u32, 1), (1, 2), (2, 0), (3, 4), (4, 5), (5, 3)];
+            let (offsets, neighbors) = csr_from_edges(n, &edges);
+            let g = CsrGraph {
+                n,
+                offsets: &offsets,
+                neighbors: &neighbors,
+            };
+            let panic_path = rabbit_order_par(g);
+            let try_path = try_rabbit_order_par(g).expect("well-formed CSR must succeed");
+            assert_eq!(panic_path, try_path);
+        }
+
+        #[test]
+        fn try_rabbit_order_par_rejects_offsets_length_mismatch() {
+            // offsets.len()=2 but n=3 — should be 4 entries.
+            let offsets = [0_u32, 0];
+            let neighbors: [u32; 0] = [];
+            let g = CsrGraph {
+                n: 3,
+                offsets: &offsets,
+                neighbors: &neighbors,
+            };
+            let err = try_rabbit_order_par(g)
+                .expect_err("malformed offsets must error, not panic");
+            assert_eq!(
+                err,
+                PermutationConstructionError::InvalidCsr(super::super::super::CsrGraphError::OffsetsLengthMismatch {
+                    actual_len: 2,
+                    expected_len: 4,
+                })
+            );
+        }
+
+        #[test]
+        fn try_rabbit_order_par_rejects_neighbor_out_of_range() {
+            // Single neighbour with id 99 but n=2.
+            let offsets = [0_u32, 1, 1];
+            let neighbors = [99_u32];
+            let g = CsrGraph {
+                n: 2,
+                offsets: &offsets,
+                neighbors: &neighbors,
+            };
+            let err = try_rabbit_order_par(g)
+                .expect_err("out-of-range neighbour must error, not panic");
+            assert_eq!(
+                err,
+                PermutationConstructionError::InvalidCsr(super::super::super::CsrGraphError::NeighborOutOfRange {
+                    neighbor: 99,
+                    n: 2,
+                    at_index: 0,
+                })
             );
         }
     }

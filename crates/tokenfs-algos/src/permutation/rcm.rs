@@ -37,7 +37,7 @@ use alloc::vec;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
-use super::{CsrGraph, Permutation};
+use super::{CsrGraph, Permutation, PermutationConstructionError};
 
 /// Maximum number of GPS pseudoperipheral iterations.
 ///
@@ -63,7 +63,8 @@ const GPS_MAX_ITERATIONS: u32 = 8;
 ///
 /// Panics if `graph.offsets.len()` is not exactly `graph.n + 1`, or if
 /// any neighbour ID is out of range `0..graph.n`, or if a CSR offset
-/// pair is inverted.
+/// pair is inverted. Kernel/FUSE callers that need a non-panicking
+/// variant should prefer [`try_rcm`].
 #[must_use]
 pub fn rcm(graph: CsrGraph<'_>) -> Permutation {
     let n = graph.n as usize;
@@ -123,6 +124,36 @@ pub fn rcm(graph: CsrGraph<'_>) -> Permutation {
     // `order` is a permutation of `0..n` with `n <= u32::MAX as usize`
     // (CSR vertex IDs are u32 by construction).
     unsafe { Permutation::from_vec_unchecked(order) }
+}
+
+/// Like [`rcm`] but returns an error on malformed CSR input instead
+/// of panicking.
+///
+/// Validates the entire CSR header upfront via
+/// [`CsrGraph::try_validate`] (offsets length, monotonicity,
+/// neighbours-tail consistency, in-range neighbour IDs) before
+/// invoking the existing internal pipeline. On a successful validation
+/// dispatches to [`rcm`] — the success path is bit-identical to the
+/// panicking sibling.
+///
+/// **Allocation note:** the try_* path is about not panicking on bad
+/// input. It is NOT heap-free. Internally the BFS queue, per-vertex
+/// degree cache, frontier-sort buffer, and visit-order accumulator
+/// are still allocated on the heap. RCM is a build-time primitive
+/// (image-build phase, see `02b_DEPLOYMENT_MATRIX.md`); kernel-mode
+/// consumers load the resulting [`Permutation`] from the sealed image
+/// and apply it via the kernel-safe [`Permutation::try_apply_into`]
+/// or [`Permutation::try_apply_into_strict`].
+///
+/// # Errors
+///
+/// Returns [`PermutationConstructionError::InvalidCsr`] wrapping the
+/// first [`super::CsrGraphError`] encountered during upfront
+/// validation. See [`CsrGraph::try_validate`] for the full failure
+/// list.
+pub fn try_rcm(graph: CsrGraph<'_>) -> Result<Permutation, PermutationConstructionError> {
+    graph.try_validate()?;
+    Ok(rcm(graph))
 }
 
 /// Finds the lowest-degree unvisited vertex (tie-break: lowest ID).
@@ -757,5 +788,65 @@ mod tests {
         let permuted = perm.apply(&src);
         let recovered = inv.apply(&permuted);
         assert_eq!(recovered, src);
+    }
+
+    // ----- audit-R7-followup #11 — try_rcm fallible builder -----
+
+    #[test]
+    fn try_rcm_matches_rcm_on_well_formed_input() {
+        // Happy path: bit-identical to the panicking sibling on a
+        // shape-correct CSR.
+        let n = 8_u32;
+        let edges: Vec<(u32, u32)> = (0..(n - 1)).map(|i| (i, i + 1)).collect();
+        let (offsets, neighbors) = csr_from_edges(n, &edges);
+        let g = CsrGraph {
+            n,
+            offsets: &offsets,
+            neighbors: &neighbors,
+        };
+        let panic_path = rcm(g);
+        let try_path = try_rcm(g).expect("well-formed CSR must succeed");
+        assert_eq!(panic_path, try_path);
+    }
+
+    #[test]
+    fn try_rcm_rejects_offsets_length_mismatch_without_panicking() {
+        // offsets.len() == 2 but n == 3 — should be 4 entries.
+        let offsets = [0_u32, 0];
+        let neighbors: [u32; 0] = [];
+        let g = CsrGraph {
+            n: 3,
+            offsets: &offsets,
+            neighbors: &neighbors,
+        };
+        let err = try_rcm(g).expect_err("malformed offsets must error");
+        assert_eq!(
+            err,
+            PermutationConstructionError::InvalidCsr(super::super::CsrGraphError::OffsetsLengthMismatch {
+                actual_len: 2,
+                expected_len: 4,
+            })
+        );
+    }
+
+    #[test]
+    fn try_rcm_rejects_neighbor_out_of_range_without_panicking() {
+        // Single edge from 0 to 99, but n=2.
+        let offsets = [0_u32, 1, 1];
+        let neighbors = [99_u32];
+        let g = CsrGraph {
+            n: 2,
+            offsets: &offsets,
+            neighbors: &neighbors,
+        };
+        let err = try_rcm(g).expect_err("out-of-range neighbour must error");
+        assert_eq!(
+            err,
+            PermutationConstructionError::InvalidCsr(super::super::CsrGraphError::NeighborOutOfRange {
+                neighbor: 99,
+                n: 2,
+                at_index: 0,
+            })
+        );
     }
 }
