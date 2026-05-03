@@ -450,6 +450,77 @@ impl Permutation {
         true
     }
 
+    /// Like [`Permutation::validate_no_alloc`] but returns a structured
+    /// error on failure instead of panicking on undersized scratch.
+    ///
+    /// `scratch` must have at least `self.len().div_ceil(64)` u64
+    /// words. The first `len().div_ceil(64)` words of `scratch` are
+    /// zeroed on entry. On a successful traversal, returns `Ok(())` —
+    /// the [`Permutation`] is a valid bijection on `0..self.len()`.
+    ///
+    /// This is the kernel-safe sibling of
+    /// [`Permutation::validate_no_alloc`]: it covers exactly the same
+    /// failure modes (length overflow, undersized scratch, out-of-range
+    /// index, duplicate index) but reports each via a non-panicking
+    /// [`PermutationValidationError`] variant. Use it when validating a
+    /// [`Permutation`] freshly loaded from untrusted on-disk data
+    /// without committing to the apply step `try_apply_into_strict`
+    /// performs.
+    ///
+    /// # Errors
+    ///
+    /// * [`PermutationValidationError::LengthOverflow`] when
+    ///   `self.len() > u32::MAX as usize` (vertex IDs are u32 by
+    ///   construction; should never trigger via the public
+    ///   constructors but defends against `from_vec_unchecked` abuse).
+    /// * [`PermutationValidationError::ScratchTooSmall`] when
+    ///   `scratch.len() < self.len().div_ceil(64)`.
+    /// * [`PermutationValidationError::OutOfRangeIndex`] when an entry
+    ///   of the permutation is `>= self.len()`.
+    /// * [`PermutationValidationError::DuplicateIndex`] when two
+    ///   entries of the permutation map to the same destination slot.
+    pub fn try_validate_no_alloc(
+        &self,
+        scratch: &mut [u64],
+    ) -> Result<(), PermutationValidationError> {
+        let n = self.0.len();
+        if n > u32::MAX as usize {
+            return Err(PermutationValidationError::LengthOverflow { len: n });
+        }
+        let words_needed = n.div_ceil(64);
+        if scratch.len() < words_needed {
+            return Err(PermutationValidationError::ScratchTooSmall {
+                needed_words: words_needed,
+                actual_words: scratch.len(),
+            });
+        }
+        // Zero only the prefix we will use; leave any tail untouched
+        // so callers can re-use a larger scratch buffer cheaply.
+        for slot in scratch.iter_mut().take(words_needed) {
+            *slot = 0;
+        }
+        for (i, &id_u32) in self.0.iter().enumerate() {
+            let id = id_u32 as usize;
+            if id >= n {
+                return Err(PermutationValidationError::OutOfRangeIndex {
+                    src_index: i,
+                    value: id_u32,
+                });
+            }
+            let word = id >> 6;
+            let bit = 1_u64 << (id & 63);
+            let cell = &mut scratch[word];
+            if *cell & bit != 0 {
+                return Err(PermutationValidationError::DuplicateIndex {
+                    src_index: i,
+                    value: id_u32,
+                });
+            }
+            *cell |= bit;
+        }
+        Ok(())
+    }
+
     /// Like [`Permutation::apply_into`] but verifies during apply that
     /// no destination slot is written twice. Uses caller-provided
     /// u64-bitset scratch instead of allocating.
@@ -650,6 +721,76 @@ impl core::fmt::Display for PermutationApplyError {
 
 #[cfg(feature = "std")]
 impl std::error::Error for PermutationApplyError {}
+
+/// Failure modes returned by [`Permutation::try_validate_no_alloc`].
+///
+/// All variants are non-allocating and `Copy` so they can be propagated
+/// from kernel-mode call sites without touching the heap. They surface
+/// the offending source index and value when applicable so a caller can
+/// log or telemetry-tag corrupted on-disk permutations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PermutationValidationError {
+    /// Permutation length exceeds `u32::MAX as usize`. Vertex IDs are
+    /// `u32` by construction so this should be unreachable through
+    /// public constructors; the variant exists to defend against
+    /// misuse of [`Permutation::from_vec_unchecked`].
+    LengthOverflow {
+        /// The over-large permutation length.
+        len: usize,
+    },
+    /// `scratch.len() < self.len().div_ceil(64)`. Bitset scratch is
+    /// too small to track destination occupancy.
+    ScratchTooSmall {
+        /// Required number of u64 words.
+        needed_words: usize,
+        /// Caller-supplied number of u64 words.
+        actual_words: usize,
+    },
+    /// Out-of-range index — perm contains an entry `>= self.len()`.
+    OutOfRangeIndex {
+        /// Source index whose value is out of range.
+        src_index: usize,
+        /// The offending out-of-range value.
+        value: u32,
+    },
+    /// Duplicate index detected — perm is not a valid bijection. The
+    /// destination slot was already claimed by an earlier source index.
+    DuplicateIndex {
+        /// Source index whose mapping triggered the collision.
+        src_index: usize,
+        /// The duplicated value.
+        value: u32,
+    },
+}
+
+impl core::fmt::Display for PermutationValidationError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::LengthOverflow { len } => write!(
+                f,
+                "Permutation::try_validate_no_alloc: permutation length ({len}) exceeds u32::MAX"
+            ),
+            Self::ScratchTooSmall {
+                needed_words,
+                actual_words,
+            } => write!(
+                f,
+                "Permutation::try_validate_no_alloc: scratch words ({actual_words}) < needed ({needed_words})"
+            ),
+            Self::OutOfRangeIndex { src_index, value } => write!(
+                f,
+                "Permutation::try_validate_no_alloc: out-of-range value {value} at src index {src_index}"
+            ),
+            Self::DuplicateIndex { src_index, value } => write!(
+                f,
+                "Permutation::try_validate_no_alloc: duplicate value {value} at src index {src_index}"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for PermutationValidationError {}
 
 /// A borrowed compressed sparse row (CSR) adjacency input for graph
 /// permutations.
@@ -1151,5 +1292,101 @@ mod tests {
         );
         // dst must not have been touched.
         assert_eq!(dst, [0_u8; 2]);
+    }
+
+    // ----- audit-R7-followup #9 — try_validate_no_alloc -----
+
+    #[test]
+    fn try_validate_no_alloc_accepts_valid_perms() {
+        // Happy path matches `validate_no_alloc(...)` -> true on every
+        // valid permutation we previously verified that way.
+        for n in [0_usize, 1, 2, 5, 17, 64, 65, 128, 129, 256] {
+            let perm = Permutation::identity(n);
+            let mut scratch = vec![0_u64; n.div_ceil(64).max(1)];
+            perm.try_validate_no_alloc(&mut scratch)
+                .expect("identity must validate");
+        }
+        // Cross-word valid permutation.
+        let mut v: Vec<u32> = (0..70_u32).rev().collect();
+        v.swap(3, 65);
+        let perm = Permutation::try_from_vec(v).expect("valid");
+        let mut scratch = [0_u64; 2];
+        perm.try_validate_no_alloc(&mut scratch)
+            .expect("reverse-with-swap must validate");
+    }
+
+    #[test]
+    fn try_validate_no_alloc_rejects_undersized_scratch() {
+        // n=65 needs 2 u64 words; pass 1.
+        let perm = Permutation::identity(65);
+        let mut scratch = [0_u64; 1];
+        let err = perm
+            .try_validate_no_alloc(&mut scratch)
+            .expect_err("undersized scratch must error, not panic");
+        assert_eq!(
+            err,
+            PermutationValidationError::ScratchTooSmall {
+                needed_words: 2,
+                actual_words: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn try_validate_no_alloc_rejects_duplicates() {
+        // SAFETY: deliberately invalid — used only to exercise the validator.
+        let perm = unsafe { Permutation::from_vec_unchecked(vec![0_u32, 1, 1]) };
+        let mut scratch = [0_u64; 1];
+        let err = perm
+            .try_validate_no_alloc(&mut scratch)
+            .expect_err("duplicate must error");
+        assert_eq!(
+            err,
+            PermutationValidationError::DuplicateIndex {
+                src_index: 2,
+                value: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn try_validate_no_alloc_rejects_out_of_range() {
+        // SAFETY: deliberately invalid — used only to exercise the validator.
+        let perm = unsafe { Permutation::from_vec_unchecked(vec![0_u32, 1, 5]) };
+        let mut scratch = [0_u64; 1];
+        let err = perm
+            .try_validate_no_alloc(&mut scratch)
+            .expect_err("out-of-range must error");
+        assert_eq!(
+            err,
+            PermutationValidationError::OutOfRangeIndex {
+                src_index: 2,
+                value: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn permutation_validation_error_display_renders_all_variants() {
+        // Cover the Display impl so all arms are exercised.
+        let cases = [
+            PermutationValidationError::LengthOverflow { len: 1 << 33 },
+            PermutationValidationError::ScratchTooSmall {
+                needed_words: 2,
+                actual_words: 1,
+            },
+            PermutationValidationError::OutOfRangeIndex {
+                src_index: 1,
+                value: 9,
+            },
+            PermutationValidationError::DuplicateIndex {
+                src_index: 2,
+                value: 1,
+            },
+        ];
+        for c in cases {
+            let s = format!("{c}");
+            assert!(s.starts_with("Permutation::try_validate_no_alloc"));
+        }
     }
 }
