@@ -2,175 +2,221 @@
 
 Guidance for coding agents working in this repository.
 
-This repository is currently at the planning stage. Read `PLAN.md` before
-writing code, and keep implementation choices aligned with that document unless
-the user explicitly revises the plan.
+## Current State (v0.4.6, 2026-05-03)
 
-## Project Goals
+`tokenfs-algos` is a shipped Rust crate for hardware-accelerated byte-stream
+compute primitives. As of v0.4.6:
 
-`tokenfs-algos` is intended to become a low-level Rust algorithms crate for
-hardware-accelerated byte-stream analysis. The core crate must be usable by:
+- 979 lib tests pass with `--all-features`; 671 with
+  `--no-default-features --features alloc` (the kernel-safe surface).
+- 13 cargo-fuzz targets compile and run nightly under
+  `.github/workflows/fuzz-nightly.yml`.
+- 10 GitHub Actions workflows: per-push CI (correctness + clippy + bench),
+  sanitizers (Miri + ASan + MSan), code coverage (cargo-llvm-cov),
+  bench-regression, calibration (self-hosted), mutation testing
+  (cargo-mutants), CodeQL, dependency security, and the panic-surface
+  lint (`cargo xtask panic-surface-lint`).
+- OSS-Fuzz integration files live in `oss-fuzz/`; PR submission to
+  google/oss-fuzz is queued.
+- Audit-R4 through R10 are closed. The kernel-safe-by-default narrative
+  is structurally enforced: `tools/xtask/panic_surface_allowlist.txt`
+  contains zero entries, and `cargo xtask panic-surface-lint` blocks
+  any new `pub fn` that introduces a panicking macro without a
+  `#[cfg(feature = "userspace")]` gate.
 
-- `../tokenfs-paper/` and related TokenFS tooling.
-- A future TokenFS kernel module or kernel-adjacent implementation.
-- A future FUSE filesystem implementation.
-- A Python package built with PyO3 and maturin on top of the Rust crate.
+Read `PLAN.md` for the living roadmap, `CHANGELOG.md` for the audit-lineage
+and per-release diff, and `docs/KERNEL_SAFETY.md` (when present) for the
+kernel-safe-by-default contract.
 
-The core library is not a tokenizer, filesystem, compression codec, file parser,
-or machine-learning layer. It is pure compute over byte slices.
+## Where Things Live
 
-## Repository Priorities
+```text
+tokenfs-algos/
+├── Cargo.toml                         # workspace
+├── PLAN.md                            # living roadmap (read first)
+├── CHANGELOG.md                       # per-release diff + audit lineage
+├── README.md                          # consumer-facing entry point
+├── AGENTS.md                          # this file
+├── crates/
+│   ├── tokenfs-algos/                 # the core crate
+│   └── tokenfs-algos-no-std-smoke/    # no_std + alloc consumer smoke
+├── tools/xtask/                       # workspace automation
+│   ├── src/main.rs                    # `cargo xtask <task>` entries
+│   └── panic_surface_allowlist.txt    # SHOULD STAY EMPTY (load-bearing)
+├── fuzz/                              # 13 cargo-fuzz targets
+├── oss-fuzz/                          # upstream submission mirror
+├── docs/                              # planning + session logs
+└── .github/workflows/                 # 10 CI workflows
+```
 
-1. Build the Rust crate first.
-2. Keep the core APIs content-agnostic and domain-neutral.
-3. Keep kernel/FUSE viability in mind from the beginning.
-4. Add Python bindings as a wrapper layer, not as a dependency of the core crate.
-5. Benchmark, profile, fuzz, and parity-test aggressively.
+`docs/` mixes living docs (PRIMITIVE_CONTRACTS.md, PLANNER_DESIGN.md,
+NO_STD_POSTURE.md, PROCESSOR_AWARE_DISPATCH.md, FS_PRIMITIVES_GAP.md,
+KERNEL_SAFETY.md) with dated session logs (BENCHMARK_SESSION_*.md,
+CORE_PRIMITIVE_COMPLETION_*.md, etc.). Session logs are historical
+record only — don't update them.
+
+## Kernel-Safe-By-Default Contract
+
+This is the load-bearing invariant of the crate. **Any new code must
+maintain it.**
+
+Public surface comes in two flavors:
+
+- **Kernel-safe** (reachable in `--no-default-features --features alloc`
+  builds): never panics on caller input. Returns `Result` for all
+  shape / range / overflow errors. Backend kernels expose
+  `pub (unsafe) fn <name>_unchecked` siblings the runtime dispatchers
+  call after upfront validation.
+- **Userspace** (gated on `feature = "userspace"`): the panicking
+  ergonomic surface. Each panicking entry is a thin wrapper around the
+  fallible `try_*` sibling or asserts then calls the `_unchecked`
+  inner.
+
+When adding a new `pub fn`:
+
+1. If the function has caller-provided shape preconditions (length
+   match, in-range index, non-zero divisor), add a `try_*` sibling
+   that returns `Result<_, MyError>` for those preconditions.
+2. The panicking version, if you keep one, must be
+   `#[cfg(feature = "userspace")]`-gated and should be a thin
+   `try_*(...).expect(...)` wrapper.
+3. For runtime SIMD dispatchers, add a `_unchecked` sibling on each
+   backend kernel and have the dispatcher call `_unchecked` after
+   upfront validation. The asserting kernel stays as the
+   userspace-only oracle.
+4. Where the body is too large to duplicate, extract a private `_inner`
+   helper that takes a pre-validated input. The userspace-gated entry
+   asserts then calls `_inner`; the `try_*` sibling validates then
+   calls `_inner`. See `permutation::rabbit::rabbit_order_inner` /
+   `rcm_inner` for canonical examples.
+
+`cargo xtask panic-surface-lint` enforces this. The allowlist
+(`tools/xtask/panic_surface_allowlist.txt`) is empty by policy —
+**extending it is almost never the correct response.** If the lint
+catches you, fix the panic.
 
 ## Rust Toolchain
 
-- Prefer current Rust nightly for active development when it unlocks useful SIMD,
-  const-generic, profiling, or benchmarking functionality.
+- `rust-toolchain.toml` selects nightly explicitly with `rustfmt`,
+  `clippy`, `llvm-tools-preview`, and `miri` components.
+- Stable Rust is a soft target: `cargo build` should succeed on stable
+  for the default features. Nightly is required for fuzz, sanitizers,
+  miri, and `bench-internals`-gated tests.
 - Gate unstable functionality behind a `nightly` Cargo feature.
-- Keep scalar reference implementations available for every public algorithm.
-- Keep runtime-dispatched SIMD backends bit-exact with scalar output.
-- Use current stable Rust as a compatibility target where practical, but do not
-  block important v0.x design work solely to preserve an old MSRV.
-
-When adding a toolchain file later, prefer a checked-in `rust-toolchain.toml`
-that selects nightly explicitly and lists required components such as
-`rustfmt`, `clippy`, and profiler support.
-
-## Crate Shape
-
-Follow the module structure in `PLAN.md` unless there is a concrete reason to
-change it:
-
-- `windows`
-- `histogram`
-- `entropy`
-- `divergence`
-- `runlength`
-- `byteclass`
-- `chunk`
-- `fingerprint`
-- `primitives`
-- `dispatch`
-- `error`
-- `prelude`
-
-Keep raw SIMD and target-feature-specific functions in `primitives` and
-`pub(crate)` by default. Public APIs should be safe, documented, and hard to
-misuse.
-
-The histogram planner lives in `dispatch::planner` as a rule-table architecture:
-named thresholds and confidence bands in `planner::consts`, derived workload
-predicates in `planner::signals::Signals`, the `Rule` data type in
-`planner::rule`, and the priority-ordered `RULES` slice in `planner::rules`.
-Adding a new rule or tuning constant is a structured operation — see
-`docs/PLANNER_DESIGN.md` for the recipe and the architectural rationale.
-Magic numbers in rule bodies, substring-matched confidence sources, and
-implicit precedence by source-line order are all design regressions; CI
-catches the first two via `planner_fallback_source_implies_low_confidence`
-and the architecture tests in `dispatch::tests`.
+- Keep scalar reference implementations available for every public
+  algorithm. Runtime-dispatched SIMD backends must be bit-exact with
+  scalar.
 
 ## Core API Rules
 
 - Operate on `&[u8]`, slices, iterators, and small value types.
-- Avoid file I/O, process I/O, global mutable policy, and domain-specific types
-  in the core crate.
-- Avoid panics in public APIs; return small error types where errors are
-  meaningful.
+- Avoid file I/O, process I/O, global mutable policy, and
+  domain-specific types in the core crate.
+- Never panic in kernel-safe `pub fn` bodies. Return small error types
+  where errors are meaningful. See "Kernel-Safe-By-Default Contract"
+  above.
 - Keep outputs deterministic across architectures and feature sets.
 - Prefer fixed-size arrays and plain data structs for hot-path outputs.
-- Make data structures FFI-friendly where doing so does not distort the Rust API.
-- Document every public item with examples once implementation begins.
+- Make data structures FFI-friendly where doing so does not distort
+  the Rust API.
 
-## Kernel And FUSE Readiness
+## Kernel and FUSE Readiness
 
-The future kernel-module use case means the core algorithms should avoid
-unnecessary dependencies on `std`, allocation, threads, and OS services.
+The kernel-module use case means the core algorithms must avoid
+unnecessary dependencies on `std`, allocation, threads, and OS
+services.
 
-- Keep a path toward `no_std` plus optional `alloc`.
-- Do not make `rayon`, filesystem APIs, logging frameworks, or heap-heavy data
-  structures mandatory for core algorithms.
-- Keep parallelism feature-gated.
-- Keep unsafe code isolated, reviewed, documented, and covered by tests.
-- Do not assume x86_64. Maintain scalar fallback and plan for NEON/SVE.
-- Do not let Python, FUSE, or CLI convenience concerns leak into the core crate.
+- The default kernel-safe surface is
+  `--no-default-features --features alloc`. The
+  `tokenfs-algos-no-std-smoke` crate exercises this through a real
+  `#![no_std]` consumer; its `smoke()` covers
+  `bits::popcount_u64_slice`, `try_streamvbyte_{encode,decode}_u32`,
+  `try_sha256_batch_st`, `hash::sha256::try_sha256`, `vector::dot_f32`,
+  `vector::l2_squared_f32`, `Permutation::try_from_vec` +
+  `try_apply_into`, `hash::contains_u32_simd`,
+  `try_contains_u32_batch_simd`, and
+  `search::packed_dfa::PackedDfa::try_new`.
+- `cargo xtask security` builds + checks this crate; if a kernel-safe
+  primitive moves out from under `--no-default-features --features alloc`,
+  this build fails.
+- Keep `rayon`, filesystem APIs, logging frameworks, and heap-heavy
+  data structures behind feature gates.
+- Keep unsafe code isolated, reviewed, documented, and covered by
+  tests + Miri (when feasible) + ASan/MSan (`.github/workflows/sanitizers.yml`).
 
-FUSE-specific code, if added, should live in a separate crate or example binary
-that depends on the core library.
+## Python Bindings (planned, not yet present)
 
-## Python Binding Plan
+When the bindings layer lands, it goes in a separate workspace
+member (e.g. `bindings/python` or `tokenfs-algos-py`):
 
-Python bindings should be a separate workspace member or package layer, for
-example `bindings/python` or `tokenfs-algos-py`.
-
-- Use PyO3 and maturin.
-- Do not add PyO3 as a dependency of the core Rust crate.
+- PyO3 + maturin.
+- Do not add PyO3 as a dependency of the core crate.
 - Release the GIL around long-running compute kernels.
-- Use zero-copy buffers where safe and practical.
-- Keep NumPy support optional unless the user asks otherwise.
-- Benchmark Python-call overhead separately from Rust kernel throughput.
-- Mirror only stable, useful high-level APIs into Python; do not expose raw SIMD
-  primitives.
+- Use zero-copy buffers where safe.
+- Mirror only stable, useful high-level APIs into Python; do not
+  expose raw SIMD primitives.
 
 ## Testing Requirements
 
 Testing is part of the implementation, not a follow-up.
 
-Minimum expected coverage for new algorithms:
+Minimum coverage for a new algorithm:
 
-- Known-value unit tests.
+- Known-value unit tests (FIPS / NIST / paper references where
+  available).
 - Scalar reference tests.
-- Backend parity tests for every available SIMD backend.
-- Property tests for invariants and edge cases.
-- Fuzz or randomized tests for parser-like or windowing code.
-- Regression tests for any bug fixed during development.
+- Backend parity tests for every available SIMD backend, asserting
+  bit-exact equality with the scalar oracle.
+- Property tests (proptest) for invariants — entropy bounds,
+  divergence non-negativity, permutation bijection, etc.
+- Fuzz target for parser-like or windowing code (add to
+  `fuzz/fuzz_targets/` and the `fuzz/Cargo.toml` manifest).
+- Regression test for any bug fixed during development.
+- A `try_*` sibling test that exercises the error path explicitly.
 
-Important invariants include:
+Important invariants:
 
-- Entropy bounds and exact values for constant/uniform inputs.
-- Divergence non-negativity and identity properties.
-- Identical output for scalar, AVX2, AVX-512, NEON, and SVE backends when those
-  backends are available.
-- Correct handling of empty, tiny, unaligned, and non-power-of-two inputs.
-- No out-of-bounds reads in vectorized tail handling.
+- Identical output for scalar, AVX2, AVX-512, NEON, and SVE backends
+  when those backends are available.
+- Correct handling of empty, tiny, unaligned, and non-power-of-two
+  inputs.
+- No out-of-bounds reads in vectorized tail handling — Miri + ASan
+  catch these in CI.
 
-## Benchmarking And Profiling
+## Benchmarking and Profiling
 
-Every hot-path algorithm needs Criterion benchmarks before it is considered
-done.
+Every hot-path algorithm needs Criterion benchmarks before it is
+considered done.
 
-Use benchmarks to track:
+Bench targets are split:
 
-- Throughput in bytes/sec.
-- Per-block latency for 256-byte and filesystem-scale blocks.
-- Scalar vs. SIMD speedup.
-- Runtime dispatch overhead.
-- Python wrapper overhead when bindings exist.
+- `cargo xtask bench-primitives` — isolated primitive matrix.
+- `cargo xtask bench-workloads` — workload matrix.
+- `cargo xtask bench-real-{f21,f22}` — calibration matrices on real
+  paper data; opt-in via `TOKENFS_ALGOS_REAL_DATA`.
+- `cargo xtask bench-compare <old> <new>` and
+  `cargo xtask bench-regression-check <baseline> <current> <threshold_pct>`
+  — drive the bench-regression CI workflow.
 
 Use profiling tools as appropriate:
 
-- `cargo bench`
-- `cargo test --release`
-- `cargo flamegraph`
-- `perf stat`
-- `perf record`
-- `valgrind` or sanitizer builds where useful
-- `miri` for unsafe-heavy code when feasible
+- `cargo xtask profile` / `profile-flamegraph` (perf wrappers).
+- `valgrind` or sanitizer builds where useful.
+- `miri` for unsafe-heavy code (run via `.github/workflows/sanitizers.yml`).
 
-Do not optimize by changing algorithm semantics. If an approximation is used,
-make it explicit, shared across backends, documented, and tested.
+Do not optimize by changing algorithm semantics. If an approximation
+is used, make it explicit, shared across backends, documented, and
+tested.
 
-## SIMD And Unsafe Code
+## SIMD and Unsafe Code
 
 - Write scalar first unless porting an already-proven SIMD prototype.
-- Keep target-feature code small and local.
+- Keep target-feature code small and local. The
+  `arch-pinned-kernels` Cargo feature gates per-backend `pub mod`
+  visibility — see `audit-R7 #17` / v0.4.1 for the rationale.
 - Use runtime feature detection once and cache the selected backend.
-- Use `cfg-if` or a similarly clear pattern for backend selection.
-- Keep lookup tables shared across backends to preserve bit-exact parity.
+- Keep lookup tables shared across backends to preserve bit-exact
+  parity.
 - Explain every unsafe block with the condition that makes it sound.
 - Test unaligned buffers and tail lengths around vector widths.
 
@@ -178,79 +224,55 @@ make it explicit, shared across backends, documented, and tested.
 
 Keep dependencies tight.
 
-Allowed baseline dependencies from the plan:
+Allowed baseline:
 
 - `cfg-if`
-- `bytemuck` when needed for safe representation work
-- `rayon` behind a `parallel` feature
+- `bytemuck` for safe representation work
+- `rayon` behind the `parallel` feature
+- `blake3` behind the `blake3` feature
 - `criterion`, `proptest`, and small test helpers as dev-dependencies
 
-Avoid domain-specific dependencies in the core crate. Compression, TokenFS
-integration, FUSE, Python, and profile catalogs should live in separate crates,
-features, examples, or downstream repositories.
+Avoid domain-specific dependencies in the core crate. Compression,
+TokenFS integration, FUSE, Python, and profile catalogs live in
+separate crates, features, examples, or downstream repositories.
 
-## Workspace Direction
-
-Prefer a workspace layout from the first code commit, even if it initially
-contains only the core crate. A likely future shape is:
-
-```text
-tokenfs-algos/
-├── Cargo.toml
-├── crates/
-│   └── tokenfs-algos/
-├── bindings/
-│   └── python/
-├── benches/
-├── examples/
-├── tests/
-├── PLAN.md
-└── AGENTS.md
-```
-
-If the user chooses a single-crate layout instead, keep paths simple and avoid
-premature abstraction.
-
-## Integration With tokenfs-paper
-
-The F22 prototype is expected to migrate from:
-
-```text
-../tokenfs-paper/tools/rust/entropy_primitives/
-```
-
-into this crate.
-
-Migration work must preserve:
-
-- Existing semantics.
-- Existing parity checks.
-- Existing calibration behavior.
-- Existing benchmark targets.
-
-After migration, `../tokenfs-paper/` should consume this crate through a path
-dependency or a published crate version. Do not duplicate algorithm code across
-repositories once the migration is complete.
+`cargo xtask security` checks the no_std dependency tree and rejects
+known-forbidden crates (blake3, criterion, proptest, rayon, serde_json)
+from the kernel-safe surface.
 
 ## Code Quality Expectations
 
-- Run `cargo fmt` before finalizing Rust changes.
-- Run `cargo clippy --all-targets --all-features` when practical.
+- `cargo xtask check` must pass before finalizing changes. It runs
+  fmt, clippy, doc, no_std build matrix, no_std smoke crate, and the
+  panic-surface lint.
 - Prefer explicit, small APIs over clever macro-heavy surfaces.
-- Keep comments useful and sparse.
-- Keep public docs precise about units, bounds, determinism, and backend parity.
+- Keep comments useful and sparse. Don't restate what the code says;
+  explain WHY when non-obvious (a workaround, a hidden constraint, a
+  past incident).
+- Keep public docs precise about units, bounds, determinism, and
+  backend parity.
 - Avoid unrelated refactors while implementing a focused task.
+- For multi-file migrations (rename a function, gate it, update
+  callers): always preview matches with `grep -n` first; explicitly
+  guard regex with negative lookbehind for `try_` and `_unchecked`
+  patterns; check the diff before running cargo. Sed/perl
+  substitutions over the codebase repeatedly hit docstrings, string
+  literals, and adjacent `try_*` calls — when in doubt, do the
+  migration in surgical Edit calls.
 
 ## Definition Of Done For Substantial Changes
 
 A substantial change is not done until:
 
-- The relevant implementation exists.
-- Tests cover scalar behavior and edge cases.
+- The implementation exists and follows the kernel-safe-by-default
+  contract above.
+- Tests cover scalar behavior, edge cases, and `try_*` error paths.
 - SIMD parity is tested if SIMD is involved.
 - Benchmarks exist for hot-path code.
+- `cargo xtask check` is green (including the panic-surface lint).
 - Documentation or examples are updated for public APIs.
-- The change has been checked against the goals in `PLAN.md`.
+- For audit-related work: the relevant `audit-RN #M` reference is in
+  the commit message and CHANGELOG entry.
 
-If a step cannot be completed in the current environment, state exactly what was
-not run and why.
+If a step cannot be completed in the current environment, state
+exactly what was not run and why.

@@ -1,6 +1,6 @@
 # tokenfs-algos — Plan
 
-**Status:** living roadmap. Created 2026-04-30, updated 2026-05-01. The workspace and core crate now exist; this document records both the founding intent and the gates that must stay true as implementation continues.
+**Status:** living roadmap. Created 2026-04-30; last updated 2026-05-03 (post-v0.4.6 release). The workspace, core crate, and 0.4.x release train all exist; this document records both the founding intent and the gates that must stay true as implementation continues.
 
 **Audience:** future readers (you, me, contributors) who want to understand why this crate exists separately from `binary-bpe`, `tokenfs_writer`, and `tokenfs_reader`, what it does, and how the API and modules fit together.
 
@@ -8,46 +8,50 @@
 
 ## 0. Living Roadmap
 
-### Completed Foundations
+### Released
 
-- Workspace scaffold, crate module tree, `xtask`, benchmark history, SVG/HTML reports, and GitHub-ready metadata exist.
-- Public primitive contracts are documented in `docs/PRIMITIVE_CONTRACTS.md`: pure `&[u8]`, scalar baseline, pinned kernels, planner/default path, stable benchmark labels, and no hot-path allocation unless documented.
-- Byte histograms, exact n-gram histograms, dense byte-pair histograms, Misra-Gries, Count-Min Sketch, CRC32C hash bins, FNV-1a/mix64 hash families, byte-class counts, UTF-8 validation, run-length/structure summaries, Gear chunking, normalized FastCDC chunking, distribution distances, calibrated byte-distribution lookup, selector signals, and F22/content fingerprints exist at scalar/reference level.
-- Runtime processor detection, histogram planner explanations, pinned histogram kernels, benchmark comparison, planner parity reports, thread/topology workload dimensions, and benchmark artifact logging exist.
-- F22 block fingerprint has scalar and x86 AVX2/SSE4.2 pinned paths. F22 extent fingerprint has a fused scalar/runtime-dispatched accumulator path; pinned scalar is exact, while the public default samples large-extent H4 by design.
-- `no_std`/`alloc` checks are intentionally supported for the core crate where feasible; math goes through the crate-local `math` wrapper and `libm` outside `std`.
+| Version | Date | Theme |
+|---|---|---|
+| 0.1.x | 2026-04-30 → 05-01 | Phase A: popcount, batched hash, bit_pack |
+| 0.2.x | 2026-05-01 → 05-02 | Phase B + C: streamvbyte, bitmap, rank_select, demonstrators |
+| 0.3.x | 2026-05-02 | Phase D: Rabbit Order |
+| 0.4.0 | 2026-05-02 | Surface flip: try_* coverage + userspace umbrella |
+| 0.4.1-0.4.3 | 2026-05-02 → 05-03 | Audit-R7/R8/R9 closeouts |
+| 0.4.4 | 2026-05-02 | Audit-R10 Tier 0 + Tier 1 |
+| 0.4.5 | 2026-05-03 | Audit-R10 Tier 2 + Tier 3 + honest-gap closure |
+| 0.4.6 | 2026-05-03 | Audit-R10 systematic gating sweep COMPLETE (allowlist 30 → 0) |
 
-### Current Blockers
+See `CHANGELOG.md` for per-release diffs and audit lineage.
 
-- F21/F22 calibration is now a hard gate when `--features calibration` is used. The next blocker is keeping those gates green on clean commits and quiet-host benchmark reruns.
-- Exact H2/H3/H4/H8 APIs are correct research/calibration surfaces, but high-order exact entropy is not a universal hot path. Dense H2/conditional entropy now has caller-owned scratch; planner policy still needs longer-run evidence before routing hot paths to exact high-order entropy.
-- Benchmark semantics now distinguish throughput from early-exit latency for UTF-8 and expose chunk-quality labels. Planner win/miss/gap needs continued calibration reporting as real workloads expand.
-- SIMD coverage is honest but incomplete: NEON, AVX-512, SVE, and SVE2 are feature-shaped scalar fallbacks until real parity-tested kernels land.
-- README/examples now cover the core public path; docs.rs-level examples and
-  downstream integration guides still need to catch up.
+### Current State (as of v0.4.6)
 
-### Next Acceptance Gates
+- 979 lib tests pass with `--all-features`; 671 with `--no-default-features --features alloc` (the kernel-safe surface).
+- Every module in §4 below exists with at least a scalar reference; AVX2/AVX-512/NEON/SSE4.1/SHA-NI/FEAT_SHA2 backends exist for the modules where benchmarks justify them (popcount, bit_pack, streamvbyte, rank_select, set_membership, bloom_kernels, hll/kernels, sha256, byteclass, runlength, vector distance, similarity::minhash::kernels_gather, permutation::rabbit::kernels). `arch-pinned-kernels` controls per-backend `pub mod` visibility.
+- 13 cargo-fuzz targets compile and run nightly under `.github/workflows/fuzz-nightly.yml`. cargo-mutants weekly. Miri / ASan / MSan on push + Sundays.
+- 10 GitHub Actions workflows are in place; OSS-Fuzz integration files live in `oss-fuzz/` ready for upstream submission.
+- **Audit-R4 through R10 are closed.** The kernel-safe-by-default narrative is structurally enforced: `tools/xtask/panic_surface_allowlist.txt` contains zero entries, and `cargo xtask panic-surface-lint` blocks any new `pub fn` that introduces a panicking macro without a `#[cfg(feature = "userspace")]` gate.
+- Public primitive contracts are documented in `docs/PRIMITIVE_CONTRACTS.md`. Kernel-safety contract is documented in `docs/KERNEL_SAFETY.md` (covers the `try_*` / `_unchecked` / `_inner` conventions, the lint, and the allowlist policy).
+- F22 block fingerprint has scalar + x86 AVX2/SSE4.2 pinned paths. F22 extent fingerprint has a fused scalar/runtime-dispatched accumulator; pinned scalar is exact, public default samples large-extent H4 by design.
+- `no_std + alloc` is the kernel-safe surface; math goes through the crate-local `math` wrapper and `libm` outside `std`.
 
-- `cargo test -p tokenfs-algos --features calibration` must give clear pass/fail output for:
-  - F21 feature drift against the paper sidecar.
-  - F21 selector analysis thresholds from the paper analysis artifact.
-  - F22 H1/fingerprint drift.
-  - F22 block and extent throughput sanity.
-- `cargo xtask bench-real-f21` must run the paper/rootfs workload matrix, emit report artifacts, and fail when planner-calibration rows are missing or the median planner gap exceeds the configured threshold.
-- `cargo xtask bench-real-f22` must run F22 fingerprint primitive benches, emit report artifacts, and fail when block/extent throughput targets are missed.
-- Public examples should cover the common contract:
-  - `histogram::block(bytes)`
-  - `fingerprint::block(bytes)`
-  - `fingerprint::extent(bytes)`
-  - `chunk::fastcdc_chunks(bytes, config)`
-  - `distribution::nearest_reference(...)`
-  - pinned `kernels::*` paths.
+### Next Acceptance Gates (v0.5.0)
 
-### Deferred Hardware Backends
+The remaining work for v0.5.0 is enhancement, not safety. Each item is a separate task in the project tracker:
 
-- AVX2 remains the primary optimized x86 target.
-- AVX-512, NEON, SVE, and SVE2 stay visible in dispatch/backend reporting but must remain marked scalar fallback until native kernels have scalar parity tests and benchmark labels.
-- Hardware work should follow profiling evidence: histogram, F22 extent, dense sketch distance, UTF-8 validation, and CRC/hash-bin sketching are the current candidates.
+- **T3.4 iai-callgrind** — deterministic hardware-counter benches, complementing the wall-clock criterion benches. Decide: required for v0.5.0, or push to v0.6?
+- **T3.5 bench-history publication** — gh-pages or bencher.dev. Decide: which target, what cadence.
+- **T3.6 std default-flip** — drop `std` from default features (audit-R9 #4 carry-over). Breaking change; decide: do this in v0.5.0 or queue for v1.0?
+
+The rest of v0.5.0 is whatever the next audit round (R11) surfaces.
+
+### Hardware Backend Status
+
+- AVX2 is the primary optimized x86 target with full coverage.
+- AVX-512 backends exist for popcount, hll/kernels, set_membership; gated on `feature = "avx512"` and require nightly.
+- NEON backends exist for popcount, hll/kernels, set_membership, bloom_kernels, streamvbyte, bit_pack, vector distance.
+- SSE4.1 backend exists for set_membership; SSSE3 backend exists for streamvbyte. Both file-split + `arch-pinned-kernels`-gated per audit-R10 T1.3.
+- SHA-NI (x86) and FEAT_SHA2 (AArch64) hardware kernels exist for sha256.
+- SVE / SVE2 remain feature-shaped scalar fallbacks until profiling evidence justifies real kernels.
 
 ### Consumer-Facing Milestones
 
@@ -543,13 +547,15 @@ The crate has its own GitHub repo at `mjbommar/tokenfs-algos`. The TokenFS paper
 
 ## 13. Active Next Steps
 
-In the order they should happen now:
+As of v0.4.6, in priority order:
 
-1. **Keep calibration hard.** Maintain `cargo test -p tokenfs-algos --features calibration`, `cargo xtask bench-real-f21`, and `cargo xtask bench-real-f22` as explicit gates with thresholds and clear skip/fail behavior.
-2. **Rerun clean long baselines.** The latest dirty short run made F21 planner parity green and F22 extent green, but F22 block latency did not make the 1.5 us optimization target. Recheck on a quiet host before tuning.
-3. **Tune from stable misses only.** Planner policy changes should come from longer paper/real-data reports and should add tests for each durable rule.
-4. **Profile before new SIMD.** Add AVX2/AVX-512/NEON/SVE kernels only after flamegraphs or timing tables identify the next bottleneck.
-5. **Prepare downstream integration.** Wire `binary-bpe` and TokenFS consumers against `fingerprint`, `selector`, `chunk`, and `distribution` APIs once calibration gates are green.
+1. **Triage v0.5.0 scope.** The remaining items are T3.4 (iai-callgrind), T3.5 (bench-history publication), T3.6 (drop `std` from default features). Decide which are in-scope for v0.5.0 vs deferred. T3.6 is breaking; either v0.5.0 absorbs the breaking change or it waits for v1.0.
+2. **Submit OSS-Fuzz integration.** The `oss-fuzz/` directory has the upstream files ready (`Dockerfile`, `build.sh`, `project.yaml`). Open a PR against `google/oss-fuzz`. Once merged, ClusterFuzz coverage tracking + automatic regression bisection come for free.
+3. **Bake the new CI workflows.** `.github/workflows/{sanitizers,coverage,fuzz-nightly,mutation-testing,bench-regression,calibration}.yml` are all new in v0.4.5. Watch the first few weeks of runs, tune thresholds, and adjust the bench-regression threshold (currently 15%) once we have a noise baseline from GitHub-hosted runners.
+4. **Set up the calibration host.** `.github/workflows/calibration.yml` requires a `[self-hosted, perf-quiet]` labeled runner. Until that exists, the workflow queues forever then times out. Either provision the host or rewrite the workflow to opt-in via `workflow_dispatch` only.
+5. **Profile before new SIMD.** Add AVX-512 / NEON / SVE kernels only after flamegraphs or timing tables identify the next bottleneck. iai-callgrind (T3.4) will help here.
+6. **Downstream integration.** Wire `binary-bpe` and TokenFS consumers against `fingerprint`, `selector`, `chunk`, `distribution`, `permutation`, `similarity`, and `format` APIs. The kernel-safe-by-default surface is now stable enough for kernel-mode consumers to design against.
+7. **Audit-R11.** Schedule the next external audit pass once v0.5.0 ships. The previous audit cadence (R4 → R10) ran in parallel with implementation; R11 should focus on the consumer-facing API ergonomics and the no-panic surface from a fresh reviewer.
 
 ---
 
