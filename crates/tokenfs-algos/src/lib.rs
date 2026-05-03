@@ -4,7 +4,7 @@
 //! slices. The public API starts with scalar reference implementations and is
 //! structured so SIMD backends can be added without changing callers.
 //!
-//! ## Cargo feature: `panicking-shape-apis`
+//! ## Default surface is kernel-safe (v0.4.0+)
 //!
 //! Several primitive entry points (e.g. [`bits::bit_pack::BitPacker::encode_u32_slice`],
 //! [`bits::streamvbyte::streamvbyte_decode_u32`], [`vector::batch::dot_f32_one_to_many`],
@@ -17,18 +17,28 @@
 //! For kernel- and FUSE-class consumers (per
 //! `docs/v0.2_planning/02b_DEPLOYMENT_MATRIX.md`) the panicking branches
 //! must not exist on the public surface — a panic in a kernel softirq is
-//! fatal. The on-by-default `panicking-shape-apis` Cargo feature gates the
-//! panicking variants behind `#[cfg(feature = "panicking-shape-apis")]`.
+//! fatal. **As of v0.4.0 the default features omit `panicking-shape-apis`**
+//! so kernel/FUSE/forensics consumers get the panic-free surface
+//! automatically. The panicking variants are gated behind
+//! `#[cfg(feature = "panicking-shape-apis")]`, which is pulled in by the
+//! `userspace` umbrella feature.
 //!
-//! Userspace consumers get the unchanged behaviour by default. Kernel
-//! consumers opt out:
+//! **Kernel/FUSE/forensics**: do nothing. The default is panic-free.
+//! Only the `try_*` wrappers are reachable; calls to the panicking
+//! constructors fail to compile.
 //!
 //! ```toml
-//! tokenfs-algos = { version = "0.2", default-features = false, features = ["alloc"] }
+//! tokenfs-algos = "0.4"  # default = ["std", "avx2", "neon"], no panicking surface
 //! ```
 //!
-//! Under that build, only the `try_*` wrappers are reachable; calls to the
-//! panicking constructors fail to compile. See audit-R5 finding #157.
+//! **Userspace consumers wanting the ergonomic panicking surface**: opt in.
+//!
+//! ```toml
+//! tokenfs-algos = { version = "0.4", features = ["userspace"] }
+//! ```
+//!
+//! See audit-R5 finding #157 + audit-R7-followup #1/3/4/14 for the
+//! evolution of this gating.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 // AArch64 SVE / SVE2 intrinsics (`core::arch::aarch64::sv*`) are gated

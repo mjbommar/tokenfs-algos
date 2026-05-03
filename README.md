@@ -131,17 +131,24 @@ and tune the API surface for different deployment shapes:
   (`*_batch_par`). Userspace only.
 - **`blake3`** — pulls in the `blake3` crate for content-addressable
   hashing. Userspace only.
-- **`panicking-shape-apis`** (default) — exposes the panicking shape /
-  length-validating wrappers (`BitPacker::encode_u32_slice`,
-  `dot_f32_one_to_many`, `RankSelectDict::build`, `sha256_batch_st`,
-  `signature_batch_simd`, etc.). Each has a fallible `try_*` parallel
-  that returns a typed error. Kernel and FUSE consumers should disable
-  this feature so that only the `try_*` entry points are reachable on
-  the public surface (audit-R5 finding #157):
+- **`userspace`** — umbrella feature for ergonomic userspace consumers.
+  Pulls in `std` and `panicking-shape-apis`. **As of v0.4.0 the default
+  features no longer include `panicking-shape-apis`** so kernel/FUSE
+  consumers get the panic-free surface automatically; userspace
+  consumers wanting the v0.3.x-equivalent ergonomic surface opt back
+  in:
 
   ```toml
-  tokenfs-algos = { version = "0.2", default-features = false, features = ["alloc"] }
+  tokenfs-algos = { version = "0.4", features = ["userspace"] }
   ```
+
+  Kernel/FUSE consumers do nothing — the default is already kernel-safe.
+- **`panicking-shape-apis`** (opt-in via `userspace` since v0.4.0) —
+  exposes the panicking shape / length-validating wrappers
+  (`BitPacker::encode_u32_slice`, `dot_f32_one_to_many`,
+  `RankSelectDict::build`, `sha256_batch_st`, `signature_batch_simd`,
+  etc.). Each has a fallible `try_*` parallel that returns a typed error
+  (audit-R5 #157, audit-R7-followup #1/3/4/14).
 - **`tunes-json`** / **`calibration`** / **`bench-internals`** /
   **`permutation_hilbert`** — auxiliary features for tooling, paper
   artifacts, micro-benches, and the Hilbert-curve permutation path.
