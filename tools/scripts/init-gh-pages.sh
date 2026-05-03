@@ -2,18 +2,20 @@
 # init-gh-pages.sh — one-time bootstrap of the orphan `gh-pages` branch
 # that backs the bench-history publication site (audit-R10 T3.5).
 #
-# Run this from a clean working tree on `main`. It creates an orphan
-# `gh-pages` branch with a placeholder index page + `.nojekyll` marker,
-# pushes it to `origin`, and switches you back to `main`.
+# Uses `git worktree add --orphan` (git >= 2.42) so the gh-pages branch
+# is built in a separate working directory — your main checkout's
+# `target/`, `.env`, and other gitignored state stay untouched. No
+# destructive `git clean` happens against your primary worktree.
+#
+# Run from anywhere inside the repo on any branch. Idempotent: refuses
+# to proceed if `gh-pages` already exists locally or remotely.
 #
 # After running:
-#   1. In repo settings -> Pages: source = `gh-pages` branch, root path.
+#   1. In repo settings -> Pages: source = `gh-pages` branch, root path
+#      (one-time; GitHub remembers it across pushes).
 #   2. Wait for the first `bench-history.yml` run on a main push (or
-#      trigger it manually via `gh workflow run bench-history.yml`) to
-#      populate the actual archive + rendered site.
-#
-# Idempotent: if the branch already exists locally or remotely, the
-# script bails out with a clear message rather than overwriting.
+#      `gh workflow run bench-history.yml`) to populate the actual
+#      archive + rendered site.
 
 set -euo pipefail
 
@@ -21,13 +23,6 @@ if ! git rev-parse --is-inside-work-tree > /dev/null 2>&1; then
   echo "error: not inside a git working tree" >&2
   exit 1
 fi
-
-if ! git diff --quiet || ! git diff --cached --quiet; then
-  echo "error: working tree has uncommitted changes; commit or stash first" >&2
-  exit 1
-fi
-
-current_branch=$(git symbolic-ref --short HEAD)
 
 if git rev-parse --verify --quiet gh-pages > /dev/null; then
   echo "error: local 'gh-pages' branch already exists" >&2
@@ -41,18 +36,15 @@ if git ls-remote --exit-code --heads origin gh-pages > /dev/null 2>&1; then
   exit 1
 fi
 
-echo "==> creating orphan gh-pages branch"
-git checkout --orphan gh-pages
+worktree_dir="${TMPDIR:-/tmp}/tokenfs-pages-init.$$"
+trap 'git worktree remove --force "${worktree_dir}" > /dev/null 2>&1 || true' EXIT
 
-echo "==> wiping working tree (orphan branches inherit it)"
-git rm -rf --quiet . > /dev/null 2>&1 || true
-# `git rm -rf .` does not touch ignored files; clean those too so the
-# initial commit only contains what we explicitly add below.
-git clean -fdx --quiet > /dev/null 2>&1 || true
+echo "==> creating orphan gh-pages worktree at ${worktree_dir}"
+git worktree add --orphan -b gh-pages "${worktree_dir}" > /dev/null
 
 echo "==> seeding placeholder index + .nojekyll"
-touch .nojekyll
-cat > index.html <<'EOF'
+touch "${worktree_dir}/.nojekyll"
+cat > "${worktree_dir}/index.html" <<'EOF'
 <!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <title>tokenfs-algos bench history (initializing)</title>
@@ -67,14 +59,13 @@ the first successful <code>bench-history.yml</code> workflow run on
 </body></html>
 EOF
 
-git add .nojekyll index.html
-git commit --quiet -m "init gh-pages branch (placeholder; replaced by bench-history.yml)"
+echo "==> committing in worktree"
+git -C "${worktree_dir}" add -A
+git -C "${worktree_dir}" commit --quiet \
+  -m "init gh-pages branch (placeholder; replaced by bench-history.yml)"
 
 echo "==> pushing gh-pages to origin"
-git push -u origin gh-pages
-
-echo "==> returning to ${current_branch}"
-git checkout --quiet "${current_branch}"
+git -C "${worktree_dir}" push -u origin gh-pages
 
 cat <<EOF
 
@@ -89,4 +80,6 @@ Next steps:
 
 The publish workflow will then run automatically after every successful
 bench-regression.yml on main.
+
+(Worktree at ${worktree_dir} is auto-removed on exit.)
 EOF
