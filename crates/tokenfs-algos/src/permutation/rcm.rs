@@ -66,6 +66,9 @@ const GPS_MAX_ITERATIONS: u32 = 8;
 /// pair is inverted. Kernel/FUSE callers that need a non-panicking
 /// variant should prefer [`try_rcm`].
 ///
+/// Available only with `feature = "userspace"` (audit-R10 #1 / #216).
+/// Kernel/FUSE callers should use [`try_rcm`] instead.
+#[cfg(feature = "userspace")]
 #[must_use]
 pub fn rcm(graph: CsrGraph<'_>) -> Permutation {
     let n = graph.n as usize;
@@ -76,10 +79,6 @@ pub fn rcm(graph: CsrGraph<'_>) -> Permutation {
         graph.offsets.len(),
         n + 1
     );
-    if n == 0 {
-        return Permutation::try_identity(0).expect("identity construction within u32::MAX");
-    }
-    // Validate offsets are monotone and in-bounds; bail out early if not.
     for w in graph.offsets.windows(2) {
         assert!(
             w[0] <= w[1],
@@ -88,13 +87,27 @@ pub fn rcm(graph: CsrGraph<'_>) -> Permutation {
             w[1]
         );
     }
-    assert_eq!(
-        graph.offsets[n] as usize,
-        graph.neighbors.len(),
-        "rcm: offsets[n] ({}) != neighbors.len() ({})",
-        graph.offsets[n],
-        graph.neighbors.len()
-    );
+    if n != 0 {
+        assert_eq!(
+            graph.offsets[n] as usize,
+            graph.neighbors.len(),
+            "rcm: offsets[n] ({}) != neighbors.len() ({})",
+            graph.offsets[n],
+            graph.neighbors.len()
+        );
+    }
+    rcm_inner(graph)
+}
+
+/// Shared inner kernel for [`rcm`] and [`try_rcm`].
+///
+/// Assumes `graph` has been validated upstream; skips the asserts the
+/// userspace-gated entry performs (audit-R10 #1 / #216).
+fn rcm_inner(graph: CsrGraph<'_>) -> Permutation {
+    let n = graph.n as usize;
+    if n == 0 {
+        return Permutation::try_identity(0).expect("identity construction within u32::MAX");
+    }
 
     // Per-vertex degree cache. CSR `degree(v)` is one subtraction; the
     // hot loop reads degree per visited frontier element so caching as
@@ -154,7 +167,10 @@ pub fn rcm(graph: CsrGraph<'_>) -> Permutation {
 /// list.
 pub fn try_rcm(graph: CsrGraph<'_>) -> Result<Permutation, PermutationConstructionError> {
     graph.try_validate()?;
-    Ok(rcm(graph))
+    // try_validate() already checked offsets shape + monotonicity;
+    // call the panic-free inner kernel directly so this entry stays
+    // kernel-safe (audit-R10 #1 / #216).
+    Ok(rcm_inner(graph))
 }
 
 /// Finds the lowest-degree unvisited vertex (tie-break: lowest ID).
@@ -456,7 +472,7 @@ mod tests {
             offsets: &offsets,
             neighbors: &neighbors,
         };
-        let perm = rcm(g);
+        let perm = rcm_inner(g);
         assert!(perm.is_empty());
     }
 
@@ -469,7 +485,7 @@ mod tests {
             offsets: &offsets,
             neighbors: &neighbors,
         };
-        let perm = rcm(g);
+        let perm = rcm_inner(g);
         assert_valid_permutation(&perm, 1);
         assert_eq!(perm.as_slice(), &[0_u32]);
     }
@@ -484,7 +500,7 @@ mod tests {
             offsets: &offsets,
             neighbors: &neighbors,
         };
-        let perm = rcm(g);
+        let perm = rcm_inner(g);
         assert_valid_permutation(&perm, 5);
     }
 
@@ -502,7 +518,7 @@ mod tests {
         let identity =
             Permutation::try_identity(n as usize).expect("identity construction within u32::MAX");
         let original_bw = bandwidth(&g, &identity);
-        let perm = rcm(g);
+        let perm = rcm_inner(g);
         let new_bw = bandwidth(&g, &perm);
         assert_valid_permutation(&perm, n as usize);
         assert!(
@@ -522,7 +538,7 @@ mod tests {
             offsets: &offsets,
             neighbors: &neighbors,
         };
-        let perm = rcm(g);
+        let perm = rcm_inner(g);
         assert_valid_permutation(&perm, n as usize);
         // The center has highest degree; the leaves have degree 1.
         // Pseudoperipheral start picks a leaf; reversing puts the
@@ -546,7 +562,7 @@ mod tests {
             offsets: &offsets,
             neighbors: &neighbors,
         };
-        let perm = rcm(g);
+        let perm = rcm_inner(g);
         assert_valid_permutation(&perm, n as usize);
     }
 
@@ -561,7 +577,7 @@ mod tests {
             offsets: &offsets,
             neighbors: &neighbors,
         };
-        let perm = rcm(g);
+        let perm = rcm_inner(g);
         assert_valid_permutation(&perm, n as usize);
     }
 
@@ -575,9 +591,9 @@ mod tests {
             offsets: &offsets,
             neighbors: &neighbors,
         };
-        let p1 = rcm(g);
-        let p2 = rcm(g);
-        let p3 = rcm(g);
+        let p1 = rcm_inner(g);
+        let p2 = rcm_inner(g);
+        let p3 = rcm_inner(g);
         assert_eq!(p1, p2);
         assert_eq!(p2, p3);
     }
@@ -612,7 +628,7 @@ mod tests {
             offsets: &offsets,
             neighbors: &neighbors,
         };
-        let perm = rcm(g);
+        let perm = rcm_inner(g);
         assert_valid_permutation(&perm, n as usize);
         let new_bw = bandwidth(&g, &perm);
         // Loose upper bound: any BFS-level-order ordering on a 5x5
@@ -653,7 +669,7 @@ mod tests {
         let identity =
             Permutation::try_identity(n as usize).expect("identity construction within u32::MAX");
         let original_bw = bandwidth(&g, &identity);
-        let perm = rcm(g);
+        let perm = rcm_inner(g);
         let new_bw = bandwidth(&g, &perm);
         assert_valid_permutation(&perm, n as usize);
         assert!(
@@ -678,7 +694,7 @@ mod tests {
             offsets: &offsets,
             neighbors: &neighbors,
         };
-        let perm = rcm(g);
+        let perm = rcm_inner(g);
         assert_valid_permutation(&perm, n as usize);
         assert_eq!(bandwidth(&g, &perm), n - 1);
     }
@@ -703,7 +719,7 @@ mod tests {
             offsets: &offsets,
             neighbors: &neighbors,
         };
-        let perm = rcm(g);
+        let perm = rcm_inner(g);
         // The two endpoints (0 and 4) both have degree 1. GPS converges
         // to one of them; either is pseudoperipheral. The deterministic
         // tie-break on "lowest ID" means we start the seed scan at
@@ -769,7 +785,7 @@ mod tests {
                 offsets: &offsets,
                 neighbors: &neighbors,
             };
-            let perm = rcm(g);
+            let perm = rcm_inner(g);
             assert_valid_permutation(&perm, n as usize);
             // Bandwidth is bounded by `n - 1` for any permutation; the
             // valid-permutation assertion above is the load-bearing
@@ -793,7 +809,7 @@ mod tests {
             offsets: &offsets,
             neighbors: &neighbors,
         };
-        let perm = rcm(g);
+        let perm = rcm_inner(g);
         let inv = perm.inverse();
         let src: Vec<u32> = (0..n).collect();
         let permuted = perm.try_apply(&src).expect("apply: shape match");
@@ -815,7 +831,7 @@ mod tests {
             offsets: &offsets,
             neighbors: &neighbors,
         };
-        let panic_path = rcm(g);
+        let panic_path = rcm_inner(g);
         let try_path = try_rcm(g).expect("well-formed CSR must succeed");
         assert_eq!(panic_path, try_path);
     }

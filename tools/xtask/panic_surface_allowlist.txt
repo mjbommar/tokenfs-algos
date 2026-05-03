@@ -63,10 +63,13 @@
 # already has a `try_*` sibling per audit-R4 #151 / R6 #161.
 # -----------------------------------------------------------------
 
-crates/tokenfs-algos/src/permutation/rabbit.rs:279:rabbit_order:assert_eq!
-crates/tokenfs-algos/src/permutation/rabbit.rs:647:rabbit_order_par:assert_eq!
-crates/tokenfs-algos/src/permutation/rabbit.rs:1190:modularity_gains_neighbor_batch:assert_eq!
-crates/tokenfs-algos/src/permutation/rcm.rs:70:rcm:assert_eq!
+# permutation::{rabbit_order, rabbit_order_par, rcm} +
+# permutation::rabbit::kernels::auto::modularity_gains_neighbor_batch
+# CLEARED in v0.4.6 — extracted `_inner` helpers (rabbit_order_inner,
+# rabbit_order_par_inner, rcm_inner) shared between the userspace-gated
+# panicking entries and the kernel-safe `try_*` siblings; added
+# `kernels::auto::modularity_gains_neighbor_batch_unchecked` for the
+# inner pipelines.
 
 # -----------------------------------------------------------------
 # Category C — top-level SIMD/dispatch panic entries the auditor did

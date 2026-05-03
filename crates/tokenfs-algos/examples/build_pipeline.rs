@@ -30,7 +30,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use tokenfs_algos::permutation::{CsrGraph, Permutation, rcm};
+use tokenfs_algos::permutation::{CsrGraph, Permutation, try_rcm};
 use tokenfs_algos::sketch::crc32c_bytes;
 
 #[cfg(feature = "parallel")]
@@ -500,7 +500,7 @@ fn main() {
     // -------------------------------------------------------------------------
     let graph_view = csr.as_view(NUM_EXTENTS as u32);
     let t4 = Instant::now();
-    let perm = rcm(graph_view);
+    let perm = try_rcm(graph_view).expect("rcm: valid CSR graph");
     let dt_rcm = t4.elapsed();
     println!(
         "[stage 4] RCM permutation                                    : {:>8.2} ms",

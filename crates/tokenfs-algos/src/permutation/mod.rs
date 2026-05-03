@@ -34,7 +34,7 @@
 //! Phase B5 lands `hilbert_2d` / `hilbert_nd` behind the
 //! `permutation_hilbert` Cargo feature (vendor wrappers around the
 //! `fast_hilbert` and `hilbert` crates per spec § 4). Sprint 47-49 of
-//! Phase D1 lands [`rabbit_order()`] as a single-pass sequential
+//! Phase D1 lands [`rabbit_order_inner()`] as a single-pass sequential
 //! baseline; Sprint 50-52 lifts the modularity-gain inner loop into a
 //! SIMD kernel module (see [`rabbit::kernels`]); Sprint 53-55 ships
 //! [`rabbit::rabbit_order_par`] (gated on the `parallel` Cargo
@@ -99,10 +99,16 @@ pub mod rcm;
 pub use hilbert::hilbert_2d;
 #[cfg(all(feature = "permutation_hilbert", feature = "userspace"))]
 pub use hilbert::hilbert_nd;
-pub use rabbit::{rabbit_order, try_rabbit_order};
+#[cfg(feature = "userspace")]
+pub use rabbit::rabbit_order;
+#[cfg(all(feature = "parallel", feature = "userspace"))]
+pub use rabbit::rabbit_order_par;
+pub use rabbit::try_rabbit_order;
 #[cfg(feature = "parallel")]
-pub use rabbit::{rabbit_order_par, try_rabbit_order_par};
-pub use rcm::{rcm, try_rcm};
+pub use rabbit::try_rabbit_order_par;
+#[cfg(feature = "userspace")]
+pub use rcm::rcm;
+pub use rcm::try_rcm;
 
 /// A permutation array.
 ///

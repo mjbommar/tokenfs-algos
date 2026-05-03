@@ -26,7 +26,7 @@ use tokenfs_algos::bits::{
 };
 use tokenfs_algos::hash::sha256::sha256;
 use tokenfs_algos::hash::sha256_batch_st;
-use tokenfs_algos::permutation::{CsrGraph, rcm};
+use tokenfs_algos::permutation::{CsrGraph, try_rcm};
 use tokenfs_algos::vector::{kernels::scalar as vec_scalar, l2_squared_f32_one_to_many};
 
 // =============================================================================
@@ -298,7 +298,7 @@ fn build_pipeline_composition_hash_batches_match_and_rcm_round_trips() {
     };
 
     // ----- 4. Apply RCM and verify the result is a valid permutation. -----
-    let perm = rcm(graph);
+    let perm = try_rcm(graph).expect("rcm: valid CSR graph");
     assert_eq!(perm.len(), n, "rcm produced wrong-length permutation");
     let mut seen = vec![false; n];
     for &new_id in perm.as_slice() {

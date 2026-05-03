@@ -245,7 +245,7 @@ struct Merge {
 /// let neighbors = [1_u32, 2, 0, 2, 0, 1, 3, 2, 4, 5, 3, 5, 3, 4];
 /// let graph = CsrGraph { n: 6, offsets: &offsets, neighbors: &neighbors };
 ///
-/// let perm = rabbit_order(graph);
+/// let perm = rabbit_order_inner(graph);
 /// assert_eq!(perm.len(), 6);
 /// // The result is a valid permutation: every id 0..n appears exactly once.
 /// let mut seen = [false; 6];
@@ -276,6 +276,9 @@ struct Merge {
 /// need a non-panicking variant should prefer [`try_rabbit_order`].
 ///
 #[must_use]
+/// Available only with `feature = "userspace"` (audit-R10 #1 / #216).
+/// Kernel/FUSE callers should use [`try_rabbit_order`] instead.
+#[cfg(feature = "userspace")]
 pub fn rabbit_order(graph: CsrGraph<'_>) -> Permutation {
     let n = graph.n as usize;
     assert_eq!(
@@ -285,9 +288,6 @@ pub fn rabbit_order(graph: CsrGraph<'_>) -> Permutation {
         graph.offsets.len(),
         n + 1
     );
-    if n == 0 {
-        return Permutation::try_identity(0).expect("identity construction within u32::MAX");
-    }
     for w in graph.offsets.windows(2) {
         assert!(
             w[0] <= w[1],
@@ -296,13 +296,29 @@ pub fn rabbit_order(graph: CsrGraph<'_>) -> Permutation {
             w[1]
         );
     }
-    assert_eq!(
-        graph.offsets[n] as usize,
-        graph.neighbors.len(),
-        "rabbit_order: offsets[n] ({}) != neighbors.len() ({})",
-        graph.offsets[n],
-        graph.neighbors.len()
-    );
+    if n != 0 {
+        assert_eq!(
+            graph.offsets[n] as usize,
+            graph.neighbors.len(),
+            "rabbit_order: offsets[n] ({}) != neighbors.len() ({})",
+            graph.offsets[n],
+            graph.neighbors.len()
+        );
+    }
+    rabbit_order_inner(graph)
+}
+
+/// Shared inner kernel for [`rabbit_order`] and [`try_rabbit_order`].
+///
+/// Assumes `graph` has been validated upstream (offsets length,
+/// monotonicity, in-range neighbour IDs). The asserts in [`rabbit_order`]
+/// re-check upfront for userspace callers; this inner path skips them so
+/// it stays kernel-safe (audit-R10 #1 / #216).
+fn rabbit_order_inner(graph: CsrGraph<'_>) -> Permutation {
+    let n = graph.n as usize;
+    if n == 0 {
+        return Permutation::try_identity(0).expect("identity construction within u32::MAX");
+    }
 
     // Build the per-community weighted adjacency from the input CSR.
     // Self-loops contribute weight to the vertex's own degree but are
@@ -458,7 +474,10 @@ pub fn rabbit_order(graph: CsrGraph<'_>) -> Permutation {
 /// list.
 pub fn try_rabbit_order(graph: CsrGraph<'_>) -> Result<Permutation, PermutationConstructionError> {
     graph.try_validate()?;
-    Ok(rabbit_order(graph))
+    // try_validate() already checked offsets shape + monotonicity;
+    // call the panic-free inner kernel directly so this entry stays
+    // kernel-safe (audit-R10 #1 / #216).
+    Ok(rabbit_order_inner(graph))
 }
 
 /// Edge-count threshold below which [`rabbit_order_par`] falls back to
@@ -642,7 +661,9 @@ pub const RABBIT_PARALLEL_EDGE_THRESHOLD: usize = 200_000;
 /// Same panic conditions as [`rabbit_order`]. Kernel/FUSE callers
 /// that need a non-panicking variant should prefer
 /// [`try_rabbit_order_par`].
-#[cfg(feature = "parallel")]
+/// Available only with `feature = "userspace"` (audit-R10 #1 / #216).
+/// Kernel/FUSE callers should use [`try_rabbit_order_par`] instead.
+#[cfg(all(feature = "parallel", feature = "userspace"))]
 #[must_use]
 pub fn rabbit_order_par(graph: CsrGraph<'_>) -> Permutation {
     let n = graph.n as usize;
@@ -653,18 +674,6 @@ pub fn rabbit_order_par(graph: CsrGraph<'_>) -> Permutation {
         graph.offsets.len(),
         n + 1
     );
-    if n == 0 {
-        return Permutation::try_identity(0).expect("identity construction within u32::MAX");
-    }
-    // Defer the rest of the validation + small-graph fallback to the
-    // sequential path. The sequential routine performs the same bounds
-    // checks and is bit-for-bit deterministic; we want the small-graph
-    // codepath to share both behaviours so the public API is uniform.
-    if graph.neighbors.len() < RABBIT_PARALLEL_EDGE_THRESHOLD {
-        return rabbit_order(graph);
-    }
-
-    // -- input validation (mirrors `rabbit_order`) --
     for w in graph.offsets.windows(2) {
         assert!(
             w[0] <= w[1],
@@ -673,13 +682,33 @@ pub fn rabbit_order_par(graph: CsrGraph<'_>) -> Permutation {
             w[1]
         );
     }
-    assert_eq!(
-        graph.offsets[n] as usize,
-        graph.neighbors.len(),
-        "rabbit_order_par: offsets[n] ({}) != neighbors.len() ({})",
-        graph.offsets[n],
-        graph.neighbors.len()
-    );
+    if n != 0 {
+        assert_eq!(
+            graph.offsets[n] as usize,
+            graph.neighbors.len(),
+            "rabbit_order_par: offsets[n] ({}) != neighbors.len() ({})",
+            graph.offsets[n],
+            graph.neighbors.len()
+        );
+    }
+    rabbit_order_par_inner(graph)
+}
+
+/// Shared inner kernel for [`rabbit_order_par`] and
+/// [`try_rabbit_order_par`].
+///
+/// Assumes `graph` has been validated upstream; skips the asserts that
+/// the userspace-gated entry performs (audit-R10 #1 / #216).
+#[cfg(feature = "parallel")]
+fn rabbit_order_par_inner(graph: CsrGraph<'_>) -> Permutation {
+    let n = graph.n as usize;
+    if n == 0 {
+        return Permutation::try_identity(0).expect("identity construction within u32::MAX");
+    }
+    // Small-graph fallback: same correctness as the sequential path.
+    if graph.neighbors.len() < RABBIT_PARALLEL_EDGE_THRESHOLD {
+        return rabbit_order_inner(graph);
+    }
 
     // -- Build the per-community adjacency in parallel. Each vertex's
     // consolidation is independent (input is the immutable raw CSR
@@ -884,7 +913,10 @@ pub fn try_rabbit_order_par(
     graph: CsrGraph<'_>,
 ) -> Result<Permutation, PermutationConstructionError> {
     graph.try_validate()?;
-    Ok(rabbit_order_par(graph))
+    // try_validate() already checked offsets shape + monotonicity;
+    // call the panic-free inner kernel directly so this entry stays
+    // kernel-safe (audit-R10 #1 / #216).
+    Ok(rabbit_order_par_inner(graph))
 }
 
 /// Pure variant of [`consolidate_neighbours`] that returns the per-
@@ -1012,7 +1044,7 @@ fn best_merge_target(
     let self_degree = weighted_degree[u as usize];
     let m_doubled = u128::from(total_edge_weight).saturating_mul(2);
 
-    let scores = kernels::auto::modularity_gains_neighbor_batch(
+    let scores = kernels::auto::modularity_gains_neighbor_batch_unchecked(
         scratch_weights,
         scratch_degrees,
         self_degree,
@@ -1186,6 +1218,10 @@ pub mod kernels {
         /// # Panics
         ///
         /// Panics if `neighbor_weights.len() != neighbor_degrees.len()`.
+        ///
+        /// Available only with `feature = "userspace"` (audit-R10 #1 / #216).
+        /// Kernel-safe callers should use [`modularity_gains_neighbor_batch_unchecked`].
+        #[cfg(feature = "userspace")]
         #[must_use]
         pub fn modularity_gains_neighbor_batch(
             neighbor_weights: &[u64],
@@ -1209,6 +1245,82 @@ pub mod kernels {
                 if super::avx512::is_available() {
                     // SAFETY: AVX-512F + AVX-512DQ availability checked
                     // immediately above; lengths match.
+                    return unsafe {
+                        super::avx512::modularity_gains_neighbor_batch(
+                            neighbor_weights,
+                            neighbor_degrees,
+                            self_degree,
+                            m_doubled,
+                        )
+                    };
+                }
+            }
+            #[cfg(all(
+                feature = "std",
+                feature = "avx2",
+                any(target_arch = "x86", target_arch = "x86_64")
+            ))]
+            {
+                if super::avx2::is_available() {
+                    // SAFETY: AVX2 availability checked immediately above; lengths match.
+                    return unsafe {
+                        super::avx2::modularity_gains_neighbor_batch(
+                            neighbor_weights,
+                            neighbor_degrees,
+                            self_degree,
+                            m_doubled,
+                        )
+                    };
+                }
+            }
+            #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+            {
+                if super::neon::is_available() {
+                    // SAFETY: NEON is mandatory on AArch64; lengths match.
+                    return unsafe {
+                        super::neon::modularity_gains_neighbor_batch(
+                            neighbor_weights,
+                            neighbor_degrees,
+                            self_degree,
+                            m_doubled,
+                        )
+                    };
+                }
+            }
+            super::scalar::modularity_gains_neighbor_batch_unchecked(
+                neighbor_weights,
+                neighbor_degrees,
+                self_degree,
+                m_doubled,
+            )
+        }
+
+        /// Unchecked variant of [`modularity_gains_neighbor_batch`].
+        ///
+        /// # Safety
+        ///
+        /// Caller must ensure
+        /// `neighbor_weights.len() == neighbor_degrees.len()`. The
+        /// userspace-gated entry asserts this; the inner Rabbit-Order
+        /// pipelines (`rabbit_order_inner`, `rabbit_order_par_inner`)
+        /// always supply equal-length slices and use this entry to
+        /// stay reachable in non-userspace builds (audit-R10 #1 / #216).
+        #[must_use]
+        pub fn modularity_gains_neighbor_batch_unchecked(
+            neighbor_weights: &[u64],
+            neighbor_degrees: &[u64],
+            self_degree: u64,
+            m_doubled: u128,
+        ) -> Vec<i128> {
+            #[cfg(all(
+                feature = "std",
+                feature = "avx512",
+                any(target_arch = "x86", target_arch = "x86_64")
+            ))]
+            {
+                if super::avx512::is_available() {
+                    // SAFETY: AVX-512F + AVX-512DQ availability checked
+                    // immediately above; lengths match per caller invariant.
                     return unsafe {
                         super::avx512::modularity_gains_neighbor_batch(
                             neighbor_weights,
@@ -1502,7 +1614,7 @@ mod tests {
             offsets: &offsets,
             neighbors: &neighbors,
         };
-        let perm = rabbit_order(g);
+        let perm = rabbit_order_inner(g);
         assert!(perm.is_empty());
     }
 
@@ -1515,7 +1627,7 @@ mod tests {
             offsets: &offsets,
             neighbors: &neighbors,
         };
-        let perm = rabbit_order(g);
+        let perm = rabbit_order_inner(g);
         assert_valid_permutation(&perm, 1);
         assert_eq!(perm.as_slice(), &[0_u32]);
     }
@@ -1529,7 +1641,7 @@ mod tests {
             offsets: &offsets,
             neighbors: &neighbors,
         };
-        let perm = rabbit_order(g);
+        let perm = rabbit_order_inner(g);
         assert_valid_permutation(&perm, 2);
     }
 
@@ -1543,7 +1655,7 @@ mod tests {
             offsets: &offsets,
             neighbors: &neighbors,
         };
-        let perm = rabbit_order(g);
+        let perm = rabbit_order_inner(g);
         assert_valid_permutation(&perm, 5);
         // No edges means no merges; the DFS walks singletons in
         // ascending root order, which equals the identity.
@@ -1561,7 +1673,7 @@ mod tests {
             offsets: &offsets,
             neighbors: &neighbors,
         };
-        let perm = rabbit_order(g);
+        let perm = rabbit_order_inner(g);
         assert_valid_permutation(&perm, n as usize);
     }
 
@@ -1581,7 +1693,7 @@ mod tests {
             offsets: &offsets,
             neighbors: &neighbors,
         };
-        let perm = rabbit_order(g);
+        let perm = rabbit_order_inner(g);
         assert_valid_permutation(&perm, n as usize);
     }
 
@@ -1595,9 +1707,9 @@ mod tests {
             offsets: &offsets,
             neighbors: &neighbors,
         };
-        let p1 = rabbit_order(g);
-        let p2 = rabbit_order(g);
-        let p3 = rabbit_order(g);
+        let p1 = rabbit_order_inner(g);
+        let p2 = rabbit_order_inner(g);
+        let p3 = rabbit_order_inner(g);
         assert_eq!(p1, p2);
         assert_eq!(p2, p3);
     }
@@ -1612,7 +1724,7 @@ mod tests {
             offsets: &offsets,
             neighbors: &neighbors,
         };
-        let perm = rabbit_order(g);
+        let perm = rabbit_order_inner(g);
         assert_valid_permutation(&perm, n as usize);
     }
 
@@ -1627,7 +1739,7 @@ mod tests {
             offsets: &offsets,
             neighbors: &neighbors,
         };
-        let perm = rabbit_order(g);
+        let perm = rabbit_order_inner(g);
         assert_valid_permutation(&perm, n as usize);
     }
 
@@ -1659,7 +1771,7 @@ mod tests {
             offsets: &offsets,
             neighbors: &neighbors,
         };
-        let perm = rabbit_order(g);
+        let perm = rabbit_order_inner(g);
         assert_valid_permutation(&perm, n as usize);
 
         // Compute per-clique span of new positions.
@@ -1723,7 +1835,7 @@ mod tests {
             offsets: &offsets,
             neighbors: &neighbors,
         };
-        let perm = rabbit_order(g);
+        let perm = rabbit_order_inner(g);
         assert_valid_permutation(&perm, n as usize);
 
         let inv = inverse(&perm);
@@ -1752,7 +1864,7 @@ mod tests {
             offsets: &offsets,
             neighbors: &neighbors,
         };
-        let perm = rabbit_order(g);
+        let perm = rabbit_order_inner(g);
         let inv = perm.inverse();
         let src: Vec<u32> = (0..n).collect();
         let permuted = perm.try_apply(&src).expect("apply: shape match");
@@ -1805,7 +1917,7 @@ mod tests {
                 offsets: &offsets,
                 neighbors: &neighbors,
             };
-            let perm = rabbit_order(g);
+            let perm = rabbit_order_inner(g);
             assert_valid_permutation(&perm, n as usize);
         }
     }
@@ -1827,7 +1939,7 @@ mod tests {
             offsets: &offsets,
             neighbors: &neighbors,
         };
-        let perm = rabbit_order(g);
+        let perm = rabbit_order_inner(g);
         assert_valid_permutation(&perm, 3);
     }
 
@@ -1846,7 +1958,7 @@ mod tests {
             offsets: &offsets,
             neighbors: &neighbors,
         };
-        let perm = rabbit_order(g);
+        let perm = rabbit_order_inner(g);
         assert_valid_permutation(&perm, n as usize);
     }
 
@@ -1865,7 +1977,7 @@ mod tests {
             offsets: &offsets,
             neighbors: &neighbors,
         };
-        let perm = rabbit_order(g);
+        let perm = rabbit_order_inner(g);
         assert_valid_permutation(&perm, n as usize);
         // Two communities are obvious; assert each lands in a
         // contiguous block of three positions, regardless of which
@@ -1981,11 +2093,13 @@ mod tests {
     // gate on `feature = "std"` so the alloc-only build compiles
     // (audit-R6 finding #164). The kernel-level invariant is also
     // enforced by `debug_assert_eq!` inside the scalar kernel itself.
-    #[cfg(feature = "std")]
+    #[cfg(all(feature = "std", feature = "userspace"))]
     #[test]
     fn scalar_kernel_panics_on_length_mismatch() {
+        // Verifies the userspace-gated panicking entry still surfaces a
+        // clear panic on shape mismatch (audit-R10 #1 / #216).
         let result = std::panic::catch_unwind(|| {
-            kernels::scalar::modularity_gains_neighbor_batch_unchecked(&[1, 2, 3], &[1, 2], 1, 1)
+            kernels::scalar::modularity_gains_neighbor_batch(&[1, 2, 3], &[1, 2], 1, 1)
         });
         assert!(result.is_err(), "expected panic on length mismatch");
     }
@@ -2236,7 +2350,7 @@ mod tests {
                 self_degree,
                 m_doubled,
             );
-            let auto_out = kernels::auto::modularity_gains_neighbor_batch(
+            let auto_out = kernels::auto::modularity_gains_neighbor_batch_unchecked(
                 &weights,
                 &degrees,
                 self_degree,
@@ -2253,7 +2367,7 @@ mod tests {
     /// identical permutation regardless of which kernel backend the
     /// runtime selects. Since `auto::modularity_gains_neighbor_batch`
     /// is bit-exact with `scalar::modularity_gains_neighbor_batch`,
-    /// the two `rabbit_order(...)` calls must coincide.
+    /// the two `rabbit_order_inner(...)` calls must coincide.
     ///
     /// To force "scalar" inside `rabbit_order`, we cannot easily
     /// rewire the dispatcher mid-call; instead we run `rabbit_order`
@@ -2273,8 +2387,8 @@ mod tests {
             offsets: &offsets,
             neighbors: &neighbors,
         };
-        let perm_first = rabbit_order(g);
-        let perm_second = rabbit_order(g);
+        let perm_first = rabbit_order_inner(g);
+        let perm_second = rabbit_order_inner(g);
         assert_eq!(
             perm_first, perm_second,
             "rabbit_order must be deterministic across calls"
@@ -2292,7 +2406,7 @@ mod tests {
                 self_degree,
                 m_doubled,
             );
-            let auto_out = kernels::auto::modularity_gains_neighbor_batch(
+            let auto_out = kernels::auto::modularity_gains_neighbor_batch_unchecked(
                 &weights,
                 &degrees,
                 self_degree,
@@ -2316,7 +2430,7 @@ mod tests {
             offsets: &offsets,
             neighbors: &neighbors,
         };
-        let panic_path = rabbit_order(g);
+        let panic_path = rabbit_order_inner(g);
         let try_path = try_rabbit_order(g).expect("well-formed CSR must succeed");
         assert_eq!(panic_path, try_path);
     }
@@ -2452,7 +2566,7 @@ mod tests {
                 offsets: &offsets,
                 neighbors: &neighbors,
             };
-            assert_eq!(rabbit_order_par(g), rabbit_order(g));
+            assert_eq!(rabbit_order_par(g), rabbit_order_inner(g));
         }
 
         #[test]
@@ -2464,7 +2578,7 @@ mod tests {
                 offsets: &offsets,
                 neighbors: &neighbors,
             };
-            assert_eq!(rabbit_order_par(g), rabbit_order(g));
+            assert_eq!(rabbit_order_par(g), rabbit_order_inner(g));
         }
 
         #[test]
@@ -2476,7 +2590,7 @@ mod tests {
                 offsets: &offsets,
                 neighbors: &neighbors,
             };
-            assert_eq!(rabbit_order_par(g), rabbit_order(g));
+            assert_eq!(rabbit_order_par(g), rabbit_order_inner(g));
         }
 
         #[test]
@@ -2488,7 +2602,7 @@ mod tests {
                 offsets: &offsets,
                 neighbors: &neighbors,
             };
-            assert_eq!(rabbit_order_par(g), rabbit_order(g));
+            assert_eq!(rabbit_order_par(g), rabbit_order_inner(g));
         }
 
         #[test]
@@ -2503,7 +2617,7 @@ mod tests {
                 offsets: &offsets,
                 neighbors: &neighbors,
             };
-            assert_eq!(rabbit_order_par(g), rabbit_order(g));
+            assert_eq!(rabbit_order_par(g), rabbit_order_inner(g));
         }
 
         #[test]
@@ -2595,7 +2709,7 @@ mod tests {
                 assert_valid_permutation(&perm, n as usize);
                 // Below threshold, the parallel path delegates to the
                 // sequential path so they are bit-exact.
-                assert_eq!(perm, rabbit_order(g));
+                assert_eq!(perm, rabbit_order_inner(g));
             }
         }
 
