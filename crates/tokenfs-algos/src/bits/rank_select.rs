@@ -116,6 +116,22 @@ pub enum RankSelectError {
         /// Number of output slots actually supplied (= `out.len()`).
         actual: usize,
     },
+    /// One of the per-position arguments to a `try_*_batch` method
+    /// exceeds the dictionary's `n_bits`. Returned by
+    /// [`RankSelectDict::try_rank1_batch`] before any kernel dispatch
+    /// so the caller's `out` buffer is not partially overwritten.
+    /// Carries the offending position, its index in the input slice,
+    /// and the dictionary's `n_bits` for shrinker-friendly diagnostics
+    /// (audit-R9 #3).
+    BatchPositionOutOfRange {
+        /// Caller-supplied position (cast losslessly from `usize`).
+        position: u64,
+        /// Index of the offending entry in the input `positions` slice.
+        index: usize,
+        /// Dictionary's logical bit count at query time (cast losslessly
+        /// from `usize`).
+        n_bits: u64,
+    },
 }
 
 impl core::fmt::Display for RankSelectError {
@@ -138,6 +154,15 @@ impl core::fmt::Display for RankSelectError {
                 f,
                 "RankSelectDict batch output slice too short: needed {needed} slots, \
                  caller supplied {actual}"
+            ),
+            Self::BatchPositionOutOfRange {
+                position,
+                index,
+                n_bits,
+            } => write!(
+                f,
+                "RankSelectDict batch position out of range at index {index}: \
+                 position = {position} > n_bits = {n_bits}"
             ),
         }
     }
@@ -492,10 +517,13 @@ impl<'a> RankSelectDict<'a> {
     /// # Errors
     ///
     /// Returns [`RankSelectError::BatchOutputTooShort`] when
-    /// `out.len() < positions.len()`. Per-position out-of-range
-    /// positions still panic (the underlying [`Self::rank1`]); pre-
-    /// filter `positions` against [`Self::len_bits`] for a fully
-    /// no-panic batch query.
+    /// `out.len() < positions.len()`, or
+    /// [`RankSelectError::BatchPositionOutOfRange`] (with the offending
+    /// position, its slice index, and the dictionary's `n_bits`) when
+    /// any per-position argument exceeds `n_bits`. Both checks fire
+    /// before any kernel dispatch, so the caller's `out` buffer is
+    /// never partially mutated on the failure path
+    /// (audit-R9 #3 closeout).
     pub fn try_rank1_batch(
         &self,
         positions: &[usize],
@@ -506,6 +534,15 @@ impl<'a> RankSelectDict<'a> {
                 needed: positions.len(),
                 actual: out.len(),
             });
+        }
+        for (index, &position) in positions.iter().enumerate() {
+            if position > self.n_bits {
+                return Err(RankSelectError::BatchPositionOutOfRange {
+                    position: position as u64,
+                    index,
+                    n_bits: self.n_bits as u64,
+                });
+            }
         }
         kernels::auto::rank1_batch(self, positions, out);
         Ok(())
@@ -1805,6 +1842,46 @@ mod tests {
         let mut empty_out: [usize; 0] = [];
         dict.try_rank1_batch(&empty, &mut empty_out)
             .expect("empty batch must succeed");
+    }
+
+    /// audit-R9 #3: try_rank1_batch must NOT panic on per-position OOB.
+    /// It must Err early before the kernel dispatch and leave `out`
+    /// untouched.
+    #[test]
+    fn try_rank1_batch_returns_err_on_per_position_oob() {
+        let bits = [u64::MAX; 4];
+        let dict = RankSelectDict::try_build(&bits, 256).expect("valid build");
+        // Sentinel: any leftover values would indicate partial mutation.
+        const SENTINEL: usize = 0xDEAD_BEEF;
+        let positions = [10_usize, 50, 100_000, 200];
+        let mut out = [SENTINEL; 4];
+        let err = dict
+            .try_rank1_batch(&positions, &mut out)
+            .expect_err("per-position OOB must Err, not panic");
+        assert_eq!(
+            err,
+            RankSelectError::BatchPositionOutOfRange {
+                position: 100_000,
+                index: 2,
+                n_bits: 256,
+            }
+        );
+        // Critically: no slot in `out` may have been mutated.
+        assert_eq!(out, [SENTINEL; 4]);
+    }
+
+    /// audit-R9 #3: boundary `position == n_bits` is in range (per the
+    /// existing rank1 contract) and must not produce
+    /// BatchPositionOutOfRange.
+    #[test]
+    fn try_rank1_batch_position_eq_n_bits_is_in_range() {
+        let bits = [u64::MAX; 4];
+        let dict = RankSelectDict::try_build(&bits, 256).expect("valid build");
+        let positions = [0_usize, 128, 256]; // 256 == n_bits
+        let mut out = [0_usize; 3];
+        dict.try_rank1_batch(&positions, &mut out)
+            .expect("boundary position must succeed");
+        assert_eq!(out, [0, 128, 256]);
     }
 
     #[test]
