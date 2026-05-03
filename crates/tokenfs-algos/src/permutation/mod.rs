@@ -1773,9 +1773,7 @@ mod tests {
         };
         for v in 0_u32..4 {
             let panic_path = g.neighbors_of(v);
-            let try_path = g
-                .try_neighbors_of(v)
-                .expect("well-formed CSR must succeed");
+            let try_path = g.try_neighbors_of(v).expect("well-formed CSR must succeed");
             assert_eq!(panic_path, try_path);
         }
     }
@@ -1831,11 +1829,7 @@ mod tests {
             .expect_err("non-monotone offsets must error");
         assert_eq!(
             err,
-            CsrGraphError::OffsetsNonMonotone {
-                i: 1,
-                lo: 5,
-                hi: 2,
-            }
+            CsrGraphError::OffsetsNonMonotone { i: 1, lo: 5, hi: 2 }
         );
     }
 
@@ -1877,11 +1871,7 @@ mod tests {
             .expect_err("non-monotone offsets must error");
         assert_eq!(
             err,
-            CsrGraphError::OffsetsNonMonotone {
-                i: 1,
-                lo: 5,
-                hi: 2,
-            }
+            CsrGraphError::OffsetsNonMonotone { i: 1, lo: 5, hi: 2 }
         );
     }
 
@@ -1907,11 +1897,7 @@ mod tests {
         // Cover every Display arm.
         let cases = [
             CsrGraphError::OutOfRange { v: 5, n: 3 },
-            CsrGraphError::OffsetsNonMonotone {
-                i: 1,
-                lo: 5,
-                hi: 2,
-            },
+            CsrGraphError::OffsetsNonMonotone { i: 1, lo: 5, hi: 2 },
             CsrGraphError::NeighborsOutOfBounds {
                 offset: 99,
                 neighbors_len: 5,
@@ -1996,11 +1982,7 @@ mod tests {
             .expect_err("non-monotone offsets must error");
         assert_eq!(
             err,
-            CsrGraphError::OffsetsNonMonotone {
-                i: 1,
-                lo: 5,
-                hi: 2,
-            }
+            CsrGraphError::OffsetsNonMonotone { i: 1, lo: 5, hi: 2 }
         );
     }
 
@@ -2049,10 +2031,8 @@ mod tests {
 
     #[test]
     fn permutation_construction_error_display_renders() {
-        let err = PermutationConstructionError::InvalidCsr(CsrGraphError::OutOfRange {
-            v: 5,
-            n: 3,
-        });
+        let err =
+            PermutationConstructionError::InvalidCsr(CsrGraphError::OutOfRange { v: 5, n: 3 });
         let s = format!("{err}");
         assert!(s.starts_with("permutation construction failed"));
         assert!(s.contains("CsrGraph"));

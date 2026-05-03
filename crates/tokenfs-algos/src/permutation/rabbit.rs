@@ -453,9 +453,7 @@ pub fn rabbit_order(graph: CsrGraph<'_>) -> Permutation {
 /// first [`super::CsrGraphError`] encountered during upfront
 /// validation. See [`CsrGraph::try_validate`] for the full failure
 /// list.
-pub fn try_rabbit_order(
-    graph: CsrGraph<'_>,
-) -> Result<Permutation, PermutationConstructionError> {
+pub fn try_rabbit_order(graph: CsrGraph<'_>) -> Result<Permutation, PermutationConstructionError> {
     graph.try_validate()?;
     Ok(rabbit_order(graph))
 }
@@ -2780,11 +2778,9 @@ mod tests {
         };
         let err = try_rabbit_order(g).expect_err("non-monotone offsets must error");
         match err {
-            PermutationConstructionError::InvalidCsr(super::super::CsrGraphError::OffsetsNonMonotone {
-                i,
-                lo,
-                hi,
-            }) => {
+            PermutationConstructionError::InvalidCsr(
+                super::super::CsrGraphError::OffsetsNonMonotone { i, lo, hi },
+            ) => {
                 assert_eq!(i, 1);
                 assert_eq!(lo, 5);
                 assert_eq!(hi, 2);
@@ -2806,10 +2802,12 @@ mod tests {
         let err = try_rabbit_order(g).expect_err("tail-length mismatch must error");
         assert_eq!(
             err,
-            PermutationConstructionError::InvalidCsr(super::super::CsrGraphError::NeighborsLengthMismatch {
-                offsets_tail: 2,
-                neighbors_len: 1,
-            })
+            PermutationConstructionError::InvalidCsr(
+                super::super::CsrGraphError::NeighborsLengthMismatch {
+                    offsets_tail: 2,
+                    neighbors_len: 1,
+                }
+            )
         );
     }
 
@@ -3180,14 +3178,15 @@ mod tests {
                 offsets: &offsets,
                 neighbors: &neighbors,
             };
-            let err = try_rabbit_order_par(g)
-                .expect_err("malformed offsets must error, not panic");
+            let err = try_rabbit_order_par(g).expect_err("malformed offsets must error, not panic");
             assert_eq!(
                 err,
-                PermutationConstructionError::InvalidCsr(super::super::super::CsrGraphError::OffsetsLengthMismatch {
-                    actual_len: 2,
-                    expected_len: 4,
-                })
+                PermutationConstructionError::InvalidCsr(
+                    super::super::super::CsrGraphError::OffsetsLengthMismatch {
+                        actual_len: 2,
+                        expected_len: 4,
+                    }
+                )
             );
         }
 
@@ -3201,15 +3200,17 @@ mod tests {
                 offsets: &offsets,
                 neighbors: &neighbors,
             };
-            let err = try_rabbit_order_par(g)
-                .expect_err("out-of-range neighbour must error, not panic");
+            let err =
+                try_rabbit_order_par(g).expect_err("out-of-range neighbour must error, not panic");
             assert_eq!(
                 err,
-                PermutationConstructionError::InvalidCsr(super::super::super::CsrGraphError::NeighborOutOfRange {
-                    neighbor: 99,
-                    n: 2,
-                    at_index: 0,
-                })
+                PermutationConstructionError::InvalidCsr(
+                    super::super::super::CsrGraphError::NeighborOutOfRange {
+                        neighbor: 99,
+                        n: 2,
+                        at_index: 0,
+                    }
+                )
             );
         }
     }

@@ -822,10 +822,12 @@ mod tests {
         let err = try_rcm(g).expect_err("malformed offsets must error");
         assert_eq!(
             err,
-            PermutationConstructionError::InvalidCsr(super::super::CsrGraphError::OffsetsLengthMismatch {
-                actual_len: 2,
-                expected_len: 4,
-            })
+            PermutationConstructionError::InvalidCsr(
+                super::super::CsrGraphError::OffsetsLengthMismatch {
+                    actual_len: 2,
+                    expected_len: 4,
+                }
+            )
         );
     }
 
@@ -842,11 +844,13 @@ mod tests {
         let err = try_rcm(g).expect_err("out-of-range neighbour must error");
         assert_eq!(
             err,
-            PermutationConstructionError::InvalidCsr(super::super::CsrGraphError::NeighborOutOfRange {
-                neighbor: 99,
-                n: 2,
-                at_index: 0,
-            })
+            PermutationConstructionError::InvalidCsr(
+                super::super::CsrGraphError::NeighborOutOfRange {
+                    neighbor: 99,
+                    n: 2,
+                    at_index: 0,
+                }
+            )
         );
     }
 }
