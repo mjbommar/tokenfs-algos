@@ -16,6 +16,12 @@ libfuzzer-sys = "0.4"
 
 [dependencies.tokenfs-algos]
 path = "../crates/tokenfs-algos"
+# Fuzz targets exercise the panicking surface (so we can prove the
+# panic-free `try_*` siblings produce identical results) AND the
+# per-backend pinned kernels (so SIMD-vs-scalar parity fuzzers can
+# pin specific backends). Both gates are required for the manifest
+# to compile end-to-end (audit-R10 T0.2).
+features = ["userspace", "arch-pinned-kernels", "parallel", "blake3"]
 
 # Each fuzz target is its own binary so cargo-fuzz can drive them
 # independently. Run with: cargo +nightly fuzz run <target_name>
