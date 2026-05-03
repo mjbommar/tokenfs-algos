@@ -355,21 +355,39 @@ jobs:
         run: cargo install cargo-fuzz
 
       - name: Build all fuzz targets
+        # Build the entire fuzz manifest in one shot (faster than per-target)
+        # so all 13 declared targets are exercised by CI (audit-R10 T1.4 +
+        # T0.2). Adding a new fuzz_targets/<name>.rs + [[bin]] entry is
+        # all it takes; CI builds it automatically.
         run: |
           cd fuzz
-          cargo +nightly fuzz build chunk_gear_no_panic
-          cargo +nightly fuzz build chunk_fastcdc_no_panic
-          cargo +nightly fuzz build ngram_windows_no_panic
-          cargo +nightly fuzz build byteclass_utf8_dispatch_parity
-          cargo +nightly fuzz build runlength_transitions_dispatch_parity
+          cargo +nightly fuzz build
 
       - name: Smoke-fuzz each target (15s)
+        # Distinguish "no crash in 15s" (timeout exit 124) from "crashed"
+        # (any other non-zero) — audit-R10 T1.5: do NOT swallow crashes
+        # with `|| true`. A crash MUST fail the job; a timeout is the
+        # documented happy outcome.
         run: |
           cd fuzz
-          for target in chunk_gear_no_panic chunk_fastcdc_no_panic ngram_windows_no_panic byteclass_utf8_dispatch_parity runlength_transitions_dispatch_parity; do
+          # Discover every declared target from the binaries cargo-fuzz
+          # built rather than maintaining a hand-curated list.
+          targets=$(cargo +nightly fuzz list)
+          fail=0
+          for target in $targets; do
             echo "=== smoking $target for 15s ==="
-            timeout 25 cargo +nightly fuzz run "$target" -- -max_total_time=15 || true
+            set +e
+            timeout 25 cargo +nightly fuzz run "$target" -- -max_total_time=15
+            status=$?
+            set -e
+            if [ "$status" -eq 124 ]; then
+              echo "  ($target) timed out as expected — no crash"
+            elif [ "$status" -ne 0 ]; then
+              echo "  ($target) FAILED with exit $status — fuzzer crash"
+              fail=1
+            fi
           done
+          exit "$fail"
 
   # ============================================================================
   # Format + lint check (architecture-independent, fast).
