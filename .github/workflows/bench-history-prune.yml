@@ -1,0 +1,101 @@
+name: Bench history prune
+
+# Weekly housekeeping for the gh-pages bench-history archive. Removes
+# JSONL run files older than `RETENTION_DAYS` so the gh-pages branch
+# does not grow without bound, then regenerates the static site so the
+# rendered timelines match the trimmed data set. Audit-R10 T3.5.
+#
+# Manual `workflow_dispatch` is supported for ad-hoc cleanup.
+
+on:
+  schedule:
+    - cron: "17 5 * * 0"   # Sundays 05:17 UTC
+  workflow_dispatch:
+    inputs:
+      retention_days:
+        description: "Drop JSONL runs older than this many days"
+        required: false
+        default: "365"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RETENTION_DAYS: ${{ inputs.retention_days || '365' }}
+
+jobs:
+  prune:
+    name: Prune + republish
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup install stable --profile minimal
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bench-history
+
+      - name: Build xtask
+        run: cargo build -p xtask --release
+
+      - name: Check out gh-pages branch
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: ./pages-out/
+
+      - name: Prune runs older than RETENTION_DAYS
+        id: prune
+        run: |
+          set -euo pipefail
+          retention_seconds=$(( RETENTION_DAYS * 86400 ))
+          cutoff=$(( $(date -u +%s) - retention_seconds ))
+          dropped=0
+          if [ -d pages-out/data/runs ]; then
+            for f in pages-out/data/runs/*.jsonl; do
+              [ -e "$f" ] || continue
+              base=$(basename "$f")
+              ts=${base%%-*}
+              # Validate that ts is a positive integer.
+              if ! [[ "$ts" =~ ^[0-9]+$ ]]; then
+                echo "skipping non-conforming filename $base"
+                continue
+              fi
+              if [ "$ts" -lt "$cutoff" ]; then
+                echo "dropping $base (ts=$ts, cutoff=$cutoff)"
+                rm -f "$f"
+                dropped=$((dropped + 1))
+              fi
+            done
+          fi
+          echo "dropped=$dropped" >> "$GITHUB_OUTPUT"
+          echo "pruned $dropped runs older than $RETENTION_DAYS days"
+
+      - name: Skip republish if nothing changed
+        if: steps.prune.outputs.dropped == '0'
+        run: echo "no runs pruned; skipping site regeneration + commit"
+
+      - name: Regenerate static site
+        if: steps.prune.outputs.dropped != '0'
+        run: |
+          ./target/release/xtask bench-history-site \
+            pages-out/data/runs \
+            pages-out
+
+      - name: Commit + push pruned gh-pages
+        if: steps.prune.outputs.dropped != '0'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: ./pages-out/
+          keep_files: false
+          user_name: github-actions[bot]
+          user_email: 41898282+github-actions[bot]@users.noreply.github.com
+          commit_message: "bench-history: prune ${{ steps.prune.outputs.dropped }} runs older than ${{ env.RETENTION_DAYS }} days"

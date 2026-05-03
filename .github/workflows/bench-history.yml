@@ -1,0 +1,94 @@
+name: Bench history publication
+
+# Archives every successful bench-regression.yml run on main into the
+# `gh-pages` branch and republishes the static site at
+# https://mjbommar.github.io/tokenfs-algos/. The gh-pages branch holds
+# both the historical JSONL data (under `data/runs/`) and the rendered
+# pages (`index.html`, `groups/*.html`, `style.css`). Audit-R10 T3.5.
+#
+# Triggered as a workflow_run after `bench-regression.yml` succeeds on
+# main; reuses its `bench-baseline` artifact rather than re-running
+# benches. Manual `workflow_dispatch` is also supported (useful for
+# bootstrapping the gh-pages branch from a known-good baseline).
+
+on:
+  workflow_run:
+    workflows: ["Bench regression"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: Publish to gh-pages
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup install stable --profile minimal
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bench-history
+
+      - name: Build xtask
+        run: cargo build -p xtask --release
+
+      - name: Download latest bench JSONL from bench-regression
+        id: artifact
+        uses: dawidd6/action-download-artifact@v6
+        continue-on-error: true
+        with:
+          workflow: bench-regression.yml
+          branch: main
+          name: bench-baseline
+          path: ./current-run/
+
+      - name: Bail out if no baseline artifact
+        if: steps.artifact.outcome != 'success'
+        run: |
+          echo "::warning::no bench-baseline artifact available yet; skipping gh-pages publish"
+          exit 0
+
+      - name: Check out gh-pages branch
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: ./pages-out/
+
+      - name: Append current run to data archive
+        run: |
+          mkdir -p pages-out/data/runs
+          ts=$(date -u +%s)
+          sha=$(git rev-parse --short=12 HEAD)
+          dest="pages-out/data/runs/${ts}-${sha}.jsonl"
+          cp current-run/run.jsonl "$dest"
+          echo "appended $(wc -l < "$dest") rows to $dest"
+
+      - name: Regenerate static site
+        run: |
+          ./target/release/xtask bench-history-site \
+            pages-out/data/runs \
+            pages-out
+
+      - name: Publish to gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: ./pages-out/
+          keep_files: false
+          user_name: github-actions[bot]
+          user_email: 41898282+github-actions[bot]@users.noreply.github.com
+          commit_message: "bench-history: archive run for ${{ github.sha }}"

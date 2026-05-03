@@ -96,6 +96,37 @@ fallback path. The criterion suite (`cargo xtask bench-workloads`) is
 the everyday wall-clock companion; the iai suite is the regression
 canary.
 
+## Bench-history publication (gh-pages)
+
+Every successful `bench-regression.yml` run on `main` is archived into
+the `gh-pages` branch by `.github/workflows/bench-history.yml`, which
+republishes a static site at
+[mjbommar.github.io/tokenfs-algos/](https://mjbommar.github.io/tokenfs-algos/)
+(audit-R10 T3.5).
+
+The gh-pages branch is the canonical archive: each main push appends a
+new `data/runs/<unix-ts>-<short-sha>.jsonl` file, and `cargo xtask
+bench-history-site` regenerates `index.html` + `groups/<group>.html`
+with sparkline + per-kernel timeline SVGs computed from the full
+historical set.
+
+`.github/workflows/bench-history-prune.yml` runs weekly (Sunday 05:17
+UTC) and drops JSONL runs older than 365 days, so the gh-pages branch
+stays bounded.
+
+To bootstrap on a fresh fork: run `tools/scripts/init-gh-pages.sh`
+once to create the orphan `gh-pages` branch, then in repo settings
+flip Pages to serve from that branch. The workflows take over from
+the next main push.
+
+To preview the site locally before pushing: run any benches, then
+
+```bash
+cargo xtask bench-history-site target/bench-history/runs /tmp/bench-site
+python3 -m http.server -d /tmp/bench-site 8000
+# browse http://localhost:8000/
+```
+
 ## perf hardware counters require `perf_event_paranoid` ≤ 1
 
 `cargo xtask profile` and `profile-flamegraph` invoke `perf record`. On most

@@ -86,6 +86,7 @@ fn run() -> Result<()> {
         "bench-report" => bench_report(&rest),
         "bench-log" => record_bench_history(None),
         "bench-history" => bench_history(&rest),
+        "bench-history-site" => bench_history_site(&rest),
         "bench-iai" => bench_iai(&rest),
         "calibrate-magic-bpe" => calibrate_magic_bpe(&rest),
         "profile" => profile(&rest),
@@ -1659,6 +1660,469 @@ fn bench_iai(extra: &[OsString]) -> Result<()> {
     ]);
     args.extend(extra.iter().cloned());
     run_command_with_env("cargo", args, Vec::new())
+}
+
+// ---- bench-history-site (audit-R10 T3.5) -------------------------------
+//
+// Render the full bench-history JSONL archive into a static gh-pages
+// site (index.html + per-group timeline pages). Reads every `*.jsonl`
+// from the input runs directory, aggregates by (group, kernel) with the
+// median throughput per run, and writes inline-SVG sparklines + per-group
+// timelines.
+//
+// Used by `.github/workflows/bench-history.yml` to publish to
+// `mjbommar.github.io/tokenfs-algos/`. The runs directory IS the
+// historical archive — gh-pages branch holds both the data and the
+// rendered site in `data/runs/<unix-ts>-<short-sha>[-dirty].jsonl`.
+
+struct HistoryRunFile {
+    timestamp_unix: u64,
+    git_commit: String,
+    dirty: bool,
+    records: Vec<BenchReportRecord>,
+}
+
+struct HistoryPoint {
+    timestamp_unix: u64,
+    git_commit: String,
+    dirty: bool,
+    gib_per_s: f64,
+    sample_count: usize,
+}
+
+fn bench_history_site(args: &[OsString]) -> Result<()> {
+    if args.len() != 2 {
+        return Err("usage: cargo xtask bench-history-site <runs_dir> <output_dir>".into());
+    }
+    let runs_dir = PathBuf::from(&args[0]);
+    let output_dir = PathBuf::from(&args[1]);
+
+    let runs = read_history_runs(&runs_dir)?;
+    if runs.is_empty() {
+        return Err(format!("no JSONL runs found in `{}`", runs_dir.display()));
+    }
+
+    fs::create_dir_all(output_dir.join("groups")).map_err(|error| {
+        format!(
+            "failed to create `{}`: {error}",
+            output_dir.join("groups").display()
+        )
+    })?;
+    let nojekyll = output_dir.join(".nojekyll");
+    fs::write(&nojekyll, b"").map_err(write_error(&nojekyll))?;
+    let css_path = output_dir.join("style.css");
+    write_history_site_css(&css_path)?;
+
+    let aggregated = aggregate_history(&runs);
+    let total_runs = runs.len();
+    let latest_run = runs.last().expect("non-empty");
+    let latest_ts = latest_run.timestamp_unix;
+    let latest_sha = latest_run.git_commit.clone();
+
+    let index_path = output_dir.join("index.html");
+    write_history_index(&index_path, &aggregated, total_runs, latest_ts, &latest_sha)?;
+
+    for (group, kernels) in &aggregated {
+        let safe = sanitize_group_name(group);
+        let group_path = output_dir.join("groups").join(format!("{safe}.html"));
+        write_history_group_page(&group_path, group, kernels, total_runs)?;
+    }
+
+    eprintln!(
+        "xtask: wrote bench-history site to `{}` ({} runs, {} groups)",
+        output_dir.display(),
+        total_runs,
+        aggregated.len()
+    );
+    Ok(())
+}
+
+fn read_history_runs(runs_dir: &Path) -> Result<Vec<HistoryRunFile>> {
+    let entries = fs::read_dir(runs_dir)
+        .map_err(|error| format!("failed to read `{}`: {error}", runs_dir.display()))?;
+    let mut runs = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!("failed to read entry in `{}`: {error}", runs_dir.display())
+        })?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let file_stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| format!("non-utf8 path: `{}`", path.display()))?;
+        let (timestamp_unix, git_commit, dirty) =
+            parse_history_filename(file_stem).ok_or_else(|| {
+                format!("filename `{file_stem}.jsonl` does not match `<unix-ts>-<sha>[-dirty]`")
+            })?;
+        let records = read_bench_report_records(&path)?;
+        if records.is_empty() {
+            continue;
+        }
+        runs.push(HistoryRunFile {
+            timestamp_unix,
+            git_commit,
+            dirty,
+            records,
+        });
+    }
+    runs.sort_by_key(|run| run.timestamp_unix);
+    Ok(runs)
+}
+
+fn parse_history_filename(stem: &str) -> Option<(u64, String, bool)> {
+    let mut parts = stem.splitn(3, '-');
+    let ts_str = parts.next()?;
+    let timestamp = ts_str.parse::<u64>().ok()?;
+    let sha = parts.next()?.to_string();
+    let dirty = parts.next() == Some("dirty");
+    Some((timestamp, sha, dirty))
+}
+
+fn aggregate_history(
+    runs: &[HistoryRunFile],
+) -> BTreeMap<String, BTreeMap<String, Vec<HistoryPoint>>> {
+    let mut agg: BTreeMap<String, BTreeMap<String, Vec<HistoryPoint>>> = BTreeMap::new();
+    for run in runs {
+        let mut bucket: BTreeMap<(String, String), Vec<f64>> = BTreeMap::new();
+        for record in &run.records {
+            if record.group.is_empty() || record.kernel.is_empty() {
+                continue;
+            }
+            bucket
+                .entry((record.group.clone(), record.kernel.clone()))
+                .or_default()
+                .push(record.gib_per_s);
+        }
+        for ((group, kernel), throughputs) in bucket {
+            let median = median_f64(&throughputs);
+            agg.entry(group)
+                .or_default()
+                .entry(kernel)
+                .or_default()
+                .push(HistoryPoint {
+                    timestamp_unix: run.timestamp_unix,
+                    git_commit: run.git_commit.clone(),
+                    dirty: run.dirty,
+                    gib_per_s: median,
+                    sample_count: throughputs.len(),
+                });
+        }
+    }
+    for kernels in agg.values_mut() {
+        for points in kernels.values_mut() {
+            points.sort_by_key(|point| point.timestamp_unix);
+        }
+    }
+    agg
+}
+
+fn median_f64(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    let mid = sorted.len() / 2;
+    if sorted.len().is_multiple_of(2) {
+        (sorted[mid - 1] + sorted[mid]) / 2.0
+    } else {
+        sorted[mid]
+    }
+}
+
+fn sanitize_group_name(group: &str) -> String {
+    group
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn write_history_site_css(path: &Path) -> Result<()> {
+    let css = "\
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; \
+margin: 2rem auto; max-width: 1100px; padding: 0 1rem; color: #222; line-height: 1.5; }\n\
+h1 { border-bottom: 2px solid #333; padding-bottom: 0.4rem; }\n\
+h2 { margin-top: 2.5rem; }\n\
+table { border-collapse: collapse; width: 100%; margin: 1rem 0; }\n\
+th, td { border-bottom: 1px solid #e0e0e0; padding: 0.45rem 0.6rem; text-align: left; }\n\
+th { background: #f7f7f7; font-weight: 600; }\n\
+tr:hover td { background: #fafafa; }\n\
+td.numeric { text-align: right; font-variant-numeric: tabular-nums; }\n\
+td.spark { width: 220px; padding: 0; }\n\
+td.spark svg { display: block; }\n\
+.kernel-name { font-family: ui-monospace, 'SF Mono', Menlo, monospace; font-size: 0.92em; }\n\
+.meta { color: #666; font-size: 0.9em; }\n\
+.timeline { margin: 1.5rem 0 2.5rem; padding: 1rem; background: #fafafa; border: 1px solid #e0e0e0; }\n\
+.timeline h3 { margin: 0 0 0.5rem; font-family: ui-monospace, monospace; font-size: 1rem; }\n\
+.timeline svg { display: block; max-width: 100%; }\n\
+a { color: #2f7ed8; text-decoration: none; }\n\
+a:hover { text-decoration: underline; }\n\
+nav { margin: 1rem 0; }\n\
+.dirty { color: #c0392b; }\n\
+footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #e0e0e0; color: #888; font-size: 0.85em; }\n";
+    fs::write(path, css).map_err(write_error(path))
+}
+
+fn write_history_index(
+    path: &Path,
+    aggregated: &BTreeMap<String, BTreeMap<String, Vec<HistoryPoint>>>,
+    total_runs: usize,
+    latest_ts: u64,
+    latest_sha: &str,
+) -> Result<()> {
+    let mut buf = String::new();
+    buf.push_str("<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\n");
+    buf.push_str("<title>tokenfs-algos bench history</title>\n");
+    buf.push_str("<link rel=\"stylesheet\" href=\"style.css\">\n");
+    buf.push_str("</head><body>\n");
+    buf.push_str("<h1>tokenfs-algos bench history</h1>\n");
+    buf.push_str(&format!(
+        "<p class=\"meta\">{} runs archived &middot; latest: {} (commit <code>{}</code>)</p>\n",
+        total_runs,
+        format_unix_timestamp(latest_ts),
+        html_escape(latest_sha)
+    ));
+    buf.push_str("<p class=\"meta\">Each row plots median GiB/s for a (benchmark group, kernel) pair across all archived runs. Sparkline x-axis is run index, not wall time. Hover for per-point detail.</p>\n");
+
+    for (group, kernels) in aggregated {
+        let safe = sanitize_group_name(group);
+        buf.push_str(&format!(
+            "<h2><a href=\"groups/{safe}.html\">{}</a></h2>\n",
+            html_escape(group)
+        ));
+        buf.push_str("<table>\n<thead><tr><th>kernel</th><th class=\"numeric\">latest GiB/s</th><th class=\"numeric\">runs</th><th class=\"spark\">trend</th></tr></thead>\n<tbody>\n");
+        for (kernel, points) in kernels {
+            let latest = points.last().map(|p| p.gib_per_s).unwrap_or(0.0);
+            let spark = render_sparkline_svg(points, 200, 36);
+            buf.push_str(&format!(
+                "<tr><td class=\"kernel-name\">{}</td><td class=\"numeric\">{:.3}</td><td class=\"numeric\">{}</td><td class=\"spark\">{}</td></tr>\n",
+                html_escape(kernel),
+                latest,
+                points.len(),
+                spark
+            ));
+        }
+        buf.push_str("</tbody></table>\n");
+    }
+
+    buf.push_str("<footer>\n");
+    buf.push_str("Generated by <code>cargo xtask bench-history-site</code> &middot; ");
+    buf.push_str(
+        "source: <a href=\"https://github.com/mjbommar/tokenfs-algos\">tokenfs-algos</a>\n",
+    );
+    buf.push_str("</footer>\n</body></html>\n");
+
+    fs::write(path, buf).map_err(write_error(path))
+}
+
+fn write_history_group_page(
+    path: &Path,
+    group: &str,
+    kernels: &BTreeMap<String, Vec<HistoryPoint>>,
+    total_runs: usize,
+) -> Result<()> {
+    let mut buf = String::new();
+    buf.push_str("<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\n");
+    buf.push_str(&format!(
+        "<title>{} &middot; tokenfs-algos bench history</title>\n",
+        html_escape(group)
+    ));
+    buf.push_str("<link rel=\"stylesheet\" href=\"../style.css\">\n");
+    buf.push_str("</head><body>\n");
+    buf.push_str("<nav><a href=\"../index.html\">&larr; index</a></nav>\n");
+    buf.push_str(&format!("<h1>{}</h1>\n", html_escape(group)));
+    buf.push_str(&format!(
+        "<p class=\"meta\">{} kernels &middot; {} archived runs total</p>\n",
+        kernels.len(),
+        total_runs
+    ));
+
+    for (kernel, points) in kernels {
+        buf.push_str("<section class=\"timeline\">\n");
+        buf.push_str(&format!("<h3>{}</h3>\n", html_escape(kernel)));
+        buf.push_str(&render_timeline_svg(points, 900, 220));
+        buf.push_str("</section>\n");
+    }
+
+    buf.push_str("</body></html>\n");
+    fs::write(path, buf).map_err(write_error(path))
+}
+
+fn render_sparkline_svg(points: &[HistoryPoint], width: u32, height: u32) -> String {
+    if points.is_empty() {
+        return String::new();
+    }
+    let max = points.iter().map(|p| p.gib_per_s).fold(0.0_f64, f64::max);
+    let min = points
+        .iter()
+        .map(|p| p.gib_per_s)
+        .fold(f64::INFINITY, f64::min);
+    let span = (max - min).max(1e-9);
+    let pad = 2.0_f64;
+    let plot_w = (width as f64) - 2.0 * pad;
+    let plot_h = (height as f64) - 2.0 * pad;
+    let denom = (points.len() - 1).max(1) as f64;
+
+    let mut path_data = String::new();
+    for (i, point) in points.iter().enumerate() {
+        let x = pad + (i as f64 / denom) * plot_w;
+        let y = pad + plot_h - ((point.gib_per_s - min) / span) * plot_h;
+        if i == 0 {
+            path_data.push_str(&format!("M {x:.1} {y:.1}"));
+        } else {
+            path_data.push_str(&format!(" L {x:.1} {y:.1}"));
+        }
+    }
+
+    let last = points.last().expect("non-empty: checked at top of fn");
+    let last_x = pad + plot_w;
+    let last_y = pad + plot_h - ((last.gib_per_s - min) / span) * plot_h;
+
+    format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\" viewBox=\"0 0 {width} {height}\">\
+<path d=\"{path_data}\" stroke=\"#2f7ed8\" stroke-width=\"1.4\" fill=\"none\"/>\
+<circle cx=\"{last_x:.1}\" cy=\"{last_y:.1}\" r=\"2.4\" fill=\"#2f7ed8\"><title>{:.3} GiB/s</title></circle>\
+</svg>",
+        last.gib_per_s
+    )
+}
+
+fn render_timeline_svg(points: &[HistoryPoint], width: u32, height: u32) -> String {
+    if points.is_empty() {
+        return String::new();
+    }
+    let max = points.iter().map(|p| p.gib_per_s).fold(0.0_f64, f64::max);
+    let min = 0.0_f64;
+    let span = (max - min).max(1e-9);
+    let margin_left = 64.0_f64;
+    let margin_bottom = 32.0_f64;
+    let margin_top = 12.0_f64;
+    let margin_right = 12.0_f64;
+    let plot_w = (width as f64) - margin_left - margin_right;
+    let plot_h = (height as f64) - margin_top - margin_bottom;
+
+    let denom = (points.len() - 1).max(1) as f64;
+
+    let mut svg = String::new();
+    svg.push_str(&format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\" viewBox=\"0 0 {width} {height}\">"
+    ));
+    svg.push_str("<rect width=\"100%\" height=\"100%\" fill=\"#ffffff\"/>");
+
+    let baseline_y = margin_top + plot_h;
+    svg.push_str(&format!(
+        "<line x1=\"{margin_left}\" y1=\"{baseline_y}\" x2=\"{}\" y2=\"{baseline_y}\" stroke=\"#888\"/>",
+        margin_left + plot_w
+    ));
+    svg.push_str(&format!(
+        "<line x1=\"{margin_left}\" y1=\"{margin_top}\" x2=\"{margin_left}\" y2=\"{baseline_y}\" stroke=\"#888\"/>"
+    ));
+
+    let mut path_data = String::new();
+    for (i, point) in points.iter().enumerate() {
+        let x = margin_left + (i as f64 / denom) * plot_w;
+        let y = margin_top + plot_h - ((point.gib_per_s - min) / span) * plot_h;
+        if i == 0 {
+            path_data.push_str(&format!("M {x:.1} {y:.1}"));
+        } else {
+            path_data.push_str(&format!(" L {x:.1} {y:.1}"));
+        }
+    }
+    svg.push_str(&format!(
+        "<path d=\"{path_data}\" stroke=\"#2f7ed8\" stroke-width=\"1.6\" fill=\"none\"/>"
+    ));
+
+    for (i, point) in points.iter().enumerate() {
+        let x = margin_left + (i as f64 / denom) * plot_w;
+        let y = margin_top + plot_h - ((point.gib_per_s - min) / span) * plot_h;
+        let dirty_marker = if point.dirty { " (dirty)" } else { "" };
+        let color = if point.dirty { "#c0392b" } else { "#2f7ed8" };
+        svg.push_str(&format!(
+            "<circle cx=\"{x:.1}\" cy=\"{y:.1}\" r=\"2.4\" fill=\"{color}\"><title>{} &mdash; commit {}{} &mdash; {:.3} GiB/s ({} samples)</title></circle>",
+            format_unix_timestamp(point.timestamp_unix),
+            html_escape(&point.git_commit),
+            dirty_marker,
+            point.gib_per_s,
+            point.sample_count,
+        ));
+    }
+
+    svg.push_str(&format!(
+        "<text x=\"{}\" y=\"{}\" text-anchor=\"end\" font-family=\"sans-serif\" font-size=\"11\">{:.2} GiB/s</text>",
+        margin_left - 6.0,
+        margin_top + 4.0,
+        max
+    ));
+    svg.push_str(&format!(
+        "<text x=\"{}\" y=\"{}\" text-anchor=\"end\" font-family=\"sans-serif\" font-size=\"11\">0</text>",
+        margin_left - 6.0,
+        baseline_y + 4.0
+    ));
+
+    let first_ts = points
+        .first()
+        .expect("non-empty: checked at top of fn")
+        .timestamp_unix;
+    let last_ts = points
+        .last()
+        .expect("non-empty: checked at top of fn")
+        .timestamp_unix;
+    svg.push_str(&format!(
+        "<text x=\"{margin_left}\" y=\"{}\" font-family=\"sans-serif\" font-size=\"11\">{}</text>",
+        baseline_y + 18.0,
+        format_unix_date(first_ts)
+    ));
+    svg.push_str(&format!(
+        "<text x=\"{}\" y=\"{}\" text-anchor=\"end\" font-family=\"sans-serif\" font-size=\"11\">{}</text>",
+        margin_left + plot_w,
+        baseline_y + 18.0,
+        format_unix_date(last_ts)
+    ));
+
+    svg.push_str("</svg>");
+    svg
+}
+
+fn format_unix_timestamp(unix: u64) -> String {
+    // ISO-8601 UTC, no chrono dep. Standard library only.
+    let secs = unix;
+    let (y, m, d, hh, mm, ss) = unix_to_ymd_hms(secs);
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
+}
+
+fn format_unix_date(unix: u64) -> String {
+    let (y, m, d, _, _, _) = unix_to_ymd_hms(unix);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+fn unix_to_ymd_hms(unix: u64) -> (u32, u32, u32, u32, u32, u32) {
+    // Civil-from-days algorithm (Howard Hinnant, public domain).
+    let days = (unix / 86_400) as i64;
+    let secs_of_day = unix % 86_400;
+    let hh = (secs_of_day / 3_600) as u32;
+    let mm = ((secs_of_day % 3_600) / 60) as u32;
+    let ss = (secs_of_day % 60) as u32;
+
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let y = (if m <= 2 { y + 1 } else { y }) as u32;
+    (y, m, d, hh, mm, ss)
 }
 
 fn profile(extra: &[OsString]) -> Result<()> {
@@ -5707,6 +6171,9 @@ fn help() {
                     log the current target/criterion results to benchmark history\n\
            bench-history [--label <label>]\n\
                     snapshot target/criterion estimates.json/sample.json into benches/_history/<label>/\n\
+           bench-history-site <runs_dir> <output_dir>\n\
+                    render gh-pages static site (index + per-group timelines)\n\
+                    from a directory of <unix-ts>-<sha>[-dirty].jsonl runs\n\
            bench-iai\n\
                     deterministic hardware-counter benches via iai-callgrind\n\
                     (requires valgrind; ~1%-sensitive instruction-count regression target)\n\
