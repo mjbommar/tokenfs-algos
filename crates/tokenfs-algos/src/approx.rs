@@ -2637,7 +2637,9 @@ mod tests {
         let mut bf_try = BloomFilter::new(2048, 7);
         let mut bf_ref = BloomFilter::new(2048, 7);
         for key in 0_u64..64 {
-            bf_try.try_insert_simd(key).expect("k=7 ≤ MAX_K, must succeed");
+            bf_try
+                .try_insert_simd(key)
+                .expect("k=7 ≤ MAX_K, must succeed");
             bf_ref.insert_simd(key);
         }
         // Identical bit-vector state.
