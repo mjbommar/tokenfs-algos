@@ -69,8 +69,22 @@ pub trait SplitPolicy {
     /// Returns the offset in `bytes` at which to split, or `None` to
     /// stop recursing and treat `bytes` as a leaf.
     ///
+    /// # Contract
+    ///
     /// The returned offset must satisfy `0 < offset < bytes.len()` for
-    /// the recursion to make progress.
+    /// the recursion to make progress. Implementations that violate this
+    /// contract — including returning `Some(0)`, `Some(bytes.len())`, or
+    /// `Some(n)` with `n > bytes.len()` — will be **silently treated as
+    /// a leaf** (i.e., the same as returning `None`). This guarantees the
+    /// recursive driver cannot infinite-loop or panic on a hostile or
+    /// buggy `SplitPolicy` implementation supplied by a caller.
+    ///
+    /// This silent-leaf policy is intentional: the driver returns
+    /// `F::Acc` (not `Result`), so there is no error channel to surface
+    /// the violation through. Kernel/FUSE callers that need to enforce
+    /// the contract strictly should validate inside their own
+    /// `SplitPolicy::split_at` and only return values the driver will
+    /// honor (or return `None` to stop early).
     fn split_at(&self, bytes: &[u8]) -> Option<usize>;
 }
 
@@ -132,6 +146,16 @@ where
     match policy.split_at(slice) {
         None => op.leaf(slice),
         Some(offset) => {
+            // Validate the caller-supplied offset before slicing/recursing.
+            // A `SplitPolicy` that returns `Some(0)` or `Some(slice.len())`
+            // would make the recursion never progress (one child is empty
+            // and the other equals the parent), and `Some(n)` with
+            // `n > slice.len()` would panic on the slice. Treat any
+            // contract violation as a terminal leaf — see
+            // `SplitPolicy::split_at` rustdoc for the silent-leaf policy.
+            if offset == 0 || offset >= slice.len() {
+                return op.leaf(slice);
+            }
             let mid = range.start + offset;
             let left = walk(bytes, op, policy, range.start..mid);
             let right = walk(bytes, op, policy, mid..range.end);
@@ -169,6 +193,14 @@ where
     match policy.split_at(slice) {
         None => op.leaf(slice),
         Some(offset) => {
+            // Mirror the sequential `walk` validation: silent-leaf on any
+            // SplitPolicy contract violation (offset == 0 or >= slice.len()).
+            // Required to keep `rayon::join` from splitting into an empty
+            // child + a recursive same-size child (infinite loop) or
+            // panicking on slice bounds.
+            if offset == 0 || offset >= slice.len() {
+                return op.leaf(slice);
+            }
             let mid = range.start + offset;
             let (left, right) = rayon::join(
                 || walk_par(bytes, op, policy, range.start..mid),
@@ -346,5 +378,82 @@ mod tests {
         let seq = recursive_split_fold(&bytes, &HistogramFold, &policy);
         let par = recursive_split_fold_par(&bytes, &HistogramFold, &policy);
         assert_eq!(seq, par);
+    }
+
+    /// `SplitPolicy` shim that always returns the same caller-supplied
+    /// offset — used to exercise the silent-leaf guard in the recursive
+    /// driver against `Some(0)`, `Some(len)`, and `Some(>len)` contract
+    /// violations. Stateless so it satisfies `Sync` for `walk_par`.
+    ///
+    /// For an invalid offset the guard converts the very first recursion
+    /// attempt into a leaf, so `split_at` is invoked at most once per call
+    /// regardless of the configured offset.
+    struct FixedOffsetSplit {
+        offset: usize,
+    }
+
+    impl FixedOffsetSplit {
+        fn new(offset: usize) -> Self {
+            Self { offset }
+        }
+    }
+
+    impl SplitPolicy for FixedOffsetSplit {
+        fn split_at(&self, _bytes: &[u8]) -> Option<usize> {
+            Some(self.offset)
+        }
+    }
+
+    #[test]
+    fn split_policy_some_zero_is_treated_as_leaf() {
+        // SplitPolicy returns `Some(0)`, which would cause infinite recursion
+        // (left child empty, right child equals parent) absent the guard.
+        // Expect: a single leaf — no recursion, no panic, no infinite loop.
+        let bytes = vec![0_u8; 1024];
+        let policy = FixedOffsetSplit::new(0);
+        let count = recursive_split_fold(&bytes, &LeafCountFold, &policy);
+        assert_eq!(count, 1, "Some(0) must be treated as a leaf");
+    }
+
+    #[test]
+    fn split_policy_some_len_is_treated_as_leaf() {
+        // SplitPolicy returns `Some(bytes.len())` — left child equals parent,
+        // right child empty. Same-size recursion would loop forever.
+        let bytes = vec![0_u8; 1024];
+        let policy = FixedOffsetSplit::new(bytes.len());
+        let count = recursive_split_fold(&bytes, &LeafCountFold, &policy);
+        assert_eq!(count, 1, "Some(len) must be treated as a leaf");
+    }
+
+    #[test]
+    fn split_policy_some_greater_than_len_does_not_panic() {
+        // SplitPolicy returns `Some(bytes.len() + 1)` — would panic on the
+        // out-of-bounds slice in the parent recursion absent the guard.
+        let bytes = vec![0_u8; 1024];
+        let policy = FixedOffsetSplit::new(bytes.len() + 1);
+        let count = recursive_split_fold(&bytes, &LeafCountFold, &policy);
+        assert_eq!(
+            count, 1,
+            "Some(len + 1) must be treated as a leaf, not panic"
+        );
+    }
+
+    #[test]
+    fn split_policy_some_far_greater_than_len_does_not_panic() {
+        // Stress: pathological hostile offset (`usize::MAX`).
+        let bytes = vec![0_u8; 256];
+        let policy = FixedOffsetSplit::new(usize::MAX);
+        let count = recursive_split_fold(&bytes, &LeafCountFold, &policy);
+        assert_eq!(count, 1, "usize::MAX offset must be treated as a leaf");
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_split_policy_some_zero_is_treated_as_leaf() {
+        // Mirror of the sequential guard test for `walk_par`.
+        let bytes = vec![0_u8; 1024];
+        let policy = FixedOffsetSplit::new(0);
+        let count = recursive_split_fold_par(&bytes, &LeafCountFold, &policy);
+        assert_eq!(count, 1);
     }
 }
