@@ -344,7 +344,10 @@ fn bandwidth(graph: &CsrGraph<'_>, perm: &Permutation) -> u32 {
     let p = perm.as_slice();
     let mut bw = 0_u32;
     for v in 0..graph.n {
-        for &u in graph.neighbors_of(v) {
+        for &u in graph
+            .try_neighbors_of(v)
+            .expect("neighbors_of: in-range vertex")
+        {
             if u == v {
                 continue;
             }
@@ -513,7 +516,7 @@ fn main() {
         .map(|i| (i, PAYLOAD_BYTES as u32))
         .collect();
     let t5 = Instant::now();
-    let metadata_out = perm.apply(&metadata_in);
+    let metadata_out = perm.try_apply(&metadata_in).expect("apply: shape match");
     let dt_apply = t5.elapsed();
     println!(
         "[stage 5] apply permutation to metadata                      : {:>8.2} ms",

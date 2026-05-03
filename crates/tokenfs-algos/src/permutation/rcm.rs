@@ -280,7 +280,9 @@ fn bfs_levels(
         let v = queue[head];
         head += 1;
         let lvl = levels[v as usize];
-        let neighbors = graph.neighbors_of(v);
+        let neighbors = graph
+            .try_neighbors_of(v)
+            .expect("neighbors_of: in-range vertex");
         for &u in neighbors {
             // Self-loops and duplicate edges leave `u == v` or `u`
             // already-discovered; both cases short-circuit at the
@@ -342,7 +344,10 @@ fn bfs_record_order(
 
         // Gather not-yet-visited neighbours of `v`.
         frontier_buf.clear();
-        for &u in graph.neighbors_of(v) {
+        for &u in graph
+            .try_neighbors_of(v)
+            .expect("neighbors_of: in-range vertex")
+        {
             if u == v {
                 // Self-loop contributes degree weight but not a new
                 // neighbour to enqueue.
@@ -423,7 +428,10 @@ mod tests {
         let p = perm.as_slice();
         let mut bw = 0_u32;
         for v in 0..graph.n {
-            for &u in graph.neighbors_of(v) {
+            for &u in graph
+                .try_neighbors_of(v)
+                .expect("neighbors_of: in-range vertex")
+            {
                 if u == v {
                     continue;
                 }
@@ -787,8 +795,8 @@ mod tests {
         let perm = rcm(g);
         let inv = perm.inverse();
         let src: Vec<u32> = (0..n).collect();
-        let permuted = perm.apply(&src);
-        let recovered = inv.apply(&permuted);
+        let permuted = perm.try_apply(&src).expect("apply: shape match");
+        let recovered = inv.try_apply(&permuted).expect("apply: shape match");
         assert_eq!(recovered, src);
     }
 

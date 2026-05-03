@@ -310,7 +310,9 @@ pub fn rabbit_order(graph: CsrGraph<'_>) -> Permutation {
     let mut adj: Vec<AdjList> = Vec::with_capacity(n);
     let mut self_loop: Vec<u64> = vec![0_u64; n];
     for v in 0..n {
-        let raw = graph.neighbors_of(v as u32);
+        let raw = graph
+            .try_neighbors_of(v as u32)
+            .expect("neighbors_of: in-range vertex");
         // Validate neighbour IDs eagerly — `neighbors_of` itself
         // doesn't bounds-check the IDs, only the vertex `v`.
         for &u in raw {
@@ -688,7 +690,9 @@ pub fn rabbit_order_par(graph: CsrGraph<'_>) -> Permutation {
     let consolidated: Vec<(AdjList, u64)> = (0..n)
         .into_par_iter()
         .map(|v| {
-            let raw = graph.neighbors_of(v as u32);
+            let raw = graph
+                .try_neighbors_of(v as u32)
+                .expect("neighbors_of: in-range vertex");
             for &u in raw {
                 assert!(
                     (u as usize) < n,
@@ -1750,8 +1754,8 @@ mod tests {
         let perm = rabbit_order(g);
         let inv = perm.inverse();
         let src: Vec<u32> = (0..n).collect();
-        let permuted = perm.apply(&src);
-        let recovered = inv.apply(&permuted);
+        let permuted = perm.try_apply(&src).expect("apply: shape match");
+        let recovered = inv.try_apply(&permuted).expect("apply: shape match");
         assert_eq!(recovered, src);
     }
 

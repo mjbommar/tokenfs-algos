@@ -117,7 +117,7 @@ pub use rcm::{rcm, try_rcm};
 ///
 /// `perm[i]` is always within `0..n`. The constructors enforce this
 /// invariant; mutating accessors are not exposed. Two permutations
-/// compose via `apply`: `b.apply(&a.apply(src))` applies `a` then `b`.
+/// compose via `apply`: `b.try_apply(&a.apply(src).expect("apply: shape match"))` applies `a` then `b`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Permutation(Vec<u32>);
 
@@ -198,7 +198,7 @@ impl Permutation {
     /// Returns the inverse permutation.
     ///
     /// If `p` maps `old_id -> new_id`, then `p.inverse()` maps
-    /// `new_id -> old_id`. `p.apply(p.inverse().apply(src)) == src` and
+    /// `new_id -> old_id`. `p.try_apply(p.inverse().expect("apply: shape match").apply(src)) == src` and
     /// vice versa.
     #[must_use]
     pub fn inverse(&self) -> Self {
@@ -254,6 +254,10 @@ impl Permutation {
     ///     output.
     ///   * Out-of-range indices: panics in debug, undefined-but-bounded
     ///     behaviour in release (the `Vec` bounds-check still triggers).
+    ///
+    /// Available only with `feature = "userspace"` (audit-R10 #1 / #216).
+    /// Kernel/FUSE callers must use [`Self::try_apply`].
+    #[cfg(feature = "userspace")]
     #[must_use]
     pub fn apply<T: Copy>(&self, src: &[T]) -> Vec<T> {
         assert_eq!(
@@ -274,7 +278,8 @@ impl Permutation {
         // no-op for `Copy` types but stays inside the `T: Copy` bound
         // the spec calls out (no `T: Default` requirement).
         let mut dst = vec![src[0]; n];
-        self.apply_into(src, &mut dst);
+        self.try_apply_into(src, &mut dst)
+            .expect("apply_into: shape match");
         dst
     }
 
@@ -310,6 +315,10 @@ impl Permutation {
     ///     `dst`.**
     ///   * Out-of-range indices: panics in debug, undefined-but-bounded
     ///     behaviour in release (the `Vec` bounds-check still triggers).
+    ///
+    /// Available only with `feature = "userspace"` (audit-R10 #1 / #216).
+    /// Kernel/FUSE callers must use [`Self::try_apply_into`].
+    #[cfg(feature = "userspace")]
     pub fn apply_into<T: Copy>(&self, src: &[T], dst: &mut [T]) {
         assert_eq!(
             src.len(),
@@ -445,8 +454,10 @@ impl Permutation {
     /// Panics if `scratch.len()` is below the required word count
     /// (`self.len().div_ceil(64)`). The kernel-safe sibling that
     /// returns an error instead of panicking is
-    /// [`Permutation::try_apply_into_strict`], which also performs
-    /// the apply.
+    /// [`Permutation::try_validate_no_alloc`].
+    ///
+    /// Available only with `feature = "userspace"` (audit-R10 #1 / #216).
+    #[cfg(feature = "userspace")]
     pub fn validate_no_alloc(&self, scratch: &mut [u64]) -> bool {
         let n = self.0.len();
         if n > u32::MAX as usize {
@@ -857,6 +868,9 @@ impl<'a> CsrGraph<'a> {
     /// `offsets.len() < v + 2`, or `offsets[v + 1] > neighbors.len()`).
     /// Kernel/FUSE callers that need a non-panicking variant should
     /// prefer [`CsrGraph::try_neighbors_of`].
+    ///
+    /// Available only with `feature = "userspace"` (audit-R10 #1 / #216).
+    #[cfg(feature = "userspace")]
     #[must_use]
     pub fn neighbors_of(&self, v: u32) -> &'a [u32] {
         assert!(v < self.n, "vertex {v} out of range [0, {})", self.n);
@@ -873,6 +887,9 @@ impl<'a> CsrGraph<'a> {
     /// Panics under the same conditions as [`Self::neighbors_of`].
     /// Kernel/FUSE callers that need a non-panicking variant should
     /// prefer [`CsrGraph::try_degree_of`].
+    ///
+    /// Available only with `feature = "userspace"` (audit-R10 #1 / #216).
+    #[cfg(feature = "userspace")]
     #[must_use]
     pub fn degree(&self, v: u32) -> u32 {
         assert!(v < self.n, "vertex {v} out of range [0, {})", self.n);
@@ -1246,7 +1263,7 @@ mod tests {
             }
             // Identity applied to any source returns the source unchanged.
             let src: Vec<u32> = (0..n as u32).collect();
-            let dst = perm.apply(&src);
+            let dst = perm.try_apply(&src).expect("apply: shape match");
             assert_eq!(dst, src);
         }
     }
@@ -1256,12 +1273,12 @@ mod tests {
         // Hand-built permutation: 0->2, 1->0, 2->3, 3->1.
         let perm = Permutation::try_from_vec(vec![2, 0, 3, 1]).expect("valid perm");
         let src: Vec<i32> = vec![10, 20, 30, 40];
-        let permuted = perm.apply(&src);
+        let permuted = perm.try_apply(&src).expect("apply: shape match");
         // src[0]=10 lands at position 2; src[1]=20 at 0; src[2]=30 at 3; src[3]=40 at 1.
         assert_eq!(permuted, vec![20, 40, 10, 30]);
         // Inverse round-trips back to src.
         let inv = perm.inverse();
-        let recovered = inv.apply(&permuted);
+        let recovered = inv.try_apply(&permuted).expect("apply: shape match");
         assert_eq!(recovered, src);
     }
 
@@ -1317,7 +1334,8 @@ mod tests {
         let perm = Permutation::try_from_vec(vec![1, 0, 2]).expect("valid perm");
         let src: Vec<u8> = vec![7, 8, 9];
         let mut dst = [0_u8; 3];
-        perm.apply_into(&src, &mut dst);
+        perm.try_apply_into(&src, &mut dst)
+            .expect("apply_into: shape match");
         assert_eq!(dst, [8, 7, 9]);
     }
 
@@ -1331,11 +1349,15 @@ mod tests {
             offsets: &offsets,
             neighbors: &neighbors,
         };
-        assert_eq!(g.degree(0), 1);
-        assert_eq!(g.degree(1), 2);
-        assert_eq!(g.degree(2), 2);
-        assert_eq!(g.degree(3), 1);
-        assert_eq!(g.neighbors_of(2), &[1_u32, 3]);
+        assert_eq!(g.try_degree_of(0).expect("degree: in-range vertex"), 1);
+        assert_eq!(g.try_degree_of(1).expect("degree: in-range vertex"), 2);
+        assert_eq!(g.try_degree_of(2).expect("degree: in-range vertex"), 2);
+        assert_eq!(g.try_degree_of(3).expect("degree: in-range vertex"), 1);
+        assert_eq!(
+            g.try_neighbors_of(2)
+                .expect("neighbors_of: in-range vertex"),
+            &[1_u32, 3]
+        );
     }
 
     #[test]
@@ -1352,7 +1374,7 @@ mod tests {
             let perm = Permutation::try_identity(n).expect("identity construction within u32::MAX");
             let mut scratch = vec![0_u64; n.div_ceil(64).max(1)];
             assert!(
-                perm.validate_no_alloc(&mut scratch),
+                perm.try_validate_no_alloc(&mut scratch).is_ok(),
                 "identity of length {n} must validate"
             );
         }
@@ -1367,7 +1389,7 @@ mod tests {
             let perm = Permutation::try_from_vec(v).expect("valid");
             let mut scratch = vec![0_u64; n.div_ceil(64).max(1)];
             assert!(
-                perm.validate_no_alloc(&mut scratch),
+                perm.try_validate_no_alloc(&mut scratch).is_ok(),
                 "reverse perm of length {n} must validate"
             );
         }
@@ -1378,7 +1400,7 @@ mod tests {
         // SAFETY: deliberately invalid — used only to exercise the validator.
         let perm = unsafe { Permutation::from_vec_unchecked(vec![0_u32, 1, 1]) };
         let mut scratch = [0_u64; 1];
-        assert!(!perm.validate_no_alloc(&mut scratch));
+        assert!(!perm.try_validate_no_alloc(&mut scratch).is_ok());
     }
 
     #[test]
@@ -1386,7 +1408,7 @@ mod tests {
         // SAFETY: deliberately invalid — used only to exercise the validator.
         let perm = unsafe { Permutation::from_vec_unchecked(vec![0_u32, 1, 5]) };
         let mut scratch = [0_u64; 1];
-        assert!(!perm.validate_no_alloc(&mut scratch));
+        assert!(!perm.try_validate_no_alloc(&mut scratch).is_ok());
     }
 
     #[test]
@@ -1398,7 +1420,7 @@ mod tests {
         // SAFETY: deliberately invalid — used only to exercise the validator.
         let perm = unsafe { Permutation::from_vec_unchecked(v) };
         let mut scratch = [0_u64; 2];
-        assert!(!perm.validate_no_alloc(&mut scratch));
+        assert!(!perm.try_validate_no_alloc(&mut scratch).is_ok());
     }
 
     #[test]
@@ -1406,7 +1428,7 @@ mod tests {
     fn validate_no_alloc_panics_on_undersized_scratch() {
         let perm = Permutation::try_identity(65).expect("identity construction within u32::MAX");
         let mut scratch = [0_u64; 1]; // need 2 words for n=65
-        let _ = perm.validate_no_alloc(&mut scratch);
+        let _ = perm.try_validate_no_alloc(&mut scratch).is_ok();
     }
 
     #[test]
@@ -1424,7 +1446,8 @@ mod tests {
             .expect("valid perm must succeed");
 
         let mut dst_unchecked = vec![0_u32; 70];
-        perm.apply_into(&src, &mut dst_unchecked);
+        perm.try_apply_into(&src, &mut dst_unchecked)
+            .expect("apply_into: shape match");
 
         assert_eq!(dst_strict, dst_unchecked);
     }
@@ -1539,7 +1562,8 @@ mod tests {
         let perm = unsafe { Permutation::from_vec_unchecked(vec![1_u32, 1, 2]) };
         let src = [10_u8, 20, 30];
         let mut dst = [0xAA_u8; 3];
-        perm.apply_into(&src, &mut dst);
+        perm.try_apply_into(&src, &mut dst)
+            .expect("apply_into: shape match");
         // Failure mode: slot 0 retains the sentinel because it was
         // never targeted by any src index. This is the leak the strict
         // variant exists to defend against.
@@ -1604,7 +1628,7 @@ mod tests {
         // shape-correct call.
         let perm = Permutation::try_from_vec(vec![2, 0, 3, 1]).expect("valid");
         let src: Vec<i32> = vec![10, 20, 30, 40];
-        let expected = perm.apply(&src);
+        let expected = perm.try_apply(&src).expect("apply: shape match");
         let actual = perm.try_apply(&src).expect("shape matches");
         assert_eq!(actual, expected);
     }
@@ -1640,7 +1664,8 @@ mod tests {
         let src: Vec<u8> = vec![7, 8, 9];
         let mut dst_panic = [0_u8; 3];
         let mut dst_try = [0_u8; 3];
-        perm.apply_into(&src, &mut dst_panic);
+        perm.try_apply_into(&src, &mut dst_panic)
+            .expect("apply_into: shape match");
         perm.try_apply_into(&src, &mut dst_try)
             .expect("shape matches");
         assert_eq!(dst_try, dst_panic);
@@ -1793,7 +1818,9 @@ mod tests {
             neighbors: &neighbors,
         };
         for v in 0_u32..4 {
-            let panic_path = g.neighbors_of(v);
+            let panic_path = g
+                .try_neighbors_of(v)
+                .expect("neighbors_of: in-range vertex");
             let try_path = g.try_neighbors_of(v).expect("well-formed CSR must succeed");
             assert_eq!(panic_path, try_path);
         }
@@ -1809,7 +1836,7 @@ mod tests {
             neighbors: &neighbors,
         };
         for v in 0_u32..4 {
-            let panic_path = g.degree(v);
+            let panic_path = g.try_degree_of(v).expect("degree: in-range vertex");
             let try_path = g.try_degree_of(v).expect("well-formed CSR must succeed");
             assert_eq!(panic_path, try_path);
         }

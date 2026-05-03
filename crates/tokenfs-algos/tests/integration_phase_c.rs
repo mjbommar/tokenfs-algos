@@ -322,10 +322,13 @@ fn build_pipeline_composition_hash_batches_match_and_rcm_round_trips() {
     //         trip via the inverse. -----
     let metadata_in: Vec<u32> = (0..n as u32).map(|i| i.wrapping_mul(0x9E37_79B9)).collect();
     let mut permuted = vec![0_u32; n];
-    perm.apply_into(&metadata_in, &mut permuted);
+    perm.try_apply_into(&metadata_in, &mut permuted)
+        .expect("apply_into: shape match");
     let inverse = perm.inverse();
     let mut recovered = vec![0_u32; n];
-    inverse.apply_into(&permuted, &mut recovered);
+    inverse
+        .try_apply_into(&permuted, &mut recovered)
+        .expect("apply_into: shape match");
     assert_eq!(
         recovered, metadata_in,
         "permutation inverse round-trip lost data"

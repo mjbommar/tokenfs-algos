@@ -536,9 +536,9 @@ mod tests {
         assert_valid_permutation(&perm, n);
 
         let payload: Vec<u32> = (100..(100 + n as u32)).collect();
-        let permuted = perm.apply(&payload);
+        let permuted = perm.try_apply(&payload).expect("apply: shape match");
         let inv = perm.inverse();
-        let recovered = inv.apply(&permuted);
+        let recovered = inv.try_apply(&permuted).expect("apply: shape match");
         assert_eq!(recovered, payload);
     }
 
@@ -635,9 +635,9 @@ mod tests {
         assert_valid_permutation(&perm, n);
 
         let payload: Vec<i64> = (0..n as i64).map(|i| i * 1000).collect();
-        let permuted = perm.apply(&payload);
+        let permuted = perm.try_apply(&payload).expect("apply: shape match");
         let inv = perm.inverse();
-        let recovered = inv.apply(&permuted);
+        let recovered = inv.try_apply(&permuted).expect("apply: shape match");
         assert_eq!(recovered, payload);
     }
 
