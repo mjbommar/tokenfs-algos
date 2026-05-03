@@ -85,11 +85,13 @@ pub enum ApproxError {
     },
 }
 
-/// Failure modes for the fallible Bloom batched-query API
-/// ([`BloomFilter::try_contains_batch_simd`]).
+/// Failure modes for the fallible Bloom SIMD-keyed query APIs
+/// ([`BloomFilter::try_contains_simd`] and
+/// [`BloomFilter::try_contains_batch_simd`]).
 ///
 /// Returned instead of panicking when caller-supplied buffer lengths
-/// are inconsistent; mirrors the audit-R4 pattern used for
+/// are inconsistent or the filter's `k` exceeds the SIMD position
+/// kernels' fixed buffer size; mirrors the audit-R4 pattern used for
 /// [`crate::hash::set_membership::SetMembershipBatchError`].
 #[cfg(feature = "std")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,6 +103,18 @@ pub enum BloomBatchError {
         /// Caller-supplied `out.len()`.
         out_len: usize,
     },
+    /// `BloomFilter::k()` exceeds the SIMD position kernels' compile-time
+    /// upper bound ([`bloom_kernels::MAX_K`]). The SIMD path slices a
+    /// fixed `[u64; MAX_K]` stack buffer with `[..self.k]`; `k > MAX_K`
+    /// would index out of bounds. Returned by the fallible SIMD-keyed
+    /// query paths instead of panicking.
+    KExceedsSimdMax {
+        /// `BloomFilter::k()` value that exceeds the limit.
+        k: u32,
+        /// SIMD position kernels' compile-time `k` bound
+        /// ([`bloom_kernels::MAX_K`], typically 32).
+        max: u32,
+    },
 }
 
 #[cfg(feature = "std")]
@@ -110,6 +124,10 @@ impl core::fmt::Display for BloomBatchError {
             Self::LengthMismatch { keys_len, out_len } => write!(
                 f,
                 "bloom batch length mismatch: keys.len()={keys_len} but out.len()={out_len}"
+            ),
+            Self::KExceedsSimdMax { k, max } => write!(
+                f,
+                "bloom SIMD path: k={k} exceeds bloom_kernels::MAX_K={max}"
             ),
         }
     }
@@ -676,9 +694,12 @@ mod bloom {
         ///
         /// # Panics
         ///
-        /// Panics if `keys.len() != out.len()`. Use
+        /// Panics if `keys.len() != out.len()`, or if
+        /// `self.k() > super::bloom_kernels::MAX_K` (inherited from
+        /// [`Self::contains_simd`]). Use
         /// [`Self::try_contains_batch_simd`] for a fallible variant
-        /// returning [`super::BloomBatchError`] instead.
+        /// returning [`super::BloomBatchError`] for either condition
+        /// instead of panicking.
         pub fn contains_batch_simd(&self, keys: &[u64], out: &mut [bool]) {
             assert_eq!(
                 keys.len(),
@@ -693,13 +714,28 @@ mod bloom {
         }
 
         /// Fallible variant of [`Self::contains_batch_simd`] that
-        /// returns [`super::BloomBatchError::LengthMismatch`] when
-        /// `keys.len() != out.len()`, instead of panicking.
+        /// returns [`super::BloomBatchError`] instead of panicking.
+        ///
+        /// Returns
+        /// [`super::BloomBatchError::LengthMismatch`] when
+        /// `keys.len() != out.len()`, or
+        /// [`super::BloomBatchError::KExceedsSimdMax`] when
+        /// `self.k() > super::bloom_kernels::MAX_K` — the SIMD
+        /// position kernels slice a fixed `[u64; MAX_K]` stack buffer
+        /// and would panic on out-of-bounds slicing otherwise. The
+        /// `k` check happens first so the buffer-shape error is only
+        /// reported for filters the kernel can actually service.
         pub fn try_contains_batch_simd(
             &self,
             keys: &[u64],
             out: &mut [bool],
         ) -> Result<(), super::BloomBatchError> {
+            if self.k > super::bloom_kernels::MAX_K {
+                return Err(super::BloomBatchError::KExceedsSimdMax {
+                    k: self.k as u32,
+                    max: super::bloom_kernels::MAX_K as u32,
+                });
+            }
             if keys.len() != out.len() {
                 return Err(super::BloomBatchError::LengthMismatch {
                     keys_len: keys.len(),
@@ -2449,6 +2485,83 @@ mod tests {
         // Sane lengths succeed.
         let mut out_ok = vec![false; 3];
         assert!(bf.try_contains_batch_simd(&keys, &mut out_ok).is_ok());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn bloom_simd_try_contains_batch_rejects_k_exceeds_simd_max() {
+        // k > MAX_K (= 32) would slice the fixed [u64; MAX_K] stack
+        // buffer with `[..self.k]` and panic in the inner SIMD path.
+        // The fallible path must surface this as
+        // BloomBatchError::KExceedsSimdMax instead.
+        let bf = BloomFilter::new(4096, bloom_kernels::MAX_K + 1);
+        let keys = vec![0_u64, 1, 2];
+        let mut out = vec![false; 3];
+        let err = bf.try_contains_batch_simd(&keys, &mut out).unwrap_err();
+        assert_eq!(
+            err,
+            BloomBatchError::KExceedsSimdMax {
+                k: (bloom_kernels::MAX_K + 1) as u32,
+                max: bloom_kernels::MAX_K as u32,
+            }
+        );
+        // The check fires before LengthMismatch so callers always
+        // see the more specific error first.
+        let mut wrong_len_out = vec![false; 7];
+        let err = bf
+            .try_contains_batch_simd(&keys, &mut wrong_len_out)
+            .unwrap_err();
+        assert!(matches!(err, BloomBatchError::KExceedsSimdMax { .. }));
+
+        // Even larger k still surfaces a clean error (no panic).
+        let bf64 = BloomFilter::new(4096, 64);
+        let mut out64 = vec![false; 3];
+        let err = bf64.try_contains_batch_simd(&keys, &mut out64).unwrap_err();
+        assert_eq!(
+            err,
+            BloomBatchError::KExceedsSimdMax {
+                k: 64,
+                max: bloom_kernels::MAX_K as u32,
+            }
+        );
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn bloom_simd_try_contains_simd_rejects_k_exceeds_simd_max() {
+        // Single-key fallible variant rejects the same precondition.
+        // Uses ApproxError (consistent with try_insert_simd); the
+        // batch sibling uses BloomBatchError per the established
+        // batch-error convention (audit-R8 #3 merge resolution).
+        let bf = BloomFilter::new(4096, 33);
+        let err = bf.try_contains_simd(0).unwrap_err();
+        assert_eq!(
+            err,
+            ApproxError::KExceedsSimdMax {
+                k: 33,
+                max: bloom_kernels::MAX_K,
+            }
+        );
+        // Sane k succeeds.
+        let bf_ok = BloomFilter::new(4096, 5);
+        assert!(bf_ok.try_contains_simd(0).is_ok());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn bloom_simd_contains_batch_simd_still_panics_on_k_exceeds_simd_max() {
+        // The non-`try_*` sibling keeps its panic contract: callers
+        // that opt into the panicking surface must still see a clear
+        // panic (rather than UB / out-of-bounds memory access). The
+        // panic surfaces from `&mut buf[..self.k]` slice indexing
+        // inside `contains_simd`, which is the standard
+        // "range end index N out of range for slice of length M"
+        // panic.
+        let bf = BloomFilter::new(4096, bloom_kernels::MAX_K + 1);
+        let keys = [0_u64];
+        let mut out = [false; 1];
+        bf.contains_batch_simd(&keys, &mut out);
     }
 
     #[cfg(feature = "std")]
