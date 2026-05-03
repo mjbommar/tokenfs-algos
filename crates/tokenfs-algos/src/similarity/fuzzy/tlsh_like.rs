@@ -21,9 +21,12 @@
 //!    byte is "swap-byte" nibble-swapped per the reference layout.
 //!
 //! Inputs shorter than `MIN_INPUT_BYTES` (50, matching upstream) produce
-//! no digest. The Pearson permutation table is generated deterministically
-//! at startup; it is not the canonical TLSH table (the algorithm doesn't
-//! depend on a particular permutation, only on it being a bijection).
+//! no digest. The Pearson permutation table is built deterministically at
+//! compile time via a const Fisher-Yates shuffle; the same canonical table
+//! is used under `std`, `alloc`, and `no_std` configurations so digests
+//! are stable across the kernel/userspace boundary. It is not the
+//! canonical TLSH table (the algorithm doesn't depend on a particular
+//! permutation, only on it being a bijection).
 //!
 //! # Distance
 //!
@@ -57,46 +60,51 @@ pub const DIGEST_BYTES: usize = HEADER_BYTES + BODY_BYTES;
 const SEEDS: [u8; 6] = [49, 12, 178, 166, 84, 230];
 
 // ---------------------------------------------------------------------------
-// Pearson permutation: a bijective u8 -> u8 lookup table. Initialized once
-// via OnceLock at first use. We use a deterministic Fisher-Yates shuffle
-// seeded with a fixed constant so different builds produce identical digests.
+// Pearson permutation: a bijective u8 -> u8 lookup table. Built at compile
+// time by a deterministic Fisher-Yates shuffle seeded with a fixed constant.
+// A single canonical table is shared across all feature configurations so
+// digests remain stable across the kernel/userspace boundary
+// (audit-R9 #6). The xorshift64* PRNG used here is const-stable, so the
+// table is materialized at compile time with no runtime initializer.
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "std")]
-fn pearson_table() -> &'static [u8; 256] {
-    use std::sync::OnceLock;
-    static TABLE: OnceLock<[u8; 256]> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        let mut state: u64 = 0xC8C2_5E0F_2C5C_3F6D;
-        let mut table = [0_u8; 256];
-        for (i, dst) in table.iter_mut().enumerate() {
-            *dst = i as u8;
+/// Canonical Pearson permutation table.
+///
+/// Produced by a const Fisher-Yates shuffle over an identity permutation,
+/// using xorshift64* seeded with `0xC8C2_5E0F_2C5C_3F6D`. The output is
+/// byte-for-byte identical to the previous `feature = "std"` runtime
+/// initializer, so persisted digests from earlier `std` builds remain
+/// valid; `no_std`/`alloc-only` builds now produce the same digests as
+/// `std` builds (previously they used an identity permutation).
+static PEARSON_TABLE: [u8; 256] = const {
+    let mut state: u64 = 0xC8C2_5E0F_2C5C_3F6D;
+    let mut table = [0_u8; 256];
+    let mut i = 0;
+    while i < 256 {
+        table[i] = i as u8;
+        i += 1;
+    }
+    let mut i = 255;
+    while i >= 1 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let j = (state as usize) % (i + 1);
+        // Manual swap: `slice::swap` is not yet const-stable.
+        let tmp = table[i];
+        table[i] = table[j];
+        table[j] = tmp;
+        if i == 0 {
+            break; // can't decrement past 0 without underflow
         }
-        for i in (1..256).rev() {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            let j = (state as usize) % (i + 1);
-            table.swap(i, j);
-        }
-        table
-    })
-}
+        i -= 1;
+    }
+    table
+};
 
-#[cfg(not(feature = "std"))]
+#[inline]
 fn pearson_table() -> &'static [u8; 256] {
-    // no_std fallback: identity permutation. The TLSH algorithm tolerates
-    // any bijection here; identity is the simplest static table.
-    static IDENTITY: [u8; 256] = {
-        let mut t = [0_u8; 256];
-        let mut i = 0;
-        while i < 256 {
-            t[i] = i as u8;
-            i += 1;
-        }
-        t
-    };
-    &IDENTITY
+    &PEARSON_TABLE
 }
 
 #[inline]
@@ -471,6 +479,54 @@ mod tests {
         let hex = d.to_hex();
         assert_eq!(hex.len(), DIGEST_BYTES * 2);
         assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn pearson_table_is_canonical_across_features() {
+        // The 256 entries should form a permutation: each value in 0..=255
+        // must appear exactly once.
+        let mut seen = [false; 256];
+        for &v in pearson_table().iter() {
+            assert!(!seen[v as usize], "duplicate entry {v}");
+            seen[v as usize] = true;
+        }
+        for (i, &s) in seen.iter().enumerate() {
+            assert!(s, "value {i} missing from pearson table");
+        }
+
+        // Spot-check specific entries to pin the canonical table contents.
+        // These values come from the Fisher-Yates shuffle seeded with
+        // 0xC8C2_5E0F_2C5C_3F6D and match the prior `feature = "std"`
+        // runtime initializer byte-for-byte. If this assertion ever fires,
+        // the digest format has changed and persisted digests will not
+        // verify — bump the digest version, do not "fix" the spot checks.
+        let t = pearson_table();
+        assert_eq!(t[0], 224);
+        assert_eq!(t[1], 123);
+        assert_eq!(t[42], 102);
+        assert_eq!(t[100], 108);
+        assert_eq!(t[200], 143);
+        assert_eq!(t[255], 83);
+    }
+
+    #[test]
+    fn pearson_table_matches_runtime_fisher_yates() {
+        // Cross-check: rebuild the table at runtime using the original
+        // mutable-iterator form and confirm it matches the const-fn output
+        // exactly. Guards against any const-vs-runtime arithmetic drift.
+        let mut state: u64 = 0xC8C2_5E0F_2C5C_3F6D;
+        let mut expected = [0_u8; 256];
+        for (i, dst) in expected.iter_mut().enumerate() {
+            *dst = i as u8;
+        }
+        for i in (1..256).rev() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let j = (state as usize) % (i + 1);
+            expected.swap(i, j);
+        }
+        assert_eq!(pearson_table(), &expected);
     }
 
     #[test]
