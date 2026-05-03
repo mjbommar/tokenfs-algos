@@ -1337,7 +1337,10 @@ mod hll {
         ///
         /// # Panics
         ///
-        /// Panics if precision is outside `4..=16`.
+        /// Panics if precision is outside `4..=16`. Kernel/FUSE
+        /// callers should use [`Self::try_new`] which returns
+        /// [`super::ApproxError::PrecisionOutOfRange`] on the same
+        /// precondition without aborting the caller.
         #[must_use]
         pub fn new(precision: u32) -> Self {
             assert!(
@@ -1353,6 +1356,11 @@ mod hll {
 
         /// Fallible variant of [`Self::new`] returning
         /// [`super::ApproxError`] when `precision` is outside `4..=16`.
+        ///
+        /// Validation is exhaustive: `Ok` is returned iff calling
+        /// [`Self::new`] with the same `precision` would not panic.
+        /// This is the kernel-safe entry point for the audit-R7
+        /// hardening gate.
         pub fn try_new(precision: u32) -> Result<Self, super::ApproxError> {
             if !(4..=16).contains(&precision) {
                 return Err(super::ApproxError::PrecisionOutOfRange {
@@ -1486,6 +1494,9 @@ mod hll {
         /// # Panics
         ///
         /// Panics if `other.precision != self.precision`.
+        /// Kernel/FUSE callers should use [`Self::try_merge`] which
+        /// returns [`HllMergeError::PrecisionMismatch`] on the same
+        /// precondition without aborting the caller.
         pub fn merge(&mut self, other: &Self) {
             assert_eq!(
                 self.precision, other.precision,
@@ -1521,6 +1532,9 @@ mod hll {
         /// # Panics
         ///
         /// Panics if `other.precision != self.precision`.
+        /// Kernel/FUSE callers should use [`Self::try_merge_simd`]
+        /// which returns [`HllMergeError::PrecisionMismatch`] on the
+        /// same precondition without aborting the caller.
         pub fn merge_simd(&mut self, other: &Self) {
             assert_eq!(
                 self.precision, other.precision,
