@@ -150,14 +150,22 @@ where
 /// **WARNING (kernel stack)**: returns the table *by value*. At
 /// `K = 64` that is 128 KiB on the call frame; at `K = 256` it is 512
 /// KiB. Neither is safe on a kernel-adjacent stack (typical 8-16 KiB
-/// budget). Callers in those environments must use
-/// [`build_byte_table_from_seeds_boxed`] (or, for total control over
-/// the storage, [`kernels_gather::build_table_from_seeds_into`]) to
-/// avoid the on-stack copy.
+/// budget). Callers in those environments must use one of the heap-
+/// free siblings:
+///
+/// - [`build_byte_table_from_seeds_into`] — caller-provided
+///   `&mut [[u64; K]; 256]` scratch (zero stack cost beyond the
+///   borrow); use whenever the caller already controls the storage
+///   (mmap, thread-local pool, postgres memory context, kernel
+///   `kmalloc`'d slab);
+/// - [`build_byte_table_from_seeds_boxed`] — convenience wrapper that
+///   `Box::new_uninit()`-allocates the table on the heap; or
+/// - [`kernels_gather::build_table_from_seeds_into`] — the underlying
+///   primitive.
 ///
 /// For `K <= MINHASH_TABLE_BY_VALUE_SAFE_K_MAX` (currently `K = 8`,
 /// 16 KiB table) the by-value form fits inside the documented kernel
-/// stack budget; beyond that, prefer the boxed variant.
+/// stack budget; beyond that, prefer one of the siblings above.
 ///
 /// **Hash family**: the table-based variant is **not** bit-equivalent
 /// to [`classic_from_bytes`], which streams whole inputs through
@@ -171,6 +179,36 @@ pub fn build_byte_table_from_seeds<const K: usize>(
     seeds: &[u64; K],
 ) -> [[u64; K]; kernels_gather::TABLE_ROWS] {
     kernels_gather::build_table_from_seeds(seeds)
+}
+
+/// Heap-free / kernel-safe sibling of [`build_byte_table_from_seeds`]:
+/// writes the per-byte gather table into caller-provided scratch
+/// instead of returning the (potentially large) array by value.
+///
+/// Bit-exact with [`build_byte_table_from_seeds`] for every `K`. The
+/// caller decides where the table lives (heap `Box`, mmap, thread-local
+/// pool, postgres memory context, kernel `kmalloc`'d slab, etc.) so the
+/// kernel-stack hazard documented on [`build_byte_table_from_seeds`]
+/// does not apply. This is the recommended entry point for any caller
+/// at or below the documented kernel stack budget — including
+/// FFI/cgo crossings into shallow goroutines and Postgres backend
+/// extensions called from a deep call chain.
+///
+/// `scratch` is fully overwritten on entry — its prior contents are
+/// discarded — so callers may reuse a single buffer across many calls
+/// without pre-clearing it.
+///
+/// Mirrors the §156 caller-provided-scratch convention (audit-R5 fix
+/// for `crc32_hash4_bins_pipelined`); `kernels_gather` already exposes
+/// the same primitive at [`kernels_gather::build_table_from_seeds_into`]
+/// — this wrapper is the public-facing MinHash entry point that
+/// matches the by-value [`build_byte_table_from_seeds`] naming
+/// convention (audit-R8 #6b).
+pub fn build_byte_table_from_seeds_into<const K: usize>(
+    seeds: &[u64; K],
+    scratch: &mut [[u64; K]; kernels_gather::TABLE_ROWS],
+) {
+    kernels_gather::build_table_from_seeds_into::<K>(seeds, scratch);
 }
 
 /// Heap-allocated companion of [`build_byte_table_from_seeds`].
@@ -260,6 +298,12 @@ pub fn update_bytes_table_8(
 /// Builds a fresh table-based 8-way MinHash signature from a byte
 /// slice and a precomputed gather table. Convenience wrapper over
 /// [`update_bytes_table_8`].
+///
+/// # Stack
+///
+/// Returns `Signature<8>` (~80 bytes) by value; safe at K=8. The
+/// stack-cost concern grows with `K` — for the K-generic siblings see
+/// [`signature_simd`] / [`signature_simd_into`].
 #[must_use]
 pub fn classic_from_bytes_table_8(
     bytes: &[u8],
@@ -268,6 +312,24 @@ pub fn classic_from_bytes_table_8(
     let mut sig = Signature::<8>::new();
     update_bytes_table_8(&mut sig, table, bytes);
     sig
+}
+
+/// Heap-free / kernel-safe sibling of [`classic_from_bytes_table_8`]:
+/// writes the 8-way signature into the caller-provided slot instead of
+/// returning it by value.
+///
+/// Equivalent to `*out = classic_from_bytes_table_8(bytes, table);` but
+/// avoids the (small) by-value `Signature<8>` copy. Provided for
+/// API-symmetry with [`signature_simd_into`]; useful for batch loops
+/// that pre-allocate the output and want every per-byte signature
+/// written in place (audit-R8 #6b).
+pub fn classic_from_bytes_table_8_into(
+    bytes: &[u8],
+    table: &[[u64; 8]; kernels_gather::TABLE_ROWS],
+    out: &mut Signature<8>,
+) {
+    *out = Signature::<8>::new();
+    update_bytes_table_8(out, table, bytes);
 }
 
 /// Updates a `K`-way `Signature` from a byte slice using the runtime-
@@ -310,13 +372,24 @@ pub fn update_bytes_table_kway<const K: usize>(
 /// gather table; pair with [`build_byte_table_from_seeds`] to
 /// pre-build the table from seeds.
 ///
+/// # Stack
+///
+/// Returns `Signature<K>` by value: `K * 8` bytes for the slot array
+/// plus `K` bytes for the populated bitmap. At `K = 256` that is
+/// ~2.25 KiB on the call frame — small relative to the table itself
+/// (`build_byte_table_from_seeds` discusses the table-side hazard) but
+/// non-trivial when accumulated across deep call chains in a
+/// kernel/FUSE context. The heap-free sibling
+/// [`signature_simd_into`] writes the signature into a caller-provided
+/// `&mut Signature<K>` slot instead, eliminating the by-value copy
+/// entirely (audit-R8 #6b).
+///
 /// **Allocation note (kernel stack)**: the table itself is borrowed.
 /// For `K > kernels_gather::MINHASH_TABLE_BY_VALUE_SAFE_K_MAX`
 /// (currently `K > 8`) the table footprint exceeds the kernel stack
-/// budget; build it via [`build_byte_table_from_seeds_boxed`] instead
-/// of [`build_byte_table_from_seeds`] so the table lives on the heap.
-/// `signature_simd` itself allocates only the small `Signature<K>`
-/// (16-byte slot + populated bitmap per slot), independent of `K`.
+/// budget; build it via [`build_byte_table_from_seeds_into`] /
+/// [`build_byte_table_from_seeds_boxed`] instead of
+/// [`build_byte_table_from_seeds`] so the table lives off-stack.
 #[must_use]
 pub fn signature_simd<const K: usize>(
     bytes: &[u8],
@@ -325,6 +398,33 @@ pub fn signature_simd<const K: usize>(
     let mut sig = Signature::<K>::new();
     update_bytes_table_kway::<K>(&mut sig, table, bytes);
     sig
+}
+
+/// Heap-free / kernel-safe sibling of [`signature_simd`]: writes the
+/// `K`-way signature into the caller-provided `out` slot instead of
+/// returning it by value.
+///
+/// Equivalent to `*out = signature_simd::<K>(bytes, table);` but
+/// avoids the by-value `Signature<K>` copy on return — at `K = 256`
+/// that copy is ~2.25 KiB on the call frame, which compounds across
+/// deep kernel/FUSE call chains. Use this entry point in any
+/// kernel-adjacent context, FFI/cgo crossings into shallow goroutines,
+/// or postgres backend extensions called from a deep call chain
+/// (audit-R8 #6b).
+///
+/// `out` is fully overwritten on entry — its prior contents (slots,
+/// populated flags) are reset before the K-min update runs — so callers
+/// may reuse a single signature buffer across many calls without
+/// pre-clearing it.
+///
+/// Bit-exact with [`signature_simd`] for every `K` and every input.
+pub fn signature_simd_into<const K: usize>(
+    bytes: &[u8],
+    table: &[[u64; K]; kernels_gather::TABLE_ROWS],
+    out: &mut Signature<K>,
+) {
+    *out = Signature::<K>::new();
+    update_bytes_table_kway::<K>(out, table, bytes);
 }
 
 /// Batched form of [`signature_simd`]: compute one MinHash signature
@@ -1336,5 +1436,201 @@ mod tests {
         }
         check_k!(128);
         check_k!(256);
+    }
+
+    // ----- _into sibling parity tests (audit-R8 #6b) -----------------------
+
+    /// `signature_simd_into<K>` writes a signature bit-exactly equal to
+    /// the by-value [`signature_simd`] across the K family the bench
+    /// exercises. This guards audit-R8 #6b: the kernel-safe `_into`
+    /// path must not drift in semantics from the legacy by-value form.
+    #[test]
+    fn signature_simd_into_matches_by_value() {
+        macro_rules! check_k {
+            ($k:literal) => {{
+                let seeds: [u64; $k] =
+                    core::array::from_fn(|i| 0xFEED_FACE_u64.wrapping_add(i as u64));
+                let table = build_byte_table_from_seeds_boxed::<$k>(&seeds);
+                let payload = random_bytes(2048);
+
+                let by_value = signature_simd::<$k>(&payload, &table);
+
+                let mut into = Signature::<$k>::new();
+                signature_simd_into::<$k>(&payload, &table, &mut into);
+
+                assert_eq!(into.slots(), by_value.slots(), "K={}", $k);
+                assert_eq!(into.populated, by_value.populated, "K={}", $k);
+            }};
+        }
+        check_k!(8);
+        check_k!(16);
+        check_k!(32);
+        check_k!(64);
+        check_k!(128);
+        check_k!(256);
+    }
+
+    /// Empty input is a no-op for `signature_simd_into`: no slots
+    /// populated, every slot stays `u64::MAX`. Reusing the buffer
+    /// before the call (with stale contents) must still produce an
+    /// empty signature — the `_into` form clears `out` on entry.
+    #[test]
+    fn signature_simd_into_empty_input_resets_buffer() {
+        let seeds: [u64; 16] = core::array::from_fn(|i| (i as u64) * 0xDEAD_BEEF);
+        let table = build_byte_table_from_seeds::<16>(&seeds);
+
+        // Pre-poison the output buffer to verify the `_into` path
+        // actually overwrites it.
+        let mut out = signature_simd::<16>(b"poison", &table);
+        assert!(!out.is_empty());
+
+        signature_simd_into::<16>(b"", &table, &mut out);
+        for slot in out.slots() {
+            assert_eq!(*slot, u64::MAX);
+        }
+        assert!(out.is_empty());
+    }
+
+    /// Reusing a single signature buffer across multiple calls
+    /// produces independent results — the per-call clear inside
+    /// `signature_simd_into` discards prior contents.
+    #[test]
+    fn signature_simd_into_reuses_buffer_across_calls() {
+        let seeds: [u64; 32] = core::array::from_fn(|i| 0xCAFE_F00D_u64.wrapping_add(i as u64));
+        let table = build_byte_table_from_seeds::<32>(&seeds);
+
+        let payload_a = random_bytes(1024);
+        let payload_b = random_bytes(2048);
+
+        let mut buf = Signature::<32>::new();
+
+        signature_simd_into::<32>(&payload_a, &table, &mut buf);
+        let snapshot_a = buf;
+
+        signature_simd_into::<32>(&payload_b, &table, &mut buf);
+        let snapshot_b = buf;
+
+        // The second call should equal a fresh by-value run on payload_b
+        // — independent of payload_a — because `_into` clears `out` on
+        // entry.
+        let independent_b = signature_simd::<32>(&payload_b, &table);
+        assert_eq!(snapshot_b.slots(), independent_b.slots());
+
+        // Snapshots agree on payload_a too.
+        let independent_a = signature_simd::<32>(&payload_a, &table);
+        assert_eq!(snapshot_a.slots(), independent_a.slots());
+    }
+
+    /// `classic_from_bytes_table_8_into` is bit-exact with the
+    /// by-value [`classic_from_bytes_table_8`].
+    #[test]
+    fn classic_from_bytes_table_8_into_matches_by_value() {
+        let seeds = make_test_seeds_8();
+        let table = build_byte_table_from_seeds::<8>(&seeds);
+        let payload = b"the quick brown fox jumps over the lazy dog";
+
+        let by_value = classic_from_bytes_table_8(payload, &table);
+
+        let mut into = Signature::<8>::new();
+        classic_from_bytes_table_8_into(payload, &table, &mut into);
+
+        assert_eq!(into.slots(), by_value.slots());
+        assert_eq!(into.populated, by_value.populated);
+    }
+
+    /// `classic_from_bytes_table_8_into` resets a stale buffer when
+    /// fed an empty input.
+    #[test]
+    fn classic_from_bytes_table_8_into_empty_input_resets_buffer() {
+        let seeds = make_test_seeds_8();
+        let table = build_byte_table_from_seeds::<8>(&seeds);
+
+        let mut out = classic_from_bytes_table_8(b"poison", &table);
+        assert!(!out.is_empty());
+
+        classic_from_bytes_table_8_into(b"", &table, &mut out);
+        for slot in out.slots() {
+            assert_eq!(*slot, u64::MAX);
+        }
+        assert!(out.is_empty());
+    }
+
+    /// `build_byte_table_from_seeds_into<K>` produces a bit-exact
+    /// match with the by-value [`build_byte_table_from_seeds`] across
+    /// every documented `K` width. This is the parity guarantee for
+    /// audit-R8 #6b: the kernel-safe `_into` wrapper must not drift in
+    /// semantics from the legacy by-value form.
+    ///
+    /// At `K >= 16` the test uses heap-allocated buffers so the test
+    /// itself does not reproduce the audit hazard (a 32 KiB-512 KiB
+    /// table on the test stack). Two `_into` calls with the same seeds
+    /// must produce bit-exact results because the kernel is
+    /// deterministic.
+    #[test]
+    fn build_byte_table_from_seeds_into_matches_by_value() {
+        // Stack-safe width (table footprint ≤ 16 KiB): compare the
+        // by-value path directly against the `_into` path.
+        {
+            const K: usize = 8;
+            let seeds: [u64; K] = core::array::from_fn(|i| 0x9E37_79B9_u64.wrapping_add(i as u64));
+            let by_value = build_byte_table_from_seeds::<K>(&seeds);
+            let mut into = [[0_u64; K]; kernels_gather::TABLE_ROWS];
+            build_byte_table_from_seeds_into::<K>(&seeds, &mut into);
+            assert_eq!(by_value, into, "K={K}");
+        }
+
+        // K >= 16: use only heap-allocated buffers so the test does
+        // not put a 32 KiB-512 KiB array on the test stack.
+        macro_rules! check_k_heap {
+            ($k:literal) => {{
+                let seeds: [u64; $k] =
+                    core::array::from_fn(|i| 0x9E37_79B9_u64.wrapping_add(i as u64));
+                // Use the boxed path (already proven heap-free) as the
+                // reference and the `_into` form (writing into a
+                // heap-allocated boxed buffer) as the candidate.
+                let reference = build_byte_table_from_seeds_boxed::<$k>(&seeds);
+
+                use core::mem::MaybeUninit;
+                let mut uninit: Box<
+                    MaybeUninit<[[u64; $k]; kernels_gather::TABLE_ROWS]>,
+                > = Box::new_uninit();
+                // SAFETY: `_into` writes every entry; the boxed
+                // storage is uninitialised but every byte will be
+                // overwritten before `assume_init`.
+                let mut candidate = unsafe {
+                    core::ptr::write_bytes(
+                        uninit.as_mut_ptr().cast::<u64>(),
+                        0,
+                        $k * kernels_gather::TABLE_ROWS,
+                    );
+                    uninit.assume_init()
+                };
+                build_byte_table_from_seeds_into::<$k>(&seeds, &mut candidate);
+
+                assert_eq!(*reference, *candidate, "K={}", $k);
+            }};
+        }
+        check_k_heap!(16);
+        check_k_heap!(32);
+        check_k_heap!(64);
+        check_k_heap!(128);
+        check_k_heap!(256);
+    }
+
+    /// Trivial K=8 input (empty seeds path is structural; here we
+    /// exercise the smallest meaningful K against the smallest input
+    /// shape) — the `_into` overload writes a fully populated table
+    /// without UB.
+    #[test]
+    fn build_byte_table_from_seeds_into_handles_minimal_k8() {
+        let seeds: [u64; 8] = [0; 8]; // all-zero seeds is a valid corner.
+        let mut table = [[0_u64; 8]; kernels_gather::TABLE_ROWS];
+        build_byte_table_from_seeds_into::<8>(&seeds, &mut table);
+        // Spot-check: row 0 with seed 0 is mix_word(0); row 0xFF with
+        // seed 0 is mix_word(0xFF).
+        for k in 0..8 {
+            assert_eq!(table[0][k], crate::hash::mix_word(0));
+            assert_eq!(table[0xFF][k], crate::hash::mix_word(0xFF));
+        }
     }
 }
