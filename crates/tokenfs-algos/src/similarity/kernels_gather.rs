@@ -67,6 +67,8 @@ pub const MINHASH_TABLE_BY_VALUE_SAFE_K_MAX: usize = 8;
 /// occupies `K * 256 * 8` bytes — see the module-level state-footprint
 /// table.
 ///
+/// # Stack
+///
 /// **WARNING (kernel stack)**: returns `[[u64; K]; 256]` *by value*. At
 /// `K = 64` that is 128 KiB; at `K = 256` (the new MinHash-bench width)
 /// it is 512 KiB. Neither is safe to allocate on a kernel stack
@@ -74,7 +76,7 @@ pub const MINHASH_TABLE_BY_VALUE_SAFE_K_MAX: usize = 8;
 /// `docs/v0.2_planning/02b_DEPLOYMENT_MATRIX.md`). Kernel-adjacent
 /// callers and any path that crosses an FFI/cgo boundary with a
 /// constrained stack should call [`build_table_from_seeds_into`]
-/// instead, which takes caller-provided storage.
+/// instead, which takes caller-provided storage (audit-R8 #6c).
 ///
 /// For `K <= MINHASH_TABLE_BY_VALUE_SAFE_K_MAX` (256 * K * 8 bytes
 /// stays at or under the 16 KiB upper bound) the by-value form is

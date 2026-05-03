@@ -979,7 +979,10 @@ mod tests {
         let err = ChunkConfig::try_with_sizes(2048, 1024, 4096).unwrap_err();
         assert!(matches!(
             err,
-            ChunkConfigError::MinExceedsAvg { min: 2048, avg: 1024 }
+            ChunkConfigError::MinExceedsAvg {
+                min: 2048,
+                avg: 1024
+            }
         ));
     }
 
@@ -989,7 +992,10 @@ mod tests {
         let err = ChunkConfig::try_with_sizes(512, 4096, 2048).unwrap_err();
         assert!(matches!(
             err,
-            ChunkConfigError::AvgExceedsMax { avg: 4096, max: 2048 }
+            ChunkConfigError::AvgExceedsMax {
+                avg: 4096,
+                max: 2048
+            }
         ));
     }
 
