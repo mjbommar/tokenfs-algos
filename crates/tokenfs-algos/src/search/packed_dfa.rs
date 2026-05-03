@@ -99,6 +99,82 @@ impl ByteClass {
     }
 }
 
+/// Failure modes for [`PackedDfa::try_new`].
+///
+/// `PackedDfa::new` accepts arbitrary caller-supplied patterns and
+/// allocates proportional to their total bytes; for kernel/FUSE/
+/// Postgres-extension consumers handling untrusted rule sets that is
+/// a DoS surface (`Vec` allocations panic on OOM in std builds, abort
+/// in alloc-only) and a silent-truncation hazard (lengths and IDs
+/// were `as u32` cast). Use [`PackedDfa::try_new`] in those callers
+/// (audit-R10 #2).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PackedDfaError {
+    /// `patterns.len()` exceeds `u32::MAX` so a pattern ID would
+    /// silently truncate at line 163's `pat_idx as u32` cast.
+    TooManyPatterns {
+        /// Caller-supplied number of patterns.
+        actual: usize,
+        /// `u32::MAX as usize` (the ceiling).
+        max: usize,
+    },
+    /// One pattern's byte length exceeds `u32::MAX` so the
+    /// `pattern_lens` entry would silently truncate.
+    PatternTooLong {
+        /// Index of the offending pattern.
+        index: usize,
+        /// Caller-supplied byte length.
+        actual: usize,
+        /// `u32::MAX as usize` (the ceiling).
+        max: usize,
+    },
+    /// The goto trie grew past `u32::MAX` states, which would silently
+    /// truncate the per-row state ID at line 154's `goto.len() as u32`
+    /// cast. This requires pathological pattern fan-in; realistic
+    /// pattern sets stay well below 65 K states.
+    TooManyStates {
+        /// State count seen at the point of overflow detection.
+        actual: usize,
+        /// `u32::MAX as usize`.
+        max: usize,
+    },
+    /// `Vec::try_reserve` failed for one of the up-front allocations
+    /// (goto / match_lists / pattern_lens / transitions). Returned
+    /// instead of letting `Vec::push` abort on OOM.
+    AllocationFailed {
+        /// Symbolic identifier for which allocation failed.
+        what: &'static str,
+        /// Number of elements requested.
+        capacity: usize,
+    },
+}
+
+impl core::fmt::Display for PackedDfaError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::TooManyPatterns { actual, max } => {
+                write!(f, "too many patterns: {actual} > u32::MAX ({max})")
+            }
+            Self::PatternTooLong { index, actual, max } => write!(
+                f,
+                "pattern at index {index} too long: {actual} bytes > u32::MAX ({max})"
+            ),
+            Self::TooManyStates { actual, max } => {
+                write!(f, "DFA state count {actual} exceeds u32::MAX ({max})")
+            }
+            Self::AllocationFailed { what, capacity } => {
+                write!(
+                    f,
+                    "PackedDfa allocation failed: {what} ({capacity} elements)"
+                )
+            }
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for PackedDfaError {}
+
 /// Packed multi-pattern DFA.
 #[derive(Clone, Debug)]
 pub struct PackedDfa {
@@ -128,9 +204,59 @@ impl PackedDfa {
     ///
     /// Empty pattern slices are skipped silently (they would match at
     /// every position and are rarely useful in practice).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `patterns.len() > u32::MAX`, any pattern is longer
+    /// than `u32::MAX` bytes, the goto trie grows past `u32::MAX`
+    /// states, or any internal allocation fails (OOM). Kernel/FUSE/
+    /// Postgres-extension consumers must use [`Self::try_new`] instead
+    /// — see [`PackedDfaError`] for the typed failure cases
+    /// (audit-R10 #2).
+    ///
+    /// Available only with `feature = "userspace"` (audit-R10 #2).
+    #[cfg(feature = "userspace")]
     #[must_use]
-    #[allow(clippy::needless_range_loop)] // 2D indexing on `goto[state][class]`.
     pub fn new(patterns: &[&[u8]]) -> Self {
+        Self::try_new(patterns).expect("PackedDfa::new: try_new returned Err")
+    }
+
+    /// Fallible variant of [`Self::new`].
+    ///
+    /// Validates that pattern count, per-pattern length, and the
+    /// constructed state count all fit in `u32` (the on-the-wire ID
+    /// width); uses `Vec::try_reserve` for the up-front goto trie and
+    /// match-list allocations so OOM surfaces as Err rather than abort.
+    /// This is the recommended constructor for kernel/FUSE/Postgres-
+    /// extension callers handling untrusted rule sets (audit-R10 #2).
+    #[allow(clippy::needless_range_loop)] // 2D indexing on `goto[state][class]`.
+    pub fn try_new(patterns: &[&[u8]]) -> Result<Self, PackedDfaError> {
+        // Validate pattern count fits in u32 (pat_idx is cast to u32 below).
+        if patterns.len() > u32::MAX as usize {
+            return Err(PackedDfaError::TooManyPatterns {
+                actual: patterns.len(),
+                max: u32::MAX as usize,
+            });
+        }
+        // Validate every pattern length fits in u32 (pattern_lens is u32).
+        for (idx, pat) in patterns.iter().enumerate() {
+            if pat.len() > u32::MAX as usize {
+                return Err(PackedDfaError::PatternTooLong {
+                    index: idx,
+                    actual: pat.len(),
+                    max: u32::MAX as usize,
+                });
+            }
+        }
+        Self::try_new_inner(patterns)
+    }
+
+    /// Inner construction shared between `new` and `try_new`. Splitting
+    /// the validation from the construction lets `try_new` keep its
+    /// pre-flight checks short and lets `new` be a thin
+    /// `try_new(...).expect(...)` wrapper.
+    #[allow(clippy::needless_range_loop)]
+    fn try_new_inner(patterns: &[&[u8]]) -> Result<Self, PackedDfaError> {
         let byte_class = ByteClass::from_patterns(patterns);
         let n_classes = byte_class.n_classes();
 
@@ -139,18 +265,39 @@ impl PackedDfa {
         // States are integers; state 0 is the root.
         let mut goto: Vec<Vec<u32>> = vec![vec![u32::MAX; n_classes]];
         let mut match_lists: Vec<Vec<u32>> = vec![Vec::new()];
-        let mut pattern_lens: Vec<u32> = Vec::with_capacity(patterns.len());
+        // try_reserve so OOM on a pathological pattern count surfaces as
+        // Err rather than abort (audit-R10 #2). The pattern_lens vector
+        // is the largest up-front sizing we can predict.
+        let mut pattern_lens: Vec<u32> = Vec::new();
+        pattern_lens
+            .try_reserve(patterns.len())
+            .map_err(|_| PackedDfaError::AllocationFailed {
+                what: "pattern_lens",
+                capacity: patterns.len(),
+            })?;
 
         for (pat_idx, &pat) in patterns.iter().enumerate() {
+            // SAFETY (cast): pat.len() <= u32::MAX validated upfront in try_new.
             pattern_lens.push(pat.len() as u32);
             if pat.is_empty() {
                 continue;
             }
+            // SAFETY (cast): pat_idx < patterns.len() <= u32::MAX validated upfront.
+            let pat_idx_u32 = pat_idx as u32;
             let mut s: u32 = 0;
             for &b in pat {
                 let cls = byte_class.class_of(b) as usize;
                 let next = goto[s as usize][cls];
                 if next == u32::MAX {
+                    // Check that adding one more state stays in u32 range
+                    // before we materialise it (audit-R10 #2: previously
+                    // `goto.len() as u32` silently truncated on >4G states).
+                    if goto.len() >= u32::MAX as usize {
+                        return Err(PackedDfaError::TooManyStates {
+                            actual: goto.len(),
+                            max: u32::MAX as usize,
+                        });
+                    }
                     let new_state = goto.len() as u32;
                     goto.push(vec![u32::MAX; n_classes]);
                     match_lists.push(Vec::new());
@@ -160,7 +307,7 @@ impl PackedDfa {
                     s = next;
                 }
             }
-            match_lists[s as usize].push(pat_idx as u32);
+            match_lists[s as usize].push(pat_idx_u32);
         }
 
         // ---- Phase 2: BFS to compute failure links & compose into a flat DFA ----
@@ -245,7 +392,14 @@ impl PackedDfa {
         }
 
         // Flatten `goto` into a single Vec<u32> in row-major order.
-        let mut transitions: Vec<u32> = Vec::with_capacity(n_states * n_classes);
+        let transition_capacity = n_states.saturating_mul(n_classes);
+        let mut transitions: Vec<u32> = Vec::new();
+        transitions.try_reserve(transition_capacity).map_err(|_| {
+            PackedDfaError::AllocationFailed {
+                what: "transitions",
+                capacity: transition_capacity,
+            }
+        })?;
         for row in &goto {
             transitions.extend_from_slice(row);
         }
@@ -254,13 +408,13 @@ impl PackedDfa {
         // post-verify candidate matches against the haystack window.
         let owned_patterns: Vec<Vec<u8>> = patterns.iter().map(|p| p.to_vec()).collect();
 
-        Self {
+        Ok(Self {
             byte_class,
             transitions,
             match_lists,
             pattern_lens,
             patterns: owned_patterns,
-        }
+        })
     }
 
     /// Number of distinct DFA states (including the root).
@@ -414,7 +568,7 @@ mod tests {
 
     #[test]
     fn one_pattern_matches_simple() {
-        let dfa = PackedDfa::new(&[b"abc"]);
+        let dfa = PackedDfa::try_new(&[b"abc"]).expect("test patterns within bounds");
         assert_eq!(dfa.find(b"xxabcxx"), Some((2, 0)));
         assert_eq!(dfa.find(b""), None);
         assert_eq!(dfa.find(b"abc"), Some((0, 0)));
@@ -422,7 +576,7 @@ mod tests {
 
     #[test]
     fn two_patterns_pick_first_to_end() {
-        let dfa = PackedDfa::new(&[b"ab", b"bc"]);
+        let dfa = PackedDfa::try_new(&[b"ab", b"bc"]).expect("test patterns within bounds");
         // At position 0 'a', position 1 'b' triggers match for "ab".
         assert_eq!(dfa.find(b"abc"), Some((0, 0)));
     }
@@ -430,7 +584,7 @@ mod tests {
     #[test]
     fn five_patterns_overlapping() {
         let pats: &[&[u8]] = &[b"he", b"she", b"his", b"hers", b"shes"];
-        let dfa = PackedDfa::new(pats);
+        let dfa = PackedDfa::try_new(pats).expect("test patterns within bounds");
         // "ushers": 'u', 's', 'h', 'e' triggers "he" then "she".
         let hits: alloc::vec::Vec<_> = dfa.find_iter(b"ushers").collect();
         // Expect at least "he" at offset 2 and "she" at offset 1; the
@@ -445,7 +599,7 @@ mod tests {
         // the byte-class capacity exactly.
         let bytes: alloc::vec::Vec<u8> = (b'a'..b'a' + 32).collect();
         let pats: alloc::vec::Vec<&[u8]> = bytes.iter().map(core::slice::from_ref).collect();
-        let dfa = PackedDfa::new(&pats);
+        let dfa = PackedDfa::try_new(&pats).expect("test patterns within bounds");
         for (i, b) in bytes.iter().enumerate() {
             let hay = [*b];
             assert_eq!(dfa.find(&hay), Some((0, i)), "byte {b}");
@@ -467,7 +621,7 @@ mod tests {
         let bytes: alloc::vec::Vec<u8> = (b'A'..=b'Z').chain(b'0'..=b'6').collect();
         assert_eq!(bytes.len(), 33);
         let pats: alloc::vec::Vec<&[u8]> = bytes.iter().map(core::slice::from_ref).collect();
-        let dfa = PackedDfa::new(&pats);
+        let dfa = PackedDfa::try_new(&pats).expect("test patterns within bounds");
         // Every real pattern still matches.
         for (i, b) in bytes.iter().enumerate() {
             let hay = [*b];
@@ -497,7 +651,7 @@ mod tests {
         // also post-verifies and rejects unrelated bytes.
         let bytes: alloc::vec::Vec<u8> = (b'A'..=b'Z').chain(b'0'..=b'6').collect();
         let pats: alloc::vec::Vec<&[u8]> = bytes.iter().map(core::slice::from_ref).collect();
-        let dfa = PackedDfa::new(&pats);
+        let dfa = PackedDfa::try_new(&pats).expect("test patterns within bounds");
         // Haystack is a string of bytes that are NOT in the pattern set;
         // the pre-fix DFA would report a phantom (offset, 32) for each.
         let hay = b"~~~7777!!!~~~";
@@ -515,7 +669,7 @@ mod tests {
         // offset, not phantom matches at the surrounding bytes.
         let bytes: alloc::vec::Vec<u8> = (b'A'..=b'Z').chain(b'0'..=b'6').collect();
         let pats: alloc::vec::Vec<&[u8]> = bytes.iter().map(core::slice::from_ref).collect();
-        let dfa = PackedDfa::new(&pats);
+        let dfa = PackedDfa::try_new(&pats).expect("test patterns within bounds");
         let hay = b"~~~6~~~";
         let hits: alloc::vec::Vec<_> = dfa.find_iter(hay).collect();
         // '6' is pattern index 32 (26 letters + 0..=5 = 32, then '6' = 33rd).
@@ -524,13 +678,13 @@ mod tests {
 
     #[test]
     fn empty_haystack() {
-        let dfa = PackedDfa::new(&[b"abc"]);
+        let dfa = PackedDfa::try_new(&[b"abc"]).expect("test patterns within bounds");
         assert_eq!(dfa.find(b""), None);
     }
 
     #[test]
     fn find_iter_reports_all() {
-        let dfa = PackedDfa::new(&[b"aa"]);
+        let dfa = PackedDfa::try_new(&[b"aa"]).expect("test patterns within bounds");
         let hits: alloc::vec::Vec<_> = dfa.find_iter(b"aaaa").collect();
         // Overlapping hits: end-positions 2, 3, 4 → starts 0, 1, 2.
         assert_eq!(hits, alloc::vec![(0, 0), (1, 0), (2, 0)]);
@@ -545,7 +699,7 @@ mod tests {
             (&[b"abc", b"abd"], b"xxabcabd"),
         ];
         for &(pats, hay) in cases {
-            let dfa = PackedDfa::new(pats);
+            let dfa = PackedDfa::try_new(pats).expect("test patterns within bounds");
             let dfa_hit = dfa.find(hay);
             let naive_hit = naive_first_match(pats, hay);
             // Both should agree on existence; the exact (offset, idx)

@@ -639,7 +639,12 @@ impl Sniffer {
     #[must_use]
     pub fn new() -> Self {
         let patterns: Vec<&[u8]> = MAGIC_RULES.iter().map(|rule| rule.pattern).collect();
-        let dfa = PackedDfa::new(&patterns);
+        // Use try_new with expect because MAGIC_RULES is a compile-time
+        // constant we control: pattern count and per-pattern length are
+        // bounded and well below the u32 limits try_new validates. The
+        // panicking PackedDfa::new is gated on userspace (audit-R10 #2)
+        // so we route through the always-available fallible primitive.
+        let dfa = PackedDfa::try_new(&patterns).expect("MAGIC_RULES is compile-time bounded");
         let max_anchor = MAGIC_RULES
             .iter()
             .map(|rule| rule.offset + rule.pattern.len())

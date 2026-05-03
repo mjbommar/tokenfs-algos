@@ -316,7 +316,7 @@ pub mod kernels {
         /// Panics if `control_out.len() < ceil(values.len()/4)` or
         /// `data_out.len() < streamvbyte_data_max_len(values.len())`.
         /// Available only with `feature = "userspace"` (audit-R10 #1) —
-        /// kernel/FUSE callers should use [`try_streamvbyte_encode_u32`]
+        /// kernel/FUSE callers should use [`super::super::try_streamvbyte_encode_u32`]
         /// (top-level), or the `_unchecked` sibling below after
         /// validating buffer lengths.
         #[cfg(feature = "userspace")]
