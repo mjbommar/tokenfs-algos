@@ -523,7 +523,8 @@ fn main() {
     // -------------------------------------------------------------------------
     // Quality metrics
     // -------------------------------------------------------------------------
-    let identity = Permutation::identity(NUM_EXTENTS);
+    let identity =
+        Permutation::try_identity(NUM_EXTENTS).expect("identity construction within u32::MAX");
     let bw_before = bandwidth(&graph_view, &identity);
     let bw_after = bandwidth(&graph_view, &perm);
     let bw_ratio = if bw_before == 0 {

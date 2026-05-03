@@ -285,7 +285,7 @@ pub fn rabbit_order(graph: CsrGraph<'_>) -> Permutation {
         n + 1
     );
     if n == 0 {
-        return Permutation::identity(0);
+        return Permutation::try_identity(0).expect("identity construction within u32::MAX");
     }
     for w in graph.offsets.windows(2) {
         assert!(
@@ -341,7 +341,7 @@ pub fn rabbit_order(graph: CsrGraph<'_>) -> Permutation {
     // singleton communities. Every DFS leaf is a singleton, walked
     // by ascending ID.
     if total_edge_weight == 0 {
-        return Permutation::identity(n);
+        return Permutation::try_identity(n).expect("identity construction within u32::MAX");
     }
 
     // Lowest-degree-first iteration via a min-heap. Stale entries
@@ -651,7 +651,7 @@ pub fn rabbit_order_par(graph: CsrGraph<'_>) -> Permutation {
         n + 1
     );
     if n == 0 {
-        return Permutation::identity(0);
+        return Permutation::try_identity(0).expect("identity construction within u32::MAX");
     }
     // Defer the rest of the validation + small-graph fallback to the
     // sequential path. The sequential routine performs the same bounds
@@ -714,7 +714,7 @@ pub fn rabbit_order_par(graph: CsrGraph<'_>) -> Permutation {
     };
 
     if total_edge_weight == 0 {
-        return Permutation::identity(n);
+        return Permutation::try_identity(n).expect("identity construction within u32::MAX");
     }
 
     let mut alive: Vec<bool> = vec![true; n];

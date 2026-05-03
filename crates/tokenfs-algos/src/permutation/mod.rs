@@ -123,21 +123,32 @@ pub struct Permutation(Vec<u32>);
 
 impl Permutation {
     /// Returns the identity permutation of length `n` — `perm[i] = i`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n > u32::MAX`. Kernel/FUSE callers should use
+    /// [`Self::try_identity`] (audit-R10 #216 closeout).
+    ///
+    /// Available only with `feature = "userspace"`.
+    #[cfg(feature = "userspace")]
     #[must_use]
     pub fn identity(n: usize) -> Self {
-        // u32::try_from is preferred but the cast is safe for any
-        // `n <= u32::MAX as usize`; permutations longer than that are
-        // out of scope (vertex IDs are u32).
-        assert!(
-            n <= u32::MAX as usize,
-            "permutation length exceeds u32 vertex space"
-        );
+        Self::try_identity(n).expect("Permutation::identity: n > u32::MAX")
+    }
+
+    /// Fallible variant of [`Self::identity`]: returns
+    /// [`PermutationConstructionError::LengthExceedsU32`] when
+    /// `n > u32::MAX` instead of panicking.
+    pub fn try_identity(n: usize) -> Result<Self, PermutationConstructionError> {
+        if n > u32::MAX as usize {
+            return Err(PermutationConstructionError::LengthExceedsU32 { n });
+        }
         let mut perm = Vec::with_capacity(n);
         for i in 0..n {
-            // SAFETY: i < n <= u32::MAX as usize, so the cast cannot overflow.
+            // SAFETY (cast): i < n <= u32::MAX as usize verified above.
             perm.push(i as u32);
         }
-        Self(perm)
+        Ok(Self(perm))
     }
 
     /// Constructs a [`Permutation`] from a raw `Vec<u32>` WITHOUT
@@ -357,11 +368,11 @@ impl Permutation {
         // invariant; every slot is overwritten by `apply_into`. The
         // bound `T: Copy` makes the clone a no-op.
         let mut dst = vec![src[0]; n];
-        // SAFETY-LIKE: `apply_into`'s shape contract is satisfied
+        // SAFETY-LIKE: `try_apply_into`'s shape contract is satisfied
         // because we just verified `src.len() == n` and built `dst` of
-        // length `n`. The unchecked-panic-on-shape path inside
-        // `apply_into` cannot trigger.
-        self.apply_into(src, &mut dst);
+        // length `n`; the call is infallible from this entry point.
+        self.try_apply_into(src, &mut dst)
+            .expect("try_apply: pre-validated shape");
         Ok(dst)
     }
 
@@ -1179,6 +1190,12 @@ pub enum PermutationConstructionError {
     /// The input [`CsrGraph`] is internally inconsistent. See the
     /// nested [`CsrGraphError`] for the precise failure mode.
     InvalidCsr(CsrGraphError),
+    /// Requested permutation length exceeds the `u32` vertex-ID space
+    /// that [`Permutation`] uses internally.
+    LengthExceedsU32 {
+        /// Caller-supplied permutation length.
+        n: usize,
+    },
 }
 
 impl From<CsrGraphError> for PermutationConstructionError {
@@ -1193,6 +1210,9 @@ impl core::fmt::Display for PermutationConstructionError {
             Self::InvalidCsr(err) => {
                 write!(f, "permutation construction failed: invalid CSR: {err}")
             }
+            Self::LengthExceedsU32 { n } => {
+                write!(f, "permutation length {n} exceeds u32::MAX vertex-ID space")
+            }
         }
     }
 }
@@ -1202,6 +1222,7 @@ impl std::error::Error for PermutationConstructionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidCsr(err) => Some(err),
+            Self::LengthExceedsU32 { .. } => None,
         }
     }
 }
@@ -1217,7 +1238,7 @@ mod tests {
     #[test]
     fn identity_round_trip() {
         for n in [0_usize, 1, 2, 5, 17, 256] {
-            let perm = Permutation::identity(n);
+            let perm = Permutation::try_identity(n).expect("identity construction within u32::MAX");
             assert_eq!(perm.len(), n);
             assert_eq!(perm.is_empty(), n == 0);
             for (i, &v) in perm.as_slice().iter().enumerate() {
@@ -1328,7 +1349,7 @@ mod tests {
     #[test]
     fn validate_no_alloc_accepts_identity_and_arbitrary_valid_perms() {
         for n in [0_usize, 1, 2, 5, 17, 64, 65, 128, 129, 256] {
-            let perm = Permutation::identity(n);
+            let perm = Permutation::try_identity(n).expect("identity construction within u32::MAX");
             let mut scratch = vec![0_u64; n.div_ceil(64).max(1)];
             assert!(
                 perm.validate_no_alloc(&mut scratch),
@@ -1383,7 +1404,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "scratch words")]
     fn validate_no_alloc_panics_on_undersized_scratch() {
-        let perm = Permutation::identity(65);
+        let perm = Permutation::try_identity(65).expect("identity construction within u32::MAX");
         let mut scratch = [0_u64; 1]; // need 2 words for n=65
         let _ = perm.validate_no_alloc(&mut scratch);
     }
@@ -1449,7 +1470,7 @@ mod tests {
 
     #[test]
     fn try_apply_into_strict_rejects_src_len_mismatch() {
-        let perm = Permutation::identity(3);
+        let perm = Permutation::try_identity(3).expect("identity construction within u32::MAX");
         let src = [10_u8, 20];
         let mut dst = [0_u8; 3];
         let mut scratch = [0_u64; 1];
@@ -1467,7 +1488,7 @@ mod tests {
 
     #[test]
     fn try_apply_into_strict_rejects_dst_too_small() {
-        let perm = Permutation::identity(3);
+        let perm = Permutation::try_identity(3).expect("identity construction within u32::MAX");
         let src = [10_u8, 20, 30];
         let mut dst = [0_u8; 2];
         let mut scratch = [0_u64; 1];
@@ -1486,7 +1507,7 @@ mod tests {
     #[test]
     fn try_apply_into_strict_rejects_scratch_too_small() {
         // n=65 needs 2 u64 words; pass 1.
-        let perm = Permutation::identity(65);
+        let perm = Permutation::try_identity(65).expect("identity construction within u32::MAX");
         let src: Vec<u32> = (0..65_u32).collect();
         let mut dst = vec![0_u32; 65];
         let mut scratch = [0_u64; 1];
@@ -1590,7 +1611,7 @@ mod tests {
 
     #[test]
     fn try_apply_returns_src_len_mismatch_without_panicking() {
-        let perm = Permutation::identity(4);
+        let perm = Permutation::try_identity(4).expect("identity construction within u32::MAX");
         let src: Vec<i32> = vec![10, 20, 30]; // wrong length
         let err = perm.try_apply(&src).expect_err("length mismatch");
         assert_eq!(
@@ -1606,7 +1627,7 @@ mod tests {
     fn try_apply_handles_empty_perm_without_inspecting_src() {
         // Boundary: zero-length perm with zero-length src returns
         // empty Vec without touching `src`.
-        let perm = Permutation::identity(0);
+        let perm = Permutation::try_identity(0).expect("identity construction within u32::MAX");
         let src: Vec<u8> = Vec::new();
         let out = perm.try_apply(&src).expect("empty matches empty");
         assert!(out.is_empty());
@@ -1627,7 +1648,7 @@ mod tests {
 
     #[test]
     fn try_apply_into_rejects_src_len_mismatch() {
-        let perm = Permutation::identity(3);
+        let perm = Permutation::try_identity(3).expect("identity construction within u32::MAX");
         let src = [10_u8, 20]; // wrong length
         let mut dst = [0_u8; 3];
         let err = perm
@@ -1646,7 +1667,7 @@ mod tests {
 
     #[test]
     fn try_apply_into_rejects_dst_too_small() {
-        let perm = Permutation::identity(3);
+        let perm = Permutation::try_identity(3).expect("identity construction within u32::MAX");
         let src = [10_u8, 20, 30];
         let mut dst = [0_u8; 2]; // too small
         let err = perm
@@ -1670,7 +1691,7 @@ mod tests {
         // Happy path matches `validate_no_alloc(...)` -> true on every
         // valid permutation we previously verified that way.
         for n in [0_usize, 1, 2, 5, 17, 64, 65, 128, 129, 256] {
-            let perm = Permutation::identity(n);
+            let perm = Permutation::try_identity(n).expect("identity construction within u32::MAX");
             let mut scratch = vec![0_u64; n.div_ceil(64).max(1)];
             perm.try_validate_no_alloc(&mut scratch)
                 .expect("identity must validate");
@@ -1687,7 +1708,7 @@ mod tests {
     #[test]
     fn try_validate_no_alloc_rejects_undersized_scratch() {
         // n=65 needs 2 u64 words; pass 1.
-        let perm = Permutation::identity(65);
+        let perm = Permutation::try_identity(65).expect("identity construction within u32::MAX");
         let mut scratch = [0_u64; 1];
         let err = perm
             .try_validate_no_alloc(&mut scratch)

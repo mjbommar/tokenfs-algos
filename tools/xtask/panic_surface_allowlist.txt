@@ -61,12 +61,11 @@ crates/tokenfs-algos/src/permutation/rabbit/kernels/scalar.rs:31:modularity_gain
 # already has a `try_*` sibling per audit-R4 #151 / R6 #161.
 # -----------------------------------------------------------------
 
-crates/tokenfs-algos/src/permutation/mod.rs:127:identity:assert!
-crates/tokenfs-algos/src/permutation/mod.rs:247:apply:assert_eq!
-crates/tokenfs-algos/src/permutation/mod.rs:302:apply_into:assert_eq!
-crates/tokenfs-algos/src/permutation/mod.rs:439:validate_no_alloc:assert!
-crates/tokenfs-algos/src/permutation/mod.rs:850:neighbors_of:assert!
-crates/tokenfs-algos/src/permutation/mod.rs:866:degree:assert!
+crates/tokenfs-algos/src/permutation/mod.rs:258:apply:assert_eq!
+crates/tokenfs-algos/src/permutation/mod.rs:313:apply_into:assert_eq!
+crates/tokenfs-algos/src/permutation/mod.rs:450:validate_no_alloc:assert!
+crates/tokenfs-algos/src/permutation/mod.rs:861:neighbors_of:assert!
+crates/tokenfs-algos/src/permutation/mod.rs:877:degree:assert!
 crates/tokenfs-algos/src/permutation/hilbert.rs:90:hilbert_2d:assert!
 crates/tokenfs-algos/src/permutation/hilbert.rs:165:hilbert_nd:assert!
 crates/tokenfs-algos/src/permutation/rabbit.rs:278:rabbit_order:assert_eq!

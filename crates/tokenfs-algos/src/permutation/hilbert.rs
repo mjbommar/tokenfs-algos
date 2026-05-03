@@ -30,7 +30,7 @@
 //! ## Determinism
 //!
 //! * Tie-breaks on equal Hilbert keys go to the lower input index.
-//! * Empty inputs return `Permutation::identity(0)`.
+//! * Empty inputs return `Permutation::try_identity(0).expect("identity construction within u32::MAX")`.
 //! * All-coincident inputs (zero-range on every axis) collapse to the
 //!   identity permutation in original index order.
 //! * The same input always produces the same permutation, independent
@@ -73,8 +73,8 @@ const GRID_MAX: u32 = (1 << BITS_PER_AXIS) - 1;
 ///
 /// # Edge cases
 ///
-/// * `points.is_empty()` returns `Permutation::identity(0)`.
-/// * `points.len() == 1` returns `Permutation::identity(1)`.
+/// * `points.is_empty()` returns `Permutation::try_identity(0).expect("identity construction within u32::MAX")`.
+/// * `points.len() == 1` returns `Permutation::try_identity(1).expect("identity construction within u32::MAX")`.
 /// * If every coordinate value coincides (zero range on both axes),
 ///   the result is the identity permutation in original index order
 ///   (all points map to grid origin and tie-break on input index).
@@ -90,7 +90,7 @@ const GRID_MAX: u32 = (1 << BITS_PER_AXIS) - 1;
 pub fn hilbert_2d(points: &[(f32, f32)]) -> Permutation {
     let n = points.len();
     if n <= 1 {
-        return Permutation::identity(n);
+        return Permutation::try_identity(n).expect("identity construction within u32::MAX");
     }
 
     let (x_min, x_max) = axis_range(points.iter().map(|&(x, _)| x));
@@ -148,8 +148,8 @@ pub fn hilbert_2d(points: &[(f32, f32)]) -> Permutation {
 ///
 /// # Edge cases
 ///
-/// * `points.is_empty()` returns `Permutation::identity(0)`.
-/// * `points.len() == 1` returns `Permutation::identity(1)`.
+/// * `points.is_empty()` returns `Permutation::try_identity(0).expect("identity construction within u32::MAX")`.
+/// * `points.len() == 1` returns `Permutation::try_identity(1).expect("identity construction within u32::MAX")`.
 /// * If every coordinate value on a given axis coincides, that axis
 ///   collapses to grid origin without affecting the ordering on the
 ///   remaining axes.
@@ -165,7 +165,7 @@ pub fn hilbert_2d(points: &[(f32, f32)]) -> Permutation {
 pub fn hilbert_nd(points: &[Vec<f32>], dim: usize) -> Permutation {
     let n = points.len();
     if n <= 1 {
-        return Permutation::identity(n);
+        return Permutation::try_identity(n).expect("identity construction within u32::MAX");
     }
     assert!(
         dim > 0,

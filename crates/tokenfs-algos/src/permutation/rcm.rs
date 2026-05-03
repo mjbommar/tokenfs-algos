@@ -76,7 +76,7 @@ pub fn rcm(graph: CsrGraph<'_>) -> Permutation {
         n + 1
     );
     if n == 0 {
-        return Permutation::identity(0);
+        return Permutation::try_identity(0).expect("identity construction within u32::MAX");
     }
     // Validate offsets are monotone and in-bounds; bail out early if not.
     for w in graph.offsets.windows(2) {
@@ -490,7 +490,8 @@ mod tests {
             offsets: &offsets,
             neighbors: &neighbors,
         };
-        let identity = Permutation::identity(n as usize);
+        let identity =
+            Permutation::try_identity(n as usize).expect("identity construction within u32::MAX");
         let original_bw = bandwidth(&g, &identity);
         let perm = rcm(g);
         let new_bw = bandwidth(&g, &perm);
@@ -640,7 +641,8 @@ mod tests {
             offsets: &offsets,
             neighbors: &neighbors,
         };
-        let identity = Permutation::identity(n as usize);
+        let identity =
+            Permutation::try_identity(n as usize).expect("identity construction within u32::MAX");
         let original_bw = bandwidth(&g, &identity);
         let perm = rcm(g);
         let new_bw = bandwidth(&g, &perm);
