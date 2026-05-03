@@ -265,7 +265,7 @@ impl OwnedCsr {
 ///    `O(SHINGLES_PER_EXTENT * NUM_EXTENTS)` instead of the `O(M^2)`
 ///    that a fully-pairwise binning would produce.
 /// 3. Symmetrise into a CSR adjacency. Duplicate edges are tolerated;
-///    `rcm()` treats them as degree weight (see `rcm` rustdoc).
+///    `try_rcm()` treats them as degree weight (see `rcm` rustdoc).expect("rcm: valid CSR graph").
 ///
 /// Returns a [`OwnedCsr`] that owns the offset and neighbour arrays.
 fn build_similarity_graph(shingles: &[u32]) -> OwnedCsr {

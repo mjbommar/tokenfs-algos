@@ -61,12 +61,10 @@ crates/tokenfs-algos/src/permutation/rabbit/kernels/scalar.rs:31:modularity_gain
 # already has a `try_*` sibling per audit-R4 #151 / R6 #161.
 # -----------------------------------------------------------------
 
-crates/tokenfs-algos/src/permutation/hilbert.rs:90:hilbert_2d:assert!
-crates/tokenfs-algos/src/permutation/hilbert.rs:165:hilbert_nd:assert!
-crates/tokenfs-algos/src/permutation/rabbit.rs:278:rabbit_order:assert_eq!
-crates/tokenfs-algos/src/permutation/rabbit.rs:646:rabbit_order_par:assert_eq!
-crates/tokenfs-algos/src/permutation/rabbit.rs:1189:modularity_gains_neighbor_batch:assert_eq!
-crates/tokenfs-algos/src/permutation/rcm.rs:69:rcm:assert_eq!
+crates/tokenfs-algos/src/permutation/rabbit.rs:279:rabbit_order:assert_eq!
+crates/tokenfs-algos/src/permutation/rabbit.rs:647:rabbit_order_par:assert_eq!
+crates/tokenfs-algos/src/permutation/rabbit.rs:1190:modularity_gains_neighbor_batch:assert_eq!
+crates/tokenfs-algos/src/permutation/rcm.rs:70:rcm:assert_eq!
 
 # -----------------------------------------------------------------
 # Category C — top-level SIMD/dispatch panic entries the auditor did

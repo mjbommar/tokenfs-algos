@@ -32,7 +32,7 @@
 //! reduction for this class of workload — typically 1.25-2.4× speedup
 //! over natural-order graphs across PageRank, BFS, and CC.
 //!
-//! Use [`super::rcm()`] (Reverse Cuthill-McKee) instead when the
+//! Use [`super::try_rcm()`] (Reverse Cuthill-McKee).expect("rcm: valid CSR graph") instead when the
 //! workload is **bandwidth-driven** (sparse linear solvers, banded
 //! matrices, classical sparse-matrix-vector products) or when build
 //! cost matters: RCM is roughly 100-500× faster to compute and is
@@ -274,6 +274,7 @@ struct Merge {
 /// are non-monotone, if `offsets[n]` does not equal `neighbors.len()`,
 /// or if any neighbour ID is out of range. Kernel/FUSE callers that
 /// need a non-panicking variant should prefer [`try_rabbit_order`].
+///
 #[must_use]
 pub fn rabbit_order(graph: CsrGraph<'_>) -> Permutation {
     let n = graph.n as usize;

@@ -92,6 +92,14 @@ pub fn hilbert_2d(points: &[(f32, f32)]) -> Permutation {
     if n <= 1 {
         return Permutation::try_identity(n).expect("identity construction within u32::MAX");
     }
+    // Saturate at u32::MAX entries — vertex IDs are u32, and input
+    // sequences longer than that cannot be a valid Permutation. We
+    // truncate-and-identity rather than panic (audit-R10 #1 / #216 +
+    // matches the docstring's "does not panic" guarantee).
+    if n > u32::MAX as usize {
+        return Permutation::try_identity(u32::MAX as usize)
+            .expect("identity construction within u32::MAX");
+    }
 
     let (x_min, x_max) = axis_range(points.iter().map(|&(x, _)| x));
     let (y_min, y_max) = axis_range(points.iter().map(|&(_, y)| y));
@@ -107,13 +115,8 @@ pub fn hilbert_2d(points: &[(f32, f32)]) -> Permutation {
             // `order` is the curve order (number of bits per axis); we
             // standardize on 16 bits per axis.
             let key = fast_hilbert::xy2h::<u32>(qx, qy, BITS_PER_AXIS as u8);
-            // SAFETY-LIKE: i < n <= u32::MAX as usize is enforced by
-            // the n > 1 path above and the `usize -> u32` cast below
-            // is bounded by `Permutation` length limits.
-            assert!(
-                i <= u32::MAX as usize,
-                "hilbert_2d: input length exceeds u32 vertex space"
-            );
+            // SAFETY (cast): i < n <= u32::MAX guaranteed by the
+            // truncate-and-identity guard above.
             (key, i as u32)
         })
         .collect();
@@ -161,6 +164,12 @@ pub fn hilbert_2d(points: &[(f32, f32)]) -> Permutation {
 ///   is undefined for a zero-dimensional space with more than one
 ///   point. (Single-point and empty inputs short-circuit to identity
 ///   above.)
+/// * Panics if any `points[i].len() != dim`.
+///
+/// Available only with `feature = "userspace"` (audit-R10 #1 / #216).
+/// Kernel/FUSE callers needing Hilbert ordering should validate
+/// `dim > 0` and per-row `len == dim` upfront before calling.
+#[cfg(feature = "userspace")]
 #[must_use]
 pub fn hilbert_nd(points: &[Vec<f32>], dim: usize) -> Permutation {
     let n = points.len();

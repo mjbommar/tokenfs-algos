@@ -15,9 +15,9 @@
 //! | API | Input shape | Build cost | Quality | Use when |
 //! |---|---|---|---|---|
 //! | [`Permutation::identity`] | none (length only) | trivial | none | a permutation slot is required but no reordering is desired (placeholder, baseline, or fixture) |
-//! | [`rcm()`] | sparse undirected graph ([`CsrGraph`]) | very cheap (`O(\|V\| + \|E\| log Δ)`, ~10 ms / 228 K vertices) | bandwidth-minimising; modest cache-locality win | sparse-matrix solvers, bandwidth-driven workloads, or any "good enough" graph reorder where build time matters |
+//! | [`try_rcm()`] | sparse undirected graph ([`CsrGraph`]).expect("rcm: valid CSR graph") | very cheap (`O(\|V\| + \|E\| log Δ)`, ~10 ms / 228 K vertices) | bandwidth-minimising; modest cache-locality win | sparse-matrix solvers, bandwidth-driven workloads, or any "good enough" graph reorder where build time matters |
 //! | [`hilbert_2d`] / [`hilbert_nd`] | point cloud in 2D or N-D (`&[(f32,f32)]` / `&[Vec<f32>]`) | `O(n log n)` sort | preserves metric locality on the embedding | data has a true low-dimensional point embedding (PCA-projected fingerprints, t-SNE/UMAP outputs); spatial-locality scans |
-//! | [`rabbit_order()`] / [`rabbit_order_par()`] | sparse undirected graph ([`CsrGraph`]) | heavy (`O(\|E\| log \|V\|)`, 1-5 s / 228 K vertices) | best published cache-locality; community-aware | community-structured graphs feeding locality-sensitive workloads (BFS, PageRank, neighbour scans, TokenFS dedup-cluster reads) |
+//! | [`try_rabbit_order()`] / [`try_rabbit_order_par().expect("rabbit_order: valid CSR graph").expect("rabbit_order_par: valid CSR graph")`] | sparse undirected graph ([`CsrGraph`]) | heavy (`O(\|E\| log \|V\|)`, 1-5 s / 228 K vertices) | best published cache-locality; community-aware | community-structured graphs feeding locality-sensitive workloads (BFS, PageRank, neighbour scans, TokenFS dedup-cluster reads) |
 //!
 //! [`hilbert_2d`] / [`hilbert_nd`] are gated on the `permutation_hilbert`
 //! Cargo feature; [`rabbit_order_par`] is gated on the `parallel` Cargo
@@ -30,7 +30,7 @@
 //!
 //! ## Sprint 11-13 / Sprint 47-49 / Sprint 53-55 status
 //!
-//! Phase B4 of `01_PHASES.md` lands [`rcm()`] (Reverse Cuthill-McKee).
+//! Phase B4 of `01_PHASES.md` lands [`try_rcm()`] (Reverse Cuthill-McKee).expect("rcm: valid CSR graph").
 //! Phase B5 lands `hilbert_2d` / `hilbert_nd` behind the
 //! `permutation_hilbert` Cargo feature (vendor wrappers around the
 //! `fast_hilbert` and `hilbert` crates per spec § 4). Sprint 47-49 of
@@ -47,7 +47,7 @@
 //! Per `docs/v0.2_planning/02b_DEPLOYMENT_MATRIX.md`:
 //!
 //! * **Permutation construction** ([`rcm()`], `hilbert_2d` /
-//!   `hilbert_nd`, [`rabbit_order()`]): build-time only. These
+//!   `hilbert_nd`, [`try_rabbit_order()`]).expect("rabbit_order: valid CSR graph"): build-time only. These
 //!   algorithms allocate large work buffers (BFS queue, key-array
 //!   sort, dendrogram) that cannot be made stack-only. Never runs in
 //!   kernel.
@@ -96,7 +96,9 @@ pub mod rabbit;
 pub mod rcm;
 
 #[cfg(feature = "permutation_hilbert")]
-pub use hilbert::{hilbert_2d, hilbert_nd};
+pub use hilbert::hilbert_2d;
+#[cfg(all(feature = "permutation_hilbert", feature = "userspace"))]
+pub use hilbert::hilbert_nd;
 pub use rabbit::{rabbit_order, try_rabbit_order};
 #[cfg(feature = "parallel")]
 pub use rabbit::{rabbit_order_par, try_rabbit_order_par};

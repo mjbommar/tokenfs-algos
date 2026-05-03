@@ -65,6 +65,7 @@ const GPS_MAX_ITERATIONS: u32 = 8;
 /// any neighbour ID is out of range `0..graph.n`, or if a CSR offset
 /// pair is inverted. Kernel/FUSE callers that need a non-panicking
 /// variant should prefer [`try_rcm`].
+///
 #[must_use]
 pub fn rcm(graph: CsrGraph<'_>) -> Permutation {
     let n = graph.n as usize;
