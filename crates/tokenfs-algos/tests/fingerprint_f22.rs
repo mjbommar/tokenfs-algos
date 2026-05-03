@@ -458,8 +458,13 @@ fn f21_compatible_features(bytes: &[u8]) -> F21Features {
 
     let histogram = ByteHistogram::from_block(bytes);
     let h1 = entropy::shannon::h1(&histogram);
+    // Use the heap-free with_scratch sibling so this fixture-builder
+    // works under both default (kernel-safe) and userspace builds
+    // (audit-R8 #6b: by-value `joint::h2_pairs` is now gated).
     let h2 = if bytes.len() >= 2 {
-        entropy::joint::h2_pairs(bytes) * (bytes.len() - 1) as f32 / bytes.len() as f32
+        let mut scratch = tokenfs_algos::histogram::pair::BytePairScratch::default();
+        entropy::joint::h2_pairs_with_scratch(bytes, &mut scratch) * (bytes.len() - 1) as f32
+            / bytes.len() as f32
     } else {
         h1
     };

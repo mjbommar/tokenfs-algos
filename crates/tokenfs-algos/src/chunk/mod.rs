@@ -795,8 +795,11 @@ mod tests {
         CHUNK_AVG_SIZE_CAP, ChunkConfig, ChunkConfigError, FastCdcConfig, chunks, fastcdc_chunks,
         fastcdc_find_boundary, find_boundary, gear_hash, summarize_chunk_quality,
     };
-    // `Vec` is not in the no-std prelude; alias it from `alloc` for
-    // the alloc-only build (audit-R6 finding #164).
+    // `Vec` and the `vec!` macro are not in the no-std prelude; alias
+    // both from `alloc` for the alloc-only build (audit-R6 #164,
+    // audit-R8 followup).
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::vec;
     #[cfg(all(feature = "alloc", not(feature = "std")))]
     use alloc::vec::Vec;
 

@@ -1,10 +1,14 @@
 #![allow(missing_docs)]
 
 use tokenfs_algos::{
-    entropy::{conditional, joint, min, renyi, shannon},
+    entropy::{min, renyi, shannon},
     hash,
     histogram::ByteHistogram,
 };
+// Used only by the userspace-gated `adjacent_pair_entropy_known_values`
+// test (audit-R8 #6b).
+#[cfg(feature = "userspace")]
+use tokenfs_algos::entropy::{conditional, joint};
 
 #[test]
 fn empty_histogram_has_zero_entropy() {
@@ -35,6 +39,12 @@ fn min_and_collision_entropy_match_uniform_distribution() {
     assert!((renyi::collision_h1(&histogram) - 8.0).abs() < 0.000_001);
 }
 
+// `joint::h2_pairs` builds a 256 KiB dense pair histogram on the stack
+// and is gated on the `userspace` feature (audit-R8 #6b). This test
+// exercises the by-value entry; kernel-default builds skip it. The
+// heap-free `h2_pairs_with_scratch` / `h2_pairs_with_dense_scratch`
+// siblings are tested in the lib's `entropy::joint::tests` module.
+#[cfg(feature = "userspace")]
 #[test]
 fn adjacent_pair_entropy_known_values() {
     assert_eq!(joint::h2_pairs(b"aaaaaaaa"), 0.0);

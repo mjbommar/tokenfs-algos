@@ -442,10 +442,12 @@ const fn pair_index(first: u8, second: u8) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{BytePairCountsScratch, BytePairHistogram, BytePairScratch};
-    // `Box` is not in the no-std prelude; alias it from `alloc` for
-    // the alloc-only build (audit-R6 finding #164).
+    // `Box`/`Vec` are not in the no-std prelude; alias them from `alloc`
+    // for the alloc-only build (audit-R6 #164, audit-R8 followup).
     #[cfg(all(feature = "alloc", not(feature = "std")))]
     use alloc::boxed::Box;
+    #[cfg(all(feature = "alloc", not(feature = "std")))]
+    use alloc::vec::Vec;
 
     /// Heap-allocate a zeroed `BytePairCountsScratch` without ever
     /// materialising the 256 KiB inner array on the test stack.

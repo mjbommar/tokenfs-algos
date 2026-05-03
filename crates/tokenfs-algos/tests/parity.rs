@@ -52,10 +52,17 @@ fn new_pinned_scalar_paths_match_public_defaults() {
         entropy::kernels::auto::collision_h1(&histogram),
         entropy::kernels::scalar::collision_h1(&histogram)
     );
-    assert_eq!(
-        entropy::kernels::auto::joint_h2_pairs(&bytes),
-        entropy::kernels::scalar::joint_h2_pairs(&bytes)
-    );
+    // `entropy::kernels::{auto,scalar}::joint_h2_pairs` are gated on
+    // `userspace` because they build a 256 KiB dense pair histogram
+    // on the stack (audit-R8 #6b). The heap-free with_scratch path
+    // is exercised in the lib unit tests.
+    #[cfg(feature = "userspace")]
+    {
+        assert_eq!(
+            entropy::kernels::auto::joint_h2_pairs(&bytes),
+            entropy::kernels::scalar::joint_h2_pairs(&bytes)
+        );
+    }
     assert_eq!(
         entropy::kernels::auto::conditional_h_next_given_prev(&bytes),
         entropy::kernels::scalar::conditional_h_next_given_prev(&bytes)
