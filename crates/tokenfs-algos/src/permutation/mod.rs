@@ -1426,11 +1426,14 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "scratch words")]
-    fn validate_no_alloc_panics_on_undersized_scratch() {
+    fn try_validate_no_alloc_errors_on_undersized_scratch() {
         let perm = Permutation::try_identity(65).expect("identity construction within u32::MAX");
         let mut scratch = [0_u64; 1]; // need 2 words for n=65
-        let _ = perm.try_validate_no_alloc(&mut scratch).is_ok();
+        let result = perm.try_validate_no_alloc(&mut scratch);
+        assert!(matches!(
+            result,
+            Err(PermutationValidationError::ScratchTooSmall { .. })
+        ));
     }
 
     #[test]

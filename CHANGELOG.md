@@ -4,6 +4,156 @@ All notable changes to this crate will be documented in this file. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.4.5] — 2026-05-03
+
+Audit-R10 Tier 2 + Tier 3 closeout: 4 MEDIUM correctness fixes, 7 new
+CI workflows, OSS-Fuzz integration, and the start of a systematic
+panic-surface gating sweep (allowlist down 38 → 30 entries).
+
+### Fixed (MEDIUM) — `try_sha256` + reject inputs > 2^64 bits (R10 #4)
+
+Per-backend SHA-256 kernels compute the FIPS 180-4 padding bit length
+via `wrapping_mul(8)`. The streaming `Hasher::try_update` checked the
+overflow upfront, but the one-shot `sha256(&[u8])` had no fallible
+sibling — for inputs > `u64::MAX / 8` bytes (~2 EiB), the digest
+silently came out wrong.
+
+  * Added `try_sha256(&[u8]) -> Result<[u8; 32], Sha256LengthOverflow>`
+    that validates `bytes.len() * 8` fits in `u64` before dispatch.
+  * Gated the panicking `sha256(&[u8])` on `feature = "userspace"`;
+    it is now a thin `try_sha256(...).expect(...)` wrapper.
+  * Migrated internal callers (`identity::sha256_cid`,
+    `hash::batched::sha256_batch_st_inner`) to the kernel-safe
+    dispatcher path so they remain reachable without `userspace`.
+
+### Fixed (MEDIUM/LOW) — saturating_add on u32 counters (R10 #5)
+
+`BytePairHistogram::add_pair`, `BytePairScratch::add_pair`,
+`BytePairHistogram::with_scratch`, `MisraGries::update`, and the
+n-gram sketch hot loop all incremented `u32` counters via `+= 1`.
+Switched to `saturating_add` so an exhausted counter pins at
+`u32::MAX` (or `u64::MAX` for `observations`) instead of silently
+wrapping in release / panicking in overflow-checking builds.
+
+### Fixed (LOW) — cap Sniffer Layer 1 DFA scan at `max_anchor` (R10 #6)
+
+`Sniffer::detect` walked `dfa.find_iter(bytes)` over the entire input
+even though no MAGIC_RULES rule starts past `max_anchor`. On
+attacker-supplied multi-GB buffers in kernel/FUSE sniffing paths
+that turned a constant-time check into an arbitrary-time scan.
+Capped Layer 1 to `bytes[..max_anchor.min(bytes.len())]`. +1 test.
+
+### Changed — `permutation::Permutation` panic surface (T2.6 / #216)
+
+Audit-R10 #1 systematic gating sweep, partial — 8 of 38 allowlisted
+entries cleared:
+
+  * `Permutation::identity` is now a thin
+    `try_identity(...).expect(...)` wrapper gated on `userspace`.
+    Added `Permutation::try_identity(n) -> Result<_, LengthExceedsU32>`
+    as the kernel-safe sibling.
+  * `Permutation::apply`, `apply_into`, `validate_no_alloc`,
+    `CsrGraph::neighbors_of`, `CsrGraph::degree` gated on
+    `userspace`. Each already has a `try_*` sibling per audit-R4 #151
+    / R6 #161; this enforces the kernel-safe-by-default narrative
+    at the type-system level.
+  * `permutation::hilbert::hilbert_2d` no longer panics on inputs
+    `> u32::MAX` — saturates to `Permutation::try_identity(u32::MAX)`
+    instead. `permutation::hilbert::hilbert_nd` gated on `userspace`
+    (its dim/length contract assertions remain inside the body).
+  * Migrated all 27 internal + test + example callers via
+    `.apply()` → `.try_apply().expect(...)`,
+    `.identity(n)` → `.try_identity(n).expect(...)`,
+    `.validate_no_alloc(s)` → `.try_validate_no_alloc(s).is_ok()`,
+    `.neighbors_of(v)` → `.try_neighbors_of(v).expect(...)`, etc.
+
+The remaining 30 panic-surface allowlist entries (kernel backends in
+`bits/{streamvbyte,bit_pack,rank_select}/kernels/`,
+`approx/bloom_kernels/`, `hash/set_membership/kernels/`,
+`permutation/rabbit/kernels/`; top-level
+`approx::contains_batch_simd`, `merge_simd`,
+`bits::rank_select::{rank0, rank1}`, `similarity::minhash::
+one_permutation_from_hashes`; and `permutation::{rabbit_order,
+rabbit_order_par, rcm, modularity_gains_neighbor_batch}`) require
+extracting `_inner` helpers shared between panicking and `try_*`
+paths so both can compile in non-userspace builds. Tracked as
+the next batch of #216 — `panic_surface_allowlist.txt` documents
+each.
+
+### Added — CI infrastructure (Tier 2 + Tier 3 + audit-R10 honest-gaps)
+
+Seven new `.github/workflows/*.yml` files plus an OSS-Fuzz
+integration directory:
+
+  * **`sanitizers.yml`** (T3.2) — Miri (UB / strict provenance,
+    scalar-only no-default-features build), AddressSanitizer (full
+    SIMD surface under `userspace,arch-pinned-kernels`),
+    UndefinedBehaviorSanitizer / MSan (uninit memory tracking).
+    Cron: Sundays 05:23 UTC.
+  * **`coverage.yml`** (T3.3) — `cargo-llvm-cov` reports for both
+    `--all-features` and the kernel-safe
+    (`--no-default-features --features alloc`) profiles. Uploads
+    LCOV + HTML to artifacts; runs per-PR.
+  * **`fuzz-nightly.yml`** (T3.7 / #217) — daily 10-min/target
+    matrix run for all 13 declared fuzz targets, with rolling
+    corpus cache and reproducer upload on crash. Closes the
+    "fuzz targets exist but aren't run on a schedule" honest-gap.
+  * **`mutation-testing.yml`** (T3.8 / #218) — weekly
+    `cargo-mutants` job. Excludes per-backend SIMD intrinsics
+    (Miri / cross-arch parity already cover them); fails CI if
+    any non-SIMD function survives mutation. Catches the
+    "tests pass on broken impl" failure mode line-coverage misses.
+  * **`bench-regression.yml`** (T2.3) — per-PR primitive bench
+    compared against the latest main baseline (downloaded from
+    the previous run's artifact); fails if any benchmark regresses
+    > 15% in throughput. Uses the existing `xtask bench-report`
+    machinery + new `cargo xtask bench-regression-check`.
+  * **`calibration.yml`** (T2.4) — scheduled F21 / F22 / Magic-BPE
+    calibration on a labeled self-hosted runner
+    (`runs-on: [self-hosted, perf-quiet]`). Runs the throughput-
+    gated test under `TOKENFS_ALGOS_RUN_THROUGHPUT_GATE=1` plus
+    the `bench-real-{f21,f22,magic-bpe}` xtask matrices, snapshots
+    output to `benches/_history/calibration-<run_id>/`. Cron:
+    Sundays 11:00 UTC.
+  * **`oss-fuzz/{Dockerfile,build.sh,project.yaml,README.md}`**
+    (T3.9 / #219) — in-tree mirror of the
+    `projects/tokenfs-algos/` files that will be submitted upstream
+    to https://github.com/google/oss-fuzz. Closes the "OSS-Fuzz
+    integration" honest-gap.
+
+### Added — `cargo xtask` commands
+
+  * `cargo xtask bench-regression-check <baseline.jsonl> <current.jsonl> <threshold_pct>`
+    used by the new bench-regression CI workflow.
+  * `cargo xtask security` (and therefore `cargo xtask check`) now
+    additionally runs `cargo check -p tokenfs-algos-no-std-smoke`
+    + the release build (T2.5 / audit-R10 #10). Smoke crate
+    coverage broadened: `try_streamvbyte_{encode,decode}_u32`,
+    `try_sha256`, `Permutation::try_from_vec` + `try_apply_into`,
+    `try_contains_u32_batch_simd`, `PackedDfa::try_new`.
+
+### Notes
+
+  * Lib test counts: 978 with `--all-features` (was 975 at v0.4.4;
+    +3 from `try_sha256` round-trip, format scan-cap test, and
+    `try_validate_no_alloc` undersized-scratch error case).
+    779 default. 672 `--no-default-features --features alloc`
+    (was 669; +3 from the new `try_*` test coverage).
+  * `cargo xtask check` green: fmt, clippy, doc, no-std-tree,
+    panic-surface-lint (30/38 grandfathered), no-std-smoke build.
+  * Audit-R10 status by tier:
+    * Tier 0 (T0.1-T0.4): ✅ shipped in v0.4.4
+    * Tier 1 (T1.1-T1.6): ✅ shipped in v0.4.4
+    * Tier 2 (T2.1-T2.5): ✅ shipped in v0.4.5
+    * Tier 2 carry-over (T2.6 / #216 systematic gating sweep):
+      ⚠️ partial — 8/38 cleared, 30 grandfathered. Rest scheduled
+      for follow-up under #216.
+    * Tier 3 (T3.1-T3.3, T3.7-T3.9): ✅ shipped in v0.4.5
+    * Tier 3 (T3.4 iai-callgrind, T3.5 bench-history publication,
+      T3.6 default-flip): ⏳ pending, scheduled for v0.5.0.
+  * **Audit-R10 honest-gaps**: code coverage, scheduled fuzzing,
+    mutation testing, OSS-Fuzz integration — **all four closed.**
+
 ## [0.4.4] — 2026-05-02
 
 Audit-R10 Tier 0 + Tier 1 closeout: 4 prerequisite CI / fuzz fixes
