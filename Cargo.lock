@@ -845,7 +845,7 @@ dependencies = [
 
 [[package]]
 name = "tokenfs-algos"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "blake3",
  "bytemuck",

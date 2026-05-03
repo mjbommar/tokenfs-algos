@@ -4,6 +4,87 @@ All notable changes to this crate will be documented in this file. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.4.2] — 2026-05-03
+
+Audit-R7 #17 + R8 #5 + R8 #6b closeout. Two architectural items
+that the v0.4.1 release deferred (Cargo.toml claimed but didn't
+actually wire) are now done.
+
+### Changed (BREAKING for downstream callers reaching into per-backend kernels)
+
+- **`arch-pinned-kernels` feature now wired** (audit-R7 #17, audit-R8 #5).
+  ~80 source files refactored to file-split the per-backend kernel
+  modules (`pub mod {scalar, avx2, avx512, neon, sse42, ...}`) so the
+  visibility can be conditionally gated:
+
+  ```rust
+  #[cfg(feature = "arch-pinned-kernels")]
+  pub mod foo;
+  #[cfg(not(feature = "arch-pinned-kernels"))]
+  #[allow(dead_code, unreachable_pub)]
+  pub(crate) mod foo;
+  ```
+
+  Default surface is now dispatchers-only (`kernels::auto::*`).
+  External callers wanting to pin a specific backend (benches,
+  consumer apps doing perf comparisons) must enable
+  `arch-pinned-kernels`. Closes the misuse-risk concern raised in
+  R8 #5: kernel-adjacent consumers can no longer accidentally call
+  `kernels::avx2::*` on a non-AVX2 host.
+
+  Affected `[[bench]]` / `[[example]]` / `[[test]]` entries that
+  reach into per-backend kernels gained
+  `required-features = ["arch-pinned-kernels"]`. A few targets
+  exercise both panicking surface and pinned backends; those carry
+  `["userspace", "arch-pinned-kernels"]`.
+
+### Changed (BREAKING for kernel-default builds)
+
+- **By-value dense helpers gated behind `userspace`** (audit-R8 #6b
+  closeout). Four functions that materialise large stack buffers
+  are no longer reachable from the default (kernel-safe) build:
+  - `entropy::joint::h2_pairs` (256 KiB stack) →
+    `h2_pairs_with_scratch` / `h2_pairs_with_dense_scratch` siblings
+    stay always-public.
+  - `similarity::minhash::build_byte_table_from_seeds<K>` (up to
+    512 KiB at K=256) → `_into` / `_boxed` siblings stay public.
+  - `similarity::minhash::signature_simd<K>` → `_into` sibling stays
+    public.
+  - `similarity::minhash::classic_from_bytes_table_8` → `_into`
+    sibling stays public.
+
+  Each gated function's docstring points at its kernel-safe sibling.
+  Internal call sites updated: `signature_batch_simd<K>` and
+  `try_signature_batch_simd<K>` now dispatch through `signature_simd_into`
+  so they remain in default builds.
+
+### Fixed
+
+- 3 integration tests (`tests/known_values.rs`, `tests/parity.rs`,
+  `tests/fingerprint_f22.rs`) referenced the now-gated
+  `joint::h2_pairs` / `kernels::*::joint_h2_pairs`; rewrote
+  `tests/fingerprint_f22.rs` to use the heap-free
+  `h2_pairs_with_scratch` sibling and `#[cfg(feature = "userspace")]`-gated
+  the other two so they remain coverable under `--features userspace`
+  but compile out of kernel-default builds.
+- `chunk/mod.rs` and `histogram/pair.rs` test mods missed the no-std
+  `vec!` / `Vec` `alloc::` imports for tests added in v0.4.1; fixed
+  so `cargo test -p tokenfs-algos --no-default-features --features alloc --lib`
+  is once-again clean (was 653 → 667 → 672 across these patches).
+
+### Notes
+
+- Lib test counts: 971 with `--all-features` (+1 vs v0.4.1's 969;
+  the one new test came in via the #6b heap-free siblings round-trip
+  parity check). 784 default. 879 `--features userspace`.
+  672 `--no-default-features --features alloc`.
+- All `cargo xtask check`, aarch64 cross-clippy, `cargo deny check`
+  green with zero advisory suppressions.
+- Audit-R7 + R8 are now fully closed. The two remaining open items
+  on the docket (#171 AVX2 modularity perf parity, #172 rabbit_order_par
+  colouring-based batching) are perf optimization — neither is a
+  safety concern, both match documented behaviour at v0.4.x.
+
 ## [0.4.1] — 2026-05-02
 
 Audit-round-8 hardening pass: 7 findings addressed via 4 parallel
