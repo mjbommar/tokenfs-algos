@@ -4,6 +4,122 @@ All notable changes to this crate will be documented in this file. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.4.4] — 2026-05-02
+
+Audit-R10 Tier 0 + Tier 1 closeout: 4 prerequisite CI / fuzz fixes
+plus 5 HIGH-severity safety closeouts plus a cross-cutting CI lint
+that prevents new ungated panic surface from regressing the
+kernel-safe-by-default narrative.
+
+### Fixed (HIGH) — `PackedDfa::try_new` with checked u32 + try_reserve (R10 #2)
+
+`PackedDfa::new` accepted untrusted pattern sets and:
+
+  * silently truncated `pat_idx`, `pattern_lens` entries, and goto
+    state IDs via `as u32` casts on inputs > `u32::MAX`,
+  * aborted on OOM via `Vec::push` instead of returning `Err`,
+  * panicked on unbounded `vec!` allocation in alloc-only builds.
+
+Added `PackedDfaError` enum (`TooManyPatterns`, `PatternTooLong`,
+`TooManyStates`, `AllocationFailed`) with `Display` +
+`std::error::Error`. `PackedDfa::try_new` validates pattern count +
+per-pattern length upfront, then runs construction with
+`Vec::try_reserve` on the largest vecs (`pattern_lens`,
+`transitions`) and an in-loop overflow check before any new state
+materialises. `PackedDfa::new` is now gated on `userspace` and is a
+thin `try_new(...).expect(...)` wrapper. `format::Sniffer::new` was
+updated to route through `try_new + expect` (MAGIC_RULES is
+compile-time bounded).
+
+### Fixed (HIGH) — remaining audit-R10 #1 panic sites gated on `userspace`
+
+Ten more `pub fn` panic sites the audit identified but earlier rounds
+had missed are now gated:
+
+  * `BloomFilter::insert_simd` and the inlined SIMD body in
+    `try_insert_simd` (the latter no longer routes through the
+    panicking variant)
+  * `HyperLogLog::merge`
+  * `bits::streamvbyte::kernels::auto::encode_u32` (with
+    `encode_u32_unchecked` sibling for the dispatcher)
+  * `bits::bit_pack::kernels::auto::encode_u32_slice`
+  * `hash::set_membership::kernels::auto::contains_u32_batch` (with
+    `contains_u32_batch_unchecked` sibling)
+
+Each panicking entry's docstring points at its `try_*` sibling.
+
+### Fixed (HIGH) — `ssse3` + `sse41` backend modules now under `arch-pinned-kernels` (R10 #3)
+
+`bits::streamvbyte::kernels::ssse3` and
+`hash::set_membership::kernels::sse41` were previously declared
+inline as `pub mod foo { ... }` (no opt-out for kernel callers).
+Refactored to file-split modules under the
+`arch-pinned-kernels`-gated pattern (matches v0.4.2's R7 #17
+closeout): default surface stays dispatchers-only; the `ssse3` /
+`sse41` per-backend symbols are reachable only with the opt-in
+`arch-pinned-kernels` feature.
+
+### Added — `panic-surface-lint` cross-cutting CI prevention (R10 T1.6)
+
+New `cargo xtask panic-surface-lint` task (also wired into
+`cargo xtask check` and `.github/workflows/ci.yml`) walks every
+`.rs` file under `crates/tokenfs-algos/src/` and reports every
+`pub fn` / `pub unsafe fn` / `pub(crate) fn` whose body contains
+`assert!`, `panic!`, `assert_eq!`, `assert_ne!`, `unreachable!`,
+`unimplemented!`, or `todo!` without an enclosing
+`#[cfg(feature = "userspace")]` or `#[cfg(test)]` gate.
+
+Single forward-pass with a brace-depth tracker + cfg-attr skip
+stack — no syn / proc-macro toolchain required. Snapshot of the 38
+currently-grandfathered sites lives in
+`tools/xtask/panic_surface_allowlist.txt` with three categories
+(kernel backends called via the gated `kernels::auto::*` dispatcher;
+`permutation/*` panicking constructors; top-level SIMD/dispatch
+entries audit-R10 #1 missed). Each entry is a tracked TODO whose
+removal is scheduled as the v0.4.5 T2.6 systematic gating sweep.
+
+### Fixed — CI infrastructure (Tier 0)
+
+  * **T0.1** Bench / example feature flags now correctly pass
+    `bench-internals,arch-pinned-kernels,userspace` to the
+    `primitives` and `similarity` benches and `userspace` to the
+    `dispatch_explain` example so the no-default-features migration
+    didn't break their CI build.
+  * **T0.2** Fuzz manifest enables
+    `userspace,arch-pinned-kernels,parallel,blake3` so all 13
+    declared fuzz targets compile with `cargo +nightly fuzz build`.
+  * **T0.3** F22 throughput perf gate (`tests/fingerprint_f22.rs`)
+    now requires `TOKENFS_ALGOS_RUN_THROUGHPUT_GATE=1` to actually
+    enforce the wall-clock check; the correctness portion of the
+    test stays in the default suite. The slow throughput gate is
+    opt-in for calibrated hardware.
+  * **T0.4** `tests/histogram_kernels.rs` now requires
+    `bench-internals` so its `#[cfg(feature = "bench-internals")]`
+    suite actually runs in CI (was reporting "0 tests passed"
+    silently).
+
+### Fixed — CI fuzz smoke (Tier 1)
+
+  * **T1.4** `cargo +nightly fuzz build` now builds all 13 declared
+    fuzz targets and `cargo +nightly fuzz list`-driven smoke matrix
+    runs each one for a few seconds.
+  * **T1.5** Removed `|| true` swallow from CI fuzz smoke runs.
+    Real crashes now fail the workflow; libFuzzer's exit-code 124
+    (timeout) is treated separately from exit-code 77 (crash).
+
+### Notes
+
+  * Lib test counts: 975 with `--all-features` (no change vs v0.4.3 —
+    the T1.1 `_unchecked` dispatcher and T1.2 `try_new` route through
+    the same existing test sites). 779 default.
+    669 `--no-default-features --features alloc`.
+  * All `cargo xtask check`, panic-surface-lint, aarch64 cross-clippy,
+    `cargo deny check` green with zero advisory suppressions.
+  * Audit-R10 Tier 2 (T2.1-T2.6, scheduled for v0.4.5) covers the
+    remaining MEDIUM findings (`try_sha256`, saturating counters,
+    bench regression CI, scheduled calibration, no_std smoke
+    broadening, panic-surface allowlist clearance).
+
 ## [0.4.3] — 2026-05-03
 
 Audit-R9 closeout: 7 of 8 findings closed (the 8th, R9 #1
