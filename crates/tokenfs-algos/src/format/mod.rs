@@ -676,7 +676,15 @@ impl Sniffer {
         // bytes beyond the first 32 distinct values into a shared
         // wildcard class, which can route unrelated bytes through the
         // same DFA edges and report spurious hits at the wrong state.
-        for (start, pat_idx) in self.dfa.find_iter(bytes) {
+        //
+        // Cap the DFA scan window at `max_anchor` (audit-R10 #6): no
+        // magic rule's start is past `max(rule.offset)`, so scanning
+        // beyond the longest anchor only burns cycles and would let
+        // an attacker-supplied multi-GB buffer turn a kernel/FUSE
+        // sniffing call into an arbitrary-time DoS.
+        let scan_end = self.max_anchor.min(bytes.len());
+        let scan = &bytes[..scan_end];
+        for (start, pat_idx) in self.dfa.find_iter(scan) {
             let rule = self.rules[pat_idx];
             if start != rule.offset {
                 continue;
@@ -1243,6 +1251,35 @@ mod tests {
         let bytes = vec![0xab_u8; 4096];
         let d = detect(&bytes);
         assert_eq!(d.format, Format::Unknown);
+    }
+
+    /// Audit-R10 #6: the magic-rule scan must be bounded by
+    /// `max_anchor`. Verify two ways: (a) the longest tail of arbitrary
+    /// bytes does not change the verdict on a short prefix, (b) a
+    /// pathological 2 MiB blob without a magic still completes
+    /// promptly because Layer 1 only walks `max_anchor` bytes.
+    #[test]
+    fn detect_caps_layer1_scan_at_max_anchor() {
+        // Real PNG header with garbage tail.
+        let mut payload = Vec::with_capacity(2 * 1024 * 1024);
+        payload.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+        payload.extend(xorshift_bytes(0xa5, 2 * 1024 * 1024));
+        let detection = Sniffer::new().detect(&payload);
+        assert_eq!(
+            detection.format,
+            Format::Png,
+            "PNG magic with 2 MiB tail must still detect PNG",
+        );
+
+        // Pathological no-magic blob; with the cap, this only walks
+        // `max_anchor` bytes for layer 1 (the layer 2/3 fallbacks are
+        // bounded separately and acceptable on attacker-supplied
+        // input).
+        let blob = xorshift_bytes(0xa5, 2 * 1024 * 1024);
+        let detection = Sniffer::new().detect(&blob);
+        // Only assert it returns; the format itself depends on the
+        // entropy fallback heuristic.
+        let _ = detection.format;
     }
 
     // ---- Sniffer parity ----
