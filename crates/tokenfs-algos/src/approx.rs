@@ -23,9 +23,16 @@
 
 /// Failure modes for the fallible approx-data-structure constructors
 /// (`BloomFilter::try_new`, `BloomFilter::try_with_target`,
-/// `HyperLogLog::try_new`).
+/// `HyperLogLog::try_new`) and the SIMD `try_*_simd` paths
+/// (`BloomFilter::try_insert_simd`, `BloomFilter::try_contains_simd`).
+///
+/// Marked `#[non_exhaustive]` so future audit cycles can add variants
+/// (e.g. tighter overflow bounds) without churning the public enum
+/// surface — kernel callers should always include a `_ =>` arm when
+/// pattern-matching.
 #[cfg(feature = "std")]
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum ApproxError {
     /// A required positive-integer parameter was zero (BloomFilter
     /// `bits` / `k`, HyperLogLog `precision` outside the valid band).
@@ -50,6 +57,31 @@ pub enum ApproxError {
         min: u32,
         /// Largest accepted precision.
         max: u32,
+    },
+    /// The optimal-loading formula for `BloomFilter::with_target`
+    /// computed a bit count that does not fit in `usize` (or would
+    /// saturate the `f64 → usize` cast and trigger `div_ceil`
+    /// overflow downstream). Caller-supplied parameters are echoed
+    /// back so the caller can clamp `expected_items` or relax
+    /// `target_fpr`.
+    BitCountOverflow {
+        /// Caller-supplied `expected_items`.
+        expected_items: usize,
+        /// Caller-supplied `target_fpr`.
+        target_fpr: f64,
+    },
+    /// The Bloom filter's `k` (number of hash positions per item)
+    /// exceeds the SIMD insert/contains buffer capacity
+    /// ([`bloom_kernels::MAX_K`]). The scalar [`BloomFilter::insert`]
+    /// / [`BloomFilter::contains`] paths are unaffected; only the
+    /// `*_simd` paths require this bound because they allocate a
+    /// stack buffer of fixed size `MAX_K`.
+    KExceedsSimdMax {
+        /// Caller-supplied `k`.
+        k: usize,
+        /// Largest `k` accepted by the SIMD APIs (currently
+        /// [`bloom_kernels::MAX_K`] = 32).
+        max: usize,
     },
 }
 
@@ -104,6 +136,19 @@ impl core::fmt::Display for ApproxError {
             } => write!(
                 f,
                 "HyperLogLog precision {requested} outside accepted band {min}..={max}"
+            ),
+            Self::BitCountOverflow {
+                expected_items,
+                target_fpr,
+            } => write!(
+                f,
+                "BloomFilter::with_target overflowed usize: expected_items={expected_items}, \
+                 target_fpr={target_fpr} (clamp expected_items or relax target_fpr)"
+            ),
+            Self::KExceedsSimdMax { k, max } => write!(
+                f,
+                "BloomFilter SIMD path requires k <= {max}, got k={k} (use the scalar \
+                 `insert` / `contains` path or rebuild with smaller k)"
             ),
         }
     }
@@ -307,7 +352,10 @@ mod bloom {
         ///
         /// # Panics
         ///
-        /// Panics if `bits == 0` or `k == 0`.
+        /// Panics if `bits == 0` or `k == 0`. Kernel/FUSE callers
+        /// should use [`Self::try_new`] which returns
+        /// [`super::ApproxError`] on the same preconditions instead of
+        /// aborting the caller.
         #[must_use]
         pub fn new(bits: usize, k: usize) -> Self {
             assert!(bits > 0, "BloomFilter bits must be > 0");
@@ -325,6 +373,16 @@ mod bloom {
         /// Builds a Bloom filter sized for `expected_items` with the
         /// requested `target_fpr` (false-positive rate). Picks bit count
         /// and `k` per the optimal-loading formulas.
+        ///
+        /// # Panics
+        ///
+        /// Panics if `expected_items == 0`, if `target_fpr` is not in
+        /// the open interval `(0, 1)`, or if the optimal bit count
+        /// overflows `usize` (e.g. enormous `expected_items` paired
+        /// with a vanishingly small `target_fpr`). Kernel/FUSE callers
+        /// should use [`Self::try_with_target`] which surfaces the
+        /// same preconditions as [`super::ApproxError`] without
+        /// panicking.
         #[must_use]
         pub fn with_target(expected_items: usize, target_fpr: f64) -> Self {
             assert!(expected_items > 0);
@@ -332,13 +390,24 @@ mod bloom {
             // m = -n ln(p) / (ln 2)^2; k = (m/n) ln 2.
             let n = expected_items as f64;
             let ln2_sq = core::f64::consts::LN_2 * core::f64::consts::LN_2;
-            let m = (-n * target_fpr.ln() / ln2_sq).ceil() as usize;
+            let m_f = (-n * target_fpr.ln() / ln2_sq).ceil();
+            assert!(
+                m_f.is_finite() && m_f >= 1.0 && m_f <= usize::MAX as f64,
+                "BloomFilter::with_target bit count {m_f} overflows usize \
+                 (expected_items={expected_items}, target_fpr={target_fpr})"
+            );
+            let m = m_f as usize;
             let k = ((m as f64 / n) * core::f64::consts::LN_2).round().max(1.0) as usize;
             Self::new(m, k)
         }
 
         /// Fallible variant of [`Self::new`] returning [`super::ApproxError`]
         /// on `bits == 0` or `k == 0` instead of panicking.
+        ///
+        /// Validation is exhaustive: `Ok` is returned iff calling
+        /// [`Self::new`] with the same arguments would not panic. This
+        /// is the kernel-safe entry point for the audit-R7 hardening
+        /// gate — see the module-level docs.
         pub fn try_new(bits: usize, k: usize) -> Result<Self, super::ApproxError> {
             if bits == 0 {
                 return Err(super::ApproxError::ZeroParameter { name: "bits" });
@@ -350,6 +419,17 @@ mod bloom {
         }
 
         /// Fallible variant of [`Self::with_target`].
+        ///
+        /// Validates `expected_items > 0`, `target_fpr ∈ (0, 1)`, and
+        /// that the optimal bit count fits in `usize`. Returns the
+        /// matching [`super::ApproxError`] variant on any violation:
+        /// [`super::ApproxError::ZeroParameter`] for
+        /// `expected_items == 0`,
+        /// [`super::ApproxError::OutOfRangeFraction`] for an
+        /// out-of-range `target_fpr` (or NaN), and
+        /// [`super::ApproxError::BitCountOverflow`] when the formula
+        /// `m = ceil(-n * ln(p) / (ln 2)^2)` saturates the
+        /// `f64 → usize` cast.
         pub fn try_with_target(
             expected_items: usize,
             target_fpr: f64,
@@ -363,6 +443,19 @@ mod bloom {
                 return Err(super::ApproxError::OutOfRangeFraction {
                     name: "target_fpr",
                     value: target_fpr,
+                });
+            }
+            // Pre-flight the formula in f64 space so we can catch
+            // saturation before the panicking `with_target` cast
+            // collapses the value into `usize::MAX` (which would then
+            // overflow `div_ceil` downstream).
+            let n = expected_items as f64;
+            let ln2_sq = core::f64::consts::LN_2 * core::f64::consts::LN_2;
+            let m_f = (-n * target_fpr.ln() / ln2_sq).ceil();
+            if !m_f.is_finite() || m_f < 1.0 || m_f > usize::MAX as f64 {
+                return Err(super::ApproxError::BitCountOverflow {
+                    expected_items,
+                    target_fpr,
                 });
             }
             Ok(Self::with_target(expected_items, target_fpr))
@@ -476,6 +569,16 @@ mod bloom {
         /// Use [`Self::insert`] instead when the input is a byte slice
         /// (the two surfaces hash differently — see the type-level
         /// docs).
+        ///
+        /// # Panics
+        ///
+        /// Panics if `self.k > bloom_kernels::MAX_K` (32) because the
+        /// SIMD path allocates a fixed-size stack buffer to hold the K
+        /// computed positions. Constructors do not enforce this bound
+        /// (the scalar [`Self::insert`] / [`Self::contains`] paths
+        /// work for any positive `k`); kernel/FUSE callers that
+        /// intend to dispatch SIMD should use [`Self::try_insert_simd`]
+        /// for the fallible parallel.
         pub fn insert_simd(&mut self, key: u64) {
             let (h1, h2) = Self::derive_hashes(key);
             let mut buf = [0_u64; super::bloom_kernels::MAX_K];
@@ -490,6 +593,27 @@ mod bloom {
             self.inserted = self.inserted.wrapping_add(1);
         }
 
+        /// Fallible variant of [`Self::insert_simd`] returning
+        /// [`super::ApproxError::KExceedsSimdMax`] when `self.k`
+        /// exceeds [`super::bloom_kernels::MAX_K`] instead of
+        /// panicking.
+        ///
+        /// `Ok(())` is returned iff calling [`Self::insert_simd`]
+        /// would not panic; the dispatch into the SIMD kernel is
+        /// otherwise identical (bit-exact). For byte-keyed input use
+        /// [`Self::insert`] (always infallible — no SIMD buffer
+        /// involved).
+        pub fn try_insert_simd(&mut self, key: u64) -> Result<(), super::ApproxError> {
+            if self.k > super::bloom_kernels::MAX_K {
+                return Err(super::ApproxError::KExceedsSimdMax {
+                    k: self.k,
+                    max: super::bloom_kernels::MAX_K,
+                });
+            }
+            self.insert_simd(key);
+            Ok(())
+        }
+
         /// SIMD-accelerated query path keyed by a precomputed `u64`.
         ///
         /// Returns true iff every one of the K positions has its bit
@@ -500,6 +624,13 @@ mod bloom {
         ///
         /// Use [`Self::contains`] instead when the input is a byte
         /// slice.
+        ///
+        /// # Panics
+        ///
+        /// Panics if `self.k > bloom_kernels::MAX_K` (32). Kernel/FUSE
+        /// callers should use [`Self::try_contains_simd`] which
+        /// returns [`super::ApproxError::KExceedsSimdMax`] on the
+        /// same precondition.
         #[must_use]
         pub fn contains_simd(&self, key: u64) -> bool {
             let (h1, h2) = Self::derive_hashes(key);
@@ -515,6 +646,25 @@ mod bloom {
                 }
             }
             true
+        }
+
+        /// Fallible variant of [`Self::contains_simd`] returning
+        /// [`super::ApproxError::KExceedsSimdMax`] when `self.k`
+        /// exceeds [`super::bloom_kernels::MAX_K`] instead of
+        /// panicking.
+        ///
+        /// `Ok(true)` / `Ok(false)` mirror [`Self::contains_simd`]'s
+        /// boolean result; the only failure mode is the SIMD-buffer
+        /// capacity check that the scalar [`Self::contains`] avoids
+        /// entirely.
+        pub fn try_contains_simd(&self, key: u64) -> Result<bool, super::ApproxError> {
+            if self.k > super::bloom_kernels::MAX_K {
+                return Err(super::ApproxError::KExceedsSimdMax {
+                    k: self.k,
+                    max: super::bloom_kernels::MAX_K,
+                });
+            }
+            Ok(self.contains_simd(key))
         }
 
         /// Batched query: writes `out[i] = contains_simd(keys[i])` for
@@ -2402,6 +2552,109 @@ mod tests {
             ));
         }
         assert!(BloomFilter::try_with_target(1000, 0.01).is_ok());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn bloom_try_with_target_rejects_bit_count_overflow() {
+        // m = -n * ln(p) / (ln 2)^2. With n = usize::MAX (~1.8e19) and
+        // a tiny target_fpr (e.g. 1e-300, so ln(p) ≈ -690), the
+        // formula yields m ≈ 1.8e19 * 690 / 0.48 ≈ 2.6e22, which
+        // saturates the f64 → usize cast. The fallible parallel must
+        // detect this and surface BitCountOverflow instead of letting
+        // the panicking with_target downstream blow up.
+        let err = BloomFilter::try_with_target(usize::MAX, 1e-300).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ApproxError::BitCountOverflow {
+                    expected_items,
+                    target_fpr,
+                } if expected_items == usize::MAX && target_fpr == 1e-300
+            ),
+            "expected BitCountOverflow, got {err:?}"
+        );
+        // Boundary: a moderate workload that does NOT overflow stays
+        // OK (sanity that we didn't accidentally tighten the gate).
+        assert!(BloomFilter::try_with_target(1_000_000, 1e-9).is_ok());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    #[should_panic(expected = "overflows usize")]
+    fn bloom_with_target_panics_on_bit_count_overflow() {
+        // Companion to the fallible test above: the panicking
+        // sibling must trip its assertion when handed parameters
+        // that the fallible variant rejects with BitCountOverflow.
+        let _ = BloomFilter::with_target(usize::MAX, 1e-300);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn bloom_try_insert_simd_rejects_oversized_k() {
+        // BloomFilter::new accepts any k > 0, but the SIMD
+        // insert/contains paths allocate a fixed-size [0; MAX_K]
+        // stack buffer and would panic for k > MAX_K. The fallible
+        // wrappers must surface KExceedsSimdMax instead.
+        let max_k = bloom_kernels::MAX_K;
+        let mut bf = BloomFilter::new(1024, max_k + 1);
+        let err = bf.try_insert_simd(0xDEAD_BEEF).unwrap_err();
+        assert!(matches!(
+            err,
+            ApproxError::KExceedsSimdMax { k, max } if k == max_k + 1 && max == max_k
+        ));
+        let err = bf.try_contains_simd(0xDEAD_BEEF).unwrap_err();
+        assert!(matches!(
+            err,
+            ApproxError::KExceedsSimdMax { k, max } if k == max_k + 1 && max == max_k
+        ));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn bloom_try_insert_simd_happy_path_matches_panicking_sibling() {
+        // For valid k (≤ MAX_K) the fallible wrappers are bit-exact
+        // with insert_simd / contains_simd. Verify by inserting via
+        // the fallible API and querying via both surfaces.
+        let mut bf_try = BloomFilter::new(2048, 7);
+        let mut bf_ref = BloomFilter::new(2048, 7);
+        for key in 0_u64..64 {
+            bf_try.try_insert_simd(key).expect("k=7 ≤ MAX_K, must succeed");
+            bf_ref.insert_simd(key);
+        }
+        // Identical bit-vector state.
+        for key in 0_u64..128 {
+            let lhs = bf_try.try_contains_simd(key).expect("k=7 ≤ MAX_K");
+            let rhs = bf_ref.contains_simd(key);
+            assert_eq!(lhs, rhs, "try/panicking diverged for key {key}");
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn bloom_try_insert_simd_boundary_k_equals_max() {
+        // Boundary case: k == MAX_K is the largest accepted value.
+        // The exact-MAX_K case must succeed, exercising the [..self.k]
+        // slice taking the full buffer.
+        let max_k = bloom_kernels::MAX_K;
+        let mut bf = BloomFilter::new(8192, max_k);
+        bf.try_insert_simd(42).expect("k == MAX_K should succeed");
+        assert!(
+            bf.try_contains_simd(42).expect("k == MAX_K should succeed"),
+            "false negative at k == MAX_K"
+        );
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    #[should_panic]
+    fn bloom_insert_simd_panics_on_oversized_k() {
+        // Companion to the fallible test: panicking sibling must
+        // panic when k > MAX_K. We don't pin the panic message
+        // because the slice-out-of-bounds message is rustc-version
+        // dependent.
+        let mut bf = BloomFilter::new(1024, bloom_kernels::MAX_K + 1);
+        bf.insert_simd(0);
     }
 
     #[cfg(feature = "std")]
