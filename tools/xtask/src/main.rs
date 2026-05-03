@@ -161,6 +161,13 @@ fn security() -> Result<()> {
         "std",
         "--lib",
     ])?;
+    // T2.5: build the dedicated no_std smoke crate so the kernel-safe
+    // surface is exercised through an actual `#![no_std]` consumer
+    // (audit-R10 #10). The crate's `smoke()` calls every kernel-claimed-
+    // safe primitive in turn; if any of them stops being reachable
+    // without `userspace`, this build fails.
+    cargo(["check", "-p", "tokenfs-algos-no-std-smoke"])?;
+    cargo(["build", "-p", "tokenfs-algos-no-std-smoke", "--release"])?;
     ensure_minimal_no_std_dependency_tree()?;
     panic_surface_lint()?;
     Ok(())
