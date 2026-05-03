@@ -1132,8 +1132,16 @@ impl Hasher {
     /// the cumulative length past that bound. Past the cap the padding
     /// length field would wrap and the digest would collide with a
     /// shorter, different input — a content-ID hazard, not a memory
-    /// hazard. Use [`Self::try_update`] in callers that want a
-    /// `Result` instead of a panic for adversarial input lengths.
+    /// hazard.
+    ///
+    /// # Kernel/FUSE callers
+    ///
+    /// Use [`Self::try_update`] instead. Untrusted callers can supply
+    /// adversarial byte streams approaching the 2 EiB cap (over multiple
+    /// syscalls feeding the same hasher); a panic at the kernel
+    /// boundary is a DoS vector. `try_update` returns
+    /// [`Sha256LengthOverflow`] on overflow with both the current bit
+    /// count and the attempted chunk size for diagnostics.
     pub fn update(&mut self, bytes: &[u8]) {
         self.try_update(bytes)
             .expect("SHA-256 stream length exceeded 2^64 bits");
