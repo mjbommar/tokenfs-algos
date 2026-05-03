@@ -513,7 +513,14 @@ pub fn build_cid_v1_string(codec: Multicodec, multihash: &[u8]) -> String {
 #[cfg(any(feature = "std", feature = "alloc"))]
 #[must_use]
 pub fn sha256_cid(bytes: &[u8]) -> String {
-    let digest = crate::hash::sha256::sha256(bytes);
+    // Route through `try_sha256` so the caller surfaces an explicit
+    // panic on >2 EiB inputs rather than the silent FIPS bit-length
+    // wrap that the per-backend kernels would otherwise produce
+    // (audit-R10 #4). Real-world inputs are bounded by available
+    // memory and never come close to 2 EiB; the `expect` documents
+    // the invariant.
+    let digest = crate::hash::sha256::try_sha256(bytes)
+        .expect("sha256_cid: input length exceeds 2^64 bits (~2 EiB) — physically impossible");
     let mh = encode_multihash_vec(MultihashCode::Sha2_256, &digest)
         .expect("SHA-256 digest is always 32 bytes (matches Sha2_256 multihash length)");
     build_cid_v1_string(Multicodec::Raw, &mh)

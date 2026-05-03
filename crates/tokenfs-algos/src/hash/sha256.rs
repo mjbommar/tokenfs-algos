@@ -94,9 +94,44 @@ pub const BLOCK_BYTES: usize = 64;
 pub const DIGEST_BYTES: usize = 32;
 
 /// Computes the SHA-256 digest of `bytes` using the fastest available backend.
+///
+/// # Panics
+///
+/// Panics if `bytes.len() * 8 > u64::MAX` — i.e. inputs larger than
+/// `u64::MAX / 8` bytes (~2 EiB) would overflow the FIPS 180-4 bit-length
+/// field. Realistic inputs are nowhere near this cap; kernel/FUSE callers
+/// that handle attacker-supplied buffers MUST use [`try_sha256`] (audit-R10
+/// #4), which surfaces the overflow as `Sha256LengthOverflow` instead.
+///
+/// Available only with `feature = "userspace"` — kernel-default builds
+/// reach [`try_sha256`] only.
+#[cfg(feature = "userspace")]
 #[must_use]
 pub fn sha256(bytes: &[u8]) -> [u8; DIGEST_BYTES] {
-    kernels::auto::sha256(bytes)
+    try_sha256(bytes).expect("sha256: input length exceeds 2^64 bits (~2 EiB)")
+}
+
+/// Fallible one-shot SHA-256.
+///
+/// Returns [`Sha256LengthOverflow`] if `bytes.len() * 8` would not fit
+/// in `u64` — i.e. inputs larger than ~2 EiB. Otherwise computes the
+/// SHA-256 digest of `bytes` using the fastest available backend
+/// (audit-R10 #4 closeout).
+///
+/// The kernel/FUSE/Postgres-extension entry point for one-shot SHA-256:
+/// the per-backend `kernels::*::sha256` use `wrapping_mul(8)` to compute
+/// the FIPS bit-length field, so feeding them an input above the cap
+/// would silently produce an incorrect digest.
+pub fn try_sha256(bytes: &[u8]) -> Result<[u8; DIGEST_BYTES], Sha256LengthOverflow> {
+    // FIPS 180-4 bit-length field is u64; reject inputs that would wrap
+    // it before any kernel touches the data.
+    if (bytes.len() as u64).checked_mul(8).is_none() {
+        return Err(Sha256LengthOverflow {
+            current_bits: 0,
+            attempted_chunk_bytes: bytes.len(),
+        });
+    }
+    Ok(kernels::auto::sha256(bytes))
 }
 
 /// Pinned SHA-256 kernels.
@@ -547,7 +582,7 @@ fn detect_backend() -> HasherBackend {
 
 #[cfg(test)]
 mod tests {
-    use super::{Hasher, HasherBackend, kernels, sha256};
+    use super::{Hasher, HasherBackend, kernels, try_sha256};
     // `Vec`, `String`, and the `vec!` / `format!` macros are not in the
     // no-std prelude; alias them from `alloc` for the alloc-only build
     // (audit-R6 finding #164).
@@ -576,6 +611,29 @@ mod tests {
             hex(&d),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
+    }
+
+    /// `try_sha256` returns the same digest as the kernel auto path for
+    /// realistic inputs (audit-R10 #4).
+    #[test]
+    fn try_sha256_matches_dispatch_for_normal_input() {
+        let cases: &[&[u8]] = &[b"", b"abc", b"the quick brown fox jumps over the lazy dog"];
+        for &msg in cases {
+            let direct = kernels::auto::sha256(msg);
+            let fallible = try_sha256(msg).expect("normal input within bit-length cap");
+            assert_eq!(direct, fallible);
+        }
+    }
+
+    /// `try_sha256` Err path for the ~2 EiB cap is unreachable on real
+    /// allocations; verify the cap arithmetic via a constructed byte
+    /// slice with `len() > usize::MAX / 8` would have wrapped.
+    /// Instead we exercise the boundary check by asserting a small
+    /// input does NOT trip the err.
+    #[test]
+    fn try_sha256_does_not_reject_realistic_inputs() {
+        let msg = vec![0u8; 1 << 20]; // 1 MiB
+        assert!(try_sha256(&msg).is_ok());
     }
 
     /// FIPS 180-4 § B.1 ("abc").
@@ -624,7 +682,7 @@ mod tests {
         ];
         for case in cases {
             assert_eq!(
-                sha256(case),
+                kernels::auto::sha256(case),
                 kernels::scalar::sha256(case),
                 "auto vs scalar for len={}",
                 case.len(),
@@ -761,7 +819,7 @@ mod tests {
     #[test]
     fn hasher_empty_matches_one_shot() {
         let h = Hasher::new();
-        assert_eq!(h.finalize(), sha256(b""));
+        assert_eq!(h.finalize(), kernels::auto::sha256(b""));
     }
 
     #[test]
@@ -770,7 +828,7 @@ mod tests {
         let mut h = Hasher::new();
         h.try_update(payload)
             .expect("test sha256 update within bounds");
-        assert_eq!(h.finalize(), sha256(payload));
+        assert_eq!(h.finalize(), kernels::auto::sha256(payload));
     }
 
     #[test]
@@ -800,7 +858,7 @@ mod tests {
         // 100 KiB random payload, chunked into 1, 17, 64, 65, 1024-byte
         // updates. Must produce the same digest as a single-shot call.
         let payload = random_bytes(100 * 1024);
-        let expected = sha256(&payload);
+        let expected = kernels::auto::sha256(&payload);
         for &chunk in &[1_usize, 17, 63, 64, 65, 127, 128, 1024, 4096] {
             let mut h = Hasher::new();
             for block in payload.chunks(chunk) {
@@ -814,7 +872,7 @@ mod tests {
     #[test]
     fn hasher_empty_updates_are_no_ops() {
         let payload = b"hello, world";
-        let expected = sha256(payload);
+        let expected = kernels::auto::sha256(payload);
         let mut h = Hasher::new();
         h.try_update(b"").expect("test sha256 update within bounds");
         h.try_update(payload)
@@ -830,9 +888,9 @@ mod tests {
         h.try_update(payload)
             .expect("test sha256 update within bounds");
         let d1 = h.finalize_reset();
-        assert_eq!(d1, sha256(payload));
+        assert_eq!(d1, kernels::auto::sha256(payload));
         // After reset, the hasher should produce the empty digest.
-        assert_eq!(h.clone().finalize(), sha256(b""));
+        assert_eq!(h.clone().finalize(), kernels::auto::sha256(b""));
         h.try_update(payload)
             .expect("test sha256 update within bounds");
         assert_eq!(h.finalize(), d1);
@@ -846,7 +904,7 @@ mod tests {
         h.reset();
         h.try_update(b"abc")
             .expect("test sha256 update within bounds");
-        assert_eq!(h.finalize(), sha256(b"abc"));
+        assert_eq!(h.finalize(), kernels::auto::sha256(b"abc"));
     }
 
     /// All NIST § B and the long-stress vector via the streaming path.

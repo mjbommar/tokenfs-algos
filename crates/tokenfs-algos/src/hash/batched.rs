@@ -51,7 +51,7 @@
 //! deployments (audit-R5 #157).
 
 use crate::hash::sha256::DIGEST_BYTES as SHA256_DIGEST_BYTES;
-use crate::hash::sha256::sha256 as sha256_one;
+use crate::hash::sha256::kernels::auto::sha256 as sha256_one;
 
 #[cfg(feature = "blake3")]
 use crate::hash::blake3::DIGEST_BYTES as BLAKE3_DIGEST_BYTES;
@@ -379,7 +379,11 @@ mod tests {
     #![allow(clippy::unwrap_used)] // Test code — panic on Err is the desired failure mode.
 
     use super::*;
-    use crate::hash::sha256::sha256;
+    // Tests use the panicking `sha256` entry, which is now userspace-gated
+    // (audit-R10 #4). Test mod is `cfg(test)`, which already implies the
+    // panicking surface is acceptable; alias through the kernel auto
+    // dispatcher so tests still compile under non-userspace test runs.
+    use crate::hash::sha256::kernels::auto::sha256;
     // `Vec` and `vec!` are not in the no-std prelude; alias them from
     // `alloc` for the alloc-only build (audit-R6 finding #164). Both are
     // only used inside `panicking-shape-apis`-gated tests / helpers, so
