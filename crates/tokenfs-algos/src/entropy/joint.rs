@@ -1,7 +1,10 @@
 //! Joint entropy estimators over adjacent byte pairs.
 
 use crate::{
-    histogram::{BytePairHistogram, BytePairScratch},
+    histogram::{
+        BytePairHistogram, BytePairScratch,
+        pair::{BytePairCountsScratch, BytePairHistogramView},
+    },
     math,
 };
 
@@ -57,7 +60,18 @@ impl PairEntropyShape {
 
 /// Computes exact adjacent-pair joint entropy `H(X_i, X_{i+1})`.
 ///
-/// This uses a dense 65,536-bin byte-pair histogram and does not allocate.
+/// This uses a dense 65,536-bin byte-pair histogram and does not heap-
+/// allocate.
+///
+/// # Stack
+///
+/// Materialises a [`BytePairHistogram`] (~256 KiB) on the call frame —
+/// well above typical kernel/FUSE stack budgets (8-16 KiB; see
+/// `docs/v0.2_planning/02b_DEPLOYMENT_MATRIX.md`). Kernel-adjacent
+/// callers must instead use [`h2_pairs_with_scratch`] (lazy-clear scratch
+/// path) or [`h2_pairs_with_dense_scratch`] (caller-provided dense
+/// counter table) — both keep the dense counters off the stack
+/// (audit-R8 #6a).
 #[must_use]
 pub fn h2_pairs(bytes: &[u8]) -> f32 {
     let histogram = BytePairHistogram::from_bytes(bytes);
@@ -71,10 +85,46 @@ pub fn h2_pairs_with_scratch(bytes: &[u8], scratch: &mut BytePairScratch) -> f32
     h2_from_pair_scratch(scratch)
 }
 
+/// Heap-free / kernel-safe sibling of [`h2_pairs`]: computes exact
+/// adjacent-pair joint entropy `H(X_i, X_{i+1})` over `bytes` using a
+/// caller-provided dense counter table.
+///
+/// Mirrors the §156 caller-provided-scratch convention used by
+/// [`crate::similarity::kernels_gather::build_table_from_seeds_into`]
+/// (audit-R5). Allocate `scratch` once via a path that does not stack-
+/// materialise the inner array (`Box::<BytePairCountsScratch>::new_uninit`,
+/// thread-local pool, postgres memory context, kernel `kmalloc`'d slab)
+/// and pass a `&mut` borrow. The caller decides where the 256 KiB dense
+/// counter table lives, so the kernel-stack hazard documented on
+/// [`h2_pairs`] does not apply (audit-R8 #6a).
+///
+/// `scratch` is fully overwritten on entry — its prior contents are
+/// discarded — so callers may reuse a single buffer across many calls
+/// without pre-clearing it.
+///
+/// Bit-exact with [`h2_pairs`] for every input.
+#[must_use]
+pub fn h2_pairs_with_dense_scratch(bytes: &[u8], scratch: &mut BytePairCountsScratch) -> f32 {
+    let view = BytePairHistogram::with_scratch(bytes, scratch);
+    h2_from_pair_view(&view)
+}
+
 /// Computes joint entropy from a dense byte-pair histogram.
 #[must_use]
 pub fn h2_from_pair_histogram(histogram: &BytePairHistogram) -> f32 {
     entropy_counts_u32(histogram.counts(), histogram.observations())
+}
+
+/// Computes joint entropy from a borrowed dense byte-pair histogram view.
+///
+/// Companion of [`h2_from_pair_histogram`] for the heap-free /
+/// caller-provided-scratch path: takes a [`BytePairHistogramView`]
+/// returned by [`BytePairHistogram::with_scratch`] so callers in
+/// kernel-adjacent contexts can compute joint entropy without the dense
+/// counter table living on the call frame (audit-R8 #6a).
+#[must_use]
+pub fn h2_from_pair_view(view: &BytePairHistogramView<'_>) -> f32 {
+    entropy_counts_u32(view.counts(), view.observations())
 }
 
 /// Computes joint entropy from reusable pair scratch state.
@@ -144,9 +194,25 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        PairEntropyShape, PairEntropyStrategy, h2_pairs, h2_pairs_with_scratch, plan_pair_entropy,
+        PairEntropyShape, PairEntropyStrategy, h2_pairs, h2_pairs_with_dense_scratch,
+        h2_pairs_with_scratch, plan_pair_entropy,
     };
-    use crate::histogram::BytePairScratch;
+    use crate::histogram::{BytePairScratch, pair::BytePairCountsScratch};
+
+    /// Heap-allocate a zeroed `BytePairCountsScratch` without ever
+    /// materialising the 256 KiB inner array on the test stack — the
+    /// kernel-safe constructor under test would defeat itself if its
+    /// own test triggered the hazard.
+    fn alloc_zeroed_dense_scratch() -> Box<BytePairCountsScratch> {
+        use core::mem::MaybeUninit;
+        let mut uninit: Box<MaybeUninit<BytePairCountsScratch>> = Box::new_uninit();
+        // SAFETY: heap storage of `sizeof::<BytePairCountsScratch>()` is
+        // valid; bit-pattern 0 is a valid u32 in every counter slot.
+        unsafe {
+            core::ptr::write_bytes(uninit.as_mut_ptr().cast::<u32>(), 0, 256 * 256);
+            uninit.assume_init()
+        }
+    }
 
     #[test]
     fn repeated_pair_joint_entropy_is_zero() {
@@ -164,6 +230,49 @@ mod tests {
         let mut scratch = Box::new(BytePairScratch::new());
         let bytes = b"abacabadabacaba";
         assert_eq!(h2_pairs(bytes), h2_pairs_with_scratch(bytes, &mut scratch));
+    }
+
+    /// `h2_pairs_with_dense_scratch` must be bit-exact with the legacy
+    /// by-value `h2_pairs` form across representative inputs. This is
+    /// the parity guarantee for audit-R8 #6a: the kernel-safe
+    /// dense-scratch path must not drift in semantics.
+    #[test]
+    fn dense_scratch_h2_matches_h2_pairs() {
+        let mut scratch = alloc_zeroed_dense_scratch();
+        for &payload in &[
+            b"" as &[u8],
+            b"a",
+            b"aaaaaaaa",
+            b"abababa",
+            b"abacabadabacaba",
+            b"the quick brown fox jumps over the lazy dog 0123456789!@#$%^&*()",
+        ] {
+            assert_eq!(
+                h2_pairs(payload),
+                h2_pairs_with_dense_scratch(payload, &mut scratch),
+                "payload={payload:?}",
+            );
+        }
+    }
+
+    /// Trivial input (empty / single byte) returns 0.0 with no UB on a
+    /// freshly cleared dense scratch.
+    #[test]
+    fn dense_scratch_h2_handles_trivial_input() {
+        let mut scratch = alloc_zeroed_dense_scratch();
+        assert_eq!(h2_pairs_with_dense_scratch(b"", &mut scratch), 0.0);
+        assert_eq!(h2_pairs_with_dense_scratch(b"x", &mut scratch), 0.0);
+    }
+
+    /// Reusing a single dense scratch across multiple calls produces
+    /// independent results — the per-call clear inside
+    /// `h2_pairs_with_dense_scratch` discards prior contents.
+    #[test]
+    fn dense_scratch_h2_reuses_buffer_across_calls() {
+        let mut scratch = alloc_zeroed_dense_scratch();
+        let _ = h2_pairs_with_dense_scratch(b"aaaaaaaa", &mut scratch);
+        let entropy = h2_pairs_with_dense_scratch(b"abababa", &mut scratch);
+        assert!((entropy - 1.0).abs() < 1e-6, "after reuse: {entropy}");
     }
 
     #[test]
