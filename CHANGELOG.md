@@ -4,6 +4,163 @@ All notable changes to this crate will be documented in this file. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] — 2026-05-02
+
+Phase D Rabbit Order release: SIMD modularity inner loop (Sprint 50-52) +
+round-based concurrent merging (Sprint 53-55) on top of the v0.2.3
+sequential baseline (Sprint 47-49). Audit-round-6 hardening rolled in.
+
+### Added — Phase D Rabbit Order (full)
+
+- **`permutation::rabbit::kernels`** module — Sprint 50-52 SIMD modularity
+  inner loop. `modularity_gain_kernel::scalar` /
+  `modularity_gain_kernel::avx2` / `modularity_gain_kernel::avx512` /
+  `modularity_gain_kernel::neon` + `auto` runtime dispatcher. The inner
+  loop computes per-neighbor `m * w_uv - k_u * k_v / m` (the integer
+  `i128` modularity-gain ledger) over a community's adjacency in batches
+  matching the host's lane width. The kernel itself clears 1 GElem/s at
+  n≥1000 batches; per-call dispatch + i128 epilogue currently leave the
+  AVX2 `auto` path at parity with scalar (0.91-1.00x) on Alder Lake —
+  see `docs/PHASE_D_BENCH_RESULTS.md` and the regression-candidate
+  analysis. The kernel is in place for downstream profiling work; a
+  follow-up sprint will reclaim the lane-parallel gain. Bench:
+  `permutation_rabbit/modularity_gain/*`.
+- **`permutation::rabbit_order_par`** — Sprint 53-55 round-based
+  concurrent merging. Parallelizes the dendrogram-build phase by
+  partitioning eligible-merger candidates into rounds where each
+  community appears at most once, then dispatching round merges via
+  `rayon`. Above `RABBIT_PARALLEL_EDGE_THRESHOLD` edges, falls through
+  to sequential `rabbit_order` to avoid coordination overhead. Above
+  the threshold the round-based variant is currently **modestly slower
+  than sequential** (0.88-0.91x on representative graphs) because the
+  apply phase per round is sequential — this matches the explicit
+  doc-comment posture and is documented as expected. The variant exists
+  primarily as a deterministic API surface for rayon-driven pipelines;
+  the colouring-based conflict-free batching that would deliver wall-
+  clock speedup is a follow-up sprint. Bench:
+  `permutation_rabbit/par_build/*`.
+- Bench harness coverage: `bench_rabbit_build`, `bench_rabbit_par_build`,
+  `bench_modularity_gain_kernel` in `crates/tokenfs-algos/benches/permutation_rcm.rs`.
+- **`docs/PHASE_D_BENCH_RESULTS.md`** captures the v0.3.0 baseline
+  numbers on i9-12900K (24 logical cores) including the two regression
+  candidates above.
+
+### Audit-round-7 hardening
+
+- **#1 `select_in_word(word, k)` release-mode k>=64 guard** — the
+  public `pub fn select_in_word(word: u64, k: u32)` previously
+  validated `k < word.count_ones()` only via `debug_assert!`; in
+  release builds, callers passing `k >= 64` reached
+  `_pdep_u64(1u64 << k, word)` (UB on shift >= 64) or the broadword
+  fallback where `k.wrapping_mul(L8)` silently produced garbage.
+  Both paths now early-return the `64` "not found" sentinel when
+  `k >= 64` or `k >= word.count_ones()`. `debug_assert!` retained
+  so a contract violation still surfaces immediately under
+  `cargo test`.
+- **#2 `bit_pack` `_unchecked` split mirroring R6 #162** — every
+  `pub fn *_u32_slice` in `bits::bit_pack::kernels::{scalar, avx2,
+  neon, auto}` now has an `*_u32_slice_unchecked` sibling without
+  the `assert!((1..=32).contains(&w))` / `assert!(out.len() >= n)`
+  guards. The asserting wrappers call into `_unchecked` after
+  pre-validation. The `try_*` paths on `BitPacker<W>` and
+  `DynamicBitPacker` now dispatch directly to
+  `kernels::auto::*_unchecked` after their own validation,
+  eliminating panic sites from the fallible API surface even with
+  `panicking-shape-apis` disabled. Closes the half-done state where
+  R6 #162 had split streamvbyte but not bit_pack.
+- **#3 `bits::rank_select` module doctest now runs** — the
+  module-level doctest contained five `assert_eq!` calls
+  demonstrating `rank1` / `select1` behaviour but was annotated
+  ` ```no_run `, so the assertions never executed under
+  `cargo test --doc`. Removed the `no_run` annotation; +1 doctest
+  pass.
+- **#4 `RuleDecision::index` widened `u16` → `u32`** — silent
+  truncation cast `index as u16` is gone. The natural `usize`
+  enumerate index always fits `u32` for any feasible rule count.
+  **BREAKING** for direct readers of `RuleDecision`; trace-mode
+  callers using accessor only need the new field type.
+- **#6 kernels module doc-text reconciled `2^32` → `2^31`** — the
+  module-level eligibility text claimed "every input < 2^32" but
+  the literal `BOUND` constant on every backend is `1_u64 << 31`.
+  Reconciled the prose to match the code (the conservative bound
+  exists to keep the i64 product symmetric around zero — see the
+  per-backend `BOUND` doc-comment for the sign-overflow rationale).
+- **(R7 follow-up) `bit_pack::encoded_len_bytes` saturation** —
+  switched from `n.saturating_mul(w as usize) >> 3` to per-byte
+  arithmetic that saturates at the byte level. The old shape
+  under-estimated the true byte count by a factor of 8 for
+  adversarial `(n, w)` pairs near `usize::MAX`. Defensive only:
+  not reachable from current call sites because `BitPacker` /
+  `DynamicBitPacker` reject `w > 32` upstream.
+
+### Audit-round-6 hardening
+
+- **#161 `Permutation::try_apply_into_strict` + `validate_no_alloc`** —
+  the strict-validation `apply_into_strict` now uses a caller-provided
+  `scratch: &mut [u64]` for permutation validity proof (zero heap
+  allocations on the hot path). Closes the prior stale-slot-leak
+  trigger where `apply_into` would silently produce a partially
+  permuted output if the permutation contained a duplicate index.
+- **#162 split bits kernels into `_unchecked` + asserting wrappers** —
+  `streamvbyte_decode_u32`, `bit_pack` encode/decode now have
+  `_unchecked` siblings that skip bounds-checks (intended for the
+  `try_*` callers that already validated upstream). Asserting
+  wrappers retain the existing public contract. Eliminates redundant
+  bounds checks on the panic-free `try_*` path.
+- **#163 `RankSelectDict` superblock counts u32 → u64** — the per-
+  superblock 1-count was previously `u32`, truncating silently for
+  bitvectors with > 4G ones (~537 MB of bitset). Now `u64` end-to-end;
+  no more silent miscounts at scale. **Breaking** for direct readers
+  of `RankSelectDict` internals; public `rank1` / `select1` API
+  unchanged.
+- **#164 no-std + Miri test coverage gap** — `cargo miri test
+  --no-default-features --features alloc` now compiles cleanly. Closes
+  a gap where alloc-only test helpers in `dispatch::tests` and
+  `streamvbyte::tests` would emit `Vec` / `vec!` references that
+  failed to resolve under no-std prelude. Fold-in fixes:
+  - `examples/{build_pipeline,inverted_index,dispatch_explain,similarity_scan}`
+    are now `required-features = ["panicking-shape-apis"]` in Cargo.toml
+    (they compose via the ergonomic panicking entry points; gated out
+    of the kernel/FUSE deployment build).
+  - `tests/integration_phase_c.rs` is `#![cfg(feature = "panicking-shape-apis")]`
+    file-level for the same reason.
+  - `bits::rank_select` and `hash::batched` doctests rewritten to use
+    the always-available `try_build` / `try_sha256_batch_st` siblings;
+    the panicking-API note moved to a follow-up paragraph.
+  - `tokenfs-algos-no-std-smoke` Cargo.toml inherits license/edition
+    from workspace and pins `tokenfs-algos = "^0.2"` (cargo-deny:
+    bans, licenses).
+
+### Documentation
+
+- **`docs/PHASE_D_RABBIT_ORDER.md`** new — what Rabbit Order solves,
+  when to use vs RCM / Hilbert, performance characteristics, worked
+  example, Arai et al. IPDPS 2016 reference.
+- **`docs/PHASE_D_BENCH_RESULTS.md`** — see SIMD modularity / par
+  paragraph above for the regression-candidate breakdown.
+- **`docs/PLANNER_DESIGN.md`** — the rules-as-data + named-constants
+  planner architecture (32 rules, consts.rs provenance, trace mode,
+  host tunes) already shipped in v0.2.3; called out here for v0.3.0
+  release notes completeness.
+
+### Notes
+
+- Lib test counts: 861 with `--all-features` (was 804 at v0.2.3
+  baseline; +57 across Phase D + R6 + R7), 773 default, 604 under
+  `--no-default-features --features alloc`.
+- All `cargo xtask check`, aarch64 cross-clippy, `cargo deny check`,
+  and `cargo miri test --no-default-features --features alloc` gates
+  green with zero advisory suppressions.
+- No new external dependencies added.
+- Two known regression candidates carried over to a v0.3.1 follow-up:
+  AVX2 modularity-gain kernel at parity-or-slightly-slower vs scalar
+  (likely Vec allocation or i128 epilogue overhead on small batches);
+  `rabbit_order_par` modestly slower than sequential above the
+  parallel-edge threshold (sequential apply phase per round bounds
+  speedup; colouring-based conflict-free batching is the long-term
+  fix). Both documented in `docs/PHASE_D_BENCH_RESULTS.md` and
+  intentional posture for the v0.3.0 cut.
+
 ## [0.2.3] — 2026-05-02
 
 v0.2.x candidate primitives + audit-round-5 hardening + Phase D Rabbit
