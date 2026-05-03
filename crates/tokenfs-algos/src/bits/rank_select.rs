@@ -66,11 +66,14 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-/// Failure modes for the fallible rank/select dictionary constructor
-/// ([`RankSelectDict::try_build`]).
+/// Failure modes for the fallible rank/select dictionary entry points
+/// ([`RankSelectDict::try_build`], [`RankSelectDict::try_rank1`],
+/// [`RankSelectDict::try_rank0`]).
 ///
-/// Returned instead of panicking when the borrowed bit slice is too
-/// short to hold the requested logical bit count.
+/// Returned instead of panicking when an input would otherwise abort the
+/// process (out-of-range positions, undersized borrowed slices). Kernel,
+/// FUSE, and other no-panic callers should use the `try_*` entry points
+/// and match on this enum.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RankSelectError {
     /// `bits.len() * 64 < n_bits` — the borrowed slice cannot hold the
@@ -80,6 +83,38 @@ pub enum RankSelectError {
         bits_len_words: usize,
         /// Caller-supplied logical bit count.
         requested_n_bits: usize,
+    },
+    /// `pos > n_bits` — the queried position lies past the end of the
+    /// dictionary's logical bitvector.
+    ///
+    /// `rank1(n_bits)` and `rank0(n_bits)` are the maximum legal queries
+    /// (and return `count_ones()` and `n_bits - count_ones()`
+    /// respectively). Anything strictly greater is an out-of-range query.
+    ///
+    /// Position fields are typed `u64` rather than `usize` so the error
+    /// has a stable layout across 32-bit and 64-bit targets — useful for
+    /// shrinker-friendly diagnostics, on-the-wire serialization, and
+    /// cross-target reproduction of failing inputs.
+    PositionOutOfRange {
+        /// Caller-supplied position (cast losslessly from `usize`).
+        pos: u64,
+        /// Dictionary's logical bit count at query time (cast losslessly
+        /// from `usize`).
+        n_bits: u64,
+    },
+    /// `out.len() < positions.len()` (or `out.len() < ks.len()`) — the
+    /// caller-supplied output slice is too short to hold one entry per
+    /// input position.
+    ///
+    /// Returned by [`RankSelectDict::try_rank1_batch`] and
+    /// [`RankSelectDict::try_select1_batch`] before any work is done so
+    /// the output slice's contents are not partially overwritten on
+    /// the failure path.
+    BatchOutputTooShort {
+        /// Number of output slots required (= input slice length).
+        needed: usize,
+        /// Number of output slots actually supplied (= `out.len()`).
+        actual: usize,
     },
 }
 
@@ -94,6 +129,15 @@ impl core::fmt::Display for RankSelectError {
                 "RankSelectDict bits slice too short: {bits_len_words} words \
                  (= {} bits) cannot hold {requested_n_bits} requested bits",
                 bits_len_words.saturating_mul(64)
+            ),
+            Self::PositionOutOfRange { pos, n_bits } => write!(
+                f,
+                "RankSelectDict position out of range: pos = {pos} > n_bits = {n_bits}"
+            ),
+            Self::BatchOutputTooShort { needed, actual } => write!(
+                f,
+                "RankSelectDict batch output slice too short: needed {needed} slots, \
+                 caller supplied {actual}"
             ),
         }
     }
@@ -272,7 +316,10 @@ impl<'a> RankSelectDict<'a> {
     ///
     /// # Panics
     ///
-    /// Panics if `i > n_bits`.
+    /// Panics if `i > n_bits`. Kernel, FUSE, and other no-panic callers
+    /// should use [`Self::try_rank1`], which validates the position and
+    /// returns [`RankSelectError::PositionOutOfRange`] instead of
+    /// aborting.
     #[must_use]
     pub fn rank1(&self, i: usize) -> usize {
         assert!(
@@ -280,7 +327,31 @@ impl<'a> RankSelectDict<'a> {
             "RankSelectDict::rank1: i = {i} > n_bits = {}",
             self.n_bits
         );
+        self.rank1_inner(i)
+    }
 
+    /// Fallible variant of [`Self::rank1`] that returns
+    /// [`RankSelectError::PositionOutOfRange`] when `i > n_bits` instead
+    /// of panicking.
+    ///
+    /// `try_rank1(0)` returns `Ok(0)` and `try_rank1(n_bits)` returns
+    /// `Ok(count_ones())`. The boundary `i == n_bits` is in range and
+    /// matches the [`Self::rank1`] specification.
+    pub fn try_rank1(&self, i: usize) -> Result<usize, RankSelectError> {
+        if i > self.n_bits {
+            return Err(RankSelectError::PositionOutOfRange {
+                pos: i as u64,
+                n_bits: self.n_bits as u64,
+            });
+        }
+        Ok(self.rank1_inner(i))
+    }
+
+    /// Internal `rank1` kernel. Caller must guarantee `i <= n_bits`.
+    /// Used by [`Self::rank1`] (after the panicking assertion) and
+    /// [`Self::try_rank1`] (after the fallible bounds check) so the hot
+    /// path is not duplicated.
+    fn rank1_inner(&self, i: usize) -> usize {
         if i == 0 {
             return 0;
         }
@@ -316,6 +387,13 @@ impl<'a> RankSelectDict<'a> {
     }
 
     /// Returns the number of 0-bits in `bits[0..i]`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `i > n_bits`. Kernel, FUSE, and other no-panic callers
+    /// should use [`Self::try_rank0`], which validates the position and
+    /// returns [`RankSelectError::PositionOutOfRange`] instead of
+    /// aborting.
     #[must_use]
     pub fn rank0(&self, i: usize) -> usize {
         assert!(
@@ -323,7 +401,24 @@ impl<'a> RankSelectDict<'a> {
             "RankSelectDict::rank0: i = {i} > n_bits = {}",
             self.n_bits
         );
-        i - self.rank1(i)
+        i - self.rank1_inner(i)
+    }
+
+    /// Fallible variant of [`Self::rank0`] that returns
+    /// [`RankSelectError::PositionOutOfRange`] when `i > n_bits` instead
+    /// of panicking.
+    ///
+    /// `try_rank0(0)` returns `Ok(0)` and `try_rank0(n_bits)` returns
+    /// `Ok(n_bits - count_ones())`. The boundary `i == n_bits` is in
+    /// range and matches the [`Self::rank0`] specification.
+    pub fn try_rank0(&self, i: usize) -> Result<usize, RankSelectError> {
+        if i > self.n_bits {
+            return Err(RankSelectError::PositionOutOfRange {
+                pos: i as u64,
+                n_bits: self.n_bits as u64,
+            });
+        }
+        Ok(i - self.rank1_inner(i))
     }
 
     /// Returns the bit position of the `(k+1)`-th 1-bit (zero-based:
@@ -369,16 +464,98 @@ impl<'a> RankSelectDict<'a> {
     /// Equivalent to `positions.iter().map(|&p| self.rank1(p))`. Provided
     /// as a batch convenience that AVX-512 VPOPCNTQ implementations can
     /// later override; today the kernel just calls `rank1` per entry.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `out.len() < positions.len()` (the batch kernel cannot
+    /// fit one rank per input slot) or if any position exceeds
+    /// `len_bits()` (delegated to [`Self::rank1`]). Kernel, FUSE, and
+    /// other no-panic callers should use [`Self::try_rank1_batch`],
+    /// which validates the output slice up front and returns
+    /// [`RankSelectError::BatchOutputTooShort`] (or
+    /// [`RankSelectError::PositionOutOfRange`] from the per-position
+    /// query) instead of aborting.
     pub fn rank1_batch(&self, positions: &[usize], out: &mut [usize]) {
         kernels::auto::rank1_batch(self, positions, out);
+    }
+
+    /// Fallible variant of [`Self::rank1_batch`] that returns
+    /// [`RankSelectError::BatchOutputTooShort`] when
+    /// `out.len() < positions.len()` instead of panicking.
+    ///
+    /// Validates the output slice up front, before any per-position
+    /// rank work, so the caller's `out` buffer is not partially mutated
+    /// on the failure path. On success, each `out[i]` holds
+    /// `self.rank1(positions[i])` for `i in 0..positions.len()` and
+    /// the rest of `out` is left untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RankSelectError::BatchOutputTooShort`] when
+    /// `out.len() < positions.len()`. Per-position out-of-range
+    /// positions still panic (the underlying [`Self::rank1`]); pre-
+    /// filter `positions` against [`Self::len_bits`] for a fully
+    /// no-panic batch query.
+    pub fn try_rank1_batch(
+        &self,
+        positions: &[usize],
+        out: &mut [usize],
+    ) -> Result<(), RankSelectError> {
+        if out.len() < positions.len() {
+            return Err(RankSelectError::BatchOutputTooShort {
+                needed: positions.len(),
+                actual: out.len(),
+            });
+        }
+        kernels::auto::rank1_batch(self, positions, out);
+        Ok(())
     }
 
     /// Returns the per-position select of `ks[i]` for each entry.
     ///
     /// Equivalent to `ks.iter().map(|&k| self.select1(k))`. Same SIMD
     /// hooks as [`Self::rank1_batch`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `out.len() < ks.len()` (the batch kernel cannot fit
+    /// one select per input slot). Kernel, FUSE, and other no-panic
+    /// callers should use [`Self::try_select1_batch`], which validates
+    /// the output slice up front and returns
+    /// [`RankSelectError::BatchOutputTooShort`] instead of aborting.
     pub fn select1_batch(&self, ks: &[usize], out: &mut [Option<usize>]) {
         kernels::auto::select1_batch(self, ks, out);
+    }
+
+    /// Fallible variant of [`Self::select1_batch`] that returns
+    /// [`RankSelectError::BatchOutputTooShort`] when
+    /// `out.len() < ks.len()` instead of panicking.
+    ///
+    /// Validates the output slice up front, before any per-position
+    /// select work, so the caller's `out` buffer is not partially
+    /// mutated on the failure path. On success, each `out[i]` holds
+    /// `self.select1(ks[i])` for `i in 0..ks.len()` and the rest of
+    /// `out` is left untouched. As with [`Self::select1`], `out[i]` is
+    /// `None` when `ks[i] >= count_ones()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RankSelectError::BatchOutputTooShort`] when
+    /// `out.len() < ks.len()`. Per-position out-of-range `k` is not an
+    /// error here (the underlying [`Self::select1`] returns `None`).
+    pub fn try_select1_batch(
+        &self,
+        ks: &[usize],
+        out: &mut [Option<usize>],
+    ) -> Result<(), RankSelectError> {
+        if out.len() < ks.len() {
+            return Err(RankSelectError::BatchOutputTooShort {
+                needed: ks.len(),
+                actual: out.len(),
+            });
+        }
+        kernels::auto::select1_batch(self, ks, out);
+        Ok(())
     }
 
     /// Internal select kernel. `select_ones=true` selects 1-bits;
@@ -1441,6 +1618,286 @@ mod tests {
         assert_eq!(dict.len_bits(), 256);
         // Alternating pattern: half the bits are set.
         assert_eq!(dict.count_ones(), 128);
+    }
+
+    // ------------------------------------------------------------------
+    // Audit-R6 finding #162 regression tests for the `try_build` path.
+    //
+    // The `try_build` constructor must surface BitsTooShort rather than
+    // panic via internal `bits[index]` out-of-range access; the kernel
+    // build loop indexes `bits` only for words inside
+    // `min((b+1)*WORDS_PER_BLOCK, bits.len())` so the precondition
+    // `bits.len() * 64 >= n_bits` is sufficient. These tests pin that
+    // contract for the no-panicking-shape-apis build.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn try_build_bits_one_word_short_returns_err_not_panic() {
+        // Need at least ceil(200/64) = 4 words, supply 3.
+        let bits = [u64::MAX; 3];
+        let err = RankSelectDict::try_build(&bits, 200).expect_err("must return Err");
+        assert_eq!(
+            err,
+            RankSelectError::BitsTooShort {
+                bits_len_words: 3,
+                requested_n_bits: 200
+            }
+        );
+    }
+
+    #[test]
+    fn try_build_with_zero_bits_succeeds_on_empty_slice() {
+        let bits: [u64; 0] = [];
+        let dict = RankSelectDict::try_build(&bits, 0).expect("zero bits is valid");
+        assert_eq!(dict.len_bits(), 0);
+        assert_eq!(dict.count_ones(), 0);
+    }
+
+    #[test]
+    fn try_build_then_query_panic_free_round_trip() {
+        // Build via try_build, then exercise rank1/select1/count_ones
+        // without involving the panicking constructor. Verifies the
+        // built dictionary is queryable on a no-panicking-shape-apis
+        // build.
+        let bits = [0xff_u64, 0xff_u64, 0xff_u64, 0xff_u64]; // 32 ones.
+        let dict = RankSelectDict::try_build(&bits, 256).expect("valid build");
+        assert_eq!(dict.count_ones(), 32);
+        assert_eq!(dict.rank1(8), 8);
+        assert_eq!(dict.select1(0), Some(0));
+        assert_eq!(dict.select1(7), Some(7));
+        assert_eq!(dict.select1(31), Some(64 + 64 + 64 + 7));
+    }
+
+    #[test]
+    fn try_build_with_partial_trailing_word_succeeds() {
+        // n_bits = 70 needs ceil(70/64) = 2 words; the build masks the
+        // trailing partial word so popcount/queries align with n_bits.
+        let bits = [u64::MAX, 0x3f_u64]; // 64 + 6 = 70 ones.
+        let dict = RankSelectDict::try_build(&bits, 70).expect("valid build");
+        assert_eq!(dict.len_bits(), 70);
+        assert_eq!(dict.count_ones(), 70);
+    }
+
+    // ------------------------------------------------------------------
+    // try_rank1 / try_rank0 (audit-R7-followup #5).
+    //
+    // Fallible siblings of `rank1` / `rank0` that surface
+    // `RankSelectError::PositionOutOfRange` rather than panicking when
+    // `i > n_bits`. These tests intentionally use `try_build` (not
+    // `build`) so they remain compilable and runnable when the
+    // `panicking-shape-apis` feature is disabled — which is the kernel-
+    // /FUSE-safe configuration this work targets.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn try_rank1_happy_path_matches_naive() {
+        // 64-bit alternating pattern: bits 0, 2, 4, ... set.
+        let bits = [0x5555_5555_5555_5555_u64];
+        let dict = RankSelectDict::try_build(&bits, 64).expect("valid build");
+        assert_eq!(dict.try_rank1(0), Ok(0));
+        assert_eq!(dict.try_rank1(1), Ok(1));
+        assert_eq!(dict.try_rank1(2), Ok(1));
+        assert_eq!(dict.try_rank1(3), Ok(2));
+        assert_eq!(dict.try_rank1(64), Ok(32));
+    }
+
+    #[test]
+    fn try_rank1_returns_position_out_of_range_when_i_gt_n_bits() {
+        let bits = [0xff_u64, 0xff_u64]; // 128 bits total, 16 ones.
+        let dict = RankSelectDict::try_build(&bits, 128).expect("valid build");
+        let err = dict.try_rank1(129).expect_err("i > n_bits must be Err");
+        assert_eq!(
+            err,
+            RankSelectError::PositionOutOfRange {
+                pos: 129,
+                n_bits: 128,
+            }
+        );
+        // Position arbitrarily far past n_bits.
+        let err = dict.try_rank1(1_000_000).expect_err("far OOB must be Err");
+        assert_eq!(
+            err,
+            RankSelectError::PositionOutOfRange {
+                pos: 1_000_000,
+                n_bits: 128,
+            }
+        );
+    }
+
+    #[test]
+    fn try_rank1_boundary_i_eq_n_bits_returns_count_ones() {
+        // Boundary case: i == n_bits is in range and must return
+        // count_ones() (per the rank1 spec).
+        let bits = [0xff_u64, 0x00_u64, 0xff_u64]; // 16 ones in 192 bits.
+        let dict = RankSelectDict::try_build(&bits, 192).expect("valid build");
+        assert_eq!(dict.try_rank1(192), Ok(dict.count_ones()));
+        assert_eq!(dict.try_rank1(192), Ok(16));
+    }
+
+    #[test]
+    fn try_rank0_happy_path_matches_naive() {
+        // 64-bit alternating pattern: bits 0, 2, 4, ... set; rank0 is
+        // the count of clear bits.
+        let bits = [0x5555_5555_5555_5555_u64];
+        let dict = RankSelectDict::try_build(&bits, 64).expect("valid build");
+        assert_eq!(dict.try_rank0(0), Ok(0));
+        assert_eq!(dict.try_rank0(1), Ok(0));
+        assert_eq!(dict.try_rank0(2), Ok(1));
+        assert_eq!(dict.try_rank0(3), Ok(1));
+        assert_eq!(dict.try_rank0(64), Ok(32));
+    }
+
+    #[test]
+    fn try_rank0_returns_position_out_of_range_when_i_gt_n_bits() {
+        let bits = [0_u64; 2]; // 128 bits, 0 ones.
+        let dict = RankSelectDict::try_build(&bits, 128).expect("valid build");
+        let err = dict.try_rank0(200).expect_err("i > n_bits must be Err");
+        assert_eq!(
+            err,
+            RankSelectError::PositionOutOfRange {
+                pos: 200,
+                n_bits: 128,
+            }
+        );
+    }
+
+    #[test]
+    fn try_rank0_boundary_i_eq_n_bits_returns_total_zeros() {
+        // Boundary case: i == n_bits is in range and must return
+        // n_bits - count_ones() (per the rank0 spec).
+        let bits = [0xff_u64, 0x00_u64, 0xff_u64]; // 16 ones in 192 bits.
+        let dict = RankSelectDict::try_build(&bits, 192).expect("valid build");
+        let total_zeros = 192 - dict.count_ones();
+        assert_eq!(dict.try_rank0(192), Ok(total_zeros));
+        assert_eq!(dict.try_rank0(192), Ok(176));
+    }
+
+    // ------------------------------------------------------------------
+    // try_rank1_batch / try_select1_batch (audit-R7-followup #6).
+    //
+    // Fallible siblings of `rank1_batch` / `select1_batch` that surface
+    // `RankSelectError::BatchOutputTooShort` rather than panicking when
+    // `out.len() < positions.len()` (or `< ks.len()`). Validation
+    // happens up front so the caller's `out` buffer is not partially
+    // mutated on the failure path. Tests use `try_build` so they remain
+    // runnable on the no-panicking-shape-apis (kernel-safe) build.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn try_rank1_batch_happy_path_matches_per_query() {
+        // 256-bit alternating pattern — half the bits set.
+        let bits = [0x5555_5555_5555_5555_u64; 4];
+        let dict = RankSelectDict::try_build(&bits, 256).expect("valid build");
+        let positions = [0_usize, 1, 7, 64, 128, 200, 256];
+        let mut out = [0_usize; 7];
+        dict.try_rank1_batch(&positions, &mut out)
+            .expect("happy path must succeed");
+        for (i, &p) in positions.iter().enumerate() {
+            assert_eq!(out[i], dict.rank1(p), "out[{i}] != rank1({p})");
+        }
+    }
+
+    #[test]
+    fn try_rank1_batch_returns_batch_output_too_short_when_out_undersized() {
+        let bits = [0xff_u64; 4];
+        let dict = RankSelectDict::try_build(&bits, 256).expect("valid build");
+        let positions = [0_usize, 1, 2, 3, 4];
+        // Sentinel value so we can confirm `out` is not partially
+        // overwritten on the failure path.
+        let mut out = [0xDEAD_BEEF_usize; 3];
+        let err = dict
+            .try_rank1_batch(&positions, &mut out)
+            .expect_err("out shorter than positions must be Err");
+        assert_eq!(
+            err,
+            RankSelectError::BatchOutputTooShort {
+                needed: 5,
+                actual: 3,
+            }
+        );
+        // No partial mutation: sentinels intact.
+        assert_eq!(out, [0xDEAD_BEEF_usize; 3]);
+    }
+
+    #[test]
+    fn try_rank1_batch_boundary_out_len_equals_positions_len() {
+        // Boundary case: out.len() == positions.len() is in range
+        // (the validation is `out.len() < positions.len()`).
+        //
+        // All-ones fixture so rank1(p) == p for every queried position.
+        let bits = [u64::MAX; 2]; // 128 bits, all set.
+        let dict = RankSelectDict::try_build(&bits, 128).expect("valid build");
+        let positions = [0_usize, 8, 16, 64, 128];
+        let mut out = [0_usize; 5]; // exactly the right size
+        dict.try_rank1_batch(&positions, &mut out)
+            .expect("equal-size out must succeed");
+        assert_eq!(out, [0, 8, 16, 64, 128]);
+
+        // Empty positions + empty out is also in range (degenerate).
+        let empty: [usize; 0] = [];
+        let mut empty_out: [usize; 0] = [];
+        dict.try_rank1_batch(&empty, &mut empty_out)
+            .expect("empty batch must succeed");
+    }
+
+    #[test]
+    fn try_select1_batch_happy_path_matches_per_query() {
+        // 256-bit alternating pattern — bits 0, 2, 4, ... set.
+        let bits = [0x5555_5555_5555_5555_u64; 4];
+        let dict = RankSelectDict::try_build(&bits, 256).expect("valid build");
+        let total = dict.count_ones();
+        let ks = [0_usize, 1, 7, 31, 63, total - 1, total]; // last is OOB → None
+        let mut out = [None; 7];
+        dict.try_select1_batch(&ks, &mut out)
+            .expect("happy path must succeed");
+        for (i, &k) in ks.iter().enumerate() {
+            assert_eq!(out[i], dict.select1(k), "out[{i}] != select1({k})");
+        }
+        // Sanity: alternating pattern → select1(j) == 2j for j < total.
+        assert_eq!(out[0], Some(0));
+        assert_eq!(out[1], Some(2));
+        assert_eq!(out[6], None); // k == total → None
+    }
+
+    #[test]
+    fn try_select1_batch_returns_batch_output_too_short_when_out_undersized() {
+        let bits = [0xff_u64; 4];
+        let dict = RankSelectDict::try_build(&bits, 256).expect("valid build");
+        let ks = [0_usize, 1, 2, 3, 4, 5, 6];
+        // Sentinel value so we can confirm `out` is not partially
+        // overwritten on the failure path.
+        let sentinel = Some(0xDEAD_BEEF_usize);
+        let mut out = [sentinel; 4];
+        let err = dict
+            .try_select1_batch(&ks, &mut out)
+            .expect_err("out shorter than ks must be Err");
+        assert_eq!(
+            err,
+            RankSelectError::BatchOutputTooShort {
+                needed: 7,
+                actual: 4,
+            }
+        );
+        // No partial mutation: sentinels intact.
+        assert_eq!(out, [sentinel; 4]);
+    }
+
+    #[test]
+    fn try_select1_batch_boundary_out_len_equals_ks_len() {
+        // Boundary case: out.len() == ks.len() is in range.
+        let bits = [0xff_u64; 2]; // 16 ones, all in low bits.
+        let dict = RankSelectDict::try_build(&bits, 128).expect("valid build");
+        let ks = [0_usize, 1, 7, 15];
+        let mut out = [None; 4]; // exactly the right size
+        dict.try_select1_batch(&ks, &mut out)
+            .expect("equal-size out must succeed");
+        assert_eq!(out, [Some(0), Some(1), Some(7), Some(64 + 7)]);
+
+        // Empty ks + empty out is also in range (degenerate).
+        let empty: [usize; 0] = [];
+        let mut empty_out: [Option<usize>; 0] = [];
+        dict.try_select1_batch(&empty, &mut empty_out)
+            .expect("empty batch must succeed");
     }
 
     #[cfg(feature = "panicking-shape-apis")]
