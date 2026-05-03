@@ -195,6 +195,11 @@ impl Permutation {
     /// For zero-length inputs, the empty `Vec` is returned without
     /// inspecting `src`.
     ///
+    /// Kernel/FUSE callers that need a non-panicking shape check should
+    /// prefer [`Permutation::try_apply`]. Callers that additionally want
+    /// proof of permutation validity should prefer
+    /// [`Permutation::try_apply_into_strict`].
+    ///
     /// # Safety contract
     ///
     /// If `self` is a valid bijection on `0..n` (constructed via
@@ -248,6 +253,11 @@ impl Permutation {
     ///
     /// Panics if `src.len() != self.len()` or `dst.len() < self.len()`.
     ///
+    /// Kernel/FUSE callers that need a non-panicking shape check should
+    /// prefer [`Permutation::try_apply_into`]. Callers that additionally
+    /// want proof of permutation validity should prefer
+    /// [`Permutation::try_apply_into_strict`].
+    ///
     /// # Safety contract
     ///
     /// If `self` is a valid bijection on `0..n` (constructed via
@@ -283,6 +293,102 @@ impl Permutation {
         for (i, &new_id) in self.0.iter().enumerate() {
             dst[new_id as usize] = src[i];
         }
+    }
+
+    /// Like [`Permutation::apply`] but returns an error on
+    /// shape-mismatch instead of panicking.
+    ///
+    /// Validates `src.len() == self.len()` upfront; on mismatch returns
+    /// [`PermutationApplyError::SrcLenMismatch`] without inspecting
+    /// `src` further. On success the body is identical to
+    /// [`Permutation::apply`] — `dst[perm[i]] = src[i]` is written into
+    /// a freshly allocated `Vec<T>` of length `self.len()`.
+    ///
+    /// This variant only checks the shape contract; it does NOT verify
+    /// that the [`Permutation`] is a valid bijection. If `self` was
+    /// constructed via [`Permutation::from_vec_unchecked`] from
+    /// untrusted on-disk data, prefer
+    /// [`Permutation::try_apply_into_strict`], which additionally
+    /// detects out-of-range and duplicate destination indices via a
+    /// caller-provided scratch bitset.
+    ///
+    /// For zero-length permutations, the empty `Vec` is returned
+    /// without inspecting `src` (provided the length matches).
+    ///
+    /// # Errors
+    ///
+    /// * [`PermutationApplyError::SrcLenMismatch`] when
+    ///   `src.len() != self.len()`.
+    pub fn try_apply<T: Copy>(&self, src: &[T]) -> Result<Vec<T>, PermutationApplyError> {
+        let n = self.0.len();
+        if src.len() != n {
+            return Err(PermutationApplyError::SrcLenMismatch {
+                expected: n,
+                actual: src.len(),
+            });
+        }
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        // Initialise dst with a clone of `src[0]` to satisfy the `Vec`
+        // invariant; every slot is overwritten by `apply_into`. The
+        // bound `T: Copy` makes the clone a no-op.
+        let mut dst = vec![src[0]; n];
+        // SAFETY-LIKE: `apply_into`'s shape contract is satisfied
+        // because we just verified `src.len() == n` and built `dst` of
+        // length `n`. The unchecked-panic-on-shape path inside
+        // `apply_into` cannot trigger.
+        self.apply_into(src, &mut dst);
+        Ok(dst)
+    }
+
+    /// Like [`Permutation::apply_into`] but returns an error on
+    /// shape-mismatch instead of panicking.
+    ///
+    /// Validates `src.len() == self.len()` and `dst.len() >= self.len()`
+    /// upfront; on either mismatch returns the corresponding
+    /// [`PermutationApplyError`] variant without writing to `dst`.
+    ///
+    /// This variant only checks the shape contract; it does NOT verify
+    /// that the [`Permutation`] is a valid bijection. If `self` was
+    /// constructed via [`Permutation::from_vec_unchecked`] from
+    /// untrusted on-disk data, prefer
+    /// [`Permutation::try_apply_into_strict`], which additionally
+    /// detects out-of-range and duplicate destination indices via a
+    /// caller-provided scratch bitset.
+    ///
+    /// On success the body is identical to
+    /// [`Permutation::apply_into`]: `dst[perm[i]] = src[i]` for every
+    /// `i in 0..self.len()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`PermutationApplyError::SrcLenMismatch`] when
+    ///   `src.len() != self.len()`.
+    /// * [`PermutationApplyError::DstTooSmall`] when
+    ///   `dst.len() < self.len()`.
+    pub fn try_apply_into<T: Copy>(
+        &self,
+        src: &[T],
+        dst: &mut [T],
+    ) -> Result<(), PermutationApplyError> {
+        let n = self.0.len();
+        if src.len() != n {
+            return Err(PermutationApplyError::SrcLenMismatch {
+                expected: n,
+                actual: src.len(),
+            });
+        }
+        if dst.len() < n {
+            return Err(PermutationApplyError::DstTooSmall {
+                needed: n,
+                actual: dst.len(),
+            });
+        }
+        for (i, &new_id) in self.0.iter().enumerate() {
+            dst[new_id as usize] = src[i];
+        }
+        Ok(())
     }
 
     /// Validates that this [`Permutation`] is a valid bijection on
@@ -957,5 +1063,93 @@ mod tests {
             let s = format!("{c}");
             assert!(s.starts_with("Permutation::try_apply_into_strict"));
         }
+    }
+
+    // ----- audit-R7-followup #7 — shape-safe try_apply / try_apply_into -----
+
+    #[test]
+    fn try_apply_matches_apply_on_valid_perm() {
+        // Happy path: identical output to the panicking sibling on a
+        // shape-correct call.
+        let perm = Permutation::try_from_vec(vec![2, 0, 3, 1]).expect("valid");
+        let src: Vec<i32> = vec![10, 20, 30, 40];
+        let expected = perm.apply(&src);
+        let actual = perm.try_apply(&src).expect("shape matches");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn try_apply_returns_src_len_mismatch_without_panicking() {
+        let perm = Permutation::identity(4);
+        let src: Vec<i32> = vec![10, 20, 30]; // wrong length
+        let err = perm.try_apply(&src).expect_err("length mismatch");
+        assert_eq!(
+            err,
+            PermutationApplyError::SrcLenMismatch {
+                expected: 4,
+                actual: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn try_apply_handles_empty_perm_without_inspecting_src() {
+        // Boundary: zero-length perm with zero-length src returns
+        // empty Vec without touching `src`.
+        let perm = Permutation::identity(0);
+        let src: Vec<u8> = Vec::new();
+        let out = perm.try_apply(&src).expect("empty matches empty");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn try_apply_into_matches_apply_into_on_valid_perm() {
+        // Happy path: identical output to the panicking sibling.
+        let perm = Permutation::try_from_vec(vec![1, 0, 2]).expect("valid perm");
+        let src: Vec<u8> = vec![7, 8, 9];
+        let mut dst_panic = [0_u8; 3];
+        let mut dst_try = [0_u8; 3];
+        perm.apply_into(&src, &mut dst_panic);
+        perm.try_apply_into(&src, &mut dst_try)
+            .expect("shape matches");
+        assert_eq!(dst_try, dst_panic);
+    }
+
+    #[test]
+    fn try_apply_into_rejects_src_len_mismatch() {
+        let perm = Permutation::identity(3);
+        let src = [10_u8, 20]; // wrong length
+        let mut dst = [0_u8; 3];
+        let err = perm
+            .try_apply_into(&src, &mut dst)
+            .expect_err("src length mismatch must error");
+        assert_eq!(
+            err,
+            PermutationApplyError::SrcLenMismatch {
+                expected: 3,
+                actual: 2,
+            }
+        );
+        // dst must not have been touched.
+        assert_eq!(dst, [0_u8; 3]);
+    }
+
+    #[test]
+    fn try_apply_into_rejects_dst_too_small() {
+        let perm = Permutation::identity(3);
+        let src = [10_u8, 20, 30];
+        let mut dst = [0_u8; 2]; // too small
+        let err = perm
+            .try_apply_into(&src, &mut dst)
+            .expect_err("dst too small must error");
+        assert_eq!(
+            err,
+            PermutationApplyError::DstTooSmall {
+                needed: 3,
+                actual: 2,
+            }
+        );
+        // dst must not have been touched.
+        assert_eq!(dst, [0_u8; 2]);
     }
 }
