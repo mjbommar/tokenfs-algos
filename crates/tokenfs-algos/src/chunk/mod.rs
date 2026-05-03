@@ -65,7 +65,7 @@ impl Default for ChunkQuality {
     }
 }
 
-/// Failure modes for the fallible `ChunkConfig` constructors.
+/// Failure modes for the fallible `ChunkConfig` / `FastCdcConfig` constructors.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChunkConfigError {
     /// `avg_size` exceeds `CHUNK_AVG_SIZE_CAP`. The infallible
@@ -76,6 +76,37 @@ pub enum ChunkConfigError {
         /// Hard cap before saturation kicks in.
         cap: usize,
     },
+    /// `min_size` was zero. Zero-progress iterators emit chunks of
+    /// length `0` indefinitely, a CPU/memory DoS hazard. The infallible
+    /// constructors clamp to `1`; `try_*` rejects.
+    ZeroMin,
+    /// `avg_size` was zero. The mask derived from `avg_size`
+    /// (`avg_size.next_power_of_two() - 1`) becomes degenerate at zero
+    /// and the boundary scan terminates with `bytes: 0`. The infallible
+    /// constructors clamp to a sane floor; `try_*` rejects.
+    ZeroAvg,
+    /// `max_size` was zero. Zero-progress iterators emit chunks of
+    /// length `0` indefinitely. The infallible constructors clamp to at
+    /// least `avg_size`; `try_*` rejects.
+    ZeroMax,
+    /// `min_size > avg_size` violates the size ordering. The infallible
+    /// constructors silently re-clamp; `try_*` rejects so kernel callers
+    /// catch the misconfiguration up-front.
+    MinExceedsAvg {
+        /// Caller-supplied min_size.
+        min: usize,
+        /// Caller-supplied avg_size (post-saturation).
+        avg: usize,
+    },
+    /// `avg_size > max_size` violates the size ordering. The infallible
+    /// constructors silently re-clamp; `try_*` rejects so kernel callers
+    /// catch the misconfiguration up-front.
+    AvgExceedsMax {
+        /// Caller-supplied avg_size (post-saturation).
+        avg: usize,
+        /// Caller-supplied max_size.
+        max: usize,
+    },
 }
 
 impl core::fmt::Display for ChunkConfigError {
@@ -85,6 +116,17 @@ impl core::fmt::Display for ChunkConfigError {
                 f,
                 "ChunkConfig avg_size {requested} exceeds the saturation cap {cap}"
             ),
+            Self::ZeroMin => f.write_str("ChunkConfig min_size must be > 0"),
+            Self::ZeroAvg => f.write_str("ChunkConfig avg_size must be > 0"),
+            Self::ZeroMax => f.write_str("ChunkConfig max_size must be > 0"),
+            Self::MinExceedsAvg { min, avg } => write!(
+                f,
+                "ChunkConfig min_size {min} exceeds avg_size {avg} (post-saturation)"
+            ),
+            Self::AvgExceedsMax { avg, max } => write!(
+                f,
+                "ChunkConfig avg_size {avg} (post-saturation) exceeds max_size {max}"
+            ),
         }
     }
 }
@@ -93,26 +135,57 @@ impl core::fmt::Display for ChunkConfigError {
 impl std::error::Error for ChunkConfigError {}
 
 /// Configuration for Gear/FastCDC-style chunking.
+///
+/// **Construction.** Always build a `ChunkConfig` through one of the
+/// constructors ([`Self::new`], [`Self::try_new`], [`Self::with_sizes`],
+/// [`Self::try_with_sizes`]). Direct struct-literal construction
+/// (`ChunkConfig { min_size: 0, avg_size: 0, max_size: 0 }`) bypasses
+/// the size validation the constructors enforce and can lead to
+/// zero-progress iterators that emit empty chunks indefinitely
+/// (CPU/memory DoS in kernel/FUSE callers).
+///
+/// The fields are kept `pub` for back-compatibility with read-only
+/// inspection (benches, tests, examples, fuzz harnesses already match
+/// against them). The iterator hot path holds a defensive runtime
+/// progress guard so even a hand-built zero-config still terminates
+/// cleanly, but kernel-adjacent callers SHOULD prefer
+/// [`Self::try_with_sizes`] to fail-fast on misconfiguration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ChunkConfig {
-    /// Minimum chunk size.
+    /// Minimum chunk size in bytes. Must be `>= 1` for the iterator to
+    /// make progress. The infallible constructors clamp; the `try_*`
+    /// constructors reject `0` with [`ChunkConfigError::ZeroMin`].
     pub min_size: usize,
-    /// Target average chunk size. This is rounded to a power-of-two mask.
+    /// Target average chunk size in bytes. Rounded to a power-of-two
+    /// mask. Must be `>= 1` and `>= min_size`. The infallible
+    /// constructors clamp; `try_*` rejects `0`
+    /// ([`ChunkConfigError::ZeroAvg`]) and inversion
+    /// ([`ChunkConfigError::MinExceedsAvg`]).
     pub avg_size: usize,
-    /// Maximum chunk size.
+    /// Maximum chunk size in bytes. Must be `>= 1` and `>= avg_size`.
+    /// The infallible constructors clamp; `try_*` rejects `0`
+    /// ([`ChunkConfigError::ZeroMax`]) and inversion
+    /// ([`ChunkConfigError::AvgExceedsMax`]).
     pub max_size: usize,
 }
 
 /// Configuration for normalized FastCDC-style chunking.
+///
+/// **Construction.** Same posture as [`ChunkConfig`]: build through
+/// constructors only. Hand-built zero values will be neutralized by the
+/// runtime progress guard inside [`FastCdcChunker`], but kernel callers
+/// SHOULD use [`Self::try_with_sizes`] to fail-fast.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FastCdcConfig {
-    /// Minimum chunk size.
+    /// Minimum chunk size in bytes. See [`ChunkConfig::min_size`].
     pub min_size: usize,
-    /// Target average chunk size. This is rounded to a power-of-two mask.
+    /// Target average chunk size. Rounded to a power-of-two mask.
+    /// See [`ChunkConfig::avg_size`].
     pub avg_size: usize,
-    /// Maximum chunk size.
+    /// Maximum chunk size. See [`ChunkConfig::max_size`].
     pub max_size: usize,
     /// Number of mask bits used for pre/post-average normalization.
+    /// Values above 8 are clamped by the constructors.
     pub normalization_level: u8,
 }
 
@@ -155,10 +228,22 @@ impl ChunkConfig {
         }
     }
 
-    /// Fallible variant of [`Self::new`]: returns `Err` when
-    /// `avg_size > CHUNK_AVG_SIZE_CAP`. Use in kernel-adjacent
-    /// callers that need to reject hostile sizes explicitly.
+    /// Fallible variant of [`Self::new`]: returns `Err` for any input
+    /// the infallible constructor would silently clamp.
+    ///
+    /// Rejects:
+    /// - `avg_size == 0` ([`ChunkConfigError::ZeroAvg`]) — would yield
+    ///   a degenerate mask.
+    /// - `avg_size > CHUNK_AVG_SIZE_CAP` ([`ChunkConfigError::AvgSizeOverflow`])
+    ///   — would saturate.
+    ///
+    /// Use in kernel-adjacent callers that need to reject hostile or
+    /// misconfigured sizes explicitly rather than receive a clamped
+    /// (but functional) config.
     pub fn try_new(avg_size: usize) -> Result<Self, ChunkConfigError> {
+        if avg_size == 0 {
+            return Err(ChunkConfigError::ZeroAvg);
+        }
         if avg_size > CHUNK_AVG_SIZE_CAP {
             return Err(ChunkConfigError::AvgSizeOverflow {
                 requested: avg_size,
@@ -185,16 +270,55 @@ impl ChunkConfig {
         }
     }
 
-    /// Fallible variant of [`Self::with_sizes`].
+    /// Fallible variant of [`Self::with_sizes`]: returns `Err` for any
+    /// input the infallible constructor would silently clamp.
+    ///
+    /// Rejects:
+    /// - `min_size == 0` ([`ChunkConfigError::ZeroMin`])
+    /// - `avg_size == 0` ([`ChunkConfigError::ZeroAvg`])
+    /// - `max_size == 0` ([`ChunkConfigError::ZeroMax`])
+    /// - `avg_size > CHUNK_AVG_SIZE_CAP` ([`ChunkConfigError::AvgSizeOverflow`])
+    /// - `min_size > avg_size` ([`ChunkConfigError::MinExceedsAvg`]) —
+    ///   evaluated against `avg_size` post-saturation.
+    /// - `avg_size > max_size` ([`ChunkConfigError::AvgExceedsMax`]) —
+    ///   evaluated against `avg_size` post-saturation.
+    ///
+    /// Use in kernel-adjacent callers that need to fail-fast on
+    /// misconfiguration rather than rely on the silent re-clamp.
     pub fn try_with_sizes(
         min_size: usize,
         avg_size: usize,
         max_size: usize,
     ) -> Result<Self, ChunkConfigError> {
+        if min_size == 0 {
+            return Err(ChunkConfigError::ZeroMin);
+        }
+        if avg_size == 0 {
+            return Err(ChunkConfigError::ZeroAvg);
+        }
+        if max_size == 0 {
+            return Err(ChunkConfigError::ZeroMax);
+        }
         if avg_size > CHUNK_AVG_SIZE_CAP {
             return Err(ChunkConfigError::AvgSizeOverflow {
                 requested: avg_size,
                 cap: CHUNK_AVG_SIZE_CAP,
+            });
+        }
+        // Validate ordering against the post-saturation avg_size so the
+        // error message matches the value the constructor would actually
+        // pin down.
+        let saturated_avg = saturating_next_power_of_two(avg_size);
+        if min_size > saturated_avg {
+            return Err(ChunkConfigError::MinExceedsAvg {
+                min: min_size,
+                avg: saturated_avg,
+            });
+        }
+        if saturated_avg > max_size {
+            return Err(ChunkConfigError::AvgExceedsMax {
+                avg: saturated_avg,
+                max: max_size,
             });
         }
         Ok(Self::with_sizes(min_size, avg_size, max_size))
@@ -220,6 +344,19 @@ impl FastCdcConfig {
         }
     }
 
+    /// Fallible variant of [`Self::new`]: returns `Err` under the same
+    /// conditions as [`ChunkConfig::try_new`]. Use in kernel-adjacent
+    /// callers that need to reject hostile sizes explicitly.
+    pub fn try_new(avg_size: usize) -> Result<Self, ChunkConfigError> {
+        let base = ChunkConfig::try_new(avg_size)?;
+        Ok(Self {
+            min_size: base.min_size,
+            avg_size: base.avg_size,
+            max_size: base.max_size,
+            normalization_level: 1,
+        })
+    }
+
     /// Creates a normalized FastCDC configuration with explicit sizes.
     #[must_use]
     pub fn with_sizes(min_size: usize, avg_size: usize, max_size: usize) -> Self {
@@ -230,6 +367,22 @@ impl FastCdcConfig {
             max_size: base.max_size,
             normalization_level: 1,
         }
+    }
+
+    /// Fallible variant of [`Self::with_sizes`]: returns `Err` under the
+    /// same conditions as [`ChunkConfig::try_with_sizes`].
+    pub fn try_with_sizes(
+        min_size: usize,
+        avg_size: usize,
+        max_size: usize,
+    ) -> Result<Self, ChunkConfigError> {
+        let base = ChunkConfig::try_with_sizes(min_size, avg_size, max_size)?;
+        Ok(Self {
+            min_size: base.min_size,
+            avg_size: base.avg_size,
+            max_size: base.max_size,
+            normalization_level: 1,
+        })
     }
 
     /// Sets the normalization level.
@@ -333,6 +486,18 @@ impl Iterator for Chunker<'_> {
         let boundary =
             find_boundary_with_state(&self.bytes[start..], self.config, self.hash.value());
 
+        // Zero-progress guard (audit-R8 #2): a hand-built `ChunkConfig`
+        // that bypasses the constructors (e.g. `min_size = avg_size =
+        // max_size = 0`) makes `find_boundary_with_state` return
+        // `bytes: 0`, which would otherwise emit empty chunks forever
+        // and never advance `position` — a CPU/memory DoS hazard for
+        // kernel/FUSE callers. Treat zero forward progress as
+        // end-of-stream and stop iterating cleanly.
+        if boundary.bytes == 0 {
+            self.position = self.bytes.len();
+            return None;
+        }
+
         let end = start + boundary.bytes;
         self.position = end;
         self.hash = boundary.hash;
@@ -356,6 +521,15 @@ impl Iterator for FastCdcChunker<'_> {
         let start = self.position;
         let boundary =
             fastcdc_boundary_with_state(&self.bytes[start..], self.config, self.hash.value());
+
+        // Zero-progress guard (audit-R8 #2): mirror of the `Chunker`
+        // guard. A bypassed-constructor zero-config (`min_size =
+        // avg_size = max_size = 0`) would emit empty chunks indefinitely
+        // — terminate cleanly instead.
+        if boundary.bytes == 0 {
+            self.position = self.bytes.len();
+            return None;
+        }
 
         let end = start + boundary.bytes;
         self.position = end;
@@ -650,7 +824,9 @@ mod tests {
 
     #[test]
     fn chunk_config_try_with_sizes_rejects_overflow() {
-        let err = ChunkConfig::try_with_sizes(0, usize::MAX, usize::MAX).unwrap_err();
+        // After audit-R8 #2 the zero-field validation triggers first, so
+        // probe overflow with a non-zero min_size.
+        let err = ChunkConfig::try_with_sizes(1, usize::MAX, usize::MAX).unwrap_err();
         assert!(matches!(err, ChunkConfigError::AvgSizeOverflow { .. }));
         assert!(ChunkConfig::try_with_sizes(1024, 4096, 8192).is_ok());
     }
@@ -751,5 +927,156 @@ mod tests {
         assert!(quality.chunks > 0);
         assert_eq!(quality.total_bytes, bytes.len());
         assert_eq!(quality.above_max_fraction, 0.0);
+    }
+
+    // -----------------------------------------------------------------
+    // audit-R8 #2: zero-config validation + iterator progress guard
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn chunk_config_try_new_rejects_zero_avg() {
+        // try_new now distinguishes ZeroAvg from AvgSizeOverflow — the
+        // infallible `new()` would silently clamp to 64.
+        let err = ChunkConfig::try_new(0).unwrap_err();
+        assert!(matches!(err, ChunkConfigError::ZeroAvg));
+    }
+
+    #[test]
+    fn chunk_config_try_with_sizes_rejects_zero_min() {
+        let err = ChunkConfig::try_with_sizes(0, 4096, 8192).unwrap_err();
+        assert!(matches!(err, ChunkConfigError::ZeroMin));
+    }
+
+    #[test]
+    fn chunk_config_try_with_sizes_rejects_zero_avg() {
+        let err = ChunkConfig::try_with_sizes(1024, 0, 8192).unwrap_err();
+        assert!(matches!(err, ChunkConfigError::ZeroAvg));
+    }
+
+    #[test]
+    fn chunk_config_try_with_sizes_rejects_zero_max() {
+        let err = ChunkConfig::try_with_sizes(1024, 4096, 0).unwrap_err();
+        assert!(matches!(err, ChunkConfigError::ZeroMax));
+    }
+
+    #[test]
+    fn chunk_config_try_with_sizes_rejects_zero_config() {
+        // The full-zero misconfiguration that produces zero-progress
+        // iterators if it bypasses the constructor — must be rejected.
+        let err = ChunkConfig::try_with_sizes(0, 0, 0).unwrap_err();
+        // Order of checks: ZeroMin fires first.
+        assert!(matches!(err, ChunkConfigError::ZeroMin));
+    }
+
+    #[test]
+    fn chunk_config_try_with_sizes_rejects_min_exceeds_avg() {
+        // min_size > avg_size (post-saturation). avg_size=1024 is already
+        // a power of two, so post-saturation it stays 1024. min=2048 > 1024.
+        let err = ChunkConfig::try_with_sizes(2048, 1024, 4096).unwrap_err();
+        assert!(matches!(
+            err,
+            ChunkConfigError::MinExceedsAvg { min: 2048, avg: 1024 }
+        ));
+    }
+
+    #[test]
+    fn chunk_config_try_with_sizes_rejects_avg_exceeds_max() {
+        // avg_size > max_size (post-saturation). avg=4096 > max=2048.
+        let err = ChunkConfig::try_with_sizes(512, 4096, 2048).unwrap_err();
+        assert!(matches!(
+            err,
+            ChunkConfigError::AvgExceedsMax { avg: 4096, max: 2048 }
+        ));
+    }
+
+    #[test]
+    fn chunk_config_try_with_sizes_accepts_valid_ordering() {
+        let cfg = ChunkConfig::try_with_sizes(1024, 4096, 16 * 1024).unwrap();
+        assert_eq!(cfg.min_size, 1024);
+        assert_eq!(cfg.avg_size, 4096);
+        assert_eq!(cfg.max_size, 16 * 1024);
+    }
+
+    #[test]
+    fn fastcdc_config_try_new_rejects_zero_avg() {
+        // FastCdcConfig now has its own try_new mirroring ChunkConfig's.
+        let err = FastCdcConfig::try_new(0).unwrap_err();
+        assert!(matches!(err, ChunkConfigError::ZeroAvg));
+        assert!(FastCdcConfig::try_new(8 * 1024).is_ok());
+    }
+
+    #[test]
+    fn fastcdc_config_try_with_sizes_rejects_zero_config() {
+        let err = FastCdcConfig::try_with_sizes(0, 0, 0).unwrap_err();
+        assert!(matches!(err, ChunkConfigError::ZeroMin));
+        assert!(FastCdcConfig::try_with_sizes(1024, 4096, 16 * 1024).is_ok());
+    }
+
+    #[test]
+    fn chunker_zero_config_progress_guard_terminates() {
+        // Bypass the constructors with a hand-built zero-config and
+        // verify the iterator's progress guard terminates instead of
+        // looping forever emitting empty chunks. A non-empty input is
+        // mandatory because the iterator's own `position >= bytes.len()`
+        // early-return would otherwise mask the guard.
+        let bytes = vec![0_u8; 4096];
+        let bypassed = ChunkConfig {
+            min_size: 0,
+            avg_size: 0,
+            max_size: 0,
+        };
+        let mut iter = chunks(&bytes, bypassed);
+        // Must return None on the very first call — no zero-length chunk
+        // should be emitted.
+        assert!(
+            iter.next().is_none(),
+            "Chunker progress guard must terminate on zero-config bypass"
+        );
+        // And subsequent calls remain None.
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn fastcdc_chunker_zero_config_progress_guard_terminates() {
+        let bytes = vec![0_u8; 4096];
+        let bypassed = FastCdcConfig {
+            min_size: 0,
+            avg_size: 0,
+            max_size: 0,
+            normalization_level: 0,
+        };
+        let mut iter = fastcdc_chunks(&bytes, bypassed);
+        assert!(
+            iter.next().is_none(),
+            "FastCdcChunker progress guard must terminate on zero-config bypass"
+        );
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn chunker_zero_config_collect_does_not_oom() {
+        // Belt-and-suspenders: `.collect()` would allocate forever on a
+        // zero-progress iterator. The guard makes the collected vec empty.
+        let bytes = vec![0_u8; 4096];
+        let bypassed = ChunkConfig {
+            min_size: 0,
+            avg_size: 0,
+            max_size: 0,
+        };
+        let parts: Vec<_> = chunks(&bytes, bypassed).collect();
+        assert!(parts.is_empty());
+    }
+
+    #[test]
+    fn fastcdc_chunker_zero_config_collect_does_not_oom() {
+        let bytes = vec![0_u8; 4096];
+        let bypassed = FastCdcConfig {
+            min_size: 0,
+            avg_size: 0,
+            max_size: 0,
+            normalization_level: 0,
+        };
+        let parts: Vec<_> = fastcdc_chunks(&bytes, bypassed).collect();
+        assert!(parts.is_empty());
     }
 }
