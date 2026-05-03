@@ -126,7 +126,7 @@ required-features = ["bench-internals"]
 [[bench]]
 name = "primitives"
 harness = false
-required-features = ["bench-internals", "arch-pinned-kernels"]
+required-features = ["bench-internals", "arch-pinned-kernels", "userspace"]
 
 # `similarity` exercises both the panicking surface (signature_batch_simd
 # etc.) and pinned scalar parity wrappers, so it needs both.

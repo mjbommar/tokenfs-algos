@@ -147,16 +147,28 @@ jobs:
         run: cargo test -p tokenfs-algos --features nightly,sve,sve2
 
       - name: Build benchmarks (no-run, smoke-check)
+        # Per-bench required-features in Cargo.toml: primitives needs
+        # bench-internals + arch-pinned-kernels; similarity needs userspace
+        # + arch-pinned-kernels; planner needs nothing extra (audit-R10 T0.1).
         run: |
-          cargo bench -p tokenfs-algos --features bench-internals --bench primitives --no-run
-          cargo bench -p tokenfs-algos --bench similarity --no-run
+          cargo bench -p tokenfs-algos \
+            --features bench-internals,arch-pinned-kernels,userspace \
+            --bench primitives --no-run
+          cargo bench -p tokenfs-algos \
+            --features userspace,arch-pinned-kernels \
+            --bench similarity --no-run
           cargo bench -p tokenfs-algos --bench planner --no-run
 
       - name: Clippy (default features)
-        run: cargo clippy -p tokenfs-algos --tests --benches --features bench-internals,tunes-json -- -D warnings
+        # Pull in arch-pinned-kernels so clippy sees the per-backend modules
+        # (their `unsafe` surface is the highest-value part to lint).
+        run: cargo clippy -p tokenfs-algos --tests --benches \
+          --features bench-internals,tunes-json,userspace,arch-pinned-kernels -- -D warnings
 
       - name: Run dispatch_explain (logs the runner's planner choices)
-        run: cargo run -p tokenfs-algos --example dispatch_explain --release
+        # dispatch_explain example required-features = ["userspace"] (audit-R10 T0.1).
+        run: cargo run -p tokenfs-algos --example dispatch_explain --release \
+          --features userspace
 
       # --- per-runner micro-benchmarks (scalar vs SIMD) ---
       # Output is a TSV: one row per (primitive, backend, payload_bytes).
