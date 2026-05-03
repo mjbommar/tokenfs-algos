@@ -16,6 +16,7 @@ or blocked by unrelated host configuration.
 | `perf stat` over the primitive driver    | `cargo xtask profile`                                                                    |
 | Flamegraph over the primitive driver      | `cargo xtask profile-flamegraph -- --profile-time 10 workload_matrix/adaptive-prefix-1k` |
 | Flamegraph over `examples/profile_primitives` | `cargo xtask profile-primitives-flamegraph`                                          |
+| Hardware-counter bench (deterministic)    | `cargo xtask bench-iai`  (requires `valgrind`)                                           |
 | Cross-test on AArch64 under QEMU          | `cargo test -p tokenfs-algos --target aarch64-unknown-linux-gnu`                         |
 
 Output artifacts live under `target/bench-history/` (`runs/`, `reports/`,
@@ -48,6 +49,52 @@ target/bench-history/
 Use `bench-compare` for durable interpretation. Criterion's inline `change` line
 compares only against `target/criterion`'s local baseline, not the project
 baseline — it lies if you run benches across branches without resetting.
+
+## Hardware-counter benches with iai-callgrind
+
+`cargo xtask bench-iai` runs a focused subset of the hot primitives
+(popcount, streamvbyte encode/decode, sha256, vector dot/l2) under
+`valgrind --tool=callgrind` via the `iai-callgrind` harness. The
+output is **deterministic across runs on the same binary** —
+instruction count, branch misses, L1/L2/LL cache references — which
+lets CI catch regressions at much tighter thresholds than the
+wall-clock criterion benches can support.
+
+| Bench harness          | Threshold | Noise source                                                       |
+| ---------------------- | --------- | ------------------------------------------------------------------ |
+| criterion (wall-clock) | 15%       | runner CPU contention, frequency scaling, cache state across runs  |
+| iai-callgrind (counters)| 1%       | none on the same binary; recompilation can shift counts ±0.5%      |
+
+This means a 3% iai-callgrind regression is **signal**, not noise. By
+contrast, a 5% criterion regression on a GitHub-hosted runner usually
+isn't reproducible.
+
+Local invocation:
+
+```bash
+sudo apt install valgrind            # Debian/Ubuntu; equivalent on other distros
+cargo install iai-callgrind-runner --version 0.16
+cargo xtask bench-iai
+```
+
+The runner version must match the `iai-callgrind` dev-dep in
+`crates/tokenfs-algos/Cargo.toml`, otherwise the bench errors at start.
+
+CI uses `.github/workflows/iai-bench.yml`, which:
+
+1. installs valgrind on the runner,
+2. downloads the most recent `iai-baseline-main` artifact (the
+   `target/iai/` directory snapshotted from the last green main run),
+3. runs the iai benches with `--baseline=main --regression=ir=1.0` so
+   the job fails on any benchmark whose instruction count regresses by
+   more than 1.0% vs that baseline,
+4. on `main`, re-runs with `--save-baseline=main` and re-uploads
+   `target/iai/` as the next baseline artifact (90-day retention).
+
+If you don't have `valgrind` installed, skip this bench — there is no
+fallback path. The criterion suite (`cargo xtask bench-workloads`) is
+the everyday wall-clock companion; the iai suite is the regression
+canary.
 
 ## perf hardware counters require `perf_event_paranoid` ≤ 1
 

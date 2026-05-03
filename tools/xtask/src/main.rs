@@ -86,6 +86,7 @@ fn run() -> Result<()> {
         "bench-report" => bench_report(&rest),
         "bench-log" => record_bench_history(None),
         "bench-history" => bench_history(&rest),
+        "bench-iai" => bench_iai(&rest),
         "calibrate-magic-bpe" => calibrate_magic_bpe(&rest),
         "profile" => profile(&rest),
         "profile-real" => profile_real(&rest),
@@ -1638,6 +1639,26 @@ fn bench_similarity_distance(extra: &[OsString]) -> Result<()> {
     args.extend(extra.iter().cloned());
     run_command_with_env("cargo", args, Vec::new())?;
     record_bench_history_since(Some("similarity_distance"), Some(started))
+}
+
+// Deterministic hardware-counter benches under valgrind+callgrind. The
+// `iai_primitives` bench is gated on `arch-pinned-kernels` (it touches
+// `bits::kernels::scalar` directly for the popcount scalar parity case);
+// the `userspace` flag pulls in the panicking-shape APIs the bench
+// fixtures expect. Requires `valgrind` on PATH — local devs without it
+// installed should skip this and run the criterion benches instead.
+fn bench_iai(extra: &[OsString]) -> Result<()> {
+    let mut args = cargo_args([
+        "bench",
+        "-p",
+        "tokenfs-algos",
+        "--features",
+        "arch-pinned-kernels,userspace",
+        "--bench",
+        "iai_primitives",
+    ]);
+    args.extend(extra.iter().cloned());
+    run_command_with_env("cargo", args, Vec::new())
 }
 
 fn profile(extra: &[OsString]) -> Result<()> {
@@ -5686,6 +5707,9 @@ fn help() {
                     log the current target/criterion results to benchmark history\n\
            bench-history [--label <label>]\n\
                     snapshot target/criterion estimates.json/sample.json into benches/_history/<label>/\n\
+           bench-iai\n\
+                    deterministic hardware-counter benches via iai-callgrind\n\
+                    (requires valgrind; ~1%-sensitive instruction-count regression target)\n\
            calibrate-magic-bpe [path]\n\
                     write MIME-grouped byte-histogram calibration JSONL from Magic-BPE samples\n\
            profile  benchmark under perf when available\n\

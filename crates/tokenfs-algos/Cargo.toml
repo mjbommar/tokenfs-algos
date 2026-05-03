@@ -113,6 +113,16 @@ serde_json = "1"
 # Mature pure-Rust succinct data structures crate. Used as a parity oracle
 # for `bits::rank_select` tests only; not a runtime dependency.
 sucds = "0.8"
+# Hardware-counter benches under valgrind+callgrind. Deterministic across
+# runs on the same binary (instruction count, branch misses, cache
+# references), so the iai-bench CI workflow can use a tight 1% regression
+# threshold on instruction count instead of the 15% noise budget the
+# wall-clock criterion benches need (audit-R10 T3.4).
+#
+# `cargo build` doesn't require valgrind; running the benches does. Local
+# devs without valgrind installed simply skip `cargo bench --bench iai_*`
+# and use the criterion benches.
+iai-callgrind = "0.16"
 
 [[bench]]
 name = "histogram"
@@ -199,6 +209,16 @@ required-features = ["arch-pinned-kernels"]
 # `approx_bloom` exercises the pinned `approx::bloom_kernels::*` backends.
 [[bench]]
 name = "approx_bloom"
+harness = false
+required-features = ["arch-pinned-kernels"]
+
+# `iai_primitives` runs deterministic hardware-counter benches under
+# valgrind+callgrind on a focused subset of hot primitives (popcount,
+# streamvbyte encode/decode, sha256, vector dot/l2). Used by
+# `.github/workflows/iai-bench.yml` to catch instruction-count
+# regressions at ~1% sensitivity (audit-R10 T3.4).
+[[bench]]
+name = "iai_primitives"
 harness = false
 required-features = ["arch-pinned-kernels"]
 
