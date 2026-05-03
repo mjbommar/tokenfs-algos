@@ -819,7 +819,10 @@ impl<'a> CsrGraph<'a> {
     /// # Panics
     ///
     /// Panics if `v >= self.n` or if the offsets/neighbors arrays are
-    /// inconsistent (e.g. `offsets[v + 1] < offsets[v]`).
+    /// inconsistent (e.g. `offsets[v + 1] < offsets[v]`,
+    /// `offsets.len() < v + 2`, or `offsets[v + 1] > neighbors.len()`).
+    /// Kernel/FUSE callers that need a non-panicking variant should
+    /// prefer [`CsrGraph::try_neighbors_of`].
     #[must_use]
     pub fn neighbors_of(&self, v: u32) -> &'a [u32] {
         assert!(v < self.n, "vertex {v} out of range [0, {})", self.n);
@@ -834,12 +837,218 @@ impl<'a> CsrGraph<'a> {
     /// # Panics
     ///
     /// Panics under the same conditions as [`Self::neighbors_of`].
+    /// Kernel/FUSE callers that need a non-panicking variant should
+    /// prefer [`CsrGraph::try_degree_of`].
     #[must_use]
     pub fn degree(&self, v: u32) -> u32 {
         assert!(v < self.n, "vertex {v} out of range [0, {})", self.n);
         self.offsets[v as usize + 1] - self.offsets[v as usize]
     }
+
+    /// Like [`CsrGraph::neighbors_of`] but returns an error on
+    /// invalid input instead of panicking.
+    ///
+    /// Validates that `v < self.n`, that the offsets array is long
+    /// enough to read both `offsets[v]` and `offsets[v + 1]`, that the
+    /// offset pair is monotone (`offsets[v] <= offsets[v + 1]`), and
+    /// that the slice bounds fit inside `self.neighbors`. On success
+    /// returns the borrowed neighbour slice; on failure returns the
+    /// matching [`CsrGraphError`] variant without touching memory
+    /// outside the bounds the validator already checked.
+    ///
+    /// Use this from kernel-mode consumers that loaded a [`CsrGraph`]
+    /// from an untrusted on-disk image and need to traverse
+    /// adjacency lists without exposing a DoS hazard at the kernel
+    /// boundary.
+    ///
+    /// # Errors
+    ///
+    /// * [`CsrGraphError::OutOfRange`] when `v >= self.n` or when
+    ///   `self.offsets.len() < (v as usize) + 2`.
+    /// * [`CsrGraphError::OffsetsNonMonotone`] when
+    ///   `self.offsets[v] > self.offsets[v + 1]`.
+    /// * [`CsrGraphError::NeighborsOutOfBounds`] when
+    ///   `self.offsets[v + 1] as usize > self.neighbors.len()`.
+    pub fn try_neighbors_of(&self, v: u32) -> Result<&'a [u32], CsrGraphError> {
+        if v >= self.n {
+            return Err(CsrGraphError::OutOfRange { v, n: self.n });
+        }
+        let v_idx = v as usize;
+        // The offsets array must be long enough to address `v + 1`.
+        // Treat that as another "out of range" failure mode — the
+        // caller's CsrGraph header is internally inconsistent.
+        if self.offsets.len() <= v_idx + 1 {
+            return Err(CsrGraphError::OutOfRange { v, n: self.n });
+        }
+        let lo = self.offsets[v_idx];
+        let hi = self.offsets[v_idx + 1];
+        if lo > hi {
+            return Err(CsrGraphError::OffsetsNonMonotone { i: v, lo, hi });
+        }
+        let hi_idx = hi as usize;
+        if hi_idx > self.neighbors.len() {
+            return Err(CsrGraphError::NeighborsOutOfBounds {
+                offset: hi,
+                neighbors_len: self.neighbors.len(),
+            });
+        }
+        let lo_idx = lo as usize;
+        // SAFETY-LIKE: lo <= hi (monotone check) and hi_idx <= len
+        // (bounds check) together imply lo_idx <= hi_idx <= len, so
+        // the slice index is in bounds.
+        Ok(&self.neighbors[lo_idx..hi_idx])
+    }
+
+    /// Like [`CsrGraph::degree`] but returns an error on invalid
+    /// input instead of panicking.
+    ///
+    /// Validates that `v < self.n`, that the offsets array is long
+    /// enough to read both `offsets[v]` and `offsets[v + 1]`, and
+    /// that the offset pair is monotone. On success returns
+    /// `offsets[v + 1] - offsets[v]`. The neighbours array length is
+    /// not consulted — degree is purely a property of the offsets
+    /// array — so [`CsrGraphError::NeighborsOutOfBounds`] is never
+    /// returned.
+    ///
+    /// # Errors
+    ///
+    /// * [`CsrGraphError::OutOfRange`] when `v >= self.n` or when
+    ///   `self.offsets.len() < (v as usize) + 2`.
+    /// * [`CsrGraphError::OffsetsNonMonotone`] when
+    ///   `self.offsets[v] > self.offsets[v + 1]`.
+    pub fn try_degree_of(&self, v: u32) -> Result<u32, CsrGraphError> {
+        if v >= self.n {
+            return Err(CsrGraphError::OutOfRange { v, n: self.n });
+        }
+        let v_idx = v as usize;
+        if self.offsets.len() <= v_idx + 1 {
+            return Err(CsrGraphError::OutOfRange { v, n: self.n });
+        }
+        let lo = self.offsets[v_idx];
+        let hi = self.offsets[v_idx + 1];
+        if lo > hi {
+            return Err(CsrGraphError::OffsetsNonMonotone { i: v, lo, hi });
+        }
+        Ok(hi - lo)
+    }
 }
+
+/// Failure modes returned by the fallible [`CsrGraph`] accessors
+/// ([`CsrGraph::try_neighbors_of`], [`CsrGraph::try_degree_of`]) and by
+/// the fallible permutation builders' upfront CSR validation
+/// (`try_rcm`, `try_rabbit_order`, `try_rabbit_order_par` — added in
+/// audit-R7-followup #11).
+///
+/// All variants are non-allocating and `Copy` so they propagate from
+/// kernel-mode call sites without touching the heap. They surface
+/// the offending vertex / offset values so a caller can log or
+/// telemetry-tag corrupted on-disk CSR images.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CsrGraphError {
+    /// Vertex `v` is out of range for the graph: `v >= n`, or the
+    /// `offsets` array does not cover index `v + 1` (header
+    /// inconsistency).
+    OutOfRange {
+        /// The offending vertex ID.
+        v: u32,
+        /// The graph's declared vertex count `self.n`.
+        n: u32,
+    },
+    /// `offsets[i] > offsets[i + 1]` — the CSR offsets array is not
+    /// monotonically non-decreasing.
+    OffsetsNonMonotone {
+        /// Index `i` whose offset pair is inverted.
+        i: u32,
+        /// `offsets[i]`.
+        lo: u32,
+        /// `offsets[i + 1]`.
+        hi: u32,
+    },
+    /// `offsets[v + 1] as usize > neighbors.len()` — the offset
+    /// claims to address past the end of the neighbours array.
+    NeighborsOutOfBounds {
+        /// The offending offset value.
+        offset: u32,
+        /// The actual length of `neighbors`.
+        neighbors_len: usize,
+    },
+    /// `offsets.len() != (n as usize) + 1` — the offsets array does
+    /// not have the required CSR length.
+    OffsetsLengthMismatch {
+        /// The actual `offsets.len()`.
+        actual_len: usize,
+        /// The required length `n + 1`.
+        expected_len: usize,
+    },
+    /// `offsets[n] as usize != neighbors.len()` — the offsets tail
+    /// does not match the neighbour array length.
+    NeighborsLengthMismatch {
+        /// The value of `offsets[n]`.
+        offsets_tail: u32,
+        /// The actual length of `neighbors`.
+        neighbors_len: usize,
+    },
+    /// A neighbour ID is out of range: `neighbors[k] >= n` for some
+    /// `k`. Reported by the permutation builders' upfront CSR
+    /// validation; not produced by the per-vertex try_* accessors
+    /// (which never read `neighbors[k]`'s value).
+    NeighborOutOfRange {
+        /// The offending neighbour ID.
+        neighbor: u32,
+        /// The graph's declared vertex count `self.n`.
+        n: u32,
+        /// Index in the `neighbors` array where the offending value
+        /// lives, for diagnostics.
+        at_index: usize,
+    },
+}
+
+impl core::fmt::Display for CsrGraphError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::OutOfRange { v, n } => {
+                write!(f, "CsrGraph: vertex {v} out of range [0, {n})")
+            }
+            Self::OffsetsNonMonotone { i, lo, hi } => write!(
+                f,
+                "CsrGraph: offsets non-monotone at index {i}: offsets[{i}]={lo} > offsets[{}]={hi}",
+                i + 1
+            ),
+            Self::NeighborsOutOfBounds {
+                offset,
+                neighbors_len,
+            } => write!(
+                f,
+                "CsrGraph: offset {offset} addresses past neighbors.len() ({neighbors_len})"
+            ),
+            Self::OffsetsLengthMismatch {
+                actual_len,
+                expected_len,
+            } => write!(
+                f,
+                "CsrGraph: offsets.len() ({actual_len}) != n + 1 ({expected_len})"
+            ),
+            Self::NeighborsLengthMismatch {
+                offsets_tail,
+                neighbors_len,
+            } => write!(
+                f,
+                "CsrGraph: offsets[n] ({offsets_tail}) != neighbors.len() ({neighbors_len})"
+            ),
+            Self::NeighborOutOfRange {
+                neighbor,
+                n,
+                at_index,
+            } => write!(
+                f,
+                "CsrGraph: neighbor {neighbor} at neighbors[{at_index}] out of range [0, {n})"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for CsrGraphError {}
 
 #[cfg(test)]
 mod tests {
@@ -1387,6 +1596,183 @@ mod tests {
         for c in cases {
             let s = format!("{c}");
             assert!(s.starts_with("Permutation::try_validate_no_alloc"));
+        }
+    }
+
+    // ----- audit-R7-followup #10 — CsrGraph::try_neighbors_of / try_degree_of -----
+
+    #[test]
+    fn try_neighbors_of_matches_neighbors_of_on_well_formed_csr() {
+        // Path: 0-1-2-3, undirected.
+        let offsets = [0_u32, 1, 3, 5, 6];
+        let neighbors = [1_u32, 0, 2, 1, 3, 2];
+        let g = CsrGraph {
+            n: 4,
+            offsets: &offsets,
+            neighbors: &neighbors,
+        };
+        for v in 0_u32..4 {
+            let panic_path = g.neighbors_of(v);
+            let try_path = g
+                .try_neighbors_of(v)
+                .expect("well-formed CSR must succeed");
+            assert_eq!(panic_path, try_path);
+        }
+    }
+
+    #[test]
+    fn try_degree_of_matches_degree_on_well_formed_csr() {
+        let offsets = [0_u32, 1, 3, 5, 6];
+        let neighbors = [1_u32, 0, 2, 1, 3, 2];
+        let g = CsrGraph {
+            n: 4,
+            offsets: &offsets,
+            neighbors: &neighbors,
+        };
+        for v in 0_u32..4 {
+            let panic_path = g.degree(v);
+            let try_path = g.try_degree_of(v).expect("well-formed CSR must succeed");
+            assert_eq!(panic_path, try_path);
+        }
+    }
+
+    #[test]
+    fn try_neighbors_of_rejects_v_out_of_range() {
+        let offsets = [0_u32, 1, 3];
+        let neighbors = [1_u32, 0, 2];
+        let g = CsrGraph {
+            n: 2,
+            offsets: &offsets,
+            neighbors: &neighbors,
+        };
+        let err = g
+            .try_neighbors_of(2)
+            .expect_err("v == n must error, not panic");
+        assert_eq!(err, CsrGraphError::OutOfRange { v: 2, n: 2 });
+        let err = g.try_neighbors_of(99).expect_err("v >> n must error");
+        assert_eq!(err, CsrGraphError::OutOfRange { v: 99, n: 2 });
+    }
+
+    #[test]
+    fn try_neighbors_of_rejects_offsets_non_monotone() {
+        // Inverted offset pair at index 1: offsets[1]=5 > offsets[2]=2.
+        // (Both are within neighbors.len() so the bounds check
+        // succeeds; the failure mode under test is the monotone
+        // check.)
+        let offsets = [0_u32, 5, 2, 6];
+        let neighbors = [1_u32, 2, 3, 4, 5, 6];
+        let g = CsrGraph {
+            n: 3,
+            offsets: &offsets,
+            neighbors: &neighbors,
+        };
+        let err = g
+            .try_neighbors_of(1)
+            .expect_err("non-monotone offsets must error");
+        assert_eq!(
+            err,
+            CsrGraphError::OffsetsNonMonotone {
+                i: 1,
+                lo: 5,
+                hi: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn try_neighbors_of_rejects_neighbors_out_of_bounds() {
+        // offsets[1] = 99 addresses past the end of neighbors.
+        let offsets = [0_u32, 99];
+        let neighbors = [1_u32, 0];
+        let g = CsrGraph {
+            n: 1,
+            offsets: &offsets,
+            neighbors: &neighbors,
+        };
+        let err = g
+            .try_neighbors_of(0)
+            .expect_err("offset > neighbors.len() must error");
+        assert_eq!(
+            err,
+            CsrGraphError::NeighborsOutOfBounds {
+                offset: 99,
+                neighbors_len: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn try_degree_of_rejects_v_out_of_range_and_non_monotone() {
+        let offsets = [0_u32, 5, 2];
+        let neighbors = [1_u32, 2, 3, 4, 5, 6];
+        let g = CsrGraph {
+            n: 2,
+            offsets: &offsets,
+            neighbors: &neighbors,
+        };
+        let err = g.try_degree_of(7).expect_err("v >> n must error");
+        assert_eq!(err, CsrGraphError::OutOfRange { v: 7, n: 2 });
+        let err = g
+            .try_degree_of(1)
+            .expect_err("non-monotone offsets must error");
+        assert_eq!(
+            err,
+            CsrGraphError::OffsetsNonMonotone {
+                i: 1,
+                lo: 5,
+                hi: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn try_neighbors_of_rejects_truncated_offsets_array() {
+        // offsets array has only one entry but n=1 — there is no
+        // offsets[1] to read.
+        let offsets = [0_u32];
+        let neighbors: [u32; 0] = [];
+        let g = CsrGraph {
+            n: 1,
+            offsets: &offsets,
+            neighbors: &neighbors,
+        };
+        let err = g
+            .try_neighbors_of(0)
+            .expect_err("truncated offsets must error");
+        assert_eq!(err, CsrGraphError::OutOfRange { v: 0, n: 1 });
+    }
+
+    #[test]
+    fn csr_graph_error_display_renders_all_variants() {
+        // Cover every Display arm.
+        let cases = [
+            CsrGraphError::OutOfRange { v: 5, n: 3 },
+            CsrGraphError::OffsetsNonMonotone {
+                i: 1,
+                lo: 5,
+                hi: 2,
+            },
+            CsrGraphError::NeighborsOutOfBounds {
+                offset: 99,
+                neighbors_len: 5,
+            },
+            CsrGraphError::OffsetsLengthMismatch {
+                actual_len: 3,
+                expected_len: 5,
+            },
+            CsrGraphError::NeighborsLengthMismatch {
+                offsets_tail: 7,
+                neighbors_len: 6,
+            },
+            CsrGraphError::NeighborOutOfRange {
+                neighbor: 9,
+                n: 4,
+                at_index: 2,
+            },
+        ];
+        for c in cases {
+            let s = format!("{c}");
+            assert!(s.starts_with("CsrGraph"));
         }
     }
 }
