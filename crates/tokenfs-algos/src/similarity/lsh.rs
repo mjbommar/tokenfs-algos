@@ -154,6 +154,9 @@ impl<Id: Clone + Eq + Hash, const K: usize> MinHashIndex<Id, K> {
     /// extension consumers should call [`Self::try_new`] instead so a
     /// malformed band shape returns a typed [`LshConstructionError`]
     /// rather than aborting the host process (audit-R7-followup #16).
+    ///
+    /// Available only with `feature = "userspace"` (audit-R9 #2).
+    #[cfg(feature = "userspace")]
     #[must_use]
     pub fn new(bands: usize, rows_per_band: usize) -> Self {
         assert!(bands > 0, "bands must be > 0");
@@ -291,6 +294,9 @@ impl<Id: Clone + Eq + Hash, const BANDS: usize> SimHashIndex<Id, BANDS> {
     /// instead so a malformed `BANDS` returns a typed
     /// [`LshConstructionError`] rather than aborting the host process
     /// (audit-R7-followup #16).
+    ///
+    /// Available only with `feature = "userspace"` (audit-R9 #2).
+    #[cfg(feature = "userspace")]
     #[must_use]
     pub fn new() -> Self {
         assert!(BANDS > 0, "BANDS must be > 0");
@@ -381,6 +387,8 @@ impl<Id: Clone + Eq + Hash, const BANDS: usize> SimHashIndex<Id, BANDS> {
     }
 }
 
+// `Default` delegates to `new`, which is gated on `userspace` (audit-R9 #2).
+#[cfg(feature = "userspace")]
 impl<Id: Clone + Eq + Hash, const BANDS: usize> Default for SimHashIndex<Id, BANDS> {
     fn default() -> Self {
         Self::new()
@@ -422,7 +430,8 @@ mod tests {
         let sig_d = classic_from_hashes::<_, K>(elements(&disjoint), 0xCAFE);
 
         // 16 bands of 8 rows each: threshold ~0.69.
-        let mut idx = MinHashIndex::<&'static str, K>::new(16, 8);
+        let mut idx =
+            MinHashIndex::<&'static str, K>::try_new(16, 8).expect("test args within bounds");
         idx.insert("b", &sig_b);
         idx.insert("d", &sig_d);
 
@@ -447,7 +456,7 @@ mod tests {
         // 32 bands of 4 rows each: threshold ~0.58 — narrower than the
         // expected high-overlap Jaccard, so target_b should be a candidate
         // while disjoint inserts should not.
-        let mut idx = MinHashIndex::<usize, K>::new(32, 4);
+        let mut idx = MinHashIndex::<usize, K>::try_new(32, 4).expect("test args within bounds");
         idx.insert(0, &sig_b);
         for i in 1..51 {
             let disjoint: Vec<u32> = (1000 + i * 100..1000 + i * 100 + 200)
@@ -476,7 +485,7 @@ mod tests {
     fn minhash_index_panics_on_invalid_band_split() {
         let result = std::panic::catch_unwind(|| {
             // 3 * 5 = 15 != K=16 → must panic.
-            MinHashIndex::<&'static str, 16>::new(3, 5)
+            MinHashIndex::<&'static str, 16>::try_new(3, 5).expect("test args within bounds")
         });
         assert!(result.is_err());
     }
@@ -494,7 +503,7 @@ mod tests {
         let sig_b = Signature64::from_bits(bits_b);
         assert_eq!(sig_a.hamming_distance(sig_b), 5);
 
-        let mut idx = SimHashIndex::<&'static str, 8>::new();
+        let mut idx = SimHashIndex::<&'static str, 8>::try_new().expect("test args within bounds");
         idx.insert("near", sig_b);
         // Add some unrelated entries.
         for i in 0..20 {
@@ -517,7 +526,7 @@ mod tests {
         let sig_far = Signature64::from_bits(!sig_a.bits());
         assert_eq!(sig_a.hamming_distance(sig_far), 64);
 
-        let mut idx = SimHashIndex::<&'static str, 8>::new();
+        let mut idx = SimHashIndex::<&'static str, 8>::try_new().expect("test args within bounds");
         idx.insert("far", sig_far);
         let (candidates, stats) = idx.query(sig_a);
         // With BANDS=8, every band has the all-bits-inverted pattern, so
@@ -704,7 +713,7 @@ mod tests {
         // drift.
         const K: usize = 32;
         let try_idx = MinHashIndex::<usize, K>::try_new(8, 4).expect("valid shape");
-        let panic_idx = MinHashIndex::<usize, K>::new(8, 4);
+        let panic_idx = MinHashIndex::<usize, K>::try_new(8, 4).expect("test args within bounds");
         assert_eq!(try_idx.len(), panic_idx.len());
         assert_eq!(try_idx.is_empty(), panic_idx.is_empty());
         assert_eq!(try_idx.rows_per_band, panic_idx.rows_per_band);
@@ -714,7 +723,7 @@ mod tests {
     #[test]
     fn simhash_index_try_new_round_trips_with_panicking_constructor() {
         let try_idx = SimHashIndex::<usize, 8>::try_new().expect("valid BANDS");
-        let panic_idx = SimHashIndex::<usize, 8>::new();
+        let panic_idx = SimHashIndex::<usize, 8>::try_new().expect("test args within bounds");
         assert_eq!(try_idx.len(), panic_idx.len());
         assert_eq!(try_idx.is_empty(), panic_idx.is_empty());
         assert_eq!(try_idx.band_width_bits, panic_idx.band_width_bits);

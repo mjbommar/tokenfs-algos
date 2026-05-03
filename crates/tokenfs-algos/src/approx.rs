@@ -374,6 +374,9 @@ mod bloom {
         /// should use [`Self::try_new`] which returns
         /// [`super::ApproxError`] on the same preconditions instead of
         /// aborting the caller.
+        ///
+        /// Available only with `feature = "userspace"` (audit-R9 #2).
+        #[cfg(feature = "userspace")]
         #[must_use]
         pub fn new(bits: usize, k: usize) -> Self {
             assert!(bits > 0, "BloomFilter bits must be > 0");
@@ -401,6 +404,9 @@ mod bloom {
         /// should use [`Self::try_with_target`] which surfaces the
         /// same preconditions as [`super::ApproxError`] without
         /// panicking.
+        ///
+        /// Available only with `feature = "userspace"` (audit-R9 #2).
+        #[cfg(feature = "userspace")]
         #[must_use]
         pub fn with_target(expected_items: usize, target_fpr: f64) -> Self {
             assert!(expected_items > 0);
@@ -433,7 +439,17 @@ mod bloom {
             if k == 0 {
                 return Err(super::ApproxError::ZeroParameter { name: "k" });
             }
-            Ok(Self::new(bits, k))
+            // Construct directly so this fallible primitive does not depend
+            // on the panicking `new`, which is gated on `userspace`
+            // (audit-R9 #2). Both paths produce bit-identical state.
+            let words_needed = bits.div_ceil(64);
+            let actual_bits = words_needed * 64;
+            Ok(Self {
+                words: vec![0; words_needed],
+                bits: actual_bits,
+                k,
+                inserted: 0,
+            })
         }
 
         /// Fallible variant of [`Self::with_target`].
@@ -476,7 +492,12 @@ mod bloom {
                     target_fpr,
                 });
             }
-            Ok(Self::with_target(expected_items, target_fpr))
+            // Construct directly so this fallible primitive does not depend
+            // on the panicking `with_target`, which is gated on `userspace`
+            // (audit-R9 #2).
+            let m = m_f as usize;
+            let k = ((m as f64 / n) * core::f64::consts::LN_2).round().max(1.0) as usize;
+            Self::try_new(m, k)
         }
 
         /// Number of items inserted.
@@ -1119,6 +1140,9 @@ mod hll {
         /// callers should use [`Self::try_new`] which returns
         /// [`super::ApproxError::PrecisionOutOfRange`] on the same
         /// precondition without aborting the caller.
+        ///
+        /// Available only with `feature = "userspace"` (audit-R9 #2).
+        #[cfg(feature = "userspace")]
         #[must_use]
         pub fn new(precision: u32) -> Self {
             assert!(
@@ -1147,7 +1171,14 @@ mod hll {
                     max: 16,
                 });
             }
-            Ok(Self::new(precision))
+            // Construct directly so this fallible primitive does not depend
+            // on the panicking `new`, which is gated on `userspace`
+            // (audit-R9 #2).
+            let m = 1_usize << precision;
+            Ok(Self {
+                registers: vec![0; m],
+                precision,
+            })
         }
 
         /// Number of registers (`2^precision`).
@@ -1643,7 +1674,7 @@ mod tests {
     #[cfg(feature = "std")]
     #[test]
     fn bloom_filter_no_false_negatives() {
-        let mut bf = BloomFilter::new(1024, 5);
+        let mut bf = BloomFilter::try_new(1024, 5).expect("test args within bounds");
         let items: Vec<&[u8]> = vec![
             b"alpha", b"beta", b"gamma", b"delta", b"epsilon", b"zeta", b"eta",
         ];
@@ -1658,7 +1689,7 @@ mod tests {
     #[cfg(feature = "std")]
     #[test]
     fn bloom_filter_false_positive_rate_within_bound() {
-        let mut bf = BloomFilter::new(4096, 5);
+        let mut bf = BloomFilter::try_new(4096, 5).expect("test args within bounds");
         for i in 0..200_u32 {
             bf.insert(&i.to_le_bytes());
         }
@@ -1680,7 +1711,7 @@ mod tests {
     #[cfg(feature = "std")]
     #[test]
     fn bloom_filter_with_target_picks_reasonable_params() {
-        let bf = BloomFilter::with_target(1000, 0.01);
+        let bf = BloomFilter::try_with_target(1000, 0.01).expect("test args within bounds");
         // m = -1000 * ln(0.01) / (ln 2)^2 ≈ 9586 bits, rounded to 9600.
         assert!(bf.bits() >= 9000 && bf.bits() <= 12_000);
         assert!(bf.k() >= 5 && bf.k() <= 10);
@@ -1689,7 +1720,7 @@ mod tests {
     #[cfg(feature = "std")]
     #[test]
     fn bloom_filter_clear_resets_state() {
-        let mut bf = BloomFilter::new(512, 3);
+        let mut bf = BloomFilter::try_new(512, 3).expect("test args within bounds");
         bf.insert(b"x");
         assert!(bf.contains(b"x"));
         bf.clear();
@@ -1702,7 +1733,7 @@ mod tests {
     #[cfg(feature = "std")]
     #[test]
     fn bloom_simd_no_false_negatives() {
-        let mut bf = BloomFilter::new(1024, 5);
+        let mut bf = BloomFilter::try_new(1024, 5).expect("test args within bounds");
         let keys: [u64; 16] = [
             0,
             1,
@@ -1735,7 +1766,7 @@ mod tests {
         // Cover every k in [1, 8] inclusive so we exercise the AVX-512
         // single-vector path (k≤8) and the AVX2/NEON tail loops.
         for k in 1_usize..=16 {
-            let mut bf = BloomFilter::new(2048, k);
+            let mut bf = BloomFilter::try_new(2048, k).expect("test args within bounds");
             for key in 0_u64..256 {
                 bf.insert_simd(key);
             }
@@ -1748,7 +1779,7 @@ mod tests {
     #[cfg(feature = "std")]
     #[test]
     fn bloom_simd_batch_matches_per_key() {
-        let mut bf = BloomFilter::new(4096, 7);
+        let mut bf = BloomFilter::try_new(4096, 7).expect("test args within bounds");
         let inserted: Vec<u64> = (0_u64..200).collect();
         for &k in &inserted {
             bf.insert_simd(k);
@@ -1771,7 +1802,7 @@ mod tests {
     fn bloom_simd_empty_filter_returns_false() {
         // Empty filter (no inserts): every contains query returns false
         // (no bits set anywhere).
-        let bf = BloomFilter::new(64, 1);
+        let bf = BloomFilter::try_new(64, 1).expect("test args within bounds");
         for k in 0_u64..32 {
             assert!(!bf.contains_simd(k), "empty filter hit on key {k}");
         }
@@ -1787,7 +1818,7 @@ mod tests {
         // m=1 → rounded to 64 bits. k=1 → one position per insert, all
         // collide on the same bit. After one insert, every contains
         // query returns true.
-        let mut bf = BloomFilter::new(1, 1);
+        let mut bf = BloomFilter::try_new(1, 1).expect("test args within bounds");
         assert_eq!(bf.bits(), 64);
         bf.insert_simd(0);
         // With one bit set, queries probabilistically hit. We only
@@ -1799,7 +1830,7 @@ mod tests {
     #[test]
     fn bloom_simd_single_hash_filter_works() {
         // k=1: degenerate Kirsch-Mitzenmacher (only h1, no h2 used).
-        let mut bf = BloomFilter::new(512, 1);
+        let mut bf = BloomFilter::try_new(512, 1).expect("test args within bounds");
         let keys: [u64; 8] = [0, 1, 42, 0xDEAD, u64::MAX, 100, 200, 300];
         for &k in &keys {
             bf.insert_simd(k);
@@ -1814,7 +1845,7 @@ mod tests {
     fn bloom_simd_maxed_out_filter_returns_true() {
         // All-bits-set filter: contains_simd returns true for every
         // query (this is the saturation degenerate case).
-        let mut bf = BloomFilter::new(64, 3);
+        let mut bf = BloomFilter::try_new(64, 3).expect("test args within bounds");
         // Manually set every bit. We can only do that via the public
         // API by inserting until all bits are set; the empty-filter
         // size 64 + k=3 + many inserts saturates quickly.
@@ -1840,7 +1871,7 @@ mod tests {
     #[cfg(feature = "std")]
     #[test]
     fn bloom_simd_try_contains_batch_rejects_length_mismatch() {
-        let bf = BloomFilter::new(512, 3);
+        let bf = BloomFilter::try_new(512, 3).expect("test args within bounds");
         let keys = vec![0_u64, 1, 2];
         let mut out = vec![false; 4]; // mismatched length
         let err = bf.try_contains_batch_simd(&keys, &mut out).unwrap_err();
@@ -1863,7 +1894,8 @@ mod tests {
         // buffer with `[..self.k]` and panic in the inner SIMD path.
         // The fallible path must surface this as
         // BloomBatchError::KExceedsSimdMax instead.
-        let bf = BloomFilter::new(4096, bloom_kernels::MAX_K + 1);
+        let bf =
+            BloomFilter::try_new(4096, bloom_kernels::MAX_K + 1).expect("test args within bounds");
         let keys = vec![0_u64, 1, 2];
         let mut out = vec![false; 3];
         let err = bf.try_contains_batch_simd(&keys, &mut out).unwrap_err();
@@ -1883,7 +1915,7 @@ mod tests {
         assert!(matches!(err, BloomBatchError::KExceedsSimdMax { .. }));
 
         // Even larger k still surfaces a clean error (no panic).
-        let bf64 = BloomFilter::new(4096, 64);
+        let bf64 = BloomFilter::try_new(4096, 64).expect("test args within bounds");
         let mut out64 = vec![false; 3];
         let err = bf64.try_contains_batch_simd(&keys, &mut out64).unwrap_err();
         assert_eq!(
@@ -1902,7 +1934,7 @@ mod tests {
         // Uses ApproxError (consistent with try_insert_simd); the
         // batch sibling uses BloomBatchError per the established
         // batch-error convention (audit-R8 #3 merge resolution).
-        let bf = BloomFilter::new(4096, 33);
+        let bf = BloomFilter::try_new(4096, 33).expect("test args within bounds");
         let err = bf.try_contains_simd(0).unwrap_err();
         assert_eq!(
             err,
@@ -1912,7 +1944,7 @@ mod tests {
             }
         );
         // Sane k succeeds.
-        let bf_ok = BloomFilter::new(4096, 5);
+        let bf_ok = BloomFilter::try_new(4096, 5).expect("test args within bounds");
         assert!(bf_ok.try_contains_simd(0).is_ok());
     }
 
@@ -1927,7 +1959,8 @@ mod tests {
         // inside `contains_simd`, which is the standard
         // "range end index N out of range for slice of length M"
         // panic.
-        let bf = BloomFilter::new(4096, bloom_kernels::MAX_K + 1);
+        let bf =
+            BloomFilter::try_new(4096, bloom_kernels::MAX_K + 1).expect("test args within bounds");
         let keys = [0_u64];
         let mut out = [false; 1];
         bf.contains_batch_simd(&keys, &mut out);
@@ -1939,7 +1972,7 @@ mod tests {
         // Mirror the byte-keyed false-positive test: insert N keys,
         // probe with disjoint keys, observed FPR should be within ~3x
         // of predicted.
-        let mut bf = BloomFilter::new(4096, 5);
+        let mut bf = BloomFilter::try_new(4096, 5).expect("test args within bounds");
         for i in 0_u64..200 {
             bf.insert_simd(i);
         }
@@ -1963,7 +1996,7 @@ mod tests {
     #[cfg(feature = "std")]
     #[test]
     fn hll_cardinality_within_documented_error_bound() {
-        let mut hll = HyperLogLog::new(12); // 1.6% std err
+        let mut hll = HyperLogLog::try_new(12).expect("test args within bounds"); // 1.6% std err
         let true_card = 50_000_u64;
         for i in 0..true_card {
             hll.insert(&i.to_le_bytes());
@@ -1980,7 +2013,7 @@ mod tests {
     #[cfg(feature = "std")]
     #[test]
     fn hll_small_cardinality_uses_correction() {
-        let mut hll = HyperLogLog::new(8);
+        let mut hll = HyperLogLog::try_new(8).expect("test args within bounds");
         for i in 0..50_u64 {
             hll.insert(&i.to_le_bytes());
         }
@@ -1992,8 +2025,8 @@ mod tests {
     #[cfg(feature = "std")]
     #[test]
     fn hll_merge_combines_estimates() {
-        let mut a = HyperLogLog::new(10);
-        let mut b = HyperLogLog::new(10);
+        let mut a = HyperLogLog::try_new(10).expect("test args within bounds");
+        let mut b = HyperLogLog::try_new(10).expect("test args within bounds");
         for i in 0..5_000_u64 {
             a.insert(&i.to_le_bytes());
         }
@@ -2010,7 +2043,7 @@ mod tests {
     #[cfg(feature = "std")]
     #[test]
     fn hll_clear_resets_state() {
-        let mut hll = HyperLogLog::new(8);
+        let mut hll = HyperLogLog::try_new(8).expect("test args within bounds");
         for i in 0..1000_u64 {
             hll.insert(&i.to_le_bytes());
         }
@@ -2079,13 +2112,14 @@ mod tests {
         assert!(BloomFilter::try_with_target(1_000_000, 1e-9).is_ok());
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(all(feature = "std", feature = "userspace"))]
     #[test]
     #[should_panic(expected = "overflows usize")]
     fn bloom_with_target_panics_on_bit_count_overflow() {
         // Companion to the fallible test above: the panicking
-        // sibling must trip its assertion when handed parameters
-        // that the fallible variant rejects with BitCountOverflow.
+        // sibling (gated on `userspace` per audit-R9 #2) must trip its
+        // assertion when handed parameters that the fallible variant
+        // rejects with BitCountOverflow.
         let _ = BloomFilter::with_target(usize::MAX, 1e-300);
     }
 
@@ -2097,7 +2131,7 @@ mod tests {
         // stack buffer and would panic for k > MAX_K. The fallible
         // wrappers must surface KExceedsSimdMax instead.
         let max_k = bloom_kernels::MAX_K;
-        let mut bf = BloomFilter::new(1024, max_k + 1);
+        let mut bf = BloomFilter::try_new(1024, max_k + 1).expect("test args within bounds");
         let err = bf.try_insert_simd(0xDEAD_BEEF).unwrap_err();
         assert!(matches!(
             err,
@@ -2116,8 +2150,8 @@ mod tests {
         // For valid k (≤ MAX_K) the fallible wrappers are bit-exact
         // with insert_simd / contains_simd. Verify by inserting via
         // the fallible API and querying via both surfaces.
-        let mut bf_try = BloomFilter::new(2048, 7);
-        let mut bf_ref = BloomFilter::new(2048, 7);
+        let mut bf_try = BloomFilter::try_new(2048, 7).expect("test args within bounds");
+        let mut bf_ref = BloomFilter::try_new(2048, 7).expect("test args within bounds");
         for key in 0_u64..64 {
             bf_try
                 .try_insert_simd(key)
@@ -2139,7 +2173,7 @@ mod tests {
         // The exact-MAX_K case must succeed, exercising the [..self.k]
         // slice taking the full buffer.
         let max_k = bloom_kernels::MAX_K;
-        let mut bf = BloomFilter::new(8192, max_k);
+        let mut bf = BloomFilter::try_new(8192, max_k).expect("test args within bounds");
         bf.try_insert_simd(42).expect("k == MAX_K should succeed");
         assert!(
             bf.try_contains_simd(42).expect("k == MAX_K should succeed"),
@@ -2155,7 +2189,8 @@ mod tests {
         // panic when k > MAX_K. We don't pin the panic message
         // because the slice-out-of-bounds message is rustc-version
         // dependent.
-        let mut bf = BloomFilter::new(1024, bloom_kernels::MAX_K + 1);
+        let mut bf =
+            BloomFilter::try_new(1024, bloom_kernels::MAX_K + 1).expect("test args within bounds");
         bf.insert_simd(0);
     }
 
@@ -2204,7 +2239,7 @@ mod tests {
 
     #[cfg(feature = "std")]
     fn build_hll_with_inserts(precision: u32, seed: u64, n: usize) -> HyperLogLog {
-        let mut hll = HyperLogLog::new(precision);
+        let mut hll = HyperLogLog::try_new(precision).expect("test args within bounds");
         for h in deterministic_hash_stream(seed, n) {
             hll.insert_hash(h);
         }
@@ -2253,8 +2288,8 @@ mod tests {
         // per-byte max kernel's tail handling and lane-shuffle paths.
         let precision = 10;
         let m = 1_usize << precision;
-        let mut a = HyperLogLog::new(precision);
-        let mut b = HyperLogLog::new(precision);
+        let mut a = HyperLogLog::try_new(precision).expect("test args within bounds");
+        let mut b = HyperLogLog::try_new(precision).expect("test args within bounds");
 
         // Manually clobber the registers to a known pattern via the
         // public merge contract: insert hashes that drive each register
@@ -2320,7 +2355,7 @@ mod tests {
         // All registers zero ⇒ Z = m (every term is 2^0 = 1.0) ⇒
         // raw = alpha * m^2 / m = alpha * m. Both paths must agree.
         for precision in [4_u32, 8, 12, 16] {
-            let hll = HyperLogLog::new(precision);
+            let hll = HyperLogLog::try_new(precision).expect("test args within bounds");
             let scalar = hll.count_raw();
             let simd = hll.count_simd();
             assert_eq!(
@@ -2344,7 +2379,7 @@ mod tests {
         // hash chunk). This pushes 2^-r toward subnormals and exercises
         // the LUT entries far from zero.
         for precision in [4_u32, 8, 12] {
-            let mut hll = HyperLogLog::new(precision);
+            let mut hll = HyperLogLog::try_new(precision).expect("test args within bounds");
             // Force every register to its maximum rank by inserting a
             // hash whose low (64-p) bits are all zero, for each
             // bucket index in turn.
@@ -2366,8 +2401,8 @@ mod tests {
     #[cfg(feature = "std")]
     #[test]
     fn hll_try_merge_rejects_precision_mismatch() {
-        let mut a = HyperLogLog::new(10);
-        let b = HyperLogLog::new(12);
+        let mut a = HyperLogLog::try_new(10).expect("test args within bounds");
+        let b = HyperLogLog::try_new(12).expect("test args within bounds");
         let err = a.try_merge(&b).unwrap_err();
         assert!(matches!(
             err,
@@ -2379,7 +2414,7 @@ mod tests {
             hll::HllMergeError::PrecisionMismatch { lhs: 10, rhs: 12 }
         ));
         // Equal-precision case succeeds.
-        let c = HyperLogLog::new(10);
+        let c = HyperLogLog::try_new(10).expect("test args within bounds");
         assert!(a.try_merge(&c).is_ok());
         assert!(a.try_merge_simd(&c).is_ok());
     }
@@ -2388,8 +2423,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "HyperLogLog merge requires equal precision")]
     fn hll_merge_simd_panics_on_precision_mismatch() {
-        let mut a = HyperLogLog::new(10);
-        let b = HyperLogLog::new(12);
+        let mut a = HyperLogLog::try_new(10).expect("test args within bounds");
+        let b = HyperLogLog::try_new(12).expect("test args within bounds");
         a.merge_simd(&b);
     }
 

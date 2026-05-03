@@ -975,13 +975,18 @@ pub fn detected_backend() -> Backend {
 
 /// Forces runtime-dispatched kernels to use `backend`.
 ///
-/// This function is primarily for tests and benchmarks. Production callers
-/// should normally rely on [`detected_backend`].
+/// Process-wide mutable state. Primarily for tests and benchmarks; gated
+/// on `bench-internals` since v0.4.3 (audit-R9 #7) so kernel-adjacent
+/// consumers do not get a hot-path-mutating global through the prelude.
+/// Production callers should rely on [`detected_backend`].
+#[cfg(feature = "bench-internals")]
 pub fn force_backend(backend: Backend) {
     FORCED_BACKEND.store(backend as u8, Ordering::Relaxed);
 }
 
-/// Clears a previously forced backend.
+/// Clears a previously forced backend. Same gating as [`force_backend`]
+/// (audit-R9 #7).
+#[cfg(feature = "bench-internals")]
 pub fn clear_forced_backend() {
     FORCED_BACKEND.store(AUTO_BACKEND, Ordering::Relaxed);
 }

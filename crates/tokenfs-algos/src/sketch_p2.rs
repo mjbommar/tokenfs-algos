@@ -77,6 +77,9 @@ impl Estimator {
     ///
     /// Panics if `p` is not in `(0, 1)` or is NaN. Use [`Self::try_new`]
     /// in callers that take user-controlled `p`.
+    ///
+    /// Available only with `feature = "userspace"` (audit-R9 #2).
+    #[cfg(feature = "userspace")]
     #[must_use]
     pub fn new(p: f64) -> Self {
         assert!(
@@ -100,7 +103,17 @@ impl Estimator {
         if !(p > 0.0 && p < 1.0) {
             return Err(P2Error::QuantileOutOfRange { value: p });
         }
-        Ok(Self::new(p))
+        // Construct directly so this fallible primitive does not depend
+        // on the panicking `new`, which is gated on `userspace`
+        // (audit-R9 #2).
+        Ok(Self {
+            p,
+            count: 0,
+            q: [0.0; 5],
+            n: [0; 5],
+            np: [0.0; 5],
+            dn: [0.0, p / 2.0, p, (1.0 + p) / 2.0, 1.0],
+        })
     }
 
     /// Target quantile.
@@ -291,14 +304,14 @@ mod tests {
 
     #[test]
     fn empty_estimator_returns_nan() {
-        let est = Estimator::new(0.5);
+        let est = Estimator::try_new(0.5).expect("test args within bounds");
         assert!(est.estimate().is_nan());
     }
 
     #[test]
     fn small_sample_estimate_matches_sorted_position() {
         // For count ≤ 5 we use exact sample interpolation.
-        let mut est = Estimator::new(0.5);
+        let mut est = Estimator::try_new(0.5).expect("test args within bounds");
         for v in [3.0, 1.0, 4.0, 1.0, 5.0] {
             est.update(v);
         }
@@ -309,7 +322,7 @@ mod tests {
 
     #[test]
     fn uniform_distribution_median_within_3pct() {
-        let mut est = Estimator::new(0.5);
+        let mut est = Estimator::try_new(0.5).expect("test args within bounds");
         // Deterministic xorshift PRNG over [0, 1).
         let mut state: u64 = 0xC8C2_5E0F_2C5C_3F6D;
         for _ in 0..10_000 {
@@ -325,7 +338,7 @@ mod tests {
 
     #[test]
     fn uniform_distribution_p95_within_5pct() {
-        let mut est = Estimator::new(0.95);
+        let mut est = Estimator::try_new(0.95).expect("test args within bounds");
         let mut state: u64 = 0xDEAD_BEEF_CAFE_F00D;
         for _ in 0..50_000 {
             state ^= state << 13;
@@ -340,7 +353,7 @@ mod tests {
 
     #[test]
     fn constant_input_estimate_equals_constant() {
-        let mut est = Estimator::new(0.5);
+        let mut est = Estimator::try_new(0.5).expect("test args within bounds");
         for _ in 0..1000 {
             est.update(42.0);
         }
@@ -350,7 +363,7 @@ mod tests {
 
     #[test]
     fn nan_observations_are_ignored() {
-        let mut est = Estimator::new(0.5);
+        let mut est = Estimator::try_new(0.5).expect("test args within bounds");
         for _ in 0..10 {
             est.update(f64::NAN);
         }
@@ -360,7 +373,7 @@ mod tests {
 
     #[test]
     fn clear_resets_state() {
-        let mut est = Estimator::new(0.5);
+        let mut est = Estimator::try_new(0.5).expect("test args within bounds");
         for v in [1.0, 2.0, 3.0, 4.0, 5.0] {
             est.update(v);
         }
@@ -371,8 +384,8 @@ mod tests {
 
     #[test]
     fn update_n_matches_repeated_update() {
-        let mut a = Estimator::new(0.5);
-        let mut b = Estimator::new(0.5);
+        let mut a = Estimator::try_new(0.5).expect("test args within bounds");
+        let mut b = Estimator::try_new(0.5).expect("test args within bounds");
         a.update_n(7.0, 100);
         for _ in 0..100 {
             b.update(7.0);
@@ -394,11 +407,15 @@ mod tests {
     #[cfg(feature = "std")]
     #[test]
     fn invalid_p_panics() {
-        let result = std::panic::catch_unwind(|| Estimator::new(0.0));
+        let result =
+            std::panic::catch_unwind(|| Estimator::try_new(0.0).expect("test args within bounds"));
         assert!(result.is_err());
-        let result = std::panic::catch_unwind(|| Estimator::new(1.0));
+        let result =
+            std::panic::catch_unwind(|| Estimator::try_new(1.0).expect("test args within bounds"));
         assert!(result.is_err());
-        let result = std::panic::catch_unwind(|| Estimator::new(f64::NAN));
+        let result = std::panic::catch_unwind(|| {
+            Estimator::try_new(f64::NAN).expect("test args within bounds")
+        });
         assert!(result.is_err());
     }
 

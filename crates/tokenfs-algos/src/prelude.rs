@@ -4,10 +4,14 @@ pub use crate::dispatch::{
     ApiContext, Backend, CacheProfile, CacheState, ContentKind, EntropyClass, EntropyScale,
     HistogramKernelInfo, HistogramPlan, HistogramStrategy, KernelIsa, KernelStatefulness,
     PlanContext, PlannerConfidenceSource, PrimitiveFamily, ProcessorProfile, ReadPattern,
-    SourceHint, WorkingSetClass, WorkloadShape, clear_forced_backend, detected_backend,
-    detected_cache_profile, detected_processor_profile, force_backend, histogram_kernel_catalog,
-    plan_histogram,
+    SourceHint, WorkingSetClass, WorkloadShape, detected_backend, detected_cache_profile,
+    detected_processor_profile, histogram_kernel_catalog, plan_histogram,
 };
+// Process-wide mutable backend override; gated on `bench-internals` so
+// kernel-adjacent consumers do not get policy-mutating globals through
+// the prelude (audit-R9 #7).
+#[cfg(feature = "bench-internals")]
+pub use crate::dispatch::{clear_forced_backend, force_backend};
 pub use crate::distribution::{
     ByteDistribution, ByteDistributionDistances, ByteDistributionMetric, ByteDistributionReference,
     NearestByteDistribution, nearest_byte_distribution, nearest_reference,

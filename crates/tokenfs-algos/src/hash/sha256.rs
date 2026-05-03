@@ -337,6 +337,11 @@ impl Hasher {
     /// boundary is a DoS vector. `try_update` returns
     /// [`Sha256LengthOverflow`] on overflow with both the current bit
     /// count and the attempted chunk size for diagnostics.
+    ///
+    /// Available only with `feature = "userspace"` since v0.4.3
+    /// (audit-R9 #8). Default kernel-safe builds reach `try_update`
+    /// only.
+    #[cfg(feature = "userspace")]
     pub fn update(&mut self, bytes: &[u8]) {
         self.try_update(bytes)
             .expect("SHA-256 stream length exceeded 2^64 bits");
@@ -763,14 +768,16 @@ mod tests {
     fn hasher_single_call_matches_one_shot() {
         let payload = b"the quick brown fox jumps over the lazy dog";
         let mut h = Hasher::new();
-        h.update(payload);
+        h.try_update(payload)
+            .expect("test sha256 update within bounds");
         assert_eq!(h.finalize(), sha256(payload));
     }
 
     #[test]
     fn hasher_nist_abc_matches_one_shot() {
         let mut h = Hasher::new();
-        h.update(b"abc");
+        h.try_update(b"abc")
+            .expect("test sha256 update within bounds");
         assert_eq!(
             hex(&h.finalize()),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
@@ -780,7 +787,8 @@ mod tests {
     #[test]
     fn hasher_nist_two_block_matches_one_shot() {
         let mut h = Hasher::new();
-        h.update(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq");
+        h.try_update(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")
+            .expect("test sha256 update within bounds");
         assert_eq!(
             hex(&h.finalize()),
             "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
@@ -796,7 +804,8 @@ mod tests {
         for &chunk in &[1_usize, 17, 63, 64, 65, 127, 128, 1024, 4096] {
             let mut h = Hasher::new();
             for block in payload.chunks(chunk) {
-                h.update(block);
+                h.try_update(block)
+                    .expect("test sha256 update within bounds");
             }
             assert_eq!(h.finalize(), expected, "mismatch for chunk={chunk}");
         }
@@ -807,9 +816,10 @@ mod tests {
         let payload = b"hello, world";
         let expected = sha256(payload);
         let mut h = Hasher::new();
-        h.update(b"");
-        h.update(payload);
-        h.update(b"");
+        h.try_update(b"").expect("test sha256 update within bounds");
+        h.try_update(payload)
+            .expect("test sha256 update within bounds");
+        h.try_update(b"").expect("test sha256 update within bounds");
         assert_eq!(h.finalize(), expected);
     }
 
@@ -817,21 +827,25 @@ mod tests {
     fn hasher_finalize_reset_matches_finalize_then_new() {
         let payload = b"reset me and try again";
         let mut h = Hasher::new();
-        h.update(payload);
+        h.try_update(payload)
+            .expect("test sha256 update within bounds");
         let d1 = h.finalize_reset();
         assert_eq!(d1, sha256(payload));
         // After reset, the hasher should produce the empty digest.
         assert_eq!(h.clone().finalize(), sha256(b""));
-        h.update(payload);
+        h.try_update(payload)
+            .expect("test sha256 update within bounds");
         assert_eq!(h.finalize(), d1);
     }
 
     #[test]
     fn hasher_reset_clears_state() {
         let mut h = Hasher::new();
-        h.update(b"garbage");
+        h.try_update(b"garbage")
+            .expect("test sha256 update within bounds");
         h.reset();
-        h.update(b"abc");
+        h.try_update(b"abc")
+            .expect("test sha256 update within bounds");
         assert_eq!(h.finalize(), sha256(b"abc"));
     }
 
@@ -857,7 +871,8 @@ mod tests {
             for &chunk in &[1_usize, 7, 32, 56, 64] {
                 let mut h = Hasher::new();
                 for block in input.chunks(chunk) {
-                    h.update(block);
+                    h.try_update(block)
+                        .expect("test sha256 update within bounds");
                 }
                 assert_eq!(
                     hex(&h.finalize()),
@@ -873,7 +888,8 @@ mod tests {
         let bytes = vec![b'a'; 10_000];
         let mut h = Hasher::new();
         for block in bytes.chunks(1000) {
-            h.update(block);
+            h.try_update(block)
+                .expect("test sha256 update within bounds");
         }
         assert_eq!(
             hex(&h.finalize()),
@@ -907,7 +923,8 @@ mod tests {
                 // host's fastest, so we override here for parity coverage.
                 h.backend = backend;
                 for block in payload.chunks(chunk) {
-                    h.update(block);
+                    h.try_update(block)
+                        .expect("test sha256 update within bounds");
                 }
                 assert_eq!(h.finalize(), expected, "backend={backend:?} chunk={chunk}");
             }
@@ -955,11 +972,13 @@ mod tests {
         assert!(h2.try_update(b"x").is_ok());
     }
 
+    #[cfg(feature = "userspace")]
     #[test]
     #[should_panic(expected = "SHA-256 stream length exceeded 2^64 bits")]
     fn hasher_update_panics_on_overflow() {
         // Mirrors the try_update test but exercises the panicking
-        // wrapper so the documented behavior is pinned.
+        // wrapper (gated on `userspace` per audit-R9 #8) so its
+        // documented panic behavior is pinned.
         let mut h = Hasher::new();
         h.total_bits = u64::MAX - 7;
         h.update(b"x");
