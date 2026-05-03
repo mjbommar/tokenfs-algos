@@ -108,7 +108,10 @@ pub fn try_contains_u32_batch_simd(
             out_len: out.len(),
         });
     }
-    kernels::auto::contains_u32_batch(haystack, needles, out);
+    // SAFETY: needles.len() == out.len() validated above; kernels::auto's
+    // unchecked sibling skips the redundant assert that lives in the
+    // userspace-gated `contains_u32_batch` (audit-R10 #1).
+    unsafe { kernels::auto::contains_u32_batch_unchecked(haystack, needles, out) };
     Ok(())
 }
 
@@ -166,7 +169,10 @@ pub mod kernels {
         ///
         /// # Panics
         ///
-        /// Panics if `needles.len() != out.len()`.
+        /// Panics if `needles.len() != out.len()`. Available only with
+        /// `feature = "userspace"` (audit-R10 #1) — kernel/FUSE callers
+        /// should use [`super::super::try_contains_u32_batch_simd`].
+        #[cfg(feature = "userspace")]
         pub fn contains_u32_batch(haystack: &[u32], needles: &[u32], out: &mut [bool]) {
             assert_eq!(
                 needles.len(),
@@ -175,6 +181,24 @@ pub mod kernels {
                 needles.len(),
                 out.len(),
             );
+            // SAFETY: precondition checked above.
+            unsafe { contains_u32_batch_unchecked(haystack, needles, out) };
+        }
+
+        /// Runtime-dispatched batched membership without the
+        /// length-check assert. Always available; the
+        /// `try_contains_u32_batch_simd` top-level entry calls into
+        /// this after its own validation, so kernel-default builds
+        /// reach it without the assert (audit-R10 #1).
+        ///
+        /// # Safety
+        ///
+        /// Caller must ensure `needles.len() == out.len()`.
+        pub unsafe fn contains_u32_batch_unchecked(
+            haystack: &[u32],
+            needles: &[u32],
+            out: &mut [bool],
+        ) {
             // The hot dispatch decision is per-call, not per-needle: the
             // detected backend is constant across the batch on a given
             // host. Resolve once and run a tight per-needle loop in the

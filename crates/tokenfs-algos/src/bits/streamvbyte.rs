@@ -315,6 +315,11 @@ pub mod kernels {
         ///
         /// Panics if `control_out.len() < ceil(values.len()/4)` or
         /// `data_out.len() < streamvbyte_data_max_len(values.len())`.
+        /// Available only with `feature = "userspace"` (audit-R10 #1) —
+        /// kernel/FUSE callers should use [`try_streamvbyte_encode_u32`]
+        /// (top-level), or the `_unchecked` sibling below after
+        /// validating buffer lengths.
+        #[cfg(feature = "userspace")]
         pub fn encode_u32(values: &[u32], control_out: &mut [u8], data_out: &mut [u8]) -> usize {
             // Encode is bandwidth-modest; the scalar path already runs at
             // near memory speed. SIMD-encode wins are small and the spec

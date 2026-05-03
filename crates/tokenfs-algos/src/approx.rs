@@ -618,6 +618,9 @@ mod bloom {
         /// work for any positive `k`); kernel/FUSE callers that
         /// intend to dispatch SIMD should use [`Self::try_insert_simd`]
         /// for the fallible parallel.
+        ///
+        /// Available only with `feature = "userspace"` (audit-R10 #1).
+        #[cfg(feature = "userspace")]
         pub fn insert_simd(&mut self, key: u64) {
             let (h1, h2) = Self::derive_hashes(key);
             let mut buf = [0_u64; super::bloom_kernels::MAX_K];
@@ -649,7 +652,20 @@ mod bloom {
                     max: super::bloom_kernels::MAX_K,
                 });
             }
-            self.insert_simd(key);
+            // Inline the SIMD insert so this fallible primitive does not
+            // depend on the panicking `insert_simd` (gated on
+            // `userspace` per audit-R10 #1).
+            let (h1, h2) = Self::derive_hashes(key);
+            let mut buf = [0_u64; super::bloom_kernels::MAX_K];
+            let positions = &mut buf[..self.k];
+            super::bloom_kernels::auto::positions(h1, h2, self.k, self.bits, positions);
+            for &position in positions.iter() {
+                let pos = position as usize;
+                let word = pos / 64;
+                let bit = pos % 64;
+                self.words[word] |= 1_u64 << bit;
+            }
+            self.inserted = self.inserted.wrapping_add(1);
             Ok(())
         }
 
@@ -1306,6 +1322,9 @@ mod hll {
         /// Kernel/FUSE callers should use [`Self::try_merge`] which
         /// returns [`HllMergeError::PrecisionMismatch`] on the same
         /// precondition without aborting the caller.
+        ///
+        /// Available only with `feature = "userspace"` (audit-R10 #1).
+        #[cfg(feature = "userspace")]
         pub fn merge(&mut self, other: &Self) {
             assert_eq!(
                 self.precision, other.precision,
@@ -1753,7 +1772,7 @@ mod tests {
             29,
         ];
         for &k in &keys {
-            bf.insert_simd(k);
+            bf.try_insert_simd(k).expect("test args within bounds");
         }
         for &k in &keys {
             assert!(bf.contains_simd(k), "false negative for key {k}");
@@ -1768,7 +1787,7 @@ mod tests {
         for k in 1_usize..=16 {
             let mut bf = BloomFilter::try_new(2048, k).expect("test args within bounds");
             for key in 0_u64..256 {
-                bf.insert_simd(key);
+                bf.try_insert_simd(key).expect("test args within bounds");
             }
             for key in 0_u64..256 {
                 assert!(bf.contains_simd(key), "false negative at k={k} key={key}");
@@ -1782,7 +1801,7 @@ mod tests {
         let mut bf = BloomFilter::try_new(4096, 7).expect("test args within bounds");
         let inserted: Vec<u64> = (0_u64..200).collect();
         for &k in &inserted {
-            bf.insert_simd(k);
+            bf.try_insert_simd(k).expect("test args within bounds");
         }
         // Mix of inserted and non-inserted keys.
         let probes: Vec<u64> = (0_u64..400).collect();
@@ -1820,7 +1839,7 @@ mod tests {
         // query returns true.
         let mut bf = BloomFilter::try_new(1, 1).expect("test args within bounds");
         assert_eq!(bf.bits(), 64);
-        bf.insert_simd(0);
+        bf.try_insert_simd(0).expect("test args within bounds");
         // With one bit set, queries probabilistically hit. We only
         // check the exact-key case is true.
         assert!(bf.contains_simd(0));
@@ -1833,7 +1852,7 @@ mod tests {
         let mut bf = BloomFilter::try_new(512, 1).expect("test args within bounds");
         let keys: [u64; 8] = [0, 1, 42, 0xDEAD, u64::MAX, 100, 200, 300];
         for &k in &keys {
-            bf.insert_simd(k);
+            bf.try_insert_simd(k).expect("test args within bounds");
         }
         for &k in &keys {
             assert!(bf.contains_simd(k), "k=1 false negative for {k}");
@@ -1850,7 +1869,7 @@ mod tests {
         // API by inserting until all bits are set; the empty-filter
         // size 64 + k=3 + many inserts saturates quickly.
         for key in 0_u64..256 {
-            bf.insert_simd(key);
+            bf.try_insert_simd(key).expect("test args within bounds");
         }
         // Heavy saturation expected; sample a few non-inserted keys
         // and confirm they all read as "contains" (false positives).
@@ -1974,7 +1993,7 @@ mod tests {
         // of predicted.
         let mut bf = BloomFilter::try_new(4096, 5).expect("test args within bounds");
         for i in 0_u64..200 {
-            bf.insert_simd(i);
+            bf.try_insert_simd(i).expect("test args within bounds");
         }
         let mut false_positives = 0_usize;
         let trials = 10_000;
@@ -2033,7 +2052,7 @@ mod tests {
         for i in 5_000..15_000_u64 {
             b.insert(&i.to_le_bytes());
         }
-        a.merge(&b);
+        a.try_merge(&b).expect("test args within bounds");
         let est = a.estimate();
         let true_card = 15_000.0;
         let err = (est as f64 - true_card).abs() / true_card;
@@ -2156,7 +2175,9 @@ mod tests {
             bf_try
                 .try_insert_simd(key)
                 .expect("k=7 ≤ MAX_K, must succeed");
-            bf_ref.insert_simd(key);
+            bf_ref
+                .try_insert_simd(key)
+                .expect("test args within bounds");
         }
         // Identical bit-vector state.
         for key in 0_u64..128 {
@@ -2191,7 +2212,7 @@ mod tests {
         // dependent.
         let mut bf =
             BloomFilter::try_new(1024, bloom_kernels::MAX_K + 1).expect("test args within bounds");
-        bf.insert_simd(0);
+        bf.try_insert_simd(0).expect("test args within bounds");
     }
 
     #[cfg(feature = "std")]
@@ -2256,7 +2277,7 @@ mod tests {
                 let b = build_hll_with_inserts(precision, 0xB2B2, n.saturating_add(13));
                 let mut a_simd = a_scalar.clone();
 
-                a_scalar.merge(&b);
+                a_scalar.try_merge(&b).expect("test args within bounds");
                 a_simd.merge_simd(&b);
 
                 assert_eq!(
@@ -2309,7 +2330,7 @@ mod tests {
 
         let mut scalar = a.clone();
         let mut simd = a.clone();
-        scalar.merge(&b);
+        scalar.try_merge(&b).expect("test args within bounds");
         simd.merge_simd(&b);
         assert_eq!(
             scalar.register_bytes(),

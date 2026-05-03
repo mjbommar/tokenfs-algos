@@ -387,7 +387,12 @@ pub mod kernels {
         /// # Panics
         ///
         /// Panics if `w` is outside `1..=32` or
-        /// `out.len() < ceil(values.len() * w / 8)`.
+        /// `out.len() < ceil(values.len() * w / 8)`. Available only with
+        /// `feature = "userspace"` (audit-R10 #1) — kernel/FUSE callers
+        /// should use the `_unchecked` sibling after validating, or go
+        /// through [`super::super::BitPacker::try_encode_u32_slice`] /
+        /// [`super::super::DynamicBitPacker::try_encode_u32_slice`].
+        #[cfg(feature = "userspace")]
         pub fn encode_u32_slice(w: u32, values: &[u32], out: &mut [u8]) {
             // Encode is bandwidth-modest and the per-element work is
             // dominated by cross-byte stores; the scalar path already
