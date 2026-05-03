@@ -357,7 +357,10 @@ pub mod kernels {
         /// # Panics
         ///
         /// Panics if `control.len() < ceil(n/4)`, `out.len() < n`, or
-        /// `data` runs out partway through the decode.
+        /// `data` runs out partway through the decode. Available only
+        /// with `feature = "userspace"` — kernel-safe callers should
+        /// use [`decode_u32_unchecked`] (audit-R10 #1 / #216).
+        #[cfg(feature = "userspace")]
         pub fn decode_u32(control: &[u8], data: &[u8], n: usize, out: &mut [u32]) -> usize {
             #[cfg(all(
                 feature = "std",

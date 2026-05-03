@@ -1,4 +1,6 @@
-use super::super::{GROUP, streamvbyte_control_len, streamvbyte_data_max_len};
+use super::super::GROUP;
+#[cfg(feature = "userspace")]
+use super::super::{streamvbyte_control_len, streamvbyte_data_max_len};
 
 /// Returns the per-value length code for `v`: `0..=3`, where the
 /// encoded byte width is `code + 1`.
@@ -24,7 +26,10 @@ const fn code_for(v: u32) -> u8 {
 ///
 /// Panics if `control_out` is shorter than
 /// [`streamvbyte_control_len`] or `data_out` is shorter than
-/// [`streamvbyte_data_max_len`].
+/// [`streamvbyte_data_max_len`]. Available only with
+/// `feature = "userspace"`; kernel-safe callers must use
+/// [`encode_u32_unchecked`] (audit-R10 #1 / #216).
+#[cfg(feature = "userspace")]
 pub fn encode_u32(values: &[u32], control_out: &mut [u8], data_out: &mut [u8]) -> usize {
     let n = values.len();
     assert!(
@@ -125,7 +130,10 @@ fn write_value(v: u32, code: u8, dst: &mut [u8]) -> usize {
 ///
 /// Panics if `control` has fewer than `streamvbyte_control_len(n)`
 /// bytes, `out` is shorter than `n`, or `data` runs out before the
-/// implied length is reached.
+/// implied length is reached. Available only with
+/// `feature = "userspace"`; kernel-safe callers must use
+/// [`decode_u32_unchecked`] (audit-R10 #1 / #216).
+#[cfg(feature = "userspace")]
 pub fn decode_u32(control: &[u8], data: &[u8], n: usize, out: &mut [u32]) -> usize {
     let ctrl_needed = streamvbyte_control_len(n);
     assert!(

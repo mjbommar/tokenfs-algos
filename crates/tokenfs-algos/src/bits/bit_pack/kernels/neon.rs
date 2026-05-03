@@ -19,6 +19,10 @@ pub const fn is_available() -> bool {
 /// # Safety
 ///
 /// The caller must ensure the current CPU supports NEON.
+///
+/// Available only with `feature = "userspace"`; kernel-safe callers
+/// must use [`decode_u32_slice_unchecked`] (audit-R10 #1 / #216).
+#[cfg(feature = "userspace")]
 #[target_feature(enable = "neon")]
 pub unsafe fn decode_u32_slice(w: u32, input: &[u8], n: usize, out: &mut [u32]) {
     assert!((1..=32).contains(&w), "width must be 1..=32");

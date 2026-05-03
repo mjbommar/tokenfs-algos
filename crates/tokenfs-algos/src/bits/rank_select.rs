@@ -506,6 +506,9 @@ impl<'a> RankSelectDict<'a> {
     /// [`RankSelectError::BatchOutputTooShort`] (or
     /// [`RankSelectError::PositionOutOfRange`] from the per-position
     /// query) instead of aborting.
+    ///
+    /// Available only with `feature = "userspace"` (audit-R10 #1 / #216).
+    #[cfg(feature = "userspace")]
     pub fn rank1_batch(&self, positions: &[usize], out: &mut [usize]) {
         kernels::auto::rank1_batch(self, positions, out);
     }
@@ -550,7 +553,7 @@ impl<'a> RankSelectDict<'a> {
                 });
             }
         }
-        kernels::auto::rank1_batch(self, positions, out);
+        kernels::auto::rank1_batch_unchecked(self, positions, out);
         Ok(())
     }
 
@@ -566,6 +569,9 @@ impl<'a> RankSelectDict<'a> {
     /// callers should use [`Self::try_select1_batch`], which validates
     /// the output slice up front and returns
     /// [`RankSelectError::BatchOutputTooShort`] instead of aborting.
+    ///
+    /// Available only with `feature = "userspace"` (audit-R10 #1 / #216).
+    #[cfg(feature = "userspace")]
     pub fn select1_batch(&self, ks: &[usize], out: &mut [Option<usize>]) {
         kernels::auto::select1_batch(self, ks, out);
     }
@@ -597,7 +603,7 @@ impl<'a> RankSelectDict<'a> {
                 actual: out.len(),
             });
         }
-        kernels::auto::select1_batch(self, ks, out);
+        kernels::auto::select1_batch_unchecked(self, ks, out);
         Ok(())
     }
 
@@ -922,14 +928,58 @@ pub mod kernels {
     pub mod auto {
         use super::RankSelectDict;
 
-        /// Batch rank using the best available kernel.
+        /// Batch rank using the best available kernel (panicking variant).
+        ///
+        /// # Panics
+        ///
+        /// Panics if `out.len() < positions.len()` or any position is
+        /// out-of-range. Available only with `feature = "userspace"`;
+        /// kernel-safe callers must use [`rank1_batch_unchecked`]
+        /// (audit-R10 #1 / #216).
+        #[cfg(feature = "userspace")]
         pub fn rank1_batch(dict: &RankSelectDict<'_>, positions: &[usize], out: &mut [usize]) {
             super::scalar::rank1_batch(dict, positions, out);
         }
 
-        /// Batch select using the best available kernel.
+        /// Unchecked variant of [`rank1_batch`].
+        ///
+        /// # Safety
+        ///
+        /// Caller must ensure `out.len() >= positions.len()` and every
+        /// position is in `0..=dict.len_bits()`. The fallible
+        /// `try_rank1_batch` top-level entry validates upfront before
+        /// dispatching here.
+        pub fn rank1_batch_unchecked(
+            dict: &RankSelectDict<'_>,
+            positions: &[usize],
+            out: &mut [usize],
+        ) {
+            super::scalar::rank1_batch_unchecked(dict, positions, out);
+        }
+
+        /// Batch select using the best available kernel (panicking variant).
+        ///
+        /// # Panics
+        ///
+        /// Panics if `out.len() < ks.len()`. Available only with
+        /// `feature = "userspace"`; kernel-safe callers must use
+        /// [`select1_batch_unchecked`] (audit-R10 #1 / #216).
+        #[cfg(feature = "userspace")]
         pub fn select1_batch(dict: &RankSelectDict<'_>, ks: &[usize], out: &mut [Option<usize>]) {
             super::scalar::select1_batch(dict, ks, out);
+        }
+
+        /// Unchecked variant of [`select1_batch`].
+        ///
+        /// # Safety
+        ///
+        /// Caller must ensure `out.len() >= ks.len()`.
+        pub fn select1_batch_unchecked(
+            dict: &RankSelectDict<'_>,
+            ks: &[usize],
+            out: &mut [Option<usize>],
+        ) {
+            super::scalar::select1_batch_unchecked(dict, ks, out);
         }
     }
 

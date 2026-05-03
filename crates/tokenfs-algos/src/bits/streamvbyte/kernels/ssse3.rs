@@ -5,7 +5,9 @@
 //! the original split. Now properly file-gated behind
 //! `arch-pinned-kernels`.
 
-use super::super::{GROUP, streamvbyte_control_len};
+use super::super::GROUP;
+#[cfg(feature = "userspace")]
+use super::super::streamvbyte_control_len;
 use super::scalar;
 use super::tables::{length_table, shuffle_table};
 
@@ -33,6 +35,10 @@ pub const fn is_available() -> bool {
 /// # Safety
 ///
 /// The caller must ensure the current CPU supports SSSE3.
+///
+/// Available only with `feature = "userspace"`; kernel-safe callers
+/// must use [`decode_u32_unchecked`] (audit-R10 #1 / #216).
+#[cfg(feature = "userspace")]
 #[target_feature(enable = "ssse3")]
 pub unsafe fn decode_u32(control: &[u8], data: &[u8], n: usize, out: &mut [u32]) -> usize {
     let ctrl_needed = streamvbyte_control_len(n);

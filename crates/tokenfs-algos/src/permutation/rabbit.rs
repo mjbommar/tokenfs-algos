@@ -1251,7 +1251,7 @@ pub mod kernels {
                     };
                 }
             }
-            super::scalar::modularity_gains_neighbor_batch(
+            super::scalar::modularity_gains_neighbor_batch_unchecked(
                 neighbor_weights,
                 neighbor_degrees,
                 self_degree,
@@ -1965,13 +1965,15 @@ mod tests {
         //   2*m*w - deg_u*deg_v = 6*1 - 2*2 = 2
         let weights = vec![1_u64, 1];
         let degrees = vec![2_u64, 2];
-        let scores = kernels::scalar::modularity_gains_neighbor_batch(&weights, &degrees, 2, 6);
+        let scores =
+            kernels::scalar::modularity_gains_neighbor_batch_unchecked(&weights, &degrees, 2, 6);
         assert_eq!(scores, vec![2_i128, 2_i128]);
     }
 
     #[test]
     fn scalar_kernel_handles_empty_input() {
-        let scores: Vec<i128> = kernels::scalar::modularity_gains_neighbor_batch(&[], &[], 5, 10);
+        let scores: Vec<i128> =
+            kernels::scalar::modularity_gains_neighbor_batch_unchecked(&[], &[], 5, 10);
         assert!(scores.is_empty());
     }
 
@@ -1983,7 +1985,7 @@ mod tests {
     #[test]
     fn scalar_kernel_panics_on_length_mismatch() {
         let result = std::panic::catch_unwind(|| {
-            kernels::scalar::modularity_gains_neighbor_batch(&[1, 2, 3], &[1, 2], 1, 1)
+            kernels::scalar::modularity_gains_neighbor_batch_unchecked(&[1, 2, 3], &[1, 2], 1, 1)
         });
         assert!(result.is_err(), "expected panic on length mismatch");
     }
@@ -1998,8 +2000,12 @@ mod tests {
         let w = 1_u64 << 4;
         let deg_u = 2_u64;
         let deg_v = 4_u64;
-        let scores =
-            kernels::scalar::modularity_gains_neighbor_batch(&[w], &[deg_v], deg_u, m_doubled);
+        let scores = kernels::scalar::modularity_gains_neighbor_batch_unchecked(
+            &[w],
+            &[deg_v],
+            deg_u,
+            m_doubled,
+        );
         let two_m = i128::try_from(m_doubled).expect("test m_doubled fits i128");
         let expected = two_m * i128::from(w) - i128::from(deg_u) * i128::from(deg_v);
         assert_eq!(scores, vec![expected]);
@@ -2063,7 +2069,7 @@ mod tests {
             let (weights, degrees) = random_neighbor_batch(n, 0xC0FFEE_u64 ^ n as u64, 1_000_000);
             let self_degree = 12345_u64;
             let m_doubled = 9_876_543_u128;
-            let scalar_out = kernels::scalar::modularity_gains_neighbor_batch(
+            let scalar_out = kernels::scalar::modularity_gains_neighbor_batch_unchecked(
                 &weights,
                 &degrees,
                 self_degree,
@@ -2100,7 +2106,7 @@ mod tests {
         let degrees = vec![near_max; 16];
         let self_degree = near_max;
         let m_doubled = u128::from(near_max);
-        let scalar_out = kernels::scalar::modularity_gains_neighbor_batch(
+        let scalar_out = kernels::scalar::modularity_gains_neighbor_batch_unchecked(
             &weights,
             &degrees,
             self_degree,
@@ -2131,7 +2137,7 @@ mod tests {
         let weights = vec![1_u64, 2, 3, 4, 5];
         let degrees = vec![10_u64, 20, 30, 40, 50];
         let self_degree = 1_000_u64;
-        let scalar_out = kernels::scalar::modularity_gains_neighbor_batch(
+        let scalar_out = kernels::scalar::modularity_gains_neighbor_batch_unchecked(
             &weights,
             &degrees,
             self_degree,
@@ -2160,7 +2166,7 @@ mod tests {
             let (weights, degrees) = random_neighbor_batch(n, 0xDEADBEEF_u64 ^ n as u64, 1_000_000);
             let self_degree = 7777_u64;
             let m_doubled = 1_234_567_u128;
-            let scalar_out = kernels::scalar::modularity_gains_neighbor_batch(
+            let scalar_out = kernels::scalar::modularity_gains_neighbor_batch_unchecked(
                 &weights,
                 &degrees,
                 self_degree,
@@ -2193,7 +2199,7 @@ mod tests {
             let (weights, degrees) = random_neighbor_batch(n, 0xBABE_u64 ^ n as u64, 1_000_000);
             let self_degree = 5555_u64;
             let m_doubled = 7_654_321_u128;
-            let scalar_out = kernels::scalar::modularity_gains_neighbor_batch(
+            let scalar_out = kernels::scalar::modularity_gains_neighbor_batch_unchecked(
                 &weights,
                 &degrees,
                 self_degree,
@@ -2224,7 +2230,7 @@ mod tests {
                 random_neighbor_batch(n, 0xF00D_BABE_u64 ^ n as u64, 1_000_000);
             let self_degree = 17_u64;
             let m_doubled = 32_768_u128;
-            let scalar_out = kernels::scalar::modularity_gains_neighbor_batch(
+            let scalar_out = kernels::scalar::modularity_gains_neighbor_batch_unchecked(
                 &weights,
                 &degrees,
                 self_degree,
@@ -2280,7 +2286,7 @@ mod tests {
                 random_neighbor_batch(n_neigh, 0xC0FFEE_u64 ^ n_neigh as u64, 1_000);
             let self_degree = 10_u64;
             let m_doubled = 100_u128;
-            let scalar_out = kernels::scalar::modularity_gains_neighbor_batch(
+            let scalar_out = kernels::scalar::modularity_gains_neighbor_batch_unchecked(
                 &weights,
                 &degrees,
                 self_degree,

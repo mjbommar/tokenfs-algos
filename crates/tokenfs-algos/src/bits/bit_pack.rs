@@ -422,6 +422,11 @@ pub mod kernels {
         ///
         /// Panics if `w` is outside `1..=32`,
         /// `input.len() < ceil(n * w / 8)`, or `out.len() < n`.
+        ///
+        /// Available only with `feature = "userspace"`; kernel-safe
+        /// callers must use [`decode_u32_slice_unchecked`]
+        /// (audit-R10 #1 / #216).
+        #[cfg(feature = "userspace")]
         pub fn decode_u32_slice(w: u32, input: &[u8], n: usize, out: &mut [u32]) {
             #[cfg(all(
                 feature = "std",
@@ -706,14 +711,18 @@ mod tests {
                 let values = deterministic_values(n, w, 0xABCDu64 ^ ((w as u64) << 8) ^ n as u64);
                 let needed = encoded_len_bytes(n, w);
                 let mut encoded = vec![0_u8; needed];
-                kernels::scalar::encode_u32_slice(w, &values, &mut encoded);
+                // SAFETY: `encoded` sized to `encoded_len_bytes(n, w)` and `w` is in 1..=32.
+                unsafe { kernels::scalar::encode_u32_slice_unchecked(w, &values, &mut encoded) };
 
                 let mut expected = vec![0_u32; n];
-                kernels::scalar::decode_u32_slice(w, &encoded, n, &mut expected);
+                // SAFETY: `expected` sized to n; `encoded` sized to required bytes.
+                unsafe {
+                    kernels::scalar::decode_u32_slice_unchecked(w, &encoded, n, &mut expected)
+                };
 
                 let mut actual = vec![0_u32; n];
-                // SAFETY: avx2_available() returned true above.
-                unsafe { kernels::avx2::decode_u32_slice(w, &encoded, n, &mut actual) };
+                // SAFETY: avx2_available() returned true above; buffers sized as above.
+                unsafe { kernels::avx2::decode_u32_slice_unchecked(w, &encoded, n, &mut actual) };
                 assert_eq!(actual, expected, "avx2 decode diverged at w={w} n={n}");
             }
         }

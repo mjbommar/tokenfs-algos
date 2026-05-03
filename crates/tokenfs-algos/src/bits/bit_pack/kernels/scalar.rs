@@ -5,7 +5,10 @@ use super::super::encoded_len_bytes;
 /// # Panics
 ///
 /// Panics if `out.len() < ceil(values.len()*w/8)` or `w` is
-/// outside `1..=32`.
+/// outside `1..=32`. Available only with `feature = "userspace"`;
+/// kernel-safe callers must use [`encode_u32_slice_unchecked`]
+/// (audit-R10 #1 / #216).
+#[cfg(feature = "userspace")]
 pub fn encode_u32_slice(w: u32, values: &[u32], out: &mut [u8]) {
     assert!((1..=32).contains(&w), "width must be 1..=32");
     let needed = encoded_len_bytes(values.len(), w);
@@ -96,7 +99,10 @@ pub unsafe fn encode_u32_slice_unchecked(w: u32, values: &[u32], out: &mut [u8])
 /// # Panics
 ///
 /// Panics if `input.len() < ceil(n*w/8)`, `out.len() < n`, or
-/// `w` is outside `1..=32`.
+/// `w` is outside `1..=32`. Available only with `feature = "userspace"`;
+/// kernel-safe callers must use [`decode_u32_slice_unchecked`]
+/// (audit-R10 #1 / #216).
+#[cfg(feature = "userspace")]
 pub fn decode_u32_slice(w: u32, input: &[u8], n: usize, out: &mut [u32]) {
     assert!((1..=32).contains(&w), "width must be 1..=32");
     let needed = encoded_len_bytes(n, w);

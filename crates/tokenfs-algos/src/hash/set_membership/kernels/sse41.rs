@@ -98,10 +98,24 @@ pub unsafe fn contains_u32(haystack: &[u32], needle: u32) -> bool {
 ///
 /// # Panics
 ///
-/// Panics if `needles.len() != out.len()`.
+/// Panics if `needles.len() != out.len()`. Available only with
+/// `feature = "userspace"` (audit-R10 #1 / #216).
+#[cfg(feature = "userspace")]
 #[target_feature(enable = "sse4.1")]
 pub unsafe fn contains_u32_batch(haystack: &[u32], needles: &[u32], out: &mut [bool]) {
     assert_eq!(needles.len(), out.len());
+    // SAFETY: SSE4.1 supplied; precondition checked above.
+    unsafe { contains_u32_batch_unchecked(haystack, needles, out) }
+}
+
+/// Unchecked SSE4.1 batched membership.
+///
+/// # Safety
+///
+/// Caller must ensure SSE4.1 is available and
+/// `needles.len() == out.len()`.
+#[target_feature(enable = "sse4.1")]
+pub unsafe fn contains_u32_batch_unchecked(haystack: &[u32], needles: &[u32], out: &mut [bool]) {
     for (needle, slot) in needles.iter().zip(out.iter_mut()) {
         // SAFETY: target_feature(enable = "sse4.1") on this fn
         // forwards the SSE4.1 precondition to the inner kernel.

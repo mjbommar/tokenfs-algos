@@ -33,23 +33,25 @@
 # split into `positions` (userspace-gated, asserts) + `positions_unchecked`
 # (no asserts; caller upholds preconditions). `auto::positions` routes
 # through `_unchecked` after the userspace-gated asserting wrapper.
-crates/tokenfs-algos/src/bits/bit_pack/kernels/avx2.rs:35:decode_u32_slice:assert!
-crates/tokenfs-algos/src/bits/bit_pack/kernels/neon.rs:23:decode_u32_slice:assert!
-crates/tokenfs-algos/src/bits/bit_pack/kernels/scalar.rs:9:encode_u32_slice:assert!
-crates/tokenfs-algos/src/bits/bit_pack/kernels/scalar.rs:100:decode_u32_slice:assert!
-crates/tokenfs-algos/src/bits/rank_select/kernels/scalar.rs:9:rank1_batch:assert!
-crates/tokenfs-algos/src/bits/rank_select/kernels/scalar.rs:28:select1_batch:assert!
-crates/tokenfs-algos/src/bits/streamvbyte/kernels/avx2.rs:36:decode_u32:assert!
-crates/tokenfs-algos/src/bits/streamvbyte/kernels/neon.rs:21:decode_u32:assert!
-crates/tokenfs-algos/src/bits/streamvbyte/kernels/scalar.rs:28:encode_u32:assert!
-crates/tokenfs-algos/src/bits/streamvbyte/kernels/scalar.rs:129:decode_u32:assert!
-crates/tokenfs-algos/src/bits/streamvbyte/kernels/ssse3.rs:37:decode_u32:assert!
-crates/tokenfs-algos/src/hash/set_membership/kernels/avx2.rs:109:contains_u32_batch:assert_eq!
-crates/tokenfs-algos/src/hash/set_membership/kernels/avx512.rs:62:contains_u32_batch:assert_eq!
-crates/tokenfs-algos/src/hash/set_membership/kernels/neon.rs:52:contains_u32_batch:assert_eq!
-crates/tokenfs-algos/src/hash/set_membership/kernels/scalar.rs:16:contains_u32_batch:assert_eq!
-crates/tokenfs-algos/src/hash/set_membership/kernels/sse41.rs:103:contains_u32_batch:assert_eq!
-crates/tokenfs-algos/src/permutation/rabbit/kernels/scalar.rs:31:modularity_gains_neighbor_batch:assert_eq!
+# bit_pack/kernels/{scalar,avx2,neon}.rs::{encode,decode}_u32_slice CLEARED in v0.4.6 —
+# `_unchecked` siblings already existed; gated the panicking versions on
+# `feature = "userspace"` and routed `auto::*` + tests through `_unchecked`.
+# bits/rank_select/kernels/scalar.rs::{rank1_batch,select1_batch} CLEARED in v0.4.6 —
+# `_unchecked` siblings added; gated panicking versions on `feature = "userspace"`;
+# auto::*_unchecked routed through `_unchecked`; try_*_batch top-level entries
+# now call into `_unchecked` after upfront validation.
+# streamvbyte/kernels/{scalar,avx2,neon,ssse3}.rs::{encode,decode}_u32 CLEARED in v0.4.6 —
+# `_unchecked` siblings already existed; gated the panicking versions on
+# `feature = "userspace"` and routed `auto::*` through `_unchecked`.
+# hash/set_membership/kernels/{scalar,avx2,avx512,neon,sse41}.rs::contains_u32_batch
+# CLEARED in v0.4.6 — added `_unchecked` siblings; gated panicking versions
+# on `feature = "userspace"`; auto::*_unchecked dispatcher routes through
+# `_unchecked` directly. Five entries.
+#
+# permutation/rabbit/kernels/scalar.rs::modularity_gains_neighbor_batch
+# CLEARED in v0.4.6 — added `modularity_gains_neighbor_batch_unchecked`
+# sibling sharing an `_inner` body with the panicking version; rabbit.rs
+# call sites use the unchecked variant.
 
 # -----------------------------------------------------------------
 # Category B — `permutation` module panic surface (already inside

@@ -104,10 +104,25 @@ pub unsafe fn contains_u32(haystack: &[u32], needle: u32) -> bool {
 ///
 /// # Panics
 ///
-/// Panics if `needles.len() != out.len()`.
+/// Panics if `needles.len() != out.len()`. Available only with
+/// `feature = "userspace"`; kernel-safe callers must use
+/// [`contains_u32_batch_unchecked`] (audit-R10 #1 / #216).
+#[cfg(feature = "userspace")]
 #[target_feature(enable = "avx2")]
 pub unsafe fn contains_u32_batch(haystack: &[u32], needles: &[u32], out: &mut [bool]) {
     assert_eq!(needles.len(), out.len());
+    // SAFETY: AVX2 supplied by target_feature; precondition checked above.
+    unsafe { contains_u32_batch_unchecked(haystack, needles, out) }
+}
+
+/// Unchecked AVX2 batched membership.
+///
+/// # Safety
+///
+/// Caller must ensure the current CPU supports AVX2 and
+/// `needles.len() == out.len()`.
+#[target_feature(enable = "avx2")]
+pub unsafe fn contains_u32_batch_unchecked(haystack: &[u32], needles: &[u32], out: &mut [bool]) {
     for (needle, slot) in needles.iter().zip(out.iter_mut()) {
         // SAFETY: target_feature(enable = "avx2") on this fn
         // forwards the AVX2 precondition to the inner kernel.

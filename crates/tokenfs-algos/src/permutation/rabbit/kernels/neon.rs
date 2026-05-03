@@ -66,7 +66,7 @@ pub unsafe fn modularity_gains_neighbor_batch(
         self_degree,
         m_doubled,
     ) {
-        return super::scalar::modularity_gains_neighbor_batch(
+        return super::scalar::modularity_gains_neighbor_batch_unchecked(
             neighbor_weights,
             neighbor_degrees,
             self_degree,

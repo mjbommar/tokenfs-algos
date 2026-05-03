@@ -210,8 +210,9 @@ pub mod kernels {
             ))]
             {
                 if super::avx512::is_available() {
-                    // SAFETY: availability was checked immediately above.
-                    unsafe { super::avx512::contains_u32_batch(haystack, needles, out) };
+                    // SAFETY: availability checked above; caller upholds
+                    // needles.len() == out.len() (audit-R10 #1 / #216).
+                    unsafe { super::avx512::contains_u32_batch_unchecked(haystack, needles, out) };
                     return;
                 }
             }
@@ -223,8 +224,9 @@ pub mod kernels {
             ))]
             {
                 if super::avx2::is_available() {
-                    // SAFETY: availability was checked immediately above.
-                    unsafe { super::avx2::contains_u32_batch(haystack, needles, out) };
+                    // SAFETY: availability checked above; caller upholds
+                    // needles.len() == out.len() (audit-R10 #1 / #216).
+                    unsafe { super::avx2::contains_u32_batch_unchecked(haystack, needles, out) };
                     return;
                 }
             }
@@ -232,8 +234,9 @@ pub mod kernels {
             #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
             {
                 if super::sse41::is_available() {
-                    // SAFETY: availability was checked immediately above.
-                    unsafe { super::sse41::contains_u32_batch(haystack, needles, out) };
+                    // SAFETY: availability checked above; caller upholds
+                    // needles.len() == out.len() (audit-R10 #1 / #216).
+                    unsafe { super::sse41::contains_u32_batch_unchecked(haystack, needles, out) };
                     return;
                 }
             }
@@ -241,13 +244,16 @@ pub mod kernels {
             #[cfg(all(feature = "neon", target_arch = "aarch64"))]
             {
                 if super::neon::is_available() {
-                    // SAFETY: NEON is mandatory on AArch64.
-                    unsafe { super::neon::contains_u32_batch(haystack, needles, out) };
+                    // SAFETY: NEON is mandatory on AArch64; caller upholds
+                    // needles.len() == out.len() (audit-R10 #1 / #216).
+                    unsafe { super::neon::contains_u32_batch_unchecked(haystack, needles, out) };
                     return;
                 }
             }
 
-            super::scalar::contains_u32_batch(haystack, needles, out);
+            // SAFETY: caller upholds needles.len() == out.len()
+            // (audit-R10 #1 / #216).
+            unsafe { super::scalar::contains_u32_batch_unchecked(haystack, needles, out) };
         }
     }
 

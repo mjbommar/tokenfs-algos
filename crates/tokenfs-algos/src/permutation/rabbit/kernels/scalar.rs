@@ -27,6 +27,9 @@ use alloc::vec::Vec;
 /// possible if `m_doubled > i128::MAX`, which would require
 /// `total_edge_weight > i128::MAX / 2 ≈ 2^126`, unreachable for
 /// any realistic graph).
+///
+/// Available only with `feature = "userspace"` (audit-R10 #1 / #216).
+#[cfg(feature = "userspace")]
 #[must_use]
 pub fn modularity_gains_neighbor_batch(
     neighbor_weights: &[u64],
@@ -41,6 +44,45 @@ pub fn modularity_gains_neighbor_batch(
         neighbor_weights.len(),
         neighbor_degrees.len()
     );
+    modularity_gains_neighbor_batch_inner(
+        neighbor_weights,
+        neighbor_degrees,
+        self_degree,
+        m_doubled,
+    )
+}
+
+/// Unchecked variant of [`modularity_gains_neighbor_batch`].
+///
+/// # Safety
+///
+/// Caller must ensure
+/// `neighbor_weights.len() == neighbor_degrees.len()` and
+/// `m_doubled <= i128::MAX`. (The second invariant always holds for
+/// realistic graphs; the assert in the userspace-gated entry exists
+/// as a defensive check.)
+#[must_use]
+pub fn modularity_gains_neighbor_batch_unchecked(
+    neighbor_weights: &[u64],
+    neighbor_degrees: &[u64],
+    self_degree: u64,
+    m_doubled: u128,
+) -> Vec<i128> {
+    modularity_gains_neighbor_batch_inner(
+        neighbor_weights,
+        neighbor_degrees,
+        self_degree,
+        m_doubled,
+    )
+}
+
+#[inline]
+fn modularity_gains_neighbor_batch_inner(
+    neighbor_weights: &[u64],
+    neighbor_degrees: &[u64],
+    self_degree: u64,
+    m_doubled: u128,
+) -> Vec<i128> {
     let two_m =
         i128::try_from(m_doubled).expect("m_doubled exceeds i128::MAX: total edge weight > 2^126");
     let deg_u = i128::from(self_degree);
