@@ -61,11 +61,14 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-/// Failure modes for the fallible rank/select dictionary constructor
-/// ([`RankSelectDict::try_build`]).
+/// Failure modes for the fallible rank/select dictionary entry points
+/// ([`RankSelectDict::try_build`], [`RankSelectDict::try_rank1`],
+/// [`RankSelectDict::try_rank0`]).
 ///
-/// Returned instead of panicking when the borrowed bit slice is too
-/// short to hold the requested logical bit count.
+/// Returned instead of panicking when an input would otherwise abort the
+/// process (out-of-range positions, undersized borrowed slices). Kernel,
+/// FUSE, and other no-panic callers should use the `try_*` entry points
+/// and match on this enum.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RankSelectError {
     /// `bits.len() * 64 < n_bits` — the borrowed slice cannot hold the
@@ -75,6 +78,38 @@ pub enum RankSelectError {
         bits_len_words: usize,
         /// Caller-supplied logical bit count.
         requested_n_bits: usize,
+    },
+    /// `pos > n_bits` — the queried position lies past the end of the
+    /// dictionary's logical bitvector.
+    ///
+    /// `rank1(n_bits)` and `rank0(n_bits)` are the maximum legal queries
+    /// (and return `count_ones()` and `n_bits - count_ones()`
+    /// respectively). Anything strictly greater is an out-of-range query.
+    ///
+    /// Position fields are typed `u64` rather than `usize` so the error
+    /// has a stable layout across 32-bit and 64-bit targets — useful for
+    /// shrinker-friendly diagnostics, on-the-wire serialization, and
+    /// cross-target reproduction of failing inputs.
+    PositionOutOfRange {
+        /// Caller-supplied position (cast losslessly from `usize`).
+        pos: u64,
+        /// Dictionary's logical bit count at query time (cast losslessly
+        /// from `usize`).
+        n_bits: u64,
+    },
+    /// `out.len() < positions.len()` (or `out.len() < ks.len()`) — the
+    /// caller-supplied output slice is too short to hold one entry per
+    /// input position.
+    ///
+    /// Returned by [`RankSelectDict::try_rank1_batch`] and
+    /// [`RankSelectDict::try_select1_batch`] before any work is done so
+    /// the output slice's contents are not partially overwritten on
+    /// the failure path.
+    BatchOutputTooShort {
+        /// Number of output slots required (= input slice length).
+        needed: usize,
+        /// Number of output slots actually supplied (= `out.len()`).
+        actual: usize,
     },
 }
 
@@ -89,6 +124,15 @@ impl core::fmt::Display for RankSelectError {
                 "RankSelectDict bits slice too short: {bits_len_words} words \
                  (= {} bits) cannot hold {requested_n_bits} requested bits",
                 bits_len_words.saturating_mul(64)
+            ),
+            Self::PositionOutOfRange { pos, n_bits } => write!(
+                f,
+                "RankSelectDict position out of range: pos = {pos} > n_bits = {n_bits}"
+            ),
+            Self::BatchOutputTooShort { needed, actual } => write!(
+                f,
+                "RankSelectDict batch output slice too short: needed {needed} slots, \
+                 caller supplied {actual}"
             ),
         }
     }
@@ -267,7 +311,10 @@ impl<'a> RankSelectDict<'a> {
     ///
     /// # Panics
     ///
-    /// Panics if `i > n_bits`.
+    /// Panics if `i > n_bits`. Kernel, FUSE, and other no-panic callers
+    /// should use [`Self::try_rank1`], which validates the position and
+    /// returns [`RankSelectError::PositionOutOfRange`] instead of
+    /// aborting.
     #[must_use]
     pub fn rank1(&self, i: usize) -> usize {
         assert!(
@@ -275,7 +322,31 @@ impl<'a> RankSelectDict<'a> {
             "RankSelectDict::rank1: i = {i} > n_bits = {}",
             self.n_bits
         );
+        self.rank1_inner(i)
+    }
 
+    /// Fallible variant of [`Self::rank1`] that returns
+    /// [`RankSelectError::PositionOutOfRange`] when `i > n_bits` instead
+    /// of panicking.
+    ///
+    /// `try_rank1(0)` returns `Ok(0)` and `try_rank1(n_bits)` returns
+    /// `Ok(count_ones())`. The boundary `i == n_bits` is in range and
+    /// matches the [`Self::rank1`] specification.
+    pub fn try_rank1(&self, i: usize) -> Result<usize, RankSelectError> {
+        if i > self.n_bits {
+            return Err(RankSelectError::PositionOutOfRange {
+                pos: i as u64,
+                n_bits: self.n_bits as u64,
+            });
+        }
+        Ok(self.rank1_inner(i))
+    }
+
+    /// Internal `rank1` kernel. Caller must guarantee `i <= n_bits`.
+    /// Used by [`Self::rank1`] (after the panicking assertion) and
+    /// [`Self::try_rank1`] (after the fallible bounds check) so the hot
+    /// path is not duplicated.
+    fn rank1_inner(&self, i: usize) -> usize {
         if i == 0 {
             return 0;
         }
@@ -311,6 +382,13 @@ impl<'a> RankSelectDict<'a> {
     }
 
     /// Returns the number of 0-bits in `bits[0..i]`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `i > n_bits`. Kernel, FUSE, and other no-panic callers
+    /// should use [`Self::try_rank0`], which validates the position and
+    /// returns [`RankSelectError::PositionOutOfRange`] instead of
+    /// aborting.
     #[must_use]
     pub fn rank0(&self, i: usize) -> usize {
         assert!(
@@ -318,7 +396,24 @@ impl<'a> RankSelectDict<'a> {
             "RankSelectDict::rank0: i = {i} > n_bits = {}",
             self.n_bits
         );
-        i - self.rank1(i)
+        i - self.rank1_inner(i)
+    }
+
+    /// Fallible variant of [`Self::rank0`] that returns
+    /// [`RankSelectError::PositionOutOfRange`] when `i > n_bits` instead
+    /// of panicking.
+    ///
+    /// `try_rank0(0)` returns `Ok(0)` and `try_rank0(n_bits)` returns
+    /// `Ok(n_bits - count_ones())`. The boundary `i == n_bits` is in
+    /// range and matches the [`Self::rank0`] specification.
+    pub fn try_rank0(&self, i: usize) -> Result<usize, RankSelectError> {
+        if i > self.n_bits {
+            return Err(RankSelectError::PositionOutOfRange {
+                pos: i as u64,
+                n_bits: self.n_bits as u64,
+            });
+        }
+        Ok(i - self.rank1_inner(i))
     }
 
     /// Returns the bit position of the `(k+1)`-th 1-bit (zero-based:
@@ -1419,6 +1514,100 @@ mod tests {
         let dict = RankSelectDict::try_build(&bits, 70).expect("valid build");
         assert_eq!(dict.len_bits(), 70);
         assert_eq!(dict.count_ones(), 70);
+    }
+
+    // ------------------------------------------------------------------
+    // try_rank1 / try_rank0 (audit-R7-followup #5).
+    //
+    // Fallible siblings of `rank1` / `rank0` that surface
+    // `RankSelectError::PositionOutOfRange` rather than panicking when
+    // `i > n_bits`. These tests intentionally use `try_build` (not
+    // `build`) so they remain compilable and runnable when the
+    // `panicking-shape-apis` feature is disabled — which is the kernel-
+    // /FUSE-safe configuration this work targets.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn try_rank1_happy_path_matches_naive() {
+        // 64-bit alternating pattern: bits 0, 2, 4, ... set.
+        let bits = [0x5555_5555_5555_5555_u64];
+        let dict = RankSelectDict::try_build(&bits, 64).expect("valid build");
+        assert_eq!(dict.try_rank1(0), Ok(0));
+        assert_eq!(dict.try_rank1(1), Ok(1));
+        assert_eq!(dict.try_rank1(2), Ok(1));
+        assert_eq!(dict.try_rank1(3), Ok(2));
+        assert_eq!(dict.try_rank1(64), Ok(32));
+    }
+
+    #[test]
+    fn try_rank1_returns_position_out_of_range_when_i_gt_n_bits() {
+        let bits = [0xff_u64, 0xff_u64]; // 128 bits total, 16 ones.
+        let dict = RankSelectDict::try_build(&bits, 128).expect("valid build");
+        let err = dict.try_rank1(129).expect_err("i > n_bits must be Err");
+        assert_eq!(
+            err,
+            RankSelectError::PositionOutOfRange {
+                pos: 129,
+                n_bits: 128,
+            }
+        );
+        // Position arbitrarily far past n_bits.
+        let err = dict.try_rank1(1_000_000).expect_err("far OOB must be Err");
+        assert_eq!(
+            err,
+            RankSelectError::PositionOutOfRange {
+                pos: 1_000_000,
+                n_bits: 128,
+            }
+        );
+    }
+
+    #[test]
+    fn try_rank1_boundary_i_eq_n_bits_returns_count_ones() {
+        // Boundary case: i == n_bits is in range and must return
+        // count_ones() (per the rank1 spec).
+        let bits = [0xff_u64, 0x00_u64, 0xff_u64]; // 16 ones in 192 bits.
+        let dict = RankSelectDict::try_build(&bits, 192).expect("valid build");
+        assert_eq!(dict.try_rank1(192), Ok(dict.count_ones()));
+        assert_eq!(dict.try_rank1(192), Ok(16));
+    }
+
+    #[test]
+    fn try_rank0_happy_path_matches_naive() {
+        // 64-bit alternating pattern: bits 0, 2, 4, ... set; rank0 is
+        // the count of clear bits.
+        let bits = [0x5555_5555_5555_5555_u64];
+        let dict = RankSelectDict::try_build(&bits, 64).expect("valid build");
+        assert_eq!(dict.try_rank0(0), Ok(0));
+        assert_eq!(dict.try_rank0(1), Ok(0));
+        assert_eq!(dict.try_rank0(2), Ok(1));
+        assert_eq!(dict.try_rank0(3), Ok(1));
+        assert_eq!(dict.try_rank0(64), Ok(32));
+    }
+
+    #[test]
+    fn try_rank0_returns_position_out_of_range_when_i_gt_n_bits() {
+        let bits = [0_u64; 2]; // 128 bits, 0 ones.
+        let dict = RankSelectDict::try_build(&bits, 128).expect("valid build");
+        let err = dict.try_rank0(200).expect_err("i > n_bits must be Err");
+        assert_eq!(
+            err,
+            RankSelectError::PositionOutOfRange {
+                pos: 200,
+                n_bits: 128,
+            }
+        );
+    }
+
+    #[test]
+    fn try_rank0_boundary_i_eq_n_bits_returns_total_zeros() {
+        // Boundary case: i == n_bits is in range and must return
+        // n_bits - count_ones() (per the rank0 spec).
+        let bits = [0xff_u64, 0x00_u64, 0xff_u64]; // 16 ones in 192 bits.
+        let dict = RankSelectDict::try_build(&bits, 192).expect("valid build");
+        let total_zeros = 192 - dict.count_ones();
+        assert_eq!(dict.try_rank0(192), Ok(total_zeros));
+        assert_eq!(dict.try_rank0(192), Ok(176));
     }
 
     #[cfg(feature = "panicking-shape-apis")]
