@@ -40,7 +40,8 @@ use super::kernels;
 /// and [`try_jaccard_u64_one_to_many`]).
 ///
 /// Returned instead of panicking when the caller-supplied buffer shapes
-/// are inconsistent.
+/// are inconsistent or when an output-encoding precondition is violated
+/// (e.g. the Hamming `u32` narrowing limit).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BatchShapeError {
     /// `out.len() != db.len() / stride`. Either the output buffer is
@@ -67,6 +68,19 @@ pub enum BatchShapeError {
         /// Caller-supplied `stride`.
         stride: usize,
     },
+    /// `stride > u32::MAX / 64` — exceeds the regime where the
+    /// `try_hamming_u64_one_to_many` per-pair `u64` popcount can be
+    /// narrowed to the `u32` output without overflow. Each row of
+    /// `stride` packed `u64` words holds `64 * stride` bits, so `stride
+    /// > u32::MAX / 64` is the smallest stride at which the bit count
+    /// can exceed `u32::MAX`.
+    StrideExceedsHammingLimit {
+        /// Caller-supplied `stride`.
+        stride: usize,
+        /// `u32::MAX / 64` — the largest stride accepted by
+        /// [`try_hamming_u64_one_to_many`].
+        limit: usize,
+    },
 }
 
 impl core::fmt::Display for BatchShapeError {
@@ -84,6 +98,10 @@ impl core::fmt::Display for BatchShapeError {
             Self::QueryStrideMismatch { query_len, stride } => write!(
                 f,
                 "batched API: query.len()={query_len} but stride={stride}"
+            ),
+            Self::StrideExceedsHammingLimit { stride, limit } => write!(
+                f,
+                "batched API: stride={stride} would overflow u32 hamming output (limit={limit})"
             ),
         }
     }
@@ -282,8 +300,8 @@ pub fn try_cosine_similarity_f32_one_to_many(
 pub fn hamming_u64_one_to_many(query: &[u64], db: &[u64], stride: usize, out: &mut [u32]) {
     assert_batch_shape(query.len(), db.len(), stride, out.len());
     assert!(
-        stride <= (u32::MAX as usize) / 64,
-        "hamming_u64_one_to_many: stride={stride} would overflow u32 output"
+        stride <= HAMMING_STRIDE_LIMIT,
+        "hamming_u64_one_to_many: stride={stride} would overflow u32 output (limit={HAMMING_STRIDE_LIMIT})"
     );
     hamming_u64_one_to_many_inner(query, db, stride, out);
 }
@@ -306,24 +324,33 @@ fn hamming_u64_one_to_many_inner(query: &[u64], db: &[u64], stride: usize, out: 
 
 /// Fallible variant of [`hamming_u64_one_to_many`] that returns
 /// [`BatchShapeError`] when the caller-supplied buffer shapes are
-/// inconsistent, instead of panicking.
+/// inconsistent or the stride exceeds the `u32` output narrowing
+/// limit, instead of panicking.
 ///
-/// The `stride > u32::MAX / 64` overflow check is **not** mapped to a
-/// [`BatchShapeError`] variant — that condition still panics, since it
-/// reflects an output-encoding overflow rather than a buffer-shape
-/// issue. Even with `panicking-shape-apis` disabled, this stride bound
-/// remains a panicking precondition because no `try_*` mapping exists.
+/// # Errors
+///
+/// * [`BatchShapeError::StrideExceedsHammingLimit`] —
+///   `stride > u32::MAX / 64`. Each row of `stride` packed `u64`
+///   words holds `64 * stride` bits, so any larger `stride` could
+///   produce a per-pair count that does not fit in the `u32` output
+///   slot. This bound was previously a panicking precondition
+///   (audit-R8 #4); it is now an explicit `Err`, so the function is
+///   panic-free across its full input domain. Checked **before**
+///   the shape invariants so callers can validate the stride in
+///   isolation without first having to provide matching buffers.
+/// * [`BatchShapeError::StrideZero`] — `stride == 0`.
+/// * [`BatchShapeError::QueryStrideMismatch`] — `query.len() != stride`.
+/// * [`BatchShapeError::DbStrideMismatch`] — `db.len()` not a
+///   multiple of `stride`.
+/// * [`BatchShapeError::OutLenMismatch`] — `out.len() != db.len() / stride`.
 pub fn try_hamming_u64_one_to_many(
     query: &[u64],
     db: &[u64],
     stride: usize,
     out: &mut [u32],
 ) -> Result<(), BatchShapeError> {
+    check_hamming_stride_limit(stride)?;
     check_batch_shape(query.len(), db.len(), stride, out.len())?;
-    assert!(
-        stride <= (u32::MAX as usize) / 64,
-        "try_hamming_u64_one_to_many: stride={stride} would overflow u32 output"
-    );
     hamming_u64_one_to_many_inner(query, db, stride, out);
     Ok(())
 }
@@ -427,6 +454,29 @@ fn check_batch_shape(
         return Err(BatchShapeError::OutLenMismatch {
             expected,
             actual: out_len,
+        });
+    }
+    Ok(())
+}
+
+/// `try_hamming_u64_one_to_many` output narrowing limit:
+/// `u32::MAX / 64`. Each row of `stride` packed `u64` words holds
+/// `64 * stride` bits; any `stride > u32::MAX / 64` could yield a
+/// per-pair count that overflows the `u32` output slot.
+const HAMMING_STRIDE_LIMIT: usize = (u32::MAX as usize) / 64;
+
+/// Returns `Err(BatchShapeError::StrideExceedsHammingLimit { .. })` when
+/// `stride` would cause `try_hamming_u64_one_to_many` to overflow its
+/// `u32` output narrowing.
+///
+/// Pulled out of [`try_hamming_u64_one_to_many`] so the precondition
+/// is a single source of truth (audit-R8 #4).
+#[inline]
+fn check_hamming_stride_limit(stride: usize) -> Result<(), BatchShapeError> {
+    if stride > HAMMING_STRIDE_LIMIT {
+        return Err(BatchShapeError::StrideExceedsHammingLimit {
+            stride,
+            limit: HAMMING_STRIDE_LIMIT,
         });
     }
     Ok(())
@@ -588,6 +638,56 @@ mod tests {
             BatchShapeError::OutLenMismatch {
                 expected: 1,
                 actual: 5
+            }
+        );
+    }
+
+    #[test]
+    fn try_hamming_returns_err_on_stride_exceeds_hamming_limit() {
+        // `stride > u32::MAX / 64` would let a per-pair popcount
+        // overflow the `u32` output slot. Previously this panicked
+        // (audit-R8 #4); now it surfaces as an explicit Err. The
+        // stride bound is checked **before** the shape invariants so
+        // the precondition can be validated in isolation without
+        // allocating ~67M-word buffers — empty `query`/`db`/`out`
+        // slices are fine for the validation test.
+        let limit = (u32::MAX as usize) / 64;
+        let bad_stride = limit + 1;
+        let mut out: [u32; 0] = [];
+        let err = try_hamming_u64_one_to_many(&[], &[], bad_stride, &mut out).unwrap_err();
+        assert_eq!(
+            err,
+            BatchShapeError::StrideExceedsHammingLimit {
+                stride: bad_stride,
+                limit,
+            }
+        );
+
+        // Stride exactly at the limit is accepted (no overflow), so
+        // any subsequent error is a shape error rather than the
+        // stride-limit one. Use empty slices: `db.len() / stride == 0`
+        // so a zero-length `out` matches and the call succeeds with
+        // an empty result.
+        let result = try_hamming_u64_one_to_many(&[], &[], limit, &mut out);
+        // With `query.len() == 0 != stride == limit`, this triggers
+        // QueryStrideMismatch rather than the StrideExceedsHammingLimit
+        // we just rejected — proving stride==limit is in-bounds.
+        assert_eq!(
+            result.unwrap_err(),
+            BatchShapeError::QueryStrideMismatch {
+                query_len: 0,
+                stride: limit,
+            }
+        );
+
+        // Way beyond the limit also returns a clean Err.
+        let huge_stride = usize::MAX;
+        let err = try_hamming_u64_one_to_many(&[], &[], huge_stride, &mut out).unwrap_err();
+        assert_eq!(
+            err,
+            BatchShapeError::StrideExceedsHammingLimit {
+                stride: huge_stride,
+                limit,
             }
         );
     }
