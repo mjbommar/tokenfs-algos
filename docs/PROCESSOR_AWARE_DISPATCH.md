@@ -1,6 +1,13 @@
 # Processor-Aware Dispatch
 
-Date: 2026-04-30.
+Date: 2026-04-30. Last revised: 2026-05-03.
+
+> See also: [`KERNEL_SAFETY.md`](KERNEL_SAFETY.md) for the
+> dispatcher's kernel-safety contract — the `auto::*` runtime
+> dispatchers route through `_unchecked` per-backend siblings after
+> the fallible `try_*` top-level entries validate upfront, so
+> kernel-default builds reach the algorithms without any
+> assertion-bearing code path.
 
 `tokenfs-algos` should not treat CPU support as a single AVX2/NEON switch.
 For byte-stream primitives, the relevant processor facts include instruction
@@ -63,11 +70,17 @@ The first Rust catalog slice is now present in `tokenfs_algos::dispatch`:
 - metadata records ISA class, working-set class, statefulness, preferred chunk
   size, classifier sample size, and private table footprint.
 
-The catalog now includes pinned AVX2 entries where the implementation and parity
-tests exist, including `avx2-stripe4-u32` for byte histograms and the fused F22
-block fingerprint path. AVX-512/NEON/SVE/SVE2 are feature-shaped targets, but
-`backend_kernel_support()` reports them as scalar fallback until real kernels
-exist and pass backend parity tests.
+The catalog now includes pinned AVX2 entries where the implementation
+and parity tests exist, including `avx2-stripe4-u32` for byte
+histograms and the fused F22 block fingerprint path.
+
+As of v0.4.6, real kernels exist for AVX2 (the primary x86 path),
+AVX-512 (gated on `feature = "avx512"`, nightly), NEON (default on
+AArch64), SSE4.1 (gated on `arch-pinned-kernels`), SSSE3 (likewise),
+SHA-NI (x86 SHA hardware), and FEAT_SHA2 (AArch64 SHA hardware).
+`backend_kernel_support()` distinguishes implemented backends from
+feature-shaped fallbacks. SVE/SVE2 remain scalar fallback targets
+until profiling evidence justifies real kernels.
 
 The histogram planner that consumes this catalog is implemented as a rule
 table in `dispatch::planner`. Architecture, named-constant convention,
@@ -117,8 +130,10 @@ Current implementation status:
 - `backend_kernel_support()` distinguishes native implemented backends from
   scalar fallback backends, so future ISA support is not implied by feature
   names alone;
-- `cargo run -p tokenfs-algos --example dispatch_explain` prints the detected
-  profile, the catalog, and representative planner decisions.
+- `cargo run -p tokenfs-algos --features userspace --example dispatch_explain`
+  prints the detected profile, the catalog, and representative
+  planner decisions. The `--features userspace` flag is required
+  since v0.4.0 (audit-R9 #4).
 
 ## Autotuning
 

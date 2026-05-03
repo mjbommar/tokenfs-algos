@@ -1,6 +1,17 @@
 # `no_std` posture
 
-Verified by CI on every push (see `.github/workflows/ci.yml`).
+Verified by CI on every push (`.github/workflows/ci.yml`) and by
+`cargo xtask check` locally (the `security` step). Since v0.4.5
+(audit-R10 T2.5 / #10), `cargo xtask security` also builds the
+`tokenfs-algos-no-std-smoke` crate which exercises the kernel-safe
+surface through a real `#![no_std]` consumer — if any kernel-claimed-
+safe primitive moves out from under `--no-default-features --features alloc`,
+that build fails.
+
+> See also: [`KERNEL_SAFETY.md`](KERNEL_SAFETY.md) for the
+> kernel-safe-by-default contract that overlays this posture
+> (the `try_*` / `_unchecked` / `_inner` conventions and the
+> panic-surface lint).
 
 | Configuration | Lib `cargo check --lib` | Lib `cargo build --lib` | Tests | Examples / Benches |
 |---|---|---|---|---|

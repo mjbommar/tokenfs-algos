@@ -2,10 +2,19 @@
 
 Low-level Rust algorithms for hardware-accelerated byte-stream analysis.
 
-This repository is being built from `PLAN.md` and `AGENTS.md`. The core crate
-is intended to stay content-agnostic, deterministic across backends, and usable
-from TokenFS tooling, future kernel/FUSE integrations, and separate Python
-bindings.
+The core crate is content-agnostic, deterministic across backends, and
+**kernel-safe by default**: every panicking public API is gated behind
+`feature = "userspace"`, with fallible `try_*` siblings or `_unchecked`
+runtime dispatchers reachable from kernel-default builds. The kernel-safe
+contract is enforced by `cargo xtask panic-surface-lint` and documented
+end-to-end in [`docs/KERNEL_SAFETY.md`](docs/KERNEL_SAFETY.md).
+
+Designed for use from TokenFS tooling, kernel/FUSE integrations,
+Postgres extensions, MinIO/CDN edge code, forensics tooling, and
+(future) PyO3 Python bindings.
+
+See [`PLAN.md`](PLAN.md) for the living roadmap and
+[`CHANGELOG.md`](CHANGELOG.md) for per-release diffs + audit lineage.
 
 ## Development
 
@@ -26,11 +35,16 @@ cargo xtask bench-compare target/bench-history/runs/<old>.jsonl target/bench-his
 cargo xtask bench-report
 cargo xtask profile
 cargo xtask profile-flamegraph -- --profile-time 10 workload_matrix/adaptive-prefix-1k
-cargo run -p tokenfs-algos --example dispatch_explain
-cargo run -p tokenfs-algos --example classify_block
-cargo run -p tokenfs-algos --example cdc_chunking
-cargo run -p tokenfs-algos --example content_match
+cargo run -p tokenfs-algos --features userspace --example dispatch_explain
+cargo run -p tokenfs-algos --features userspace --example classify_block
+cargo run -p tokenfs-algos --features userspace --example cdc_chunking
+cargo run -p tokenfs-algos --features userspace --example content_match
 ```
+
+The `--features userspace` flag is required for the examples since the
+v0.4 surface flip (audit-R9 #4); they reach panicking-shape APIs that
+are not in the kernel-default surface. CI passes the flag explicitly
+in `.github/workflows/ci.yml`.
 
 Real-data benchmarks are opt-in and keep large corpora out of git:
 
@@ -152,3 +166,47 @@ and tune the API surface for different deployment shapes:
 - **`tunes-json`** / **`calibration`** / **`bench-internals`** /
   **`permutation_hilbert`** — auxiliary features for tooling, paper
   artifacts, micro-benches, and the Hilbert-curve permutation path.
+
+## Kernel-safe surface
+
+The kernel-safe surface is reached via:
+
+```toml
+tokenfs-algos = { default-features = false, features = ["alloc"] }
+```
+
+Under that shape:
+
+- **No public function panics on caller input.** Every shape /
+  range / overflow precondition is reachable through a `try_*`
+  sibling that returns a typed error.
+- **Backend kernels expose `_unchecked` siblings.** The runtime
+  dispatchers (`kernels::auto::*_unchecked`) call them after
+  upfront validation; the asserting versions stay as a userspace-only
+  oracle for SIMD parity tests.
+- **No allocation outside `alloc`.** No `std::thread`, no
+  `/sys/devices/system/cpu/` reads, no rayon, no logging frameworks.
+- **No file I/O, process I/O, or global mutable policy.**
+
+The contract is enforced by `cargo xtask panic-surface-lint`, which
+walks every `pub fn` body and rejects ungated panic macros. The
+allowlist (`tools/xtask/panic_surface_allowlist.txt`) is empty by
+policy — extending it is almost never the correct response when the
+lint catches a new entry.
+
+See [`docs/KERNEL_SAFETY.md`](docs/KERNEL_SAFETY.md) for the full
+contract — `try_*` / `_unchecked` / `_inner` conventions with
+codebase examples, the lint, and the audit-R4-through-R10 lineage.
+
+## Audit posture
+
+`tokenfs-algos` has been through external audit rounds R4 → R10. As
+of v0.4.6:
+
+- All HIGH and MEDIUM findings are closed; see `CHANGELOG.md` per
+  release for the per-finding writeup.
+- `tools/xtask/panic_surface_allowlist.txt` contains zero entries.
+- 13 cargo-fuzz targets compile and run nightly under
+  `.github/workflows/fuzz-nightly.yml`. cargo-mutants weekly. Miri /
+  ASan / MSan on push + Sundays. cargo-llvm-cov per PR. OSS-Fuzz
+  integration files live in `oss-fuzz/` ready for upstream submission.

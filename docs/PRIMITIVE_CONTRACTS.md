@@ -1,6 +1,11 @@
 # Primitive Contracts
 
-Date: 2026-04-30. Last revised: 2026-05-02.
+Date: 2026-04-30. Last revised: 2026-05-03.
+
+> See also: [`KERNEL_SAFETY.md`](KERNEL_SAFETY.md) for the
+> kernel-safe-by-default contract that overlays everything below
+> (the `try_*` / `_unchecked` / `_inner` conventions, the
+> panic-surface lint, and the empty allowlist policy).
 
 This crate is a low-level primitive library. Every hot primitive should be
 usable by TokenFS, FUSE, kernel-adjacent callers, Postgres extensions,
@@ -138,7 +143,8 @@ compatibility namespaces and benchmark fixture names.
 Before treating a primitive as v0.1-ready:
 
 1. Scalar implementation exists.
-2. Public default path exists.
+2. Public default path exists (kernel-safe; never panics on caller input
+   — see [`KERNEL_SAFETY.md`](KERNEL_SAFETY.md)).
 3. Pinned scalar path exists.
 4. Known-value tests exist.
 5. Property/parity tests compare default vs scalar.
@@ -146,3 +152,7 @@ Before treating a primitive as v0.1-ready:
 7. Report artifacts show the primitive clearly.
 8. Paper calibration either passes or is explicitly skipped with a missing-path
    message.
+9. `cargo xtask panic-surface-lint` passes (no new ungated panic macros
+   in the public surface).
+10. The `tokenfs-algos-no-std-smoke` crate exercises the new kernel-safe
+    entry point if one was added.
