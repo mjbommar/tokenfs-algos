@@ -4,6 +4,95 @@ All notable changes to this crate will be documented in this file. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.4.6] — 2026-05-03
+
+Audit-R10 systematic gating sweep COMPLETE — `tools/xtask/panic_surface_allowlist.txt`
+went from 30 grandfathered entries at v0.4.5 to **zero**. Every panicking
+`pub fn` / `pub unsafe fn` reachable from the kernel-default surface is now
+either gated on `#[cfg(feature = "userspace")]` or has a `_unchecked` /
+`_inner` sibling that the runtime dispatcher / fallible `try_*` entry uses
+to stay reachable in non-userspace builds. The kernel-safe-by-default
+narrative is now actually true, not just lint-protected.
+
+### Changed (BREAKING for non-`userspace` consumers reaching panicking APIs)
+
+The following `pub fn` / `pub unsafe fn` are now `#[cfg(feature = "userspace")]`-gated;
+kernel-default builds (`--no-default-features --features alloc`) no longer see them.
+Each has either a documented `try_*` sibling or a `_unchecked` sibling for the
+arch-pinned-kernels surface:
+
+  * `approx::BloomFilter::contains_batch_simd` → `try_contains_batch_simd`
+  * `approx::HyperLogLog::merge_simd` → `try_merge_simd`
+  * `bits::rank_select::RankSelectDict::{rank0, rank1, rank1_batch, select1_batch}`
+    → `try_rank0` / `try_rank1` / `try_rank1_batch` / `try_select1_batch`
+  * `similarity::minhash::{one_permutation_from_hashes, one_permutation_from_bytes}`
+    (no try_* sibling — const-generic `K > 0` invariant; document the
+    constraint at the type level)
+  * `permutation::{rabbit_order, rabbit_order_par, rcm}` →
+    `try_rabbit_order` / `try_rabbit_order_par` / `try_rcm`
+  * Backend kernels under
+    `bits/{streamvbyte,bit_pack,rank_select}/kernels/{scalar,avx2,avx512,neon,sse41,ssse3}`,
+    `approx/bloom_kernels/{scalar,avx2,avx512,neon}`,
+    `hash/set_membership/kernels/{scalar,avx2,avx512,neon,sse41}`, and
+    `permutation/rabbit/kernels/scalar` — each `pub (unsafe) fn`
+    panicking entry now paired with a `pub (unsafe) fn <name>_unchecked`
+    sibling. The `kernels::auto::*` runtime dispatchers route through
+    `_unchecked` after their own upfront validation; the asserting
+    versions are kept as a userspace-only oracle.
+  * `permutation::rabbit::kernels::auto::modularity_gains_neighbor_batch`
+    → `modularity_gains_neighbor_batch_unchecked` (used by
+    `rabbit_order_inner` / `rabbit_order_par_inner` so the algorithm
+    stays reachable from `try_rabbit_order` / `try_rabbit_order_par`
+    in non-userspace builds).
+
+### Added — `_inner` extraction pattern as codebase convention
+
+Functions whose body needs to be shared between a userspace-gated panicking
+entry and a kernel-safe `try_*` sibling now use a private `_inner` helper
+that takes a pre-validated input. Established for:
+
+  * `permutation::rabbit::rabbit_order_inner`
+    (called by both `rabbit_order` and `try_rabbit_order`)
+  * `permutation::rabbit::rabbit_order_par_inner`
+    (called by both `rabbit_order_par` and `try_rabbit_order_par`)
+  * `permutation::rcm::rcm_inner`
+    (called by both `rcm` and `try_rcm`)
+  * `permutation::rabbit::kernels::scalar::modularity_gains_neighbor_batch_inner`
+    (called by both the asserting and `_unchecked` variants)
+  * `hash::set_membership::kernels::scalar::contains_u32_batch_inner`
+    (same pattern)
+
+### Fixed — `permutation::hilbert::hilbert_2d` no longer panics
+
+Previously `hilbert_2d` asserted on `points.len() <= u32::MAX` despite its
+docstring promising "Does not panic." Replaced the assert with a
+saturate-and-identity guard: inputs longer than `u32::MAX` collapse to
+`Permutation::try_identity(u32::MAX)` rather than panic. Matches the
+docstring's existing guarantee.
+
+`permutation::hilbert::hilbert_nd` is now `#[cfg(feature = "userspace")]`-gated
+since its body retains an inline assert on the dim/length contract;
+kernel/FUSE callers needing N-D Hilbert ordering must validate upstream.
+
+### Notes
+
+  * Lib test counts unchanged: 978 with `--all-features` (+1 vs v0.4.5
+    from `try_validate_no_alloc_errors_on_undersized_scratch`); 671
+    `--no-default-features --features alloc`. The migration only changed
+    function gating + signatures; no algorithmic behavior changed.
+  * `panic_surface_allowlist.txt` content is now categorized comments
+    only (no entries). The file is retained as the load-bearing artifact
+    for the lint, with a rule that "extending the allowlist" is almost
+    never the correct response — fix the panic instead.
+  * `cargo xtask check` green: fmt, clippy, doc, no-std-tree,
+    no-std-smoke build, panic-surface-lint at zero entries.
+  * Audit-R10 status: **ALL TIERS CLOSED.** Tier 0 (T0.1-T0.4) shipped
+    v0.4.4. Tier 1 (T1.1-T1.6) shipped v0.4.4. Tier 2 (T2.1-T2.5) +
+    Tier 3 partial (T3.1-T3.3, T3.7-T3.9) shipped v0.4.5. Tier 2 carry-
+    over (T2.6 systematic gating sweep) closed in this release.
+    Remaining v0.5.0 candidates (T3.4 iai-callgrind, T3.5 bench-history
+    publication, T3.6 default-flip) are all enhancement, not safety.
+
 ## [0.4.5] — 2026-05-03
 
 Audit-R10 Tier 2 + Tier 3 closeout: 4 MEDIUM correctness fixes, 7 new
