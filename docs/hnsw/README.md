@@ -12,10 +12,11 @@ research that backs each.
 
 ## Reading order
 
-1. **[`00_ARCHITECTURE.md`](00_ARCHITECTURE.md)** — top-level architecture: the layer table, module structure, posture matrix.
-2. **[`phases/`](phases/)** — week-by-week phase plans with deliverables, demos, and acceptance criteria.
-3. **[`components/`](components/)** — per-component specs (wire format, walker, builder, distance kernels, filter, graph layout). Filled in as research lands.
-4. **[`research/`](research/)** — read-only background: usearch source deep dive, our existing primitive inventory, HNSW algorithm notes, SIMD prior art, determinism constraints. Backs the component specs.
+1. **[`SELF_PROMPT.md`](SELF_PROMPT.md)** — kickoff prompt for picking up work in a fresh session. Has the inviolable contracts, the work loop, the "don't do this" list. Read this first if you're starting a work session.
+2. **[`00_ARCHITECTURE.md`](00_ARCHITECTURE.md)** — top-level architecture: the layer table, module structure, posture matrix.
+3. **[`phases/`](phases/)** — week-by-week phase plans with deliverables, demos, and acceptance criteria.
+4. **[`components/`](components/)** — per-component specs (wire format, walker, builder, distance kernels, filter, graph layout). Filled in as research lands.
+5. **[`research/`](research/)** — read-only background: usearch source deep dive, our existing primitive inventory, HNSW algorithm notes, SIMD prior art, determinism constraints. Backs the component specs.
 
 ## Phase index
 
