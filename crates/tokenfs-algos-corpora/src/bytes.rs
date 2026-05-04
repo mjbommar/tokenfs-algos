@@ -1,14 +1,15 @@
 //! Layer 1 — Bytes generators.
 //!
-//! How raw bytes per item are generated. Implementations live here;
-//! this file is the scaffold + variant enumeration.
+//! How raw bytes per item are generated.
 //!
 //! Phase coverage:
 //!
-//! - **#236 next:** [`BytesLayer::BitFlipVariants`] — clustering-fuzz
-//!   primitive (M seed clusters × N variants at bit-flip probability p).
-//! - **#236:** [`BytesLayer::UniformRandom`] — ChaCha8 byte stream.
-//! - **Later:** [`BytesLayer::MarkovChain`], [`BytesLayer::ByteHistogramTargeted`].
+//! - **#236 (this commit):** [`BytesLayer::BitFlipVariants`] (clustering-
+//!   fuzz primitive) + [`BytesLayer::UniformRandom`] (ChaCha8 stream).
+//! - **#238:** [`BytesLayer::MarkovChain`], [`BytesLayer::ByteHistogramTargeted`].
+
+use rand_chacha::ChaCha8Rng;
+use rand_core::{RngCore, SeedableRng};
 
 use crate::ClusterId;
 
@@ -93,4 +94,218 @@ pub struct GeneratedBytes {
     /// Cluster membership, if the layer assigns one. `None` for
     /// uniform-random / Markov / byte-histogram.
     pub cluster_id: Option<ClusterId>,
+}
+
+/// Generate a byte stream per the layer spec, deterministic from `seed`.
+///
+/// Returns one `GeneratedBytes` per item; total item count comes from
+/// [`BytesLayer::item_count`]. Some layer variants ignore `n_items`
+/// (e.g. `BitFlipVariants` derives the count from
+/// `clusters * variants_per_cluster`).
+pub fn generate(layer: &BytesLayer, seed: u64, n_items: usize) -> Vec<GeneratedBytes> {
+    match layer {
+        BytesLayer::UniformRandom { bytes_per_item } => {
+            generate_uniform_random(seed, n_items, *bytes_per_item)
+        }
+        BytesLayer::BitFlipVariants {
+            bytes_per_item,
+            clusters,
+            variants_per_cluster,
+            p_flip,
+        } => generate_bit_flip_variants(
+            seed,
+            *bytes_per_item,
+            *clusters,
+            *variants_per_cluster,
+            *p_flip,
+        ),
+        BytesLayer::MarkovChain { .. } | BytesLayer::ByteHistogramTargeted { .. } => {
+            // Filled in #238.
+            Vec::new()
+        }
+    }
+}
+
+fn generate_uniform_random(
+    seed: u64,
+    n_items: usize,
+    bytes_per_item: usize,
+) -> Vec<GeneratedBytes> {
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let mut out = Vec::with_capacity(n_items);
+    for _ in 0..n_items {
+        let mut buf = vec![0u8; bytes_per_item];
+        rng.fill_bytes(&mut buf);
+        out.push(GeneratedBytes {
+            bytes: buf,
+            cluster_id: None,
+        });
+    }
+    out
+}
+
+/// Clustering-fuzz primitive (per docs/hnsw/components/CLUSTERING_FUZZ.md
+/// §"Algorithm"). M seeds × N variants per seed; each variant is the
+/// seed bytes with each bit independently flipped at probability `p_flip`.
+///
+/// By construction:
+///   - variants of seed_i are close to each other (Hamming distance
+///     binomial(bytes*8, p_flip));
+///   - variants of seeds i and j are far apart (Hamming distance
+///     binomial(bytes*8, 0.5) since two random seeds differ in ~half
+///     their bits and small p_flip flips don't move that much).
+///
+/// Item ordering: cluster-major, variant-minor. Item key i belongs to
+/// cluster `i / variants_per_cluster`.
+fn generate_bit_flip_variants(
+    seed: u64,
+    bytes_per_item: usize,
+    clusters: usize,
+    variants_per_cluster: usize,
+    p_flip: f32,
+) -> Vec<GeneratedBytes> {
+    debug_assert!(
+        (0.0..=1.0).contains(&p_flip),
+        "p_flip must be in [0.0, 1.0]"
+    );
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+
+    // Pre-generate the M seeds.
+    let mut seeds: Vec<Vec<u8>> = Vec::with_capacity(clusters);
+    for _ in 0..clusters {
+        let mut buf = vec![0u8; bytes_per_item];
+        rng.fill_bytes(&mut buf);
+        seeds.push(buf);
+    }
+
+    let total = clusters * variants_per_cluster;
+    let mut out = Vec::with_capacity(total);
+    for (cluster_idx, seed_bytes) in seeds.iter().enumerate() {
+        for _ in 0..variants_per_cluster {
+            let mut variant = seed_bytes.clone();
+            // Flip each bit at probability p_flip. We sample u32 per
+            // 32-bit window and unpack; this is faster than per-bit
+            // gen_f32 calls and stays deterministic.
+            apply_bit_flips(&mut rng, &mut variant, p_flip);
+            out.push(GeneratedBytes {
+                bytes: variant,
+                cluster_id: Some(cluster_idx as ClusterId),
+            });
+        }
+    }
+    out
+}
+
+/// Apply independent bit flips at probability `p` to `bytes` in place,
+/// using `rng` for randomness. For determinism we pre-compute the u32
+/// threshold and compare per bit via 32-bit RNG draws (one draw per
+/// bit). Slow but predictable; #238 may swap this for a faster sampler.
+fn apply_bit_flips(rng: &mut ChaCha8Rng, bytes: &mut [u8], p: f32) {
+    if p == 0.0 {
+        return;
+    }
+    let threshold = (p * (u32::MAX as f32)) as u32;
+    for byte in bytes.iter_mut() {
+        for bit in 0..8u8 {
+            let draw = rng.next_u32();
+            if draw < threshold {
+                *byte ^= 1 << bit;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    #[test]
+    fn uniform_random_deterministic() {
+        let a = generate_uniform_random(42, 4, 16);
+        let b = generate_uniform_random(42, 4, 16);
+        assert_eq!(a.len(), 4);
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert_eq!(x.bytes, y.bytes);
+            assert_eq!(x.cluster_id, None);
+        }
+    }
+
+    #[test]
+    fn uniform_random_different_seed_different_output() {
+        let a = generate_uniform_random(42, 4, 16);
+        let b = generate_uniform_random(43, 4, 16);
+        // Vanishingly unlikely for any pair to match across seeds.
+        assert_ne!(a[0].bytes, b[0].bytes);
+    }
+
+    #[test]
+    fn bit_flip_zero_p_returns_seed_replicas() {
+        let out = generate_bit_flip_variants(7, 8, 3, 4, 0.0);
+        assert_eq!(out.len(), 12); // 3 × 4
+        for cluster in 0..3 {
+            let base_idx = cluster * 4;
+            let canonical = &out[base_idx].bytes;
+            for variant_idx in 0..4 {
+                assert_eq!(out[base_idx + variant_idx].bytes, *canonical);
+                assert_eq!(out[base_idx + variant_idx].cluster_id, Some(cluster as u32));
+            }
+        }
+    }
+
+    #[test]
+    fn bit_flip_one_p_inverts_seed() {
+        // p = 1.0 flips every bit, so variants are bit-inverses of seed.
+        let out = generate_bit_flip_variants(7, 4, 1, 1, 1.0);
+        let seed = generate_bit_flip_variants(7, 4, 1, 1, 0.0);
+        for (s, v) in seed[0].bytes.iter().zip(out[0].bytes.iter()) {
+            assert_eq!(*s ^ *v, 0xFF);
+        }
+    }
+
+    #[test]
+    fn bit_flip_clusters_preserve_membership_at_p_05() {
+        // At p = 0.05, variants of seed_i should be much closer to
+        // seed_i than to seed_j for any j != i. We measure
+        // intra-cluster vs inter-cluster Hamming distance and assert
+        // a wide gap.
+        let out = generate_bit_flip_variants(11, 32, 4, 8, 0.05);
+        assert_eq!(out.len(), 32);
+
+        // Pick the seed (variant 0) of cluster 0. Compare its Hamming
+        // distance to other variants of cluster 0 vs variants of cluster 1.
+        let seed_0 = &out[0].bytes;
+        let intra: u32 = out[1..8]
+            .iter()
+            .map(|item| hamming(seed_0, &item.bytes))
+            .sum();
+        let inter: u32 = out[8..16]
+            .iter()
+            .map(|item| hamming(seed_0, &item.bytes))
+            .sum();
+        // 7 intra-cluster vs 8 inter-cluster comparisons; normalize.
+        let intra_avg = intra as f32 / 7.0;
+        let inter_avg = inter as f32 / 8.0;
+        assert!(
+            intra_avg < inter_avg / 4.0,
+            "expected intra ({intra_avg}) << inter ({inter_avg})"
+        );
+    }
+
+    #[test]
+    fn bit_flip_deterministic_across_runs() {
+        let a = generate_bit_flip_variants(0xCAFEBABE, 16, 5, 3, 0.10);
+        let b = generate_bit_flip_variants(0xCAFEBABE, 16, 5, 3, 0.10);
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert_eq!(x.bytes, y.bytes);
+            assert_eq!(x.cluster_id, y.cluster_id);
+        }
+    }
+
+    fn hamming(a: &[u8], b: &[u8]) -> u32 {
+        a.iter()
+            .zip(b.iter())
+            .map(|(&x, &y)| (x ^ y).count_ones())
+            .sum()
+    }
 }

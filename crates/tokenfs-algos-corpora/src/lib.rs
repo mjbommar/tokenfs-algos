@@ -113,18 +113,56 @@ pub struct CorpusSpec {
 impl CorpusSpec {
     /// Generate the [`Corpus`] for this spec.
     ///
-    /// Phase 1 of the corpora crate: layer scaffolds + the
-    /// clustering bit-flip-variants preset only. Other layer
-    /// combinations panic with "not yet implemented" — to be filled
-    /// in across tasks #236 / #237 / #238.
+    /// As of #236: the bytes layer drives generation
+    /// (UniformRandom + BitFlipVariants implemented; MarkovChain +
+    /// ByteHistogramTargeted return empty until #238). Vector layer
+    /// (#237) and structure layer (#238) compose later. The
+    /// `Identity` vector layer pass-through means BitFlipVariants
+    /// corpora are immediately usable for HNSW Phase 4 clustering-
+    /// fuzz validation.
     pub fn generate(&self) -> Corpus {
-        // Wire-up lands progressively across the bytes / vector /
-        // structure layer tasks. For now this is a stub returning a
-        // skeleton Corpus with empty items — the per-layer
-        // implementations replace this as they land.
+        let raw = bytes::generate(&self.bytes_layer, self.seed, self.n_items);
+
+        // Build cluster table from the bytes layer's labels.
+        let mut clusters: Vec<ground_truth::Cluster> = Vec::new();
+        for (key, bytes) in raw.iter().enumerate() {
+            if let Some(cid) = bytes.cluster_id {
+                let idx = cid as usize;
+                while clusters.len() <= idx {
+                    clusters.push(ground_truth::Cluster {
+                        id: clusters.len() as ClusterId,
+                        members: Vec::new(),
+                    });
+                }
+                clusters[idx].members.push(key as NodeKey);
+            }
+        }
+
+        // Vector layer (#237 work) — for now the only honored layer is
+        // VectorLayer::Identity which passes bytes straight through.
+        let items = raw
+            .into_iter()
+            .enumerate()
+            .map(|(idx, gen_bytes)| {
+                let vector = match self.vector_layer {
+                    VectorLayer::Identity => gen_bytes.bytes.clone(),
+                    _ => Vec::new(), // implemented in #237
+                };
+                CorpusItem {
+                    key: idx as NodeKey,
+                    bytes: gen_bytes.bytes,
+                    vector,
+                    cluster_id: gen_bytes.cluster_id,
+                }
+            })
+            .collect();
+
         Corpus {
-            items: Vec::new(),
-            ground_truth: GroundTruth::empty(),
+            items,
+            ground_truth: GroundTruth {
+                clusters,
+                expected_knn: None,
+            },
         }
     }
 }
