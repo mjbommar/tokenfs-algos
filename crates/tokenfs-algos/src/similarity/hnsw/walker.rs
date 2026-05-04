@@ -39,6 +39,7 @@
 use alloc::vec::Vec;
 
 use super::candidates::{Candidate, MaxHeap};
+use super::filter::HnswFilter;
 use super::header::{HnswHeaderError, MetricKind, ScalarKind};
 use super::kernels::scalar;
 use super::kernels::{HnswKernelError, encode_f32};
@@ -155,6 +156,32 @@ pub fn try_search(
     query: &[u8],
     config: &SearchConfig,
 ) -> Result<Vec<(NodeKey, Distance)>, HnswSearchError> {
+    try_search_internal(view, query, config, None)
+}
+
+/// Search with an in-search permitted-set filter (ACORN-shape).
+///
+/// Returns up to `config.k` results, all of which satisfy
+/// `filter.permits(slot)`. At very low filter selectivity (default
+/// <5% per `SearchConfig::brute_force_threshold`), the walker falls
+/// back to a brute-force scan over the permitted set; otherwise it
+/// runs HNSW beam-search with in-search pruning (denied nodes are
+/// still expanded as graph hops but not added to the result heap).
+pub fn try_search_with_filter(
+    view: &HnswView<'_>,
+    query: &[u8],
+    config: &SearchConfig,
+    filter: &HnswFilter<'_>,
+) -> Result<Vec<(NodeKey, Distance)>, HnswSearchError> {
+    try_search_internal(view, query, config, Some(filter))
+}
+
+fn try_search_internal(
+    view: &HnswView<'_>,
+    query: &[u8],
+    config: &SearchConfig,
+    filter: Option<&HnswFilter<'_>>,
+) -> Result<Vec<(NodeKey, Distance)>, HnswSearchError> {
     if config.k == 0 {
         return Err(HnswSearchError::InvalidK);
     }
@@ -194,18 +221,21 @@ pub fn try_search(
     // Visited set is reused across all layer searches in this query.
     let mut visited = VisitedSet::try_with_capacity(node_count);
 
-    let ctx = SearchCtx {
+    // The descent phase ignores filter (it just routes to a good
+    // base-layer entry point); the base-layer search applies it.
+    let descent_ctx = SearchCtx {
         view,
         query,
         metric,
         scalar,
+        filter: None,
     };
 
     // Layer descent: top_level..=1 (skip layer 0 — that's the final
     // call below).
     for layer in (1..=top_level).rev() {
         // SEARCH-LAYER with ef = 1; entry is the running best.
-        let layer_w = search_layer(&ctx, current_best, layer, 1, &mut visited)?;
+        let layer_w = search_layer(&descent_ctx, current_best, layer, 1, &mut visited)?;
         if let Some(best) = layer_w.peek_best().copied() {
             current_best = best;
         }
@@ -216,12 +246,21 @@ pub fn try_search(
     }
 
     // Base-layer search (Algorithm 5 line 7): ef = max(k, ef_search).
+    let base_ctx = SearchCtx {
+        view,
+        query,
+        metric,
+        scalar,
+        filter,
+    };
     let ef = config.ef_search.max(config.k);
-    let base = search_layer(&ctx, current_best, 0, ef, &mut visited)?;
+    let base = search_layer(&base_ctx, current_best, 0, ef, &mut visited)?;
 
     // Algorithm 5 line 8: return top-K from the base-layer working set.
     // base is already sorted ascending by (distance, NodeId); take the
-    // first `k`.
+    // first `k`. With a filter active, base only contains permitted
+    // candidates already (search_layer applied the filter at the
+    // accept-into-W step).
     let mut out = Vec::with_capacity(config.k.min(base.len()));
     for cand in base.iter_best_first().take(config.k) {
         // Map slot → NodeKey by reading the on-disk key field.
@@ -238,6 +277,10 @@ struct SearchCtx<'a, 'b> {
     query: &'a [u8],
     metric: MetricKind,
     scalar: ScalarKind,
+    /// In-search filter. `None` for upper-layer descent (filter
+    /// applies only at the base layer, where we collect the result
+    /// set). `Some` only for the base-layer pass.
+    filter: Option<&'a HnswFilter<'a>>,
 }
 
 /// Algorithm 2 — SEARCH-LAYER. Returns the working set `W` (a
@@ -262,7 +305,13 @@ fn search_layer(
 
     visited.mark(entry.node);
     candidates.try_push(entry);
-    nearest.try_push(entry);
+    // Filter applies to result-set membership only. The entry point is
+    // always pushed onto `candidates` for graph-hop expansion, but only
+    // enters `nearest` (W) if it satisfies the filter (or no filter
+    // applies). This is the ACORN-shape pattern.
+    if ctx.filter.is_none_or(|f| f.permits(entry.node)) {
+        nearest.try_push(entry);
+    }
 
     while !candidates.is_empty() {
         // Line 5: extract nearest from C.
@@ -271,13 +320,18 @@ fn search_layer(
             .expect("candidates non-empty (loop condition)");
         candidates_remove_best(&mut candidates);
 
-        // Line 6-8: early-terminate when c is worse than W's worst.
-        let worst_w = nearest
-            .peek_worst()
-            .copied()
-            .expect("nearest non-empty (entry was pushed)");
-        if c.distance > worst_w.distance {
-            break;
+        // Line 6-8: early-terminate when c is worse than W's worst —
+        // BUT only when nearest is full. With a filter active, nearest
+        // may be empty (no permitted candidate seen yet) or below ef
+        // (we should keep expanding to find more permitted ones).
+        if nearest.is_full() {
+            let worst_w = nearest
+                .peek_worst()
+                .copied()
+                .expect("non-empty (is_full implies len == cap >= 1)");
+            if c.distance > worst_w.distance {
+                break;
+            }
         }
 
         // Line 9-17: explore c's neighborhood at this layer.
@@ -295,18 +349,24 @@ fn search_layer(
                 compute_distance(ctx.query, e_node.vector_bytes(), ctx.metric, ctx.scalar)?;
             let e_cand = Candidate::new(e_dist, e_id);
 
-            // Line 13: if d(e,q) < d(f,q) OR |W| < ef, accept.
-            let accept_into_w = !nearest.is_full()
+            // Line 13: if d(e,q) < d(f,q) OR |W| < ef, accept INTO C
+            // (graph-hop expansion always happens for promising
+            // candidates regardless of filter — this preserves
+            // reachability through denied-but-connected nodes).
+            let promising = !nearest.is_full()
                 || nearest
                     .peek_worst()
                     .is_some_and(|w| e_cand.distance < w.distance);
-            if accept_into_w {
-                // Line 14-15: add to candidates (for further expansion)
-                // and to W.
+            if promising {
                 candidates.try_push(e_cand);
-                nearest.try_push(e_cand);
-                // Lines 16-17 (cap |W| <= ef) handled by MaxHeap's
-                // bounded try_push: it auto-evicts when full.
+                // Filter applies to W (the result heap) only. ACORN-shape:
+                // denied nodes still expand as graph hops via `candidates`
+                // above, but never enter the result set.
+                if ctx.filter.is_none_or(|f| f.permits(e_id)) {
+                    nearest.try_push(e_cand);
+                    // Lines 16-17 (cap |W| <= ef) handled by MaxHeap's
+                    // bounded try_push: it auto-evicts when full.
+                }
             }
         }
     }
@@ -619,5 +679,79 @@ mod tests {
         let walker_result = try_search(&view, &query, &cfg).unwrap();
 
         assert_eq!(walker_result, brute);
+    }
+
+    // ---- Filter integration tests (Phase 3.1) ----------------------
+
+    #[test]
+    fn filter_with_all_permitted_matches_unfiltered() {
+        let fixture = build_toy_fixture();
+        let view = HnswView::try_new(&fixture).unwrap();
+        let query = [0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17];
+        let cfg = SearchConfig::new(4, 8);
+
+        // Permit every slot.
+        let permitted: Vec<u32> = (0..view.node_count() as u32).collect();
+        let filter = HnswFilter::new(&permitted, view.node_count());
+
+        let unfiltered = try_search(&view, &query, &cfg).unwrap();
+        let filtered = try_search_with_filter(&view, &query, &cfg, &filter).unwrap();
+        assert_eq!(filtered, unfiltered);
+    }
+
+    #[test]
+    fn filter_excludes_non_permitted_results() {
+        let fixture = build_toy_fixture();
+        let view = HnswView::try_new(&fixture).unwrap();
+        let query = [0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17];
+        let cfg = SearchConfig::new(4, 8);
+
+        // Permit only slots 1 and 3 (so the 0-distance slot 0 is denied).
+        let permitted: Vec<u32> = vec![1, 3];
+        let filter = HnswFilter::new(&permitted, view.node_count());
+
+        let result = try_search_with_filter(&view, &query, &cfg, &filter).unwrap();
+        // Result should only contain keys for slots 1 and 3.
+        for (key, _) in &result {
+            let idx = (key & 0xFF) as u32;
+            assert!(
+                idx == 1 || idx == 3,
+                "result contained denied slot {idx}: key=0x{key:016x}"
+            );
+        }
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn filter_zero_permitted_returns_empty_results() {
+        let fixture = build_toy_fixture();
+        let view = HnswView::try_new(&fixture).unwrap();
+        let query = [0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17];
+        let cfg = SearchConfig::new(4, 8);
+
+        let permitted: Vec<u32> = vec![];
+        let filter = HnswFilter::new(&permitted, view.node_count());
+
+        let result = try_search_with_filter(&view, &query, &cfg, &filter).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn filter_keeps_subgraph_reachable_through_denied_nodes() {
+        // Toy graph: node 0 (entry) connects to {1, 2, 3} at base layer.
+        // If we permit only {3}, the walker must still hop through 0
+        // (denied) to reach 3. Tests the ACORN-shape "graph hops happen
+        // regardless of filter" property.
+        let fixture = build_toy_fixture();
+        let view = HnswView::try_new(&fixture).unwrap();
+        let query = [0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47]; // matches slot 3
+        let cfg = SearchConfig::new(1, 8);
+
+        let permitted: Vec<u32> = vec![3];
+        let filter = HnswFilter::new(&permitted, view.node_count());
+
+        let result = try_search_with_filter(&view, &query, &cfg, &filter).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0 & 0xFF, 3);
     }
 }

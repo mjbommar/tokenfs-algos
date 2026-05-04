@@ -22,6 +22,8 @@
 
 #[cfg(any(feature = "std", feature = "alloc"))]
 mod candidates;
+#[cfg(any(feature = "std", feature = "alloc"))]
+mod filter;
 mod header;
 pub mod kernels;
 #[cfg(test)]
@@ -35,6 +37,8 @@ mod walker;
 
 #[cfg(any(feature = "std", feature = "alloc"))]
 pub use self::candidates::{Candidate, MaxHeap};
+#[cfg(any(feature = "std", feature = "alloc"))]
+pub use self::filter::HnswFilter;
 pub use self::header::{HEADER_BYTES, HnswHeader, HnswHeaderError, MetricKind, ScalarKind};
 #[cfg(any(feature = "std", feature = "alloc"))]
 pub use self::view::{
@@ -43,7 +47,7 @@ pub use self::view::{
 #[cfg(any(feature = "std", feature = "alloc"))]
 pub use self::visit::VisitedSet;
 #[cfg(any(feature = "std", feature = "alloc"))]
-pub use self::walker::{HnswSearchError, SearchConfig, try_search};
+pub use self::walker::{HnswSearchError, SearchConfig, try_search, try_search_with_filter};
 
 /// External caller-supplied node key. usearch v2.25's default is `u64`.
 pub type NodeKey = u64;
