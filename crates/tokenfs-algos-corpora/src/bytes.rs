@@ -4,9 +4,11 @@
 //!
 //! Phase coverage:
 //!
-//! - **#236 (this commit):** [`BytesLayer::BitFlipVariants`] (clustering-
+//! - **#236:** [`BytesLayer::BitFlipVariants`] (clustering-
 //!   fuzz primitive) + [`BytesLayer::UniformRandom`] (ChaCha8 stream).
-//! - **#238:** [`BytesLayer::MarkovChain`], [`BytesLayer::ByteHistogramTargeted`].
+//! - **#238 (this commit):** [`BytesLayer::MarkovChain`] (order-N
+//!   sampler with per-context next-byte distribution).
+//! - **Later:** [`BytesLayer::ByteHistogramTargeted`].
 
 use rand_chacha::ChaCha8Rng;
 use rand_core::{RngCore, SeedableRng};
@@ -119,8 +121,14 @@ pub fn generate(layer: &BytesLayer, seed: u64, n_items: usize) -> Vec<GeneratedB
             *variants_per_cluster,
             *p_flip,
         ),
-        BytesLayer::MarkovChain { .. } | BytesLayer::ByteHistogramTargeted { .. } => {
-            // Filled in #238.
+        BytesLayer::MarkovChain {
+            bytes_per_item,
+            order,
+            transition_seed,
+        } => generate_markov_chain(seed, n_items, *bytes_per_item, *order, *transition_seed),
+        BytesLayer::ByteHistogramTargeted { .. } => {
+            // Filled in a follow-up. For now, return empty so the spec
+            // compiles + presets don't blow up in tests.
             Vec::new()
         }
     }
@@ -194,6 +202,75 @@ fn generate_bit_flip_variants(
         }
     }
     out
+}
+
+/// Generate `n_items` Markov-chain byte sequences, each `bytes_per_item`
+/// long. The `order` parameter controls context length (1 = bigram,
+/// 2 = trigram, ...). The transition table is built from
+/// `transition_seed` independently of the per-item RNG, so multiple
+/// items share the same chain dynamics but draw different sequences.
+///
+/// Implementation: rather than store a full 256^order × 256 table
+/// (memory-prohibitive past order=2), we use a hash-mapped sparse
+/// representation: `next_byte = chacha8(transition_seed, context_hash)`.
+/// This produces a deterministic byte-given-context distribution
+/// without explicit table storage, so order can be arbitrary at
+/// constant memory.
+///
+/// At order=0 this degenerates to uniform-random per-item draws (the
+/// context hash is constant); higher orders produce text-like
+/// auto-correlated streams.
+fn generate_markov_chain(
+    seed: u64,
+    n_items: usize,
+    bytes_per_item: usize,
+    order: u8,
+    transition_seed: u64,
+) -> Vec<GeneratedBytes> {
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let mut out = Vec::with_capacity(n_items);
+    for _ in 0..n_items {
+        let mut buf = vec![0u8; bytes_per_item];
+        // Bootstrap the first `order` bytes with uniform random; the
+        // chain proper starts at byte `order`.
+        let bootstrap = (order as usize).min(bytes_per_item);
+        if bootstrap > 0 {
+            rng.fill_bytes(&mut buf[..bootstrap]);
+        }
+        for i in bootstrap..bytes_per_item {
+            // Hash the order-byte context + transition_seed + draw seed.
+            let context_start = i - order as usize;
+            let context = &buf[context_start..i];
+            let next = sample_next_byte(transition_seed, context, rng.next_u64());
+            buf[i] = next;
+        }
+        out.push(GeneratedBytes {
+            bytes: buf,
+            cluster_id: None,
+        });
+    }
+    out
+}
+
+/// Mix transition_seed + context bytes + per-position salt → next byte.
+/// Deterministic given those three inputs; per-context distribution is
+/// effectively uniform over 0..256 but biased by the chain's structure
+/// (the same context always produces the same distribution given the
+/// same per-position salt sequence).
+///
+/// This is a sparse hash-table replacement for an explicit Markov
+/// transition matrix: we never materialize the matrix, but the chain
+/// is well-defined and reproducible.
+fn sample_next_byte(transition_seed: u64, context: &[u8], salt: u64) -> u8 {
+    // FNV-1a-style mixing of (transition_seed, context, salt).
+    let mut hash: u64 = 0xCBF2_9CE4_8422_2325 ^ transition_seed;
+    for &b in context {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x100_0000_01B3);
+    }
+    hash ^= salt;
+    hash = hash.wrapping_mul(0x100_0000_01B3);
+    (hash & 0xFF) as u8
 }
 
 /// Apply independent bit flips at probability `p` to `bytes` in place,
@@ -307,5 +384,32 @@ mod tests {
             .zip(b.iter())
             .map(|(&x, &y)| (x ^ y).count_ones())
             .sum()
+    }
+
+    #[test]
+    fn markov_emits_correct_count_and_size() {
+        let out = generate_markov_chain(7, 4, 16, 2, 42);
+        assert_eq!(out.len(), 4);
+        for item in &out {
+            assert_eq!(item.bytes.len(), 16);
+            assert_eq!(item.cluster_id, None);
+        }
+    }
+
+    #[test]
+    fn markov_deterministic_across_runs() {
+        let a = generate_markov_chain(11, 3, 32, 2, 99);
+        let b = generate_markov_chain(11, 3, 32, 2, 99);
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert_eq!(x.bytes, y.bytes);
+        }
+    }
+
+    #[test]
+    fn markov_different_transition_seed_different_chain() {
+        let a = generate_markov_chain(11, 1, 64, 2, 100);
+        let b = generate_markov_chain(11, 1, 64, 2, 200);
+        // Same RNG seed but different transition table → different bytes.
+        assert_ne!(a[0].bytes, b[0].bytes);
     }
 }

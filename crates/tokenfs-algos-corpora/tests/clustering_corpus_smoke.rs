@@ -123,3 +123,82 @@ fn hamming(a: &[u8], b: &[u8]) -> u32 {
         .map(|(&x, &y)| (x ^ y).count_ones())
         .sum()
 }
+
+// ----- Preset smoke tests (one per implemented use-case path) -----
+
+#[test]
+fn preset_snapshot_dedup_tiny_yields_dedup_at_floor() {
+    use tokenfs_algos_corpora::{Scale, presets};
+
+    let spec = presets::snapshot_dedup(Scale::Tiny, 0xCAFE);
+    let corpus = spec.generate();
+
+    // Tiny: 5 base files × 12 snapshots = 60 items.
+    assert_eq!(corpus.items.len(), 60);
+
+    // Dedup floor sanity: at least 50% of items should be bit-identical
+    // to a base item (preset configures p_unchanged = 0.95).
+    let base_byte_set: std::collections::HashSet<Vec<u8>> = corpus
+        .items
+        .iter()
+        .step_by(12) // every 12th item is the snapshot-0 (base) of one file
+        .map(|item| item.bytes.clone())
+        .collect();
+    assert_eq!(base_byte_set.len(), 5);
+
+    let replicas = corpus
+        .items
+        .iter()
+        .filter(|item| base_byte_set.contains(&item.bytes))
+        .count();
+    let dedup = replicas as f32 / corpus.items.len() as f32;
+    assert!(dedup >= 0.5, "snapshot-dedup rate {dedup} below floor 0.5");
+}
+
+#[test]
+fn preset_rootfs_near_duplicate_tiny_has_clusters() {
+    use tokenfs_algos_corpora::{Scale, presets};
+
+    let spec = presets::rootfs_near_duplicate(Scale::Tiny, 42);
+    let corpus = spec.generate();
+
+    // Tiny: 10 clusters × 5 variants = 50 items.
+    assert_eq!(corpus.items.len(), 50);
+    assert_eq!(corpus.ground_truth.clusters.len(), 10);
+    for cluster in &corpus.ground_truth.clusters {
+        assert_eq!(cluster.members.len(), 5);
+    }
+
+    // Vector layer is F22 → 20 bytes per vector.
+    for item in &corpus.items {
+        assert_eq!(item.vector.len(), 20);
+    }
+}
+
+#[test]
+fn preset_rag_embeddings_tiny_has_clusters_and_i8_vectors() {
+    use tokenfs_algos_corpora::{Scale, presets};
+
+    let spec = presets::rag_embeddings(Scale::Tiny, 99);
+    let corpus = spec.generate();
+
+    assert_eq!(corpus.items.len(), 50); // 10 × 5
+    assert_eq!(corpus.ground_truth.clusters.len(), 10);
+    for item in &corpus.items {
+        assert_eq!(item.vector.len(), 384); // i8 dim=384 → 384 bytes
+    }
+}
+
+#[test]
+fn preset_forensics_planted_clusters_tiny() {
+    use tokenfs_algos_corpora::{Scale, presets};
+
+    let spec = presets::forensics_planted_clusters(Scale::Tiny, 7);
+    let corpus = spec.generate();
+    assert_eq!(corpus.items.len(), 50);
+    assert_eq!(corpus.ground_truth.clusters.len(), 10);
+    // F22 vector layer.
+    for item in &corpus.items {
+        assert_eq!(item.vector.len(), 20);
+    }
+}

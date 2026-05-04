@@ -121,7 +121,14 @@ impl CorpusSpec {
     /// corpora are immediately usable for HNSW Phase 4 clustering-
     /// fuzz validation.
     pub fn generate(&self) -> Corpus {
+        // 1. Bytes layer.
         let raw = bytes::generate(&self.bytes_layer, self.seed, self.n_items);
+
+        // 2. Structure layer (transforms the items in place).
+        // Independent seed derived from spec seed so structure
+        // mutations don't drift if bytes-layer params change.
+        let structure_seed = self.seed.wrapping_add(0xA5A5_A5A5_5A5A_5A5A);
+        let raw = structure::transform(&self.structure_layer, raw, structure_seed);
 
         // Build cluster table from the bytes layer's labels.
         let mut clusters: Vec<ground_truth::Cluster> = Vec::new();
