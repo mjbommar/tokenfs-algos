@@ -20,12 +20,18 @@
 //! Phase 1 (this commit): wire-format header parser + opaque types. No
 //! walker yet, no SIMD distance kernels yet.
 
+#[cfg(feature = "hnsw-build")]
+pub mod build;
 #[cfg(any(feature = "std", feature = "alloc"))]
 mod candidates;
 #[cfg(any(feature = "std", feature = "alloc"))]
 mod filter;
+#[cfg(feature = "hnsw-build")]
+mod graph;
 mod header;
 pub mod kernels;
+#[cfg(feature = "hnsw-build")]
+mod select;
 #[cfg(test)]
 pub(crate) mod tests;
 #[cfg(any(feature = "std", feature = "alloc"))]
@@ -48,6 +54,13 @@ pub use self::view::{
 pub use self::visit::VisitedSet;
 #[cfg(any(feature = "std", feature = "alloc"))]
 pub use self::walker::{HnswSearchError, SearchConfig, try_search, try_search_with_filter};
+
+#[cfg(feature = "hnsw-build")]
+pub use self::build::BuildConfig;
+#[cfg(feature = "hnsw-build")]
+pub use self::graph::{Graph, Node};
+#[cfg(feature = "hnsw-build")]
+pub use self::select::select_neighbors_simple;
 
 /// External caller-supplied node key. usearch v2.25's default is `u64`.
 pub type NodeKey = u64;

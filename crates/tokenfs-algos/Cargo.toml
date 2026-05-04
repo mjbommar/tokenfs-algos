@@ -91,6 +91,13 @@ blake3 = ["dep:blake3", "std"]
 # crate (which transitively brought RUSTSEC-2022-0004 +
 # RUSTSEC-2021-0145 into the dep tree).
 permutation_hilbert = ["std", "dep:fast_hilbert"]
+# HNSW builder (`similarity::hnsw::build`). std-gated; pulls in
+# `rand_chacha` for SLSA-L3-deterministic level assignment per
+# `docs/hnsw/research/DETERMINISM.md`. Walker (search-only path) does
+# NOT require this feature; `try_search` and the read-side surface
+# stay reachable in the kernel-default `--no-default-features
+# --features alloc` build.
+hnsw-build = ["std", "dep:rand_chacha", "dep:rand_core"]
 
 [dependencies]
 cfg-if.workspace = true
@@ -105,6 +112,11 @@ blake3 = { version = "1", default-features = false, features = ["std"], optional
 # pulling the upstream `hilbert` 0.1 crate's vulnerable transitive
 # deps (see audit-R5 finding #158).
 fast_hilbert = { version = "2", optional = true }
+# ChaCha8 deterministic RNG for the HNSW builder (similarity::hnsw::build).
+# Per docs/hnsw/research/DETERMINISM.md — explicitly required for
+# reproducible SLSA-L3 builds. Optional + gated on `hnsw-build`.
+rand_chacha = { version = "0.9", optional = true }
+rand_core = { version = "0.9", optional = true }
 
 [dev-dependencies]
 criterion = "0.8"
