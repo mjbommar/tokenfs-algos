@@ -39,6 +39,17 @@ pub fn distance_dot_i8(a: &[i8], b: &[i8]) -> Result<Distance, HnswKernelError> 
     #[cfg(all(
         any(target_arch = "x86", target_arch = "x86_64"),
         feature = "arch-pinned-kernels",
+        feature = "avx512",
+    ))]
+    {
+        if super::avx512::is_available() {
+            // SAFETY: AVX-512F detected at runtime; lengths checked above.
+            return Ok(unsafe { super::avx512::distance_dot_i8_unchecked(a, b) });
+        }
+    }
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "arch-pinned-kernels",
     ))]
     {
         if super::avx2::is_available() {
@@ -71,6 +82,16 @@ pub fn distance_l2_squared_i8(a: &[i8], b: &[i8]) -> Result<Distance, HnswKernel
             len_a: a.len(),
             len_b: b.len(),
         });
+    }
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "arch-pinned-kernels",
+        feature = "avx512",
+    ))]
+    {
+        if super::avx512::is_available() {
+            return Ok(unsafe { super::avx512::distance_l2_squared_i8_unchecked(a, b) });
+        }
     }
     #[cfg(all(
         any(target_arch = "x86", target_arch = "x86_64"),
@@ -108,6 +129,16 @@ pub fn distance_dot_u8(a: &[u8], b: &[u8]) -> Result<Distance, HnswKernelError> 
     #[cfg(all(
         any(target_arch = "x86", target_arch = "x86_64"),
         feature = "arch-pinned-kernels",
+        feature = "avx512",
+    ))]
+    {
+        if super::avx512::is_available() {
+            return Ok(unsafe { super::avx512::distance_dot_u8_unchecked(a, b) });
+        }
+    }
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "arch-pinned-kernels",
     ))]
     {
         if super::avx2::is_available() {
@@ -137,6 +168,16 @@ pub fn distance_l2_squared_u8(a: &[u8], b: &[u8]) -> Result<Distance, HnswKernel
             len_a: a.len(),
             len_b: b.len(),
         });
+    }
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "arch-pinned-kernels",
+        feature = "avx512",
+    ))]
+    {
+        if super::avx512::is_available() {
+            return Ok(unsafe { super::avx512::distance_l2_squared_u8_unchecked(a, b) });
+        }
     }
     #[cfg(all(
         any(target_arch = "x86", target_arch = "x86_64"),

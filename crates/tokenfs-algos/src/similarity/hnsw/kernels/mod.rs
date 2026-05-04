@@ -42,6 +42,13 @@
 pub mod avx2;
 #[cfg(all(
     any(feature = "std", feature = "alloc"),
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "arch-pinned-kernels",
+    feature = "avx512",
+))]
+pub mod avx512;
+#[cfg(all(
+    any(feature = "std", feature = "alloc"),
     target_arch = "aarch64",
     feature = "arch-pinned-kernels",
     feature = "neon",
