@@ -154,6 +154,62 @@ fn iai_vector_l2_squared_f32() -> Option<f32> {
     vector::l2_squared_f32(black_box(&a), black_box(&b))
 }
 
+// ----- HNSW distance kernels (Phase 2.4 iai-bench rows) -----
+//
+// Per-(metric, scalar_kind, backend) instruction-count rows for the
+// HNSW i8/u8 kernels. Fixed dim=128 (typical embedding chunk) so
+// counts are deterministic and comparable across runs. Each kernel
+// has a `_scalar` companion so the iai regression gate compares
+// apples-to-apples within a backend. Phase 2.5 will replace the
+// SIMD bodies (currently scalar fallbacks) with true vectorized
+// impls; the gate will then catch any IR regression on the SIMD path.
+
+const HNSW_DIM: usize = 128;
+
+#[library_benchmark]
+fn iai_hnsw_dot_i8_auto() -> u32 {
+    let a: Vec<i8> = (0..HNSW_DIM).map(|i| ((i as i32) - 64) as i8).collect();
+    let b: Vec<i8> = (0..HNSW_DIM)
+        .map(|i| ((i as i32 * 7) % 251 - 125) as i8)
+        .collect();
+    tokenfs_algos::similarity::hnsw::kernels::auto::distance_dot_i8(black_box(&a), black_box(&b))
+        .expect("equal lengths")
+}
+
+#[library_benchmark]
+fn iai_hnsw_dot_i8_scalar() -> u32 {
+    let a: Vec<i8> = (0..HNSW_DIM).map(|i| ((i as i32) - 64) as i8).collect();
+    let b: Vec<i8> = (0..HNSW_DIM)
+        .map(|i| ((i as i32 * 7) % 251 - 125) as i8)
+        .collect();
+    tokenfs_algos::similarity::hnsw::kernels::scalar::try_dot_i8(black_box(&a), black_box(&b))
+        .expect("equal lengths")
+}
+
+#[library_benchmark]
+fn iai_hnsw_l2_squared_i8_auto() -> u32 {
+    let a: Vec<i8> = (0..HNSW_DIM).map(|i| ((i as i32) - 64) as i8).collect();
+    let b: Vec<i8> = (0..HNSW_DIM)
+        .map(|i| ((i as i32 * 7) % 251 - 125) as i8)
+        .collect();
+    tokenfs_algos::similarity::hnsw::kernels::auto::distance_l2_squared_i8(
+        black_box(&a),
+        black_box(&b),
+    )
+    .expect("equal lengths")
+}
+
+#[library_benchmark]
+fn iai_hnsw_l2_squared_u8_auto() -> u32 {
+    let a: Vec<u8> = (0..HNSW_DIM).map(|i| (i & 0xFF) as u8).collect();
+    let b: Vec<u8> = (0..HNSW_DIM).map(|i| ((i * 7) & 0xFF) as u8).collect();
+    tokenfs_algos::similarity::hnsw::kernels::auto::distance_l2_squared_u8(
+        black_box(&a),
+        black_box(&b),
+    )
+    .expect("equal lengths")
+}
+
 // ----- harness -----
 
 library_benchmark_group!(
@@ -172,8 +228,15 @@ library_benchmark_group!(
     benchmarks = iai_vector_dot_f32, iai_vector_l2_squared_f32
 );
 
+library_benchmark_group!(
+    name = hnsw_group;
+    benchmarks = iai_hnsw_dot_i8_auto, iai_hnsw_dot_i8_scalar,
+                 iai_hnsw_l2_squared_i8_auto, iai_hnsw_l2_squared_u8_auto
+);
+
 main!(
     library_benchmark_groups = bits_group,
     hash_group,
-    vector_group
+    vector_group,
+    hnsw_group
 );

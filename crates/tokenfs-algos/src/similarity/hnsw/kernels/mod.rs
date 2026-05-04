@@ -59,6 +59,9 @@ pub mod sse41;
 #[cfg(any(feature = "std", feature = "alloc"))]
 pub use self::scalar::HnswKernelError;
 
+#[cfg(any(feature = "std", feature = "alloc"))]
+pub mod auto;
+
 use super::Distance;
 
 /// Encode an `f32` distance into the integer [`Distance`] type so the
