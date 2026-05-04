@@ -72,6 +72,13 @@ This is in `tokenfs-paper`'s tokenfs_writer crate, NOT in tokenfs-algos. Documen
 
 - `crates/tokenfs-algos/tests/hnsw_*` — re-run all earlier phase tests; nothing should regress
 
+### Fuzz targets (per `../components/CLUSTERING_FUZZ.md` §"libfuzzer integration")
+
+- `fuzz/fuzz_targets/hnsw_walker_fuzz.rs` — random bytes through `HnswView::try_new` + `try_search`; must never panic, must reject malformed input cleanly. Defends against CVE-2023-37365-class bounds-read.
+- `fuzz/fuzz_targets/hnsw_walker_clustering.rs` — clustering-fuzz harness: derives (M, N, p, seed) from libfuzzer input, builds clustering corpus, builds index, walks, asserts recall floor (>=0.5; sanity, not Phase 4's expected value). Catches walker returning empty/unsorted/duplicate results on edge cases.
+- Both targets registered in `fuzz/Cargo.toml` `[[bin]]` section.
+- Both wired into `.github/workflows/fuzz-nightly.yml` matrix.
+
 ### Benchmarks
 
 - iai-callgrind: full HNSW kernel set has bench rows; gate at 1% IR regression as established

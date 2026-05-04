@@ -38,6 +38,7 @@ research that backs each.
 | Distance kernels | `kernels/{scalar,avx2,avx512,neon,sse41,ssse3}.rs` | [`components/DISTANCE_KERNELS.md`](components/DISTANCE_KERNELS.md) |
 | Filter primitives | `filter.rs` | [`components/FILTER.md`](components/FILTER.md) |
 | Graph layout | `graph.rs` (owned) + `view.rs` (zero-copy) | [`components/GRAPH_LAYOUT.md`](components/GRAPH_LAYOUT.md) |
+| Clustering-fuzz generator + walker correctness gate | `testing/clustering.rs` + `tests/hnsw_clustering.rs` + `fuzz/fuzz_targets/hnsw_walker_clustering.rs` | [`components/CLUSTERING_FUZZ.md`](components/CLUSTERING_FUZZ.md) |
 
 ## Research index (all complete)
 

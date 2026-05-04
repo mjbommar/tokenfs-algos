@@ -2,7 +2,13 @@
 
 **Status:** plan, 2026-05-03. **Week 5 of the v0.7.0 HNSW landing.**
 
-**Goal:** end-of-week, our `Builder` produces a usearch v2.25 wire-format index that the libusearch reader consumes correctly; round-trip test confirms our builder + our walker = libusearch builder + libusearch walker on the same insertion sequence + RNG seed. Single-threaded, deterministic, SLSA-L3-ready.
+**Goal:** end-of-week, our `Builder` produces a usearch v2.25 wire-format index that round-trips: build → serialize → walker → results match brute-force scan over the same vectors at >=95% recall. Single-threaded, deterministic, SLSA-L3-ready. Clustering-fuzz validates algorithmic correctness against constructed ground truth (per `../components/CLUSTERING_FUZZ.md`).
+
+## Correctness gate (revised 2026-05-04)
+
+Original plan called for "libusearch round-trip" (build with our builder, build with libusearch, assert byte-identical). Per the user-directed fixture-strategy redesign, the primary gate is now **brute-force + clustering-fuzz**, no external dependency. See [`../components/CLUSTERING_FUZZ.md`](../components/CLUSTERING_FUZZ.md) for the design.
+
+The libusearch byte-identical check is preserved as an **optional** test gated on `--features hnsw-libusearch-compat`; runs only when the user has Python `usearch==2.25.x` available locally. Not in CI; manual sanity only.
 
 ## Deliverables
 
@@ -65,16 +71,28 @@
   - `builder_finish_returns_valid_wire_format()` — output passes `HnswView::try_new` round-trip
   - `builder_determinism_same_seed_same_input_same_output()` — build twice, assert byte-identical
 
-- `crates/tokenfs-algos/tests/hnsw_builder_round_trip.rs` (integration):
-  - Build a 10⁴-vector index with our Builder + seed=42 in single-threaded mode
-  - Build the same input with libusearch v2.25 + seed=42 in single-threaded mode
-  - Compare the two serialized bytes byte-for-byte; if not byte-identical, document the divergence and verify recall equivalence on 100 queries
-  - Walker parity: load both indexes; same 100 queries; assert k-NN result lists match
+- `crates/tokenfs-algos/tests/hnsw_clustering.rs` (integration; primary correctness gate):
+  - Generates a clustering corpus per `../components/CLUSTERING_FUZZ.md` at three operating points: (M=100, N=20, p=0.05), (M=50, N=10, p=0.10), (M=20, N=5, p=0.20)
+  - Builds with our Builder; walks with our walker
+  - Asserts average per-query recall >= the floor for each (p, T) pair documented in CLUSTERING_FUZZ.md §"Correctness assertions"
+  - Brute-force overlap: walker results' set vs. brute-force top-N >= 0.95 at efSearch=64
+
+- `crates/tokenfs-algos/tests/hnsw_round_trip.rs` (integration):
+  - Build a 10⁴-vector clustering corpus
+  - Builder serializes
+  - Walker reads the bytes back, runs the same queries
+  - Asserts walker results match brute-force scan at >=95% recall (no external libusearch oracle needed)
 
 - `crates/tokenfs-algos/tests/hnsw_builder_determinism.rs`:
-  - Build twice with the same input; assert byte-identical output
+  - Build twice with the same input + same seed; assert byte-identical output
   - Build with seed=42 and seed=43; assert different output
   - Build with same seed but different sort order of input; assert different output (validates that caller-side sorting is the determinism contract)
+
+- `crates/tokenfs-algos/tests/hnsw_libusearch_compat.rs` (optional, gated on `--features hnsw-libusearch-compat`):
+  - Spawns Python subprocess with `usearch==2.25.x`
+  - Asks libusearch to read our Builder's serialized bytes
+  - Asserts libusearch's k-NN results agree with our walker
+  - NOT in CI; manual sanity check only. Documented in `tests/README.md`.
 
 ### Benchmarks
 
@@ -127,8 +145,9 @@ xtask: panic-surface-lint: pub fn surface within allowlist (0 entries)
 
 | Risk | Mitigation |
 |---|---|
-| Our builder produces different graph topology than libusearch given identical insert order | The HNSW paper is precise enough that a correct implementation should match libusearch on deterministic input. If we diverge, the round-trip test catches it; we then bisect by checking each algorithm's output against libusearch's intermediate state. |
-| Our builder is materially slower than libusearch single-thread | Target: within 2× of libusearch single-thread. We use the same SIMD distance kernels; the algorithmic difference should be small. If slower, profile + tune. |
+| Builder produces graph topology that fails clustering recall on the corpus | The clustering-fuzz test (per `../components/CLUSTERING_FUZZ.md`) bisects: try (M=10, N=5, p=0.05) first; if recall is low at that scale, the bug is in select_neighbors / level assignment / edge pruning, not in serialization. Use the brute-force scan as ground truth — it cannot diverge from the inserted vectors. |
+| Our builder produces different bytes than libusearch given identical insert order | This is the optional `hnsw-libusearch-compat` test (out of CI). Wire-format compat is the contract; bit-identical builds are nice-to-have. If the optional test fires, document the divergence and verify our walker still recovers the corpus (the load-bearing property). |
+| Our builder is materially slower than a hypothetical libusearch reference | We don't have libusearch as a baseline at all. Target: within 2× of brute-force build for small N (where build dominates), faster than brute-force search for large N (where search dominates). iai-callgrind + criterion track absolute throughput; bench-history.yml plots regressions. |
 | Float-point determinism breaks across CPU backends | Gate SLSA-L3 builds to integer metrics (Hamming on packed binary, L2² on i8). f32 metrics work but cross-arch reproducibility is documented as not guaranteed. See `research/DETERMINISM.md` for the recommendation. |
 | Builder panics on edge cases (empty graph, vector dim mismatch) | All public entries are `try_*` returning `Result<_, HnswBuildError>`. Panic-surface lint catches any regression. |
 | Builder's RNG choice affects portability | Use `rand_chacha::ChaCha8Rng` (deterministic across architectures, well-defined output). Document the choice in `research/DETERMINISM.md`. |
