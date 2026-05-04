@@ -30,6 +30,7 @@
 mod tests;
 
 pub mod fuzzy;
+pub mod hnsw;
 pub mod kernels;
 pub mod kernels_gather;
 #[cfg(feature = "std")]
