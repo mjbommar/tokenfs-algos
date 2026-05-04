@@ -334,16 +334,22 @@ Cost: single-threaded HNSW build is ~10× slower than parallel. For typical Toke
 
 Total estimated effort: **7 weeks** of focused engineering (was 6 in the prior draft; +1 week for the builder, which the prior draft delegated to libusearch). Each phase ends with a demo-able state.
 
-### Phase 1 — wire format + walker skeleton (week 1)
+### Phase 1 — wire format + walker skeleton (week 1) ✅ shipped 2026-05-04
 
-- `header.rs` — parse + write usearch v2.25 wire-format header; magic + version validation; scalar / metric kind enum mapping.
-- `view.rs` — zero-copy view over mmapped bytes; node offset arithmetic; bounds-checked neighbor iteration.
-- `walker.rs::try_search_inner` — beam-search loop, scalar-only distance dispatch, no SIMD yet.
-- `kernels::scalar` — L2² / cosine / dot / Hamming for f32 + i8 + u8 + binary (8 distance kernels).
-- `tests.rs` — parity test against a libusearch-built reference index (committed as test fixture, ~50 KB) so we have a known-good wire-format target.
+Landed in commits `f985337..d3aa26d` over 6 day-commits. As-shipped surface differs slightly from the original plan, with the differences captured in the planning tree (`docs/hnsw/components/{WALKER,WIRE_FORMAT,GRAPH_LAYOUT}.md`) and `docs/hnsw/components/CLUSTERING_FUZZ.md`:
+
+- `header.rs` — `HnswHeader::try_parse` + every kind enum (`MetricKind`, `ScalarKind`, error variants).
+- `view.rs` — `HnswView::try_new` with full structural validation in one O(N) pass; bounds-checked `try_node` / `try_neighbors`.
+- `walker.rs::try_search` — Algorithm 5 + Algorithm 2, scalar-only distance dispatch.
+- `visit.rs` + `candidates.rs` — generation-counter VisitedSet + bounded MaxHeap with deterministic tie-break.
+- `kernels::scalar` — 8 reference distance kernels (L2² / cosine / dot for f32/i8/u8 + Hamming/Jaccard for binary).
+- `tests.rs` — hand-crafted toy fixture (per `USEARCH_DEEP_DIVE.md` §1.8 byte diagram) + 17 header tests + 17 view tests.
+- `tests/hnsw_walker_smoke.rs` — external integration suite covering single-node / flat 4-node / two-level 4-node topologies.
 - `panic_surface_allowlist.txt` stays at 0; `try_search` is the kernel-safe entry.
 
-**Demo:** `try_search` returns top-16 by Hamming distance over a 10⁴-node F22 fingerprint index, matching libusearch reference output bit-for-bit.
+Test count: 96 (88 unit + 8 integration). `cargo xtask check` green.
+
+**Demo:** `try_search` returns top-k by L2² over the toy fixture, matching brute-force scan exactly. The originally-planned "10⁴-node libusearch fixture" deliverable was redesigned into the clustering-fuzz approach (per `docs/hnsw/components/CLUSTERING_FUZZ.md`); that gate fires in Phase 4 once the Builder lands.
 
 ### Phase 2 — SIMD distance kernels + iai benches (weeks 2-3)
 

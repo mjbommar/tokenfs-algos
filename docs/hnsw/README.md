@@ -20,13 +20,40 @@ research that backs each.
 
 ## Phase index
 
-| Phase | Week | Theme | Doc |
-|---|---|---|---|
-| 1 | 1 | Wire format parser + scalar walker skeleton | [`phases/PHASE_1.md`](phases/PHASE_1.md) |
-| 2 | 2-3 | AVX2 + NEON + SSE4.1 distance kernels + iai benches | [`phases/PHASE_2.md`](phases/PHASE_2.md) |
-| 3 | 4 | Filter primitives + AVX-512 | [`phases/PHASE_3.md`](phases/PHASE_3.md) |
-| 4 | 5 | Native deterministic builder | [`phases/PHASE_4.md`](phases/PHASE_4.md) |
-| 5 | 6-7 | Kernel-FPU bracketing + tokenfs_writer integration | [`phases/PHASE_5.md`](phases/PHASE_5.md) |
+| Phase | Week | Theme | Status | Doc |
+|---|---|---|---|---|
+| 1 | 1 | Wire format parser + scalar walker skeleton | **shipped 2026-05-04** (commits f985337 → d3aa26d) | [`phases/PHASE_1.md`](phases/PHASE_1.md) |
+| 2 | 2-3 | AVX2 + NEON + SSE4.1 distance kernels + iai benches | pending | [`phases/PHASE_2.md`](phases/PHASE_2.md) |
+| 3 | 4 | Filter primitives + AVX-512 | pending | [`phases/PHASE_3.md`](phases/PHASE_3.md) |
+| 4 | 5 | Native deterministic builder | pending | [`phases/PHASE_4.md`](phases/PHASE_4.md) |
+| 5 | 6-7 | Kernel-FPU bracketing + tokenfs_writer integration | pending | [`phases/PHASE_5.md`](phases/PHASE_5.md) |
+
+### Phase 1 result snapshot
+
+96 tests passing (88 in-crate unit tests + 8 external integration smoke
+tests). `cargo xtask check` green; panic-surface allowlist still 0
+entries. The kernel-safe walker (`try_search`) is reachable in
+`--no-default-features --features alloc` builds; the
+`tokenfs-algos-no-std-smoke` consumer compiles.
+
+Module surface as shipped:
+
+```
+crates/tokenfs-algos/src/similarity/hnsw/
+├── mod.rs         re-exports + NodeId/NodeKey/Distance type aliases
+├── header.rs      HnswHeader::try_parse (kernel-safe; never panics)
+├── view.rs        HnswView<'a> zero-copy graph (kernel-safe; never panics)
+├── walker.rs      try_search — Algorithm 5 + Algorithm 2 (scalar dispatch)
+├── visit.rs       VisitedSet — generation-counter bitset, O(1) clear
+├── candidates.rs  MaxHeap + Candidate (deterministic tie-break)
+├── kernels/
+│   ├── mod.rs     encode_f32 / decode_f32 (IEEE-754 total order)
+│   └── scalar.rs  8 reference distance kernels
+└── tests.rs       17 header + 17 view tests + toy fixture builder
+```
+
+External integration test: `crates/tokenfs-algos/tests/hnsw_walker_smoke.rs`
+(8 tests across 3 fixture topologies).
 
 ## Component index
 
