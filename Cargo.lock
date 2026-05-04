@@ -958,6 +958,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokenfs-algos-corpora"
+version = "0.1.0"
+dependencies = [
+ "rand_chacha",
+ "rand_core",
+ "tokenfs-algos",
+]
+
+[[package]]
 name = "tokenfs-algos-no-std-smoke"
 version = "0.1.0"
 dependencies = [
