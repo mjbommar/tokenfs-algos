@@ -1,8 +1,39 @@
 # Component: Walker (search)
 
-**Status:** skeleton, 2026-05-03. Filled in across Phases 1 → 3 → 5.
+**Status:** Phase 1 implementation landed 2026-05-04 (commits f985337..c1c4c98). Filter integration arrives in Phase 3; kernel-FPU bracketing in Phase 5.
 
 **Lives in:** `crates/tokenfs-algos/src/similarity/hnsw/{walker.rs, visit.rs, candidates.rs}`
+
+## Phase 1 implementation summary
+
+The walker landed 2026-05-04 in `walker.rs` (~470 LOC). Implements
+HNSW Algorithm 5 (K-NN-SEARCH) calling Algorithm 2 (SEARCH-LAYER)
+via the existing `HnswView` zero-copy graph access plus three
+freshly-landed support primitives:
+
+- **`VisitedSet`** (`visit.rs`, ~100 LOC) — generation-counter
+  bitset; O(1) `clear` between layer searches via incrementing a
+  single `u32` counter.
+- **`MaxHeap` + `Candidate`** (`candidates.rs`, ~200 LOC) — bounded
+  sorted-vec heap with deterministic tie-break by `(distance, NodeId)`
+  ascending. Used both as the working set (`ef`-sized) and the
+  result set (`k`-sized).
+- **`kernels::scalar::*`** (`kernels/scalar.rs`, ~250 LOC) — eight
+  reference kernels covering `(L2² | Cosine | InnerProduct) × (F32 | I8 | U8)`
+  plus `(Hamming | Jaccard) × B1x8`. Tanimoto on binary collapses to
+  Jaccard.
+
+`SearchCtx` keeps `search_layer`'s argument count under clippy's
+`too-many-arguments` cap. Distance dispatch happens in
+`compute_distance(query, target, metric, scalar)` — Phase 1 routes
+all combos through scalar; SIMD dispatch lands Phase 2 via
+`kernels::auto::*`.
+
+Cross-arch reproducibility: integer / binary metrics produce
+byte-identical distances across x86/AArch64; f32 metrics may differ
+under FMA fusion (documented in `DETERMINISM.md` §9). Phase 5 adds
+a `try_search_kernel_safe` variant that rejects f32 metrics at the
+type level.
 
 ## Role
 
@@ -34,62 +65,48 @@ The HNSW algorithm research catalogued bugs from production HNSW implementations
 6. **Filter integration (Phase 3).** In-search pruning vs post-filter. Brute-force fallback at low selectivity. See `FILTER.md`.
 7. **Audit posture.** `try_search_inner` private; `try_search` kernel-safe entry; `search` userspace-gated panicking wrapper. `try_search_kernel_safe` rejects f32 metrics for callers explicitly in kernel context.
 
-## API skeleton
+## API as shipped (Phase 1)
 
 ```rust
 pub struct SearchConfig {
-    pub k: usize,
-    pub ef_search: usize,
-    pub metric: Metric,
-    pub scalar_kind: ScalarKind,
-    pub brute_force_threshold: f32,   // selectivity cliff for filter mode
+    pub k: usize,                  // top-K to return
+    pub ef_search: usize,          // base-layer dynamic candidate list
+                                   //   — internally bumped to max(k, ef_search)
+}
+
+impl SearchConfig {
+    pub const fn new(k: usize, ef_search: usize) -> Self;
+    /// k=16, ef_search=64 — suitable for 32-byte F22 / Hamming.
+    pub const DEFAULT: SearchConfig;
 }
 
 pub enum HnswSearchError {
     InvalidK,
-    QueryDimMismatch { expected: usize, got: usize },
-    QueryScalarMismatch { expected: ScalarKind, got_len: usize },
-    ViewMalformed,
-    FloatNotKernelSafe,    // returned from try_search_kernel_safe for f32 metrics
+    QueryLengthMismatch { got: usize, expected: usize },
+    UnsupportedMetricScalar { metric: MetricKind, scalar: ScalarKind },
+    ViewCorruption(HnswViewError),
+    KernelError(HnswKernelError),
 }
 
-// Kernel-safe entry. Reachable in --no-default-features --features alloc.
+/// Kernel-safe entry. Reachable in --no-default-features --features alloc.
 pub fn try_search(
     view: &HnswView<'_>,
     query: &[u8],
     config: &SearchConfig,
 ) -> Result<Vec<(NodeKey, Distance)>, HnswSearchError>;
-
-pub fn try_search_with_filter(
-    view: &HnswView<'_>,
-    query: &[u8],
-    config: &SearchConfig,
-    filter: &HnswFilter<'_>,
-) -> Result<Vec<(NodeKey, Distance)>, HnswSearchError>;
-
-// Explicitly kernel-only. Rejects f32 metrics.
-pub fn try_search_kernel_safe(
-    view: &HnswView<'_>,
-    query: &[u8],
-    config: &SearchConfig,
-) -> Result<Vec<(NodeKey, Distance)>, HnswSearchError>;
-
-// Userspace ergonomic. Gated on `cfg(feature = "userspace")`.
-#[cfg(feature = "userspace")]
-pub fn search(
-    view: &HnswView<'_>,
-    query: &[u8],
-    config: &SearchConfig,
-) -> Vec<(NodeKey, Distance)>;
-
-#[cfg(feature = "userspace")]
-pub fn search_with_filter(
-    view: &HnswView<'_>,
-    query: &[u8],
-    config: &SearchConfig,
-    filter: &HnswFilter<'_>,
-) -> Vec<(NodeKey, Distance)>;
 ```
+
+The `metric` and `scalar` selection comes from the view's
+`HnswHeader` (whatever the index was built with). Phase 1 does not
+need a `metric` knob in `SearchConfig` because the index already
+encodes the answer — supplying a different metric at query time
+would just mean "I built this index but want to misuse it."
+
+## API additions across later phases
+
+Phase 3 adds `HnswFilter` + `try_search_with_filter`. Phase 5 adds
+`try_search_kernel_safe` (rejects f32 metrics) and the userspace
+panicking `search` shim gated on `cfg(feature = "userspace")`.
 
 ## Cross-references
 

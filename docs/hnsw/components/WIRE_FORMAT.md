@@ -1,8 +1,71 @@
 # Component: Wire format
 
-**Status:** skeleton, 2026-05-03. Filled in during Phase 1.
+**Status:** Phase 1 read path landed 2026-05-04 (commits f985337, dac8e3c). Write path lands in Phase 4 (`build/serialize.rs`).
 
 **Lives in:** `crates/tokenfs-algos/src/similarity/hnsw/{header.rs, view.rs, build/serialize.rs}`
+
+## Phase 1 implementation summary
+
+Two modules carry the read path; write path arrives Phase 4.
+
+### `header.rs` (~380 LOC, 17 tests)
+
+Parses + validates the 64-byte `index_dense_head_t` per
+`USEARCH_DEEP_DIVE.md` §1.3. Surface:
+
+- `HEADER_BYTES = 64` (locked by usearch's `static_assert`).
+- `MetricKind` enum — char-coded (`'i'`/`'c'`/`'e'`/`'b'`/`'t'`/`'s'`/`'j'`).
+- `ScalarKind` enum — numeric codes 0..23 per usearch's
+  `index_plugins.hpp:139-164`. v0.7.0 ships kernels for B1x8, F32,
+  I8, U8 only; other variants parse correctly but the walker
+  rejects them with `UnsupportedMetricScalar`.
+- `HnswHeader::try_parse(&[u8])` — kernel-safe, never panics.
+- `HnswHeaderError` covers every failure mode:
+  `Truncated`, `WrongMagic`, `UnsupportedFormatVersion` (rejects
+  pre-v2.25), `UnknownMetricKind`, `UnknownScalarKind`,
+  `UnsupportedKeyKind` (rejects non-u64), `UnsupportedSlotKind`
+  (rejects u40 / `index_dense_big_t`), `ZeroDimensions`,
+  `InvalidMultiFlag`.
+
+The `#[cfg(feature = "userspace")] HnswHeader::parse` userspace
+shim is gated; kernel-default builds only see `try_parse`.
+
+### `view.rs` (~660 LOC, 17 tests)
+
+Zero-copy view over the full serialized index (vectors blob +
+dense head + graph blob) per `USEARCH_DEEP_DIVE.md` §1.5–§1.8. Surface:
+
+- `GRAPH_HEADER_BYTES = 40` (locked by `index_serialized_header_t`).
+- `GraphHeader { size, connectivity, connectivity_base, max_level, entry_slot }`.
+- `HnswView::try_new(bytes)` — full structural validation in one
+  O(N) pass. Catches CVE-2023-37365-class bounds bugs at
+  construction time.
+- `HnswView::{node_count, dimensions, scalar_kind, bytes_per_vector,
+  max_level, entry_point, connectivity, connectivity_base, header,
+  graph_header}`.
+- `HnswView::try_node(NodeId) → Result<NodeRef<'a>, HnswViewError>`.
+- `NodeRef::{slot, key, level, vector_bytes, try_neighbors(level) → NeighborSlice}`.
+- `NeighborSlice::{len, is_empty, get(i), iter()}` — exposes u32
+  slot IDs without a misaligned `&[u32]` transmute (slabs sit at
+  non-4-byte-aligned offsets within tapes).
+
+`HnswViewError` covers every failure mode at every layer of the
+parse, including:
+- structural truncation (vectors header / vectors blob / graph
+  header / levels array / node tape),
+- dense-head cross-checks (cols vs `bytes_per_vector`, rows vs
+  graph-header `size`),
+- graph-header invariants (connectivity ≥ 2, connectivity_base ≥
+  connectivity, entry_slot < size, max_level fits u8),
+- per-node `levels[i]` out-of-range,
+- `levels[entry_slot] != max_level` mismatch,
+- `try_neighbors` validation: count ≤ cap, every live neighbor
+  slot < node_count.
+
+Allocation footprint: only the precomputed per-node offset table
+(`Vec<u32>`) and per-node level table (`Vec<u8>`), both sized to
+`node_count` at construction. After `try_new`, every accessor is
+O(1) byte arithmetic.
 
 ## Role
 
