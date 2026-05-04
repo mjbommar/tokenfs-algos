@@ -37,13 +37,29 @@ See `CHANGELOG.md` for per-release diffs and audit lineage.
 
 ### Next Acceptance Gates (v0.6+)
 
-v0.5.0 closed the only audit-R10 item triaged as in-scope (T3.4). The remaining
-audit-R10 items were deferred per the v0.5.0 triage and are now scheduled later:
+v0.5.0 closed the only audit-R10 item triaged as in-scope (T3.4); v0.5.x
+extended that with T3.5 (gh-pages bench-history publication, live at
+`mjbommar.github.io/tokenfs-algos/`).
 
-- **T3.5 bench-history publication** — gh-pages or bencher.dev. Targeted v0.6+; decide format and cadence first.
-- **T3.6 std default-flip** — drop `std` from default features (audit-R9 #4 carry-over). Breaking; queued for v1.0.
+Remaining queue:
 
-The rest of v0.6+ is whatever the next audit round (R11) surfaces.
+- **v0.6.0 — gap-review hygiene + image_salt threading** (G6). SemVer-major
+  bump for `similarity::minhash` / `similarity::lsh` to thread the salt;
+  also bundles the `paper/` → sibling-crate split (gap review §7) and
+  calibration-fixture check-in (G11).
+- **v0.7.0 — HNSW walker** (gap review G1, G4). Pure-Rust no_std walker
+  reading the usearch v2.25 wire format, in-search filter primitives.
+  Decided in [`docs/HNSW_PATH_DECISION.md`](docs/HNSW_PATH_DECISION.md);
+  estimated 6 weeks of focused work. Builder is libusearch-wrapped in
+  `tokenfs_writer`, not in this crate.
+- **v0.8.0 — multi-modal hybrid scoring** (G2). Layer above the walker:
+  weighted score combination + empirical-CDF normalization. Depends on
+  v0.7.0 landing.
+- **v1.0 — T3.6 std default-flip** (audit-R9 #4 carry-over). Breaking
+  change; queues behind a SemVer-major bump.
+
+Other audit-R10 work is closed. The rest of v0.6+ is whatever the next
+audit round (R11) surfaces.
 
 ### Hardware Backend Status
 
@@ -548,13 +564,15 @@ The crate has its own GitHub repo at `mjbommar/tokenfs-algos`. The TokenFS paper
 
 ## 13. Active Next Steps
 
-As of v0.5.0, in priority order:
+As of v0.5.x (post-T3.5), in priority order:
 
-1. **Submit OSS-Fuzz integration.** The `oss-fuzz/` directory has the upstream files ready (`Dockerfile`, `build.sh`, `project.yaml`). Open a PR against `google/oss-fuzz`. Once merged, ClusterFuzz coverage tracking + automatic regression bisection come for free.
-2. **Bake the new CI workflows.** `.github/workflows/{sanitizers,coverage,fuzz-nightly,mutation-testing,bench-regression,calibration,iai-bench}.yml` are all relatively new (v0.4.5 + v0.5.0). Watch the first few weeks of runs, tune thresholds, and adjust the bench-regression threshold (currently 15%) once we have a noise baseline from GitHub-hosted runners. The iai-bench gate is set at 1.0% IR regression (T3.4) — tighten or loosen once a real regression flags.
-3. **Set up the calibration host.** `.github/workflows/calibration.yml` requires a `[self-hosted, perf-quiet]` labeled runner. Until that exists, the workflow queues forever then times out. Either provision the host or rewrite the workflow to opt-in via `workflow_dispatch` only.
-4. **Decide T3.5 publication target.** gh-pages vs bencher.dev for bench-history publication. Cadence: every main push, weekly digest, or both?
-5. **Profile before new SIMD.** Add AVX-512 / NEON / SVE kernels only after flamegraphs, criterion timing tables, or iai-callgrind counters identify the next bottleneck.
+1. **HNSW walker (v0.7.0).** Decided in [`docs/HNSW_PATH_DECISION.md`](docs/HNSW_PATH_DECISION.md). Pure-Rust no_std walker reading the usearch v2.25 wire format under `similarity::hnsw`. Filter primitives (G4) co-design. ~6 weeks. Builder is libusearch-wrapped in `tokenfs_writer`.
+2. **`image_salt` threading (v0.6.0).** SemVer-major bump for `similarity::minhash` / `similarity::lsh` to thread the image salt through hash inputs (gap review G6). Required before any signed external image at v1.0.
+3. **`paper/` crate split (v0.6.0).** Move `src/paper/` to a sibling `tokenfs-algos-paper` workspace member so the core stays content-agnostic per the stated principle in `AGENTS.md`. Same Apache Arrow / simdjson move (gap review §7).
+4. **Submit OSS-Fuzz integration.** The `oss-fuzz/` directory has the upstream files ready. Open a PR against `google/oss-fuzz`; once merged, ClusterFuzz coverage tracking + automatic regression bisection come for free.
+5. **Bake the new CI workflows.** Watch `.github/workflows/{sanitizers,coverage,fuzz-nightly,mutation-testing,bench-regression,calibration,iai-bench,bench-history,bench-history-prune}.yml` for the first few weeks of real runs. Tune the bench-regression threshold (currently 15%) once GitHub-hosted-runner noise has a baseline; tighten or loosen the 1.0% iai-bench IR gate once a real regression flags.
+6. **Set up the calibration host.** `.github/workflows/calibration.yml` requires a `[self-hosted, perf-quiet]` labeled runner. Either provision the host or rewrite the workflow to opt-in via `workflow_dispatch` only.
+7. **Profile before new SIMD.** Add AVX-512 / NEON / SVE kernels only after flamegraphs, criterion timing tables, or iai-callgrind counters identify the next bottleneck. The HNSW walker landing will surface its own per-backend distance kernels (per `HNSW_PATH_DECISION.md` §6 / §10).
 6. **Downstream integration.** Wire `binary-bpe` and TokenFS consumers against `fingerprint`, `selector`, `chunk`, `distribution`, `permutation`, `similarity`, and `format` APIs. The kernel-safe-by-default surface is now stable enough for kernel-mode consumers to design against.
 7. **Audit-R11.** Schedule the next external audit pass. The previous audit cadence (R4 → R10) ran in parallel with implementation; R11 should focus on consumer-facing API ergonomics and a fresh look at the no-panic surface.
 
