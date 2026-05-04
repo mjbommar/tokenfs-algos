@@ -23,6 +23,7 @@
 #[cfg(any(feature = "std", feature = "alloc"))]
 mod candidates;
 mod header;
+pub mod kernels;
 #[cfg(test)]
 mod tests;
 #[cfg(any(feature = "std", feature = "alloc"))]
