@@ -90,7 +90,7 @@ jobs:
             --html --output-dir target/llvm-cov-html-kernel-safe
 
       - name: Upload coverage artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-reports
           path: |
