@@ -138,16 +138,18 @@ impl CorpusSpec {
             }
         }
 
-        // Vector layer (#237 work) — for now the only honored layer is
-        // VectorLayer::Identity which passes bytes straight through.
+        // Vector layer — calls into vector::generate_one per item.
+        // vec_seed is derived from the spec seed + item index so each
+        // item's synthetic vector (for EmbeddingF32 / EmbeddingI8) is
+        // independent yet deterministic.
         let items = raw
             .into_iter()
             .enumerate()
             .map(|(idx, gen_bytes)| {
-                let vector = match self.vector_layer {
-                    VectorLayer::Identity => gen_bytes.bytes.clone(),
-                    _ => Vec::new(), // implemented in #237
-                };
+                let vec_seed = self
+                    .seed
+                    .wrapping_add((idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                let vector = vector::generate_one(&self.vector_layer, &gen_bytes, vec_seed);
                 CorpusItem {
                     key: idx as NodeKey,
                     bytes: gen_bytes.bytes,
