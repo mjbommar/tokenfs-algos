@@ -34,6 +34,12 @@
 //! - `no_std + core`-clean. Uses `crate::math` for `sqrt`/`ln` so the
 //!   kernel works without `std` (via `libm`).
 
+#[cfg(all(
+    any(feature = "std", feature = "alloc"),
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "arch-pinned-kernels",
+))]
+pub mod avx2;
 #[cfg(any(feature = "std", feature = "alloc"))]
 pub mod scalar;
 
