@@ -40,8 +40,21 @@
     feature = "arch-pinned-kernels",
 ))]
 pub mod avx2;
+#[cfg(all(
+    any(feature = "std", feature = "alloc"),
+    target_arch = "aarch64",
+    feature = "arch-pinned-kernels",
+    feature = "neon",
+))]
+pub mod neon;
 #[cfg(any(feature = "std", feature = "alloc"))]
 pub mod scalar;
+#[cfg(all(
+    any(feature = "std", feature = "alloc"),
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "arch-pinned-kernels",
+))]
+pub mod sse41;
 
 #[cfg(any(feature = "std", feature = "alloc"))]
 pub use self::scalar::HnswKernelError;
