@@ -31,7 +31,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout main
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust
         run: rustup install stable --profile minimal
@@ -45,7 +45,7 @@ jobs:
         run: cargo build -p xtask --release
 
       - name: Check out gh-pages branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: gh-pages
           path: ./pages-out/

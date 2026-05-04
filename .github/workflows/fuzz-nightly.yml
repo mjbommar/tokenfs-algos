@@ -53,7 +53,7 @@ jobs:
           - hash_sha256_round_trip
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install nightly
         run: rustup install nightly --profile minimal
