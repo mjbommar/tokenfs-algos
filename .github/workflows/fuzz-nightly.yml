@@ -67,7 +67,7 @@ jobs:
           shared-key: fuzz-${{ matrix.target }}
 
       - name: Restore corpus (best-effort)
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.sha }}
@@ -101,7 +101,7 @@ jobs:
 
       - name: Save corpus on success (rolling cache for next run)
         if: success()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.sha }}
