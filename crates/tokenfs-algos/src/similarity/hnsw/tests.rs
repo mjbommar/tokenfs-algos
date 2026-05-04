@@ -325,7 +325,14 @@ fn toy_vector(slot: usize) -> [u8; 8] {
 
 /// Build the full 308-byte toy fixture. M0=4 (`connectivity_base`), M=2
 /// (`connectivity`), 8-dim u8, L2² metric.
-fn build_toy_fixture() -> Vec<u8> {
+///
+/// The `#[cfg(test)]` here is redundant (the enclosing module is
+/// `#[cfg(test)] mod tests` in `mod.rs`) but is required so the
+/// `panic-surface-lint` recognises this `pub(crate) fn` as test-only
+/// — the lint scans each file in isolation and would otherwise see
+/// the `assert_eq!`s in this builder body as new ungated panic sites.
+#[cfg(test)]
+pub(crate) fn build_toy_fixture() -> Vec<u8> {
     let mut buf = Vec::with_capacity(308);
 
     // ---- vectors header (32-bit rows + cols)
