@@ -23,8 +23,14 @@
 mod header;
 #[cfg(test)]
 mod tests;
+#[cfg(any(feature = "std", feature = "alloc"))]
+mod view;
 
 pub use self::header::{HEADER_BYTES, HnswHeader, HnswHeaderError, MetricKind, ScalarKind};
+#[cfg(any(feature = "std", feature = "alloc"))]
+pub use self::view::{
+    GRAPH_HEADER_BYTES, GraphHeader, HnswView, HnswViewError, NeighborIter, NeighborSlice, NodeRef,
+};
 
 /// External caller-supplied node key. usearch v2.25's default is `u64`.
 pub type NodeKey = u64;
