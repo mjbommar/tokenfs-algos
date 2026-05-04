@@ -47,7 +47,7 @@ jobs:
 
       - name: Download latest bench JSONL from bench-regression
         id: artifact
-        uses: dawidd6/action-download-artifact@v6
+        uses: dawidd6/action-download-artifact@v21
         continue-on-error: true
         with:
           workflow: bench-regression.yml
