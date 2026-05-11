@@ -115,7 +115,7 @@ fast_hilbert = { version = "2", optional = true }
 # ChaCha8 deterministic RNG for the HNSW builder (similarity::hnsw::build).
 # Per docs/hnsw/research/DETERMINISM.md — explicitly required for
 # reproducible SLSA-L3 builds. Optional + gated on `hnsw-build`.
-rand_chacha = { version = "0.9", optional = true }
+rand_chacha = { version = "0.10", optional = true }
 rand_core = { version = "0.9", optional = true }
 
 [dev-dependencies]
