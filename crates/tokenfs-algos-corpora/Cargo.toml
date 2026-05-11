@@ -29,7 +29,7 @@ tokenfs-algos = { path = "../tokenfs-algos", version = "0.5", features = ["std",
 # rand_chacha gives us deterministic RNG output across architectures.
 # Per docs/hnsw/research/DETERMINISM.md §8 — explicitly NOT std's
 # DefaultHasher / thread_rng.
-rand_chacha = "0.9"
+rand_chacha = "0.10"
 rand_core = "0.9"
 
 [lints]
